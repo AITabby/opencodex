@@ -6,74 +6,82 @@
 
 # English
 
-**OpenCodex** is a plug-and-play local gateway that unlocks Codex Desktop for third-party APIs, featuring a premium web dashboard and macOS-native Computer Use with visual fallback.
+**OpenCodex** is a plug-and-play local gateway that unlocks Codex Desktop for third-party APIs, featuring a premium web dashboard, custom Computer Use engine, and Vision Bridge for text-only models.
 
 ## 🌟 Key Features
 
-*   **Zero-Configuration Auto-Setup**: Start the server and it automatically patches `~/.codex/config.toml` with backups, no CLI interaction needed.
-*   **Premium Glassmorphic Web Dashboard (`http://localhost:8765/dashboard`)**:
-    *   **Interactive Bilingual Switcher**: A dynamic button (`🌐 EN / 中`) translates all labels and notifications instantly.
-    *   **Keys & Endpoints Manager**: Graphically update API configurations.
-    *   **Model Dropdown Customizer**: Manually input model names and toggle which appear in Codex.
-    *   **Live SSE Terminal Logger**: Streams proxy logs in real-time as Codex operates.
-    *   **One-Click Restart**: Restart Codex Desktop directly from the dashboard.
-*   **Native macOS Computer Use & Universal Vision Bridge**:
-    *   **Mac-Native `sips` Compression**: Automatically downscales screenshots to `1200px` max dimension.
-    *   **Multimodal Fallback**: Intercepts screenshots and generates high-fidelity textual descriptions via OpenCode's `mimo-v2.5`, enabling Computer Use for text-only models.
+* **Zero-Config Setup**: Start the server, it auto-patches `~/.codex/config.toml` with backups. No CLI, no manual editing.
+* **Premium Web Dashboard** (`http://localhost:8765/dashboard`):
+  * 🌐 Bilingual (EN/中文) with instant switch
+  * 🔑 API key & endpoint management
+  * 📝 Add/delete custom models, toggle visibility in Codex
+  * 📡 Live SSE log streaming
+  * 🚀 One-click Codex restart
+  * ↺ One-click reset to native Codex
+* **Custom Computer Use Engine**:
+  * 🖱️ Native macOS mouse/keyboard/window control via CGEvent
+  * 📸 Screenshot capture with `sips` compression (1200px)
+* **Vision Bridge**:
+  * 👁️ For text-only models (DeepSeek, etc.)
+  * Automatically compresses screenshots, describes via multimodal model, injects description into prompt
+  * Supports any OpenAI-compatible vision model (configurable endpoint, model, API key)
 
----
+## 🚀 Quick Start
 
-## 🚀 Getting Started
+### Prerequisites
+- macOS
+- Node.js v18+
+- Codex Desktop installed
 
-### 📋 Prerequisites
-*   macOS
-*   Node.js (v18+) & npm installed.
-*   Codex Desktop installed.
-
-### ⚙️ Quick Installation
+### Install & Run
 
 ```bash
-cd /Users/aitabby/projects/opencodex
+git clone https://github.com/AITabby/opencodex.git
+cd opencodex
 npm install
 npm start
 ```
 
-The server starts, automatically patches your Codex config, and opens the dashboard in your browser. Configure your API key and models from there.
+Server starts, browser opens to the dashboard. Add your API key and model names, click save — done.
 
 ---
 
 # 简体中文
 
-**OpenCodex** 是一款即插即用的本地网关，帮你解锁 Codex Desktop 的第三方 API 接入，配有高颜值 Web 控制台和 macOS 原生 Computer Use 视觉降级能力。
+**OpenCodex** 是一款即插即用的本地网关，为 Codex Desktop 解锁第三方 API。配备高颜值 Web 控制台、自研 Computer Use 引擎，以及让纯文本模型也能看图操作的 Vision Bridge。
 
 ## 🌟 核心特性
 
-*   **零配置自动启动**：启动服务后自动修补 `~/.codex/config.toml`，无需任何命令行交互。
-*   **高颜值玻璃拟态 Web 控制台 (`http://localhost:8765/dashboard`)**：
-    *   **动态零刷新翻译**：右上角 `🌐 EN / 中` 按钮一键秒切中英文。
-    *   **API 配置图形化管理**：轻松填写密钥和接口地址。
-    *   **自定义模型输入**：手动输入模型名，勾选决定哪些显示在 Codex 下拉框。
-    *   **实时流式日志（SSE）**：彩色 Tag 实时推送代理请求日志。
-    *   **一键重启 Codex**：控制台直接重启 Codex Desktop。
-*   **原生 macOS Computer Use 与智能视觉降级拦截**：
-    *   **原生 `sips` 压缩**：自动截屏并缩放到 `1200px`，节省带宽。
-    *   **万能多模态 Fallback**：为非多模态模型拦截截图，生成高保真文字描述，流畅运行 Computer Use。
-
----
+* **零配置启动**：启动后自动修补 `~/.codex/config.toml`，无需任何操作。
+* **高颜值 Web 控制台**（`http://localhost:8765/dashboard`）：
+  * 🌐 中英文一键切换
+  * 🔑 图形化管理 API Key 和接口地址
+  * 📝 自由增删模型，勾选控制哪些显示在 Codex
+  * 📡 实时 SSE 日志流
+  * 🚀 一键重启 Codex
+  * ↺ 一键还原原生 Codex
+* **自研 Computer Use 引擎**：
+  * 🖱️ macOS 原生鼠标/键盘/窗口控制（CGEvent）
+  * 📸 截图自动 `sips` 压缩至 1200px
+* **Vision Bridge 视觉降级**：
+  * 👁️ 纯文本模型（DeepSeek 等）也能跑 Computer Use
+  * 自动压缩截图 → 多模态模型描述 → 注入文字到 Prompt
+  * 支持任意 OpenAI 兼容的多模态模型（可配接口、模型名、Key）
 
 ## 🚀 快速上手
 
-### 📋 准备工作
-*   macOS 系统
-*   已安装 Node.js (v18+) 和 npm。
-*   已安装并至少运行过一次 Codex Desktop。
+### 准备工作
+- macOS 系统
+- Node.js v18+
+- 已安装 Codex Desktop
 
-### ⚙️ 安装与启动
+### 安装与启动
 
 ```bash
-cd /Users/aitabby/projects/opencodex
+git clone https://github.com/AITabby/opencodex.git
+cd opencodex
 npm install
 npm start
 ```
 
-启动后自动打开浏览器控制台，在页面中填写 API Key 和模型名即可使用。
+启动后浏览器自动打开控制台，填写 API Key 和模型名，保存即可使用。
