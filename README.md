@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="demo.mp4">▶️ Watch Demo Video</a>
+  <a href="https://youtu.be/GvmXBZvvhuo">▶️ Watch Demo Video on YouTube</a>
 </p>
 
 ---
