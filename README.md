@@ -2,6 +2,10 @@
 
 [English](#english) | [简体中文](#简体中文)
 
+<p align="center">
+  <img src="preview.png" alt="OpenCodex Dashboard" width="800">
+</p>
+
 ---
 
 # English
