@@ -6,6 +6,10 @@
   <img src="preview.png" alt="OpenCodex Dashboard" width="800">
 </p>
 
+<p align="center">
+  <video src="demo.mp4" width="800" controls></video>
+</p>
+
 ---
 
 # English
