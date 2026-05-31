@@ -278,6 +278,7 @@ function _responsesInputToMessages(value: any): any[] {
 
   const messages: any[] = [];
   const pendingToolCalls: any[] = [];
+  const deferredMessages: any[] = [];
 
   function flushPendingAssistantToolCalls() {
     if (pendingToolCalls.length > 0) {
@@ -286,9 +287,17 @@ function _responsesInputToMessages(value: any): any[] {
     }
   }
 
+  function flushDeferred() {
+    if (deferredMessages.length > 0) {
+      messages.push(...deferredMessages);
+      deferredMessages.length = 0;
+    }
+  }
+
   for (const item of value) {
     if (typeof item === "string") {
       flushPendingAssistantToolCalls();
+      flushDeferred();
       messages.push({ role: "user", content: item });
       continue;
     }
@@ -296,12 +305,21 @@ function _responsesInputToMessages(value: any): any[] {
 
     const itemType = item.type;
     if ((itemType === "message" || !itemType) && "role" in item) {
-      flushPendingAssistantToolCalls();
-      let role = item.role || "user";
-      if (role === "developer") role = "system";
-      messages.push({ role, content: _contentToText(item.content || "") });
+      if (pendingToolCalls.length > 0) {
+        // Defer system/developer messages when tool calls are pending
+        let role = item.role || "user";
+        if (role === "developer") role = "system";
+        deferredMessages.push({ role, content: _contentToText(item.content || "") });
+      } else {
+        flushPendingAssistantToolCalls();
+        flushDeferred();
+        let role = item.role || "user";
+        if (role === "developer") role = "system";
+        messages.push({ role, content: _contentToText(item.content || "") });
+      }
     } else if (itemType === "input_text" || itemType === "text") {
       flushPendingAssistantToolCalls();
+      flushDeferred();
       messages.push({ role: "user", content: _contentToText(item) });
     } else if (itemType === "function_call") {
       const callId = item.call_id || item.id || "call_0";
@@ -331,6 +349,7 @@ function _responsesInputToMessages(value: any): any[] {
         tool_call_id: item.call_id,
         content: _contentToText(item.output || ""),
       });
+      flushDeferred();
     } else if (itemType === "reasoning") {
       flushPendingAssistantToolCalls();
       messages.push({
@@ -343,6 +362,7 @@ function _responsesInputToMessages(value: any): any[] {
     }
   }
   flushPendingAssistantToolCalls();
+  flushDeferred();
   return messages;
 }
 
