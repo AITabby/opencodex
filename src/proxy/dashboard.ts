@@ -822,47 +822,37 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
       currentLang = lang;
       const t = i18nDict[lang];
       
-      document.getElementById('i18n-title').innerText = t.title;
-      document.getElementById('i18n-subtitle').innerText = t.subtitle;
-      document.getElementById('i18n-status').innerText = t.status;
+      const el = (id) => document.getElementById(id);
+      const setText = (id, val) => { const e = el(id); if (e) e.innerText = val; };
+      const setHtml = (id, fn) => { const e = el(id); if (e) e.innerHTML = fn(t); };
       
-      document.getElementById('i18n-panel-api-title').innerHTML = \`
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
-        </svg>
-        \${t.panelApiTitle}\`;
+      setText('i18n-title', t.title);
+      setText('i18n-subtitle', t.subtitle);
+      setText('i18n-status', t.status);
       
-      document.getElementById('i18n-label-providers').innerText = t.labelProviders;
-      document.getElementById('i18n-label-models').innerText = t.labelModels;
-      document.getElementById('i18n-model-hint').innerText = t.modelHint;
-      document.getElementById('i18n-btn-save-config').innerText = t.btnSaveConfig;
+      setHtml('i18n-panel-api-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>\${t.panelApiTitle}\`);
       
-      document.getElementById('i18n-panel-models-title').innerHTML = \`
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path>
-        </svg>
-        \${t.panelModelsTitle}\`;
+      setText('i18n-label-providers', t.labelProviders);
+      setText('i18n-label-models', t.labelModels);
+      setText('i18n-model-hint', t.modelHint);
+      setText('i18n-btn-save-config', t.btnSaveConfig);
       
-      document.getElementById('i18n-models-desc').innerText = t.modelsDesc;
-      document.getElementById('i18n-btn-update-dropdown').innerText = t.btnUpdateDropdown;
+      setHtml('i18n-panel-models-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>\${t.panelModelsTitle}\`);
       
-      document.getElementById('i18n-panel-console-title').innerHTML = \`
-        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-        </svg>
-        \${t.panelConsoleTitle}\`;
+      setText('i18n-models-desc', t.modelsDesc);
+      setText('i18n-btn-update-dropdown', t.btnUpdateDropdown);
       
-      document.getElementById('i18n-btn-clear').innerText = t.btnClear;
+      setHtml('i18n-panel-console-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>\${t.panelConsoleTitle}\`);
       
-      const connSse = document.getElementById('i18n-connecting-sse');
-      if (connSse) connSse.innerText = t.connectingSse;
+      setText('i18n-btn-clear', t.btnClear);
+      setText('i18n-connecting-sse', t.connectingSse);
+      setText('i18n-label-config-restart', t.labelConfigRestart);
+      setText('i18n-label-models-restart', t.labelModelsRestart);
+      setText('restart-codex-btn', t.btnRestartCodex);
+      setText('reset-btn', t.btnReset);
       
-      document.getElementById('i18n-label-config-restart').innerText = t.labelConfigRestart;
-      document.getElementById('i18n-label-models-restart').innerText = t.labelModelsRestart;
-      document.getElementById('restart-codex-btn').innerText = t.btnRestartCodex;
-      document.getElementById('reset-btn').innerText = t.btnReset;
-      
-      document.getElementById('lang-btn').innerText = lang === 'zh' ? '🌐 English' : '🌐 中文';
+      const langBtn = el('lang-btn');
+      if (langBtn) langBtn.innerText = lang === 'zh' ? '🌐 English' : '🌐 中文';
     }
 
     function toggleLanguage() {
@@ -1197,7 +1187,7 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
 
     // Initial Load
     window.onload = () => {
-      setLanguage('zh'); // Default to Chinese as user requested "中英文"
+      try { setLanguage('zh'); } catch {}
       loadConfig();
       loadModels();
       setupLogsSse();
