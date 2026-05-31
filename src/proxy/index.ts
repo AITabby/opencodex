@@ -367,8 +367,10 @@ stream_idle_timeout_ms = 600000
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
       });
+      res.flushHeaders();
       
       // Send initial backlog
       for (const line of logBuffer) {
@@ -376,13 +378,18 @@ stream_idle_timeout_ms = 600000
       }
 
       const sender = (payload: any) => {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch {}
       };
 
       activeSseClients.add(sender);
 
+      const keepalive = setInterval(() => {
+        try { res.write(`:keepalive\n\n`); } catch { clearInterval(keepalive); }
+      }, 15000);
+
       req.on("close", () => {
         activeSseClients.delete(sender);
+        clearInterval(keepalive);
       });
       return;
     }
@@ -484,6 +491,21 @@ stream_idle_timeout_ms = 600000
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+      return;
+    }
+
+    if (path === "/api/logs/poll" && req.method === "GET") {
+      const since = parseInt(url.searchParams.get("since") || "0");
+      const entries = logBuffer.slice(since > 0 ? Math.max(0, logBuffer.length - (logBuffer.length - since)) : 0);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ entries, total: logBuffer.length }));
+      return;
+    }
+
+    if (path === "/api/test-log" && req.method === "POST") {
+      console.log("[OpenCodex] Test log from dashboard at " + new Date().toLocaleTimeString());
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
 

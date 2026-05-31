@@ -694,6 +694,7 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
           
           <div class="console-header-actions">
             <button class="console-btn" id="i18n-btn-clear" onclick="clearConsole()">Clear</button>
+            <button class="console-btn" onclick="fetch('/api/test-log',{method:'POST'})">Test Log</button>
           </div>
         </div>
         
@@ -1130,23 +1131,23 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
       });
     }
 
-    // Live Logs SSE Setup
-    function setupLogsSse() {
-      const consoleContainer = document.getElementById('console-logs');
-      const source = new EventSource('/api/logs/stream');
-      
-      source.onmessage = (event) => {
+    // Live Logs Polling
+    function setupLogsPolling() {
+      let lastTotal = 0;
+      setInterval(async () => {
         try {
-          const log = JSON.parse(event.data);
-          appendLogLine(log.time, log.tag, log.text, log.level);
-        } catch {
-          // ignore
-        }
-      };
-
-      source.onerror = (err) => {
-        appendLogLine('[System]', 'WARN', i18nDict[currentLang].sseLost, 'warn');
-      };
+          const r = await fetch('/api/logs/poll?since=' + lastTotal);
+          const d = await r.json();
+          if (d.total > lastTotal) {
+            const newEntries = d.entries.slice(-(d.total - lastTotal));
+            for (const log of newEntries) {
+              appendLogLine(log.time, log.tag, log.text, log.level);
+            }
+            lastTotal = d.total;
+          }
+        } catch {}
+      }, 1000);
+      appendLogLine('[System]', 'INFO', currentLang === 'zh' ? '日志轮询已启动' : 'Log polling started', 'info');
     }
 
     function appendLogLine(time, tag, text, level) {
@@ -1190,7 +1191,7 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
       try { setLanguage('zh'); } catch {}
       loadConfig();
       loadModels();
-      setupLogsSse();
+      setupLogsPolling();
     };
   </script>
 </body>
