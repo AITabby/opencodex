@@ -9,17 +9,20 @@ import http from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { exec } from "node:child_process";
+import { execSync } from "node:child_process";
 
 import {
   responsesToChat,
   chatCompletionToResponse,
   extractNamespaceMap,
   ResponsesStreamState,
-  processVisionBridge
+  processVisionBridge,
+  describeImageB64
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
+import { ScreenshotTaker } from "../cu/screenshot.js";
+import { ActionPerformer } from "../cu/actions.js";
 
 interface ProviderConfig {
   name: string;
@@ -36,6 +39,10 @@ interface ProxyConfig {
 const activeSseClients = new Set<(payload: any) => void>();
 const logBuffer: any[] = [];
 const MAX_LOG_BUFFER = 200;
+
+// Voice reply buffer - stores the last Codex response for voice
+let lastVoiceReply: string | null = null;
+let voiceReplyResolve: ((text: string) => void) | null = null;
 
 export function addLog(tag: string, text: string, level: string = "info") {
   const timeStr = new Date().toLocaleTimeString();
@@ -318,13 +325,12 @@ stream_idle_timeout_ms = 600000
   public restartCodexDesktop() {
     console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
     const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex';
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
-      } else {
-        console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
-      }
-    });
+    try {
+      execSync(cmd, { timeout: 10000, stdio: "ignore" });
+      console.log("[OpenCodex] Codex restart triggered.");
+    } catch {
+      console.log("[OpenCodex] Codex restart command issued.");
+    }
   }
 
   start(port: number) {
@@ -510,18 +516,37 @@ stream_idle_timeout_ms = 600000
     }
 
     if (path === "/api/voice" && req.method === "POST") {
-      try {
-        const data = JSON.parse(body);
-        const text = data.text;
-        if (text) {
-          console.log(`[OpenCodex-Voice] "${text}"`);
-          // TODO: inject into current Codex conversation
+      this.handleVoice(body, res);
+      return;
+    }
+
+    if (path === "/api/voice/last" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ reply: lastVoiceReply || "" }));
+      return;
+    }
+
+    if (path === "/api/voice/wait" && req.method === "GET") {
+      // Wait up to 60 seconds for a voice reply
+      const timeout = setTimeout(() => {
+        voiceReplyResolve = null;
+        if (!res.headersSent) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ reply: "" }));
         }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "ok" }));
-      } catch (err: any) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+      }, 60000);
+      voiceReplyResolve = (text: string) => {
+        clearTimeout(timeout);
+        if (!res.headersSent) {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ reply: text }));
+        }
+      };
+      if (lastVoiceReply) {
+        const r = lastVoiceReply;
+        lastVoiceReply = null;
+        voiceReplyResolve(r);
+        voiceReplyResolve = null;
       }
       return;
     }
@@ -776,6 +801,15 @@ stream_idle_timeout_ms = 600000
     }
 
     const responseBody = chatCompletionToResponse(data, requestedModel, namespaceMap);
+    // Capture response for voice
+    const respText = responseBody?.output?.find((o: any) => o.type === "message")?.content?.[0]?.text || "";
+    if (respText && voiceReplyResolve) {
+      voiceReplyResolve(respText);
+      voiceReplyResolve = null;
+    }
+    if (respText) {
+      lastVoiceReply = respText;
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(responseBody));
   }
@@ -954,6 +988,152 @@ stream_idle_timeout_ms = 600000
 
     res.write("data: [DONE]\n\n");
     res.end();
+  }
+
+  private async handleVoice(body: string, res: http.ServerResponse) {
+    try {
+      const data = JSON.parse(body);
+      const text = data.text;
+      if (!text) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No text provided" }));
+        return;
+      }
+
+      console.log(`[OpenCodex-Voice] "${text}"`);
+
+      const screenshotTaker = new ScreenshotTaker();
+      const actionPerformer = new ActionPerformer();
+
+      const cuTools = [
+        { type: "function", function: { name: "screenshot", description: "Capture the current screen and return a description", parameters: { type: "object", properties: {} } } },
+        { type: "function", function: { name: "click", description: "Click at screen coordinates", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, button: { type: "string", enum: ["left", "right"] } }, required: ["x", "y"] } } },
+        { type: "function", function: { name: "type_text", description: "Type text at current focus", parameters: { type: "object", properties: { text: { type: "string" } }, required: ["text"] } } },
+        { type: "function", function: { name: "press_key", description: "Press a keyboard key or shortcut", parameters: { type: "object", properties: { key: { type: "string" } }, required: ["key"] } } },
+        { type: "function", function: { name: "scroll", description: "Scroll at position", parameters: { type: "object", properties: { x: { type: "number" }, y: { type: "number" }, delta_y: { type: "number" } } } } },
+        { type: "function", function: { name: "drag", description: "Drag from one point to another", parameters: { type: "object", properties: { from_x: { type: "number" }, from_y: { type: "number" }, to_x: { type: "number" }, to_y: { type: "number" } }, required: ["from_x", "from_y", "to_x", "to_y"] } } },
+        { type: "function", function: { name: "get_windows", description: "List visible windows", parameters: { type: "object", properties: {} } } },
+        { type: "function", function: { name: "focus_window", description: "Focus a window by ID", parameters: { type: "object", properties: { window_id: { type: "number" } }, required: ["window_id"] } } }
+      ];
+
+      const provider = this.config.providers.find(p => p.name !== "opencode") || this.config.providers[0];
+      const apiKey = provider ? this.resolveKey(provider.api_key) : "";
+      if (!apiKey || !provider?.base_url) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", reply: "No API provider configured." }));
+        return;
+      }
+
+      const catalog = this.getModelCatalog();
+      const voiceModel = catalog.models?.find((m: any) => !m.provider || m.provider === provider.name)?.model || "deepseek-chat";
+      const config = this.config;
+
+      async function callAI(messages: any[], maxToolLoops = 5): Promise<string> {
+        for (let loop = 0; loop < maxToolLoops; loop++) {
+          const r = await fetch(`${provider!.base_url}/chat/completions`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify({
+              model: voiceModel,
+              messages,
+              tools: cuTools,
+              tool_choice: "auto",
+              stream: false,
+              max_tokens: 1024
+            }),
+            signal: AbortSignal.timeout(30000)
+          });
+          if (!r.ok) {
+            const errText = await r.text().catch(() => "");
+            return `API error: ${r.status} ${errText.slice(0, 100)}`;
+          }
+          const result = await r.json();
+          const choice = result?.choices?.[0];
+          const msg = choice?.message || {};
+          const content = msg.content || "";
+          const toolCalls = msg.tool_calls || [];
+
+          if (!toolCalls.length) {
+            return content || "Task completed.";
+          }
+
+          messages.push({ role: "assistant", content: content || null, tool_calls: toolCalls });
+
+          for (const tc of toolCalls) {
+            const fn = tc.function || {};
+            const fnName = fn.name || "";
+            let resultText = "";
+            try {
+              const args = JSON.parse(fn.arguments || "{}");
+              switch (fnName) {
+                case "screenshot": {
+                  const png = await screenshotTaker.capture();
+                  const { describeImageB64 } = await import("../proxy/translator.js");
+                  const b64 = png.toString("base64");
+                  const description = await describeImageB64(b64, config);
+                  resultText = `[SCREENSHOT DESCRIPTION: ${description || "Unable to describe the screen."}]`;
+                  break;
+                }
+                case "click": {
+                  await actionPerformer.click(args.x, args.y, args.button);
+                  resultText = `Clicked at (${args.x}, ${args.y})`;
+                  break;
+                }
+                case "type_text": {
+                  await actionPerformer.typeText(args.text);
+                  resultText = `Typed text: ${args.text.slice(0, 50)}`;
+                  break;
+                }
+                case "press_key": {
+                  await actionPerformer.pressKey(args.key);
+                  resultText = `Pressed key: ${args.key}`;
+                  break;
+                }
+                case "scroll": {
+                  await actionPerformer.scroll(args.x || 0, args.y || 0, 0, args.delta_y || -3);
+                  resultText = `Scrolled at (${args.x || 0}, ${args.y || 0})`;
+                  break;
+                }
+                case "drag": {
+                  await actionPerformer.drag(args.from_x, args.from_y, args.to_x, args.to_y);
+                  resultText = `Dragged from (${args.from_x},${args.from_y}) to (${args.to_x},${args.to_y})`;
+                  break;
+                }
+                case "get_windows": {
+                  const windows = await actionPerformer.getWindows();
+                  resultText = `Windows: ${JSON.stringify(windows.slice(0, 10))}`;
+                  break;
+                }
+                case "focus_window": {
+                  await actionPerformer.focusWindow(args.window_id);
+                  resultText = `Focused window: ${args.window_id}`;
+                  break;
+                }
+                default:
+                  resultText = `Unknown tool: ${fnName}`;
+              }
+            } catch (err: any) {
+              resultText = `Tool error: ${err.message}`;
+            }
+            console.log(`[OpenCodex-Voice] Tool ${fnName}: ${resultText}`);
+            messages.push({ role: "tool", tool_call_id: tc.id, content: resultText });
+          }
+        }
+        return "Maximum steps reached. Please try a simpler command.";
+      }
+
+      const systemMsg = "You are a voice-controlled computer assistant. You can use tools to help the user. For simple conversations (greetings, questions), respond directly without using tools. Only use screen tools when the user asks to see or interact with the screen. Keep responses brief.";
+      const reply = await callAI([
+        { role: "system", content: systemMsg },
+        { role: "user", content: text }
+      ]);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", reply }));
+    } catch (err: any) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
   }
 }
 
