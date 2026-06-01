@@ -188,9 +188,10 @@ class OpenCodex {
     this.proxy.start(8765);
     const url = "http://localhost:8765/dashboard";
     console.log(`[OpenCodex] Dashboard → ${url}`);
-    try {
-      execSync(`open "${url}"`, { timeout: 3000 });
-    } catch {}
+    // Commented out to prevent infinite browser tabs opening when MCP server restarts
+    // try {
+    //   execSync(`open "${url}"`, { timeout: 3000 });
+    // } catch {}
     const transport = new StdioServerTransport();
     await this.mcp.connect(transport);
     console.log("[OpenCodex] MCP Server connected and ready.");

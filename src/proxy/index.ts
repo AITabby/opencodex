@@ -9,7 +9,7 @@ import http from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 
 import {
   responsesToChat,
@@ -20,6 +20,7 @@ import {
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
+import { getVisualizerHtml } from "./visualizer.js";
 
 interface ProviderConfig {
   name: string;
@@ -78,11 +79,134 @@ export class ProxyServer {
     this.ensureConfigDir();
     this.loadConfig();
     this.autoPatchCodexConfig();
+    this.ensurePythonScripts();
   }
 
   private ensureConfigDir() {
     if (!existsSync(this.configDir)) {
       mkdirSync(this.configDir, { recursive: true });
+    }
+  }
+
+  private ensurePythonScripts() {
+    const minimaxScript = `import sys
+import os
+import json
+import urllib.request
+import binascii
+
+def main():
+    if len(sys.argv) < 3:
+        print("ERROR: Missing text or output path")
+        sys.exit(1)
+        
+    text = sys.argv[1]
+    output_path = sys.argv[2]
+    voice_id = sys.argv[3] if len(sys.argv) > 3 else "presenter_male"
+    
+    api_key = os.environ.get("MINIMAX_API_KEY")
+    api_host = os.environ.get("MINIMAX_API_HOST", "https://api.minimaxi.com")
+    
+    if not api_key:
+        print("ERROR: Missing MINIMAX_API_KEY environment variable")
+        sys.exit(1)
+        
+    url = f"{api_host}/v1/t2a_v2"
+    
+    payload = {
+        "model": "speech-01-turbo",
+        "text": text,
+        "stream": False,
+        "voice_setting": {
+            "voice_id": voice_id,
+            "speed": 1.0,
+            "vol": 1.0,
+            "pitch": 0
+        },
+        "audio_setting": {
+            "sample_rate": 32000,
+            "bitrate": 128000,
+            "format": "mp3"
+        },
+        "output_format": "hex"
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        req = urllib.request.Request(
+            url, 
+            data=json.dumps(payload).encode("utf-8"), 
+            headers=headers, 
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            res_data = response.read().decode("utf-8")
+            res_json = json.loads(res_data)
+            
+            if "base_resp" in res_json and res_json["base_resp"].get("status_code") != 0:
+                msg = res_json["base_resp"].get("status_msg", "Unknown error")
+                print(f"ERROR: MiniMax API Error: {msg}")
+                sys.exit(1)
+                
+            audio_hex = res_json.get("data")
+            if not audio_hex:
+                print("ERROR: No audio data returned from MiniMax")
+                sys.exit(1)
+                
+            audio_bytes = binascii.unhexlify(audio_hex)
+            
+            with open(output_path, "wb") as f:
+                f.write(audio_bytes)
+                
+            print("SUCCESS")
+    except Exception as e:
+        print(f"ERROR: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()`;
+
+    const transcribeScript = `import sys
+import os
+import warnings
+
+# Suppress warnings (like the FP16 CPU warning) to keep stdout clean
+warnings.filterwarnings("ignore")
+
+try:
+    import whisper
+    
+    if len(sys.argv) < 2:
+        print("ERROR: Missing audio file path")
+        sys.exit(1)
+        
+    audio_path = sys.argv[1]
+    if not os.path.exists(audio_path):
+        print(f"ERROR: File not found: {audio_path}")
+        sys.exit(1)
+        
+    # Load model (cached locally in ~/.cache/whisper)
+    model = whisper.load_model("base")
+    
+    # Transcribe (fp16=False avoids CPU warning)
+    result = model.transcribe(audio_path, fp16=False)
+    
+    # Output the transcribed text
+    print(result.get("text", "").strip())
+except Exception as e:
+    print(f"ERROR: {str(e)}")
+    sys.exit(1)`;
+
+    try {
+      writeFileSync("/tmp/ocb_minimax_tts.py", minimaxScript, "utf-8");
+      writeFileSync("/tmp/ocb_transcribe.py", transcribeScript, "utf-8");
+      console.error("[OpenCodex] Written helper python scripts to /tmp successfully.");
+    } catch (err: any) {
+      console.error("[OpenCodex] Failed to write helper python scripts: " + err.message);
     }
   }
 
@@ -327,11 +451,50 @@ stream_idle_timeout_ms = 600000
     });
   }
 
+  public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
+    console.log(`[OpenCodex] Restarting Voice Bar using method: ${method}`);
+    
+    // Resolve opencodex-bar directory path dynamically
+    let barDir = join(process.cwd(), "..", "opencodex-bar");
+    if (!existsSync(barDir)) {
+      const candidates = [
+        join(homedir(), "projects", "opencodex-bar"),
+        join(homedir(), "opencodex-bar")
+      ];
+      for (const candidate of candidates) {
+        if (existsSync(candidate)) {
+          barDir = candidate;
+          break;
+        }
+      }
+    }
+    console.log(`[OpenCodex] Resolved Voice Bar directory: ${barDir}`);
+
+    const killCmd = "killall OpenCodexBar 2>/dev/null || true";
+    exec(killCmd, (err) => {
+      setTimeout(() => {
+        const startCmd = method === "swift-run"
+          ? `cd ${barDir} && nohup swift run > /tmp/opencodex-bar.log 2>&1 &`
+          : `open ${join(barDir, "OpenCodexBar.app")}`;
+        exec(startCmd, (startErr) => {
+          if (startErr) {
+            console.error(`[OpenCodex] Failed to start Voice Bar via ${method}: ${startErr.message}`);
+          } else {
+            console.log(`[OpenCodex] Voice Bar start command initiated successfully via ${method}.`);
+          }
+        });
+      }, 500);
+    });
+  }
+
   start(port: number) {
     this.server = http.createServer((req, res) => {
-      let body = "";
-      req.on("data", (chunk) => (body += chunk));
-      req.on("end", () => this.handle(req, res, body));
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        const buffer = Buffer.concat(chunks);
+        this.handle(req, res, buffer);
+      });
     });
     this.server.listen(port, "0.0.0.0");
     console.error(`[OpenCodex] Unified HTTP server listening on port ${port}`);
@@ -342,7 +505,7 @@ stream_idle_timeout_ms = 600000
     this.server?.close();
   }
 
-  private handle(req: http.IncomingMessage, res: http.ServerResponse, body: string) {
+  private handle(req: http.IncomingMessage, res: http.ServerResponse, rawBody: Buffer) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, session_id");
@@ -353,6 +516,8 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    const body = rawBody.toString("utf-8");
+
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const path = url.pathname;
 
@@ -360,6 +525,29 @@ stream_idle_timeout_ms = 600000
     if (path === "/dashboard" || path === "/dashboard/") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(getDashboardHtml());
+      return;
+    }
+
+    if (path === "/visualizer" || path === "/visualizer/") {
+      const parsedUrl = new URL(req.url || "", "http://localhost");
+      const isHud = parsedUrl.searchParams.get("mode") === "hud";
+      
+      const p = join(this.configDir, "voice_settings.json");
+      let hudTheme = "vortex";
+      if (existsSync(p)) {
+        try {
+          const settings = JSON.parse(readFileSync(p, "utf-8"));
+          hudTheme = settings.hud_theme || "vortex";
+        } catch {}
+      }
+
+      res.writeHead(200, { 
+        "Content-Type": "text/html; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0"
+      });
+      res.end(getVisualizerHtml(isHud, hudTheme));
       return;
     }
 
@@ -537,6 +725,250 @@ stream_idle_timeout_ms = 600000
         this.restartCodexDesktop();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/voice-settings" && req.method === "GET") {
+      const p = join(this.configDir, "voice_settings.json");
+      let settings = {
+        stt_engine: "local-whisper",
+        stt_api_key: "",
+        stt_base_url: "https://api.openai.com/v1",
+        stt_model: "whisper-1",
+        tts_engine: "edge-tts",
+        tts_api_key: "",
+        tts_base_url: "https://api.openai.com/v1",
+        tts_model: "tts-1",
+        tts_voice: "zh-CN-XiaoxiaoNeural",
+        vad_threshold: -42.0,
+        vad_duration: 1.5,
+        voice_llm_model: "",
+        hud_theme: "vortex"
+      };
+      if (existsSync(p)) {
+        try {
+          settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) };
+        } catch {}
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(settings));
+      return;
+    }
+
+    if (path === "/api/voice-settings" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const p = join(this.configDir, "voice_settings.json");
+        const settings = {
+          stt_engine: data.stt_engine || "local-whisper",
+          stt_api_key: data.stt_api_key || "",
+          stt_base_url: data.stt_base_url || "https://api.openai.com/v1",
+          stt_model: data.stt_model || "whisper-1",
+          tts_engine: data.tts_engine || "edge-tts",
+          tts_api_key: data.tts_api_key || "",
+          tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
+          tts_model: data.tts_model || "tts-1",
+          tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
+          vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -42.0,
+          vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 1.5,
+          voice_llm_model: data.voice_llm_model || "",
+          enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
+          hud_theme: data.hud_theme || "vortex"
+        };
+        writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
+        console.error("[OpenCodex] Saved voice settings to " + p);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", settings }));
+      } catch (err: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/voice/stt" && req.method === "POST") {
+      try {
+        const p = join(this.configDir, "voice_settings.json");
+        let settings: any = {
+          stt_engine: "local-whisper",
+          stt_api_key: "",
+          stt_base_url: "https://api.openai.com/v1",
+          stt_model: "whisper-1"
+        };
+        if (existsSync(p)) {
+          try {
+            settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) };
+          } catch {}
+        }
+
+        const audioPath = "/tmp/stt_web_input.wav";
+        writeFileSync(audioPath, rawBody);
+        console.error(`[OpenCodex Voice API] Received audio data for STT, size = ${rawBody.length} bytes`);
+
+        const engine = settings.stt_engine || "local-whisper";
+        if (engine === "openai-compatible") {
+          console.error(`[OpenCodex Voice API] Transcribing via API endpoint: ${settings.stt_base_url}`);
+          this.transcribeAudioAPI(audioPath, settings)
+            .then((text) => {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ text }));
+            })
+            .catch((err) => {
+              console.error(`[OpenCodex Voice API STT API Err] ${err.message}`);
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: err.message, text: "" }));
+            });
+        } else {
+          // Default to local-whisper
+          console.error(`[OpenCodex Voice API] Transcribing locally via local-whisper...`);
+          this.transcribeAudioLocal(audioPath, (text) => {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ text: text || "" }));
+          });
+        }
+      } catch (err: any) {
+        console.error(`[OpenCodex Voice API STT Err] ${err.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message, text: "" }));
+      }
+      return;
+    }
+
+    if (path === "/api/voice/tts" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const text = data.text;
+        if (!text) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Text is empty" }));
+          return;
+        }
+
+        const p = join(this.configDir, "voice_settings.json");
+        let settings: any = {
+          tts_engine: "edge-tts",
+          tts_api_key: "",
+          tts_base_url: "https://api.openai.com/v1",
+          tts_model: "tts-1",
+          tts_voice: "zh-CN-XiaoxiaoNeural"
+        };
+        if (existsSync(p)) {
+          try {
+            settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) };
+          } catch {}
+        }
+
+        const engine = settings.tts_engine || "edge-tts";
+        console.error(`[OpenCodex Voice API] Synthesizing speech via ${engine} for text: '${text.substring(0, 30)}...'`);
+
+        if (engine === "openai-compatible") {
+          this.synthesizeSpeechAPI(text, settings)
+            .then((audioBuffer) => {
+              res.writeHead(200, { "Content-Type": "audio/mpeg" });
+              res.end(audioBuffer);
+            })
+            .catch((err) => {
+              console.error(`[OpenCodex Voice API TTS API Err] ${err.message}`);
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: err.message }));
+            });
+        } else if (engine === "minimax") {
+          this.synthesizeSpeechMiniMax(text, settings, (audioBuffer) => {
+            if (audioBuffer) {
+              res.writeHead(200, { "Content-Type": "audio/mpeg" });
+              res.end(audioBuffer);
+            } else {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "MiniMax synthesis failed" }));
+            }
+          });
+        } else {
+          // Default to edge-tts
+          this.synthesizeSpeechEdge(text, settings, (audioBuffer) => {
+            if (audioBuffer) {
+              res.writeHead(200, { "Content-Type": "audio/mpeg" });
+              res.end(audioBuffer);
+            } else {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "EdgeTTS synthesis failed" }));
+            }
+          });
+        }
+      } catch (err: any) {
+        console.error(`[OpenCodex Voice API TTS Err] ${err.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/execute-command" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const command = data.command;
+        if (!command) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Command is empty" }));
+          return;
+        }
+
+        console.error(`[OpenCodex Command Console] Executing: ${command}`);
+        const cmdPath = "/Applications/Codex.app/Contents/Resources/codex";
+        const child = spawn(cmdPath, ["--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check", "-"]);
+        
+        let output = "";
+        let errorOutput = "";
+
+        child.stdout.on("data", (chunk) => {
+          output += chunk.toString();
+        });
+
+        child.stderr.on("data", (chunk) => {
+          errorOutput += chunk.toString();
+        });
+
+        child.on("close", (code) => {
+          const cleanOutput = output.replace(/\u001B\[[0-9;]*[a-zA-Z]/g, "").trim();
+          const cleanError = errorOutput.replace(/\u001B\[[0-9;]*[a-zA-Z]/g, "").trim();
+          
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            code,
+            output: cleanOutput,
+            error: cleanError
+          }));
+        });
+
+        child.stdin.write(command + "\n");
+        child.stdin.end();
+
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/voice-bar/status" && req.method === "GET") {
+      exec('pgrep -x OpenCodexBar', (err, stdout) => {
+        const running = !err && stdout.trim().length > 0;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ running, pid: running ? stdout.trim() : null }));
+      });
+      return;
+    }
+
+    if (path === "/api/voice-bar/launch" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body || "{}");
+        const method = data.method === "app" ? "app" : "swift-run";
+        this.restartVoiceBar(method);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", method }));
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -937,6 +1369,199 @@ stream_idle_timeout_ms = 600000
 
     res.write("data: [DONE]\n\n");
     res.end();
+  }
+
+  private transcribeAudioLocal(filePath: string, cb: (text: string | null) => void) {
+    const pythonCmd = "python3";
+    const args = ["/tmp/ocb_transcribe.py", filePath];
+    const uvxPath = join(homedir(), ".local", "bin", "uvx");
+    
+    const env = {
+      ...process.env,
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+    };
+
+    const child = existsSync(uvxPath)
+      ? spawn(uvxPath, ["--with", "openai-whisper", "python3", "/tmp/ocb_transcribe.py", filePath], { env })
+      : spawn(pythonCmd, args, { env });
+
+    let output = "";
+    let errorOutput = "";
+
+    child.stdout.on("data", (chunk) => {
+      output += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      errorOutput += chunk.toString();
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        const text = output.trim();
+        console.error(`[OpenCodex Local Whisper] Transcribed text: '${text}'`);
+        cb(text);
+      } else {
+        console.error(`[OpenCodex Local Whisper Err] Exit code ${code}. Error: ${errorOutput}`);
+        cb(null);
+      }
+    });
+  }
+
+  private async transcribeAudioAPI(filePath: string, settings: any): Promise<string> {
+    const apiKey = settings.stt_api_key || "";
+    const baseUrl = settings.stt_base_url || "https://api.openai.com/v1";
+    const model = settings.stt_model || "whisper-1";
+
+    const url = baseUrl.endsWith("/audio/transcriptions")
+      ? baseUrl
+      : `${baseUrl.replace(/\/$/, "")}/audio/transcriptions`;
+
+    const audioData = readFileSync(filePath);
+    const boundary = `----WebKitFormBoundary${Math.random().toString(36).substring(2)}`;
+    let payload = Buffer.alloc(0);
+
+    const appendField = (name: string, value: string) => {
+      let str = `--${boundary}\r\n`;
+      str += `Content-Disposition: form-data; name="${name}"\r\n\r\n`;
+      str += `${value}\r\n`;
+      payload = Buffer.concat([payload, Buffer.from(str)]);
+    };
+
+    const appendFile = (name: string, filename: string, data: Buffer) => {
+      let str = `--${boundary}\r\n`;
+      str += `Content-Disposition: form-data; name="${name}"; filename="${filename}"\r\n`;
+      str += `Content-Type: audio/wav\r\n\r\n`;
+      payload = Buffer.concat([payload, Buffer.from(str), data, Buffer.from("\r\n")]);
+    };
+
+    appendField("model", model);
+    appendFile("file", "speech.wav", audioData);
+    payload = Buffer.concat([payload, Buffer.from(`--${boundary}--\r\n`)]);
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`
+      },
+      body: payload
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`STT API returned status ${response.status}: ${errText}`);
+    }
+
+    const resJson: any = await response.json();
+    return resJson.text || "";
+  }
+
+  private async synthesizeSpeechAPI(text: string, settings: any): Promise<Buffer> {
+    const apiKey = settings.tts_api_key || "";
+    const baseUrl = settings.tts_base_url || "https://api.openai.com/v1";
+    const model = settings.tts_model || "tts-1";
+    let voice = settings.tts_voice || "alloy";
+
+    const validVoices = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
+    if (!validVoices.includes(voice.toLowerCase())) {
+      voice = "alloy";
+    }
+
+    const url = baseUrl.endsWith("/audio/speech")
+      ? baseUrl
+      : `${baseUrl.replace(/\/$/, "")}/audio/speech`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ model, input: text, voice })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`TTS API returned status ${response.status}: ${errText}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  }
+
+  private synthesizeSpeechMiniMax(text: string, settings: any, cb: (data: Buffer | null) => void) {
+    const apiKey = settings.tts_api_key || "";
+    const apiHost = settings.tts_base_url || "https://api.minimaxi.com";
+    const voiceId = settings.tts_voice || "presenter_male";
+    
+    const tempOutput = "/tmp/tts_minimax_web.mp3";
+    const env = {
+      ...process.env,
+      MINIMAX_API_KEY: apiKey,
+      MINIMAX_API_HOST: apiHost,
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+    };
+    const child = spawn("python3", ["/tmp/ocb_minimax_tts.py", text, tempOutput, voiceId], { env });
+    
+    let errOutput = "";
+    child.stderr.on("data", (chunk) => {
+      errOutput += chunk.toString();
+    });
+
+    child.on("close", (code) => {
+      if (code === 0 && existsSync(tempOutput)) {
+        try {
+          const data = readFileSync(tempOutput);
+          cb(data);
+        } catch (err: any) {
+          console.error(`[OpenCodex Voice API MiniMax Err] Failed to read output file: ${err.message}`);
+          cb(null);
+        }
+      } else {
+        console.error(`[OpenCodex Voice API MiniMax Err] Exit code ${code}. Error: ${errOutput}`);
+        cb(null);
+      }
+    });
+  }
+
+  private synthesizeSpeechEdge(text: string, settings: any, cb: (data: Buffer | null) => void) {
+    let voice = settings.tts_voice || "zh-CN-XiaoxiaoNeural";
+    if (!voice.includes("-") || voice.length < 5) {
+      const hasChinese = /[\u4e00-\u9fa5]/.test(text);
+      voice = hasChinese ? "zh-CN-XiaoxiaoNeural" : "en-US-AvaNeural";
+    }
+    const tempOutput = "/tmp/tts_edge_web.mp3";
+    const uvxPath = join(homedir(), ".local", "bin", "uvx");
+    
+    const env = {
+      ...process.env,
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+    };
+
+    const child = existsSync(uvxPath)
+      ? spawn(uvxPath, ["edge-tts", "--voice", voice, "--text", text, "--write-media", tempOutput], { env })
+      : spawn("edge-tts", ["--voice", voice, "--text", text, "--write-media", tempOutput], { env });
+
+    let errOutput = "";
+    child.stderr.on("data", (chunk) => {
+      errOutput += chunk.toString();
+    });
+
+    child.on("close", (code) => {
+      if (code === 0 && existsSync(tempOutput)) {
+        try {
+          const data = readFileSync(tempOutput);
+          cb(data);
+        } catch (err: any) {
+          console.error(`[OpenCodex Voice API EdgeTTS Err] Failed to read output file: ${err.message}`);
+          cb(null);
+        }
+      } else {
+        console.error(`[OpenCodex Voice API EdgeTTS Err] Exit code ${code}. Error: ${errOutput}`);
+        cb(null);
+      }
+    });
   }
 }
 
