@@ -8,7 +8,8 @@
 import http from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { exec, spawn } from "node:child_process";
 
 import {
@@ -454,19 +455,26 @@ stream_idle_timeout_ms = 600000
   public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
     console.log(`[OpenCodex] Restarting Voice Bar using method: ${method}`);
     
-    // Resolve opencodex-bar directory path dynamically
-    let barDir = join(process.cwd(), "..", "opencodex-bar");
-    if (!existsSync(barDir)) {
-      const candidates = [
-        join(homedir(), "projects", "opencodex-bar"),
-        join(homedir(), "opencodex-bar")
-      ];
-      for (const candidate of candidates) {
-        if (existsSync(candidate)) {
-          barDir = candidate;
-          break;
-        }
+    // Resolve opencodex-bar directory path dynamically and portably
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      join(moduleDir, "..", "..", "..", "opencodex-bar"), // relative to compiled dist/proxy/index.js
+      join(moduleDir, "..", "..", "opencodex-bar"),      // relative to src/proxy/index.ts
+      join(process.cwd(), "..", "opencodex-bar"),
+      join(process.cwd(), "opencodex-bar"),
+      join(homedir(), "projects", "opencodex-bar"),
+      join(homedir(), "opencodex-bar")
+    ];
+
+    let barDir = "";
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        barDir = candidate;
+        break;
       }
+    }
+    if (!barDir) {
+      barDir = join(process.cwd(), "..", "opencodex-bar"); // default fallback
     }
     console.log(`[OpenCodex] Resolved Voice Bar directory: ${barDir}`);
 
@@ -479,15 +487,15 @@ stream_idle_timeout_ms = 600000
           const debugPath = join(barDir, ".build/arm64-apple-macosx/debug/OpenCodexBar");
           let binPath = "swift run";
           if (existsSync(releasePath)) {
-            binPath = `"${releasePath}"`;
+            binPath = `./.build/arm64-apple-macosx/release/OpenCodexBar`;
             console.log(`[OpenCodex] Found compiled release binary: ${releasePath}`);
           } else if (existsSync(debugPath)) {
-            binPath = `"${debugPath}"`;
+            binPath = `./.build/arm64-apple-macosx/debug/OpenCodexBar`;
             console.log(`[OpenCodex] Found compiled debug binary: ${debugPath}`);
           } else {
             console.log(`[OpenCodex] No pre-compiled binary found. Falling back to swift run.`);
           }
-          startCmd = `cd "${barDir}" && nohup ${binPath} > /tmp/opencodex-bar.log 2>&1 &`;
+          startCmd = `cd "${barDir}" && ${binPath} > /dev/null 2>&1 &`;
         }
         exec(startCmd, (startErr) => {
           if (startErr) {
