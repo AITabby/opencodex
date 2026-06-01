@@ -954,7 +954,26 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
             const totalLen = text.length;
             const otherChars = Math.max(0, totalLen - cnChars);
             
-            const durationMs = cnChars * 220 + enWords * 300 + otherChars * 150 + 350;
+            // Progressive speaking rate: faster for longer paragraphs to match neural TTS speed-ups
+            let msPerCn = 220;
+            let msPerEn = 300;
+            let msPerOther = 150;
+            
+            if (totalLen > 100) {
+              msPerCn = 160;
+              msPerEn = 240;
+              msPerOther = 100;
+            } else if (totalLen > 50) {
+              msPerCn = 185;
+              msPerEn = 265;
+              msPerOther = 120;
+            } else if (totalLen > 25) {
+              msPerCn = 205;
+              msPerEn = 285;
+              msPerOther = 135;
+            }
+            
+            const durationMs = cnChars * msPerCn + enWords * msPerEn + otherChars * msPerOther + 300;
             const durationSec = Math.max(1.2, durationMs / 1000);
             
             subtext.style.transition = 'transform ' + durationSec + 's linear';
