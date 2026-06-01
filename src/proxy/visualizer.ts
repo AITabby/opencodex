@@ -672,6 +672,20 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       flex: 1 !important;
       height: 100% !important;
     }
+    .hud-subtitle-line {
+      font-size: 0.76rem;
+      font-weight: 500;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      height: 1.2rem;
+      line-height: 1.2rem;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      width: 230px;
+      transition: color 0.4s ease, opacity 0.4s ease;
+      background: transparent;
+      box-sizing: border-box;
+    }
   </style>
 </head>
 <body ${isHudModeStatic ? 'class="hud-mode theme-' + hudTheme + '"' : ''}>
@@ -800,14 +814,16 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           极光频谱与环境粒子流 (Spectrum & Particles)
         </div>
         <!-- Left text container specifically for HUD Mode -->
-        <div id="hud-text-container" style="display: none; flex-direction: column; justify-content: center; width: 230px; gap: 0.15rem; flex-shrink: 0; text-align: left; overflow: hidden; position: relative;">
+        <div id="hud-text-container" style="display: none; flex-direction: column; justify-content: center; width: 230px; gap: 0.15rem; flex-shrink: 0; text-align: left; overflow: hidden; position: relative; height: 100%;">
           <div id="hud-state-label" style="font-size: 0.65rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; color: var(--color-secondary); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; z-index: 2; background: transparent;">
             <span class="status-dot" id="hud-status-dot"></span>
             <span id="hud-state-text">IDLE</span>
           </div>
           <!-- Subtext scrolling viewport wrapper -->
-          <div style="width: 230px; overflow: hidden; position: relative; height: 1.2rem; z-index: 1;">
-            <div id="hud-subtext" style="font-size: 0.76rem; font-weight: 500; color: rgba(255, 255, 255, 0.88); white-space: nowrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: inline-block; position: absolute; left: 0; top: 0; transform: translateX(0); width: max-content; max-width: none !important;">Ready</div>
+          <div id="hud-text-viewport" style="width: 230px; overflow: hidden; position: relative; height: 2.4rem; z-index: 1;">
+            <div id="hud-text-scroll-container" style="display: flex; flex-direction: column; position: absolute; left: 0; top: 0; width: 100%; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1);">
+              <div id="hud-subtext" class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.88); opacity: 1;">Ready</div>
+            </div>
           </div>
         </div>
         <div class="preview-area">
@@ -876,19 +892,28 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
     // Expose dynamic JSBridge interface for native app integrations
     let currentSpeechText = "";
+    let lastCurrentText = "";
 
     window.updateVoiceState = function(state, amplitude, text) {
       // state: 'listening', 'thinking', 'speaking', 'idle'
       const stateLabel = document.getElementById('hud-state-label');
       const stateText = document.getElementById('hud-state-text');
       const statusDot = document.getElementById('hud-status-dot');
-      const subtext = document.getElementById('hud-subtext');
+      const scrollContainer = document.getElementById('hud-text-scroll-container');
       
       currentAmplitude = amplitude;
       
-      if (state === 'listening') {
+      function resetToSingleLine(labelText) {
+        lastCurrentText = "";
         currentSpeechText = "";
-        
+        if (scrollContainer) {
+          scrollContainer.style.transition = 'none';
+          scrollContainer.style.transform = 'translateY(0)';
+          scrollContainer.innerHTML = '<div id="hud-subtext" class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.88); opacity: 1;">' + labelText + '</div>';
+        }
+      }
+      
+      if (state === 'listening') {
         // Dynamic theme synchronization on wake-up!
         fetch('/api/voice-settings')
           .then(res => res.json())
@@ -904,25 +929,16 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           statusDot.style.backgroundColor = 'var(--color-danger)';
           statusDot.style.boxShadow = '0 0 8px var(--color-danger)';
         }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Listening to voice...';
-        }
+        resetToSingleLine(text || 'Listening to voice...');
         eqMode = 'realtime';
       } else if (state === 'thinking') {
-        currentSpeechText = "";
         if (stateLabel) stateLabel.style.color = 'var(--color-warning)';
         if (stateText) stateText.innerText = 'Thinking';
         if (statusDot) {
           statusDot.style.backgroundColor = 'var(--color-warning)';
           statusDot.style.boxShadow = '0 0 8px var(--color-warning)';
         }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Thinking...';
-        }
+        resetToSingleLine(text || 'Thinking...');
         eqMode = 'quiet';
       } else if (state === 'speaking') {
         if (stateLabel) stateLabel.style.color = 'var(--color-secondary)';
@@ -933,42 +949,78 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         }
         eqMode = 'realtime';
         
-        if (subtext && text && currentSpeechText !== text) {
-          currentSpeechText = text;
-          // 1. Reset position immediately
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text;
+        if (scrollContainer && text) {
+          const parts = text.split('|');
+          const current = parts[0] || '';
+          const next = parts[1] || '';
           
-          // 2. Measure and trigger smooth marquee scroll
-          const textWidth = subtext.offsetWidth;
-          const containerWidth = 230;
-          const offset = textWidth - containerWidth;
-          
-          if (offset > 0) {
-            // Force layout reflow so the transition starts from 0
-            subtext.offsetHeight; 
+          if (current !== lastCurrentText) {
+            const oldLines = Array.from(scrollContainer.children);
             
-            // 220ms per character average Chinese speaking rate
-            const duration = text.length * 0.22; 
-            
-            subtext.style.transition = 'transform ' + duration + 's linear';
-            subtext.style.transform = 'translateX(-' + offset + 'px)';
+            if (oldLines.length === 0 || lastCurrentText === "") {
+              // Initial render of speaking text (from thinking/idle state)
+              scrollContainer.style.transition = 'none';
+              scrollContainer.style.transform = 'translateY(0)';
+              
+              let html = '<div class="hud-subtitle-line" style="color: rgba(255, 255, 255, 1.0); opacity: 1;">' + current + '</div>';
+              if (next) {
+                html += '<div class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.35); opacity: 1;">' + next + '</div>';
+              }
+              scrollContainer.innerHTML = html;
+              lastCurrentText = current;
+            } else {
+              // Cinematic sliding transition!
+              // Append the new upcoming sentence at the bottom
+              const newUpcomingDiv = document.createElement('div');
+              newUpcomingDiv.className = 'hud-subtitle-line';
+              newUpcomingDiv.style.color = 'rgba(255, 255, 255, 0.35)';
+              newUpcomingDiv.style.opacity = '0'; // Start invisible
+              newUpcomingDiv.innerText = next;
+              scrollContainer.appendChild(newUpcomingDiv);
+              
+              // Force layout reflow so styles take effect
+              newUpcomingDiv.offsetHeight;
+              
+              // Apply transitions to the lines
+              const lines = Array.from(scrollContainer.children);
+              // Line 0 is sliding out (fading out)
+              if (lines[0]) {
+                lines[0].style.opacity = '0';
+              }
+              // Line 1 (which was upcoming) is turning bright white (active)
+              if (lines[1]) {
+                lines[1].style.color = 'rgba(255, 255, 255, 1.0)';
+                lines[1].style.opacity = '1';
+              }
+              // Line 2 (the new upcoming) fades in
+              newUpcomingDiv.style.opacity = '1';
+              
+              // Slide the scroll container up by 1.2rem
+              scrollContainer.style.transition = 'transform 0.45s cubic-bezier(0.25, 1, 0.5, 1)';
+              scrollContainer.style.transform = 'translateY(-1.2rem)';
+              
+              // Save state immediately to prevent race conditions during timer intervals
+              lastCurrentText = current;
+              
+              // After transition completes, prune the top element and reset transform
+              setTimeout(() => {
+                if (scrollContainer.contains(lines[0])) {
+                  scrollContainer.removeChild(lines[0]);
+                }
+                scrollContainer.style.transition = 'none';
+                scrollContainer.style.transform = 'translateY(0)';
+              }, 450);
+            }
           }
         }
       } else if (state === 'idle') {
-        currentSpeechText = "";
         if (stateLabel) stateLabel.style.color = 'var(--color-success)';
         if (stateText) stateText.innerText = 'Idle';
         if (statusDot) {
           statusDot.style.backgroundColor = 'var(--color-success)';
           statusDot.style.boxShadow = '0 0 8px var(--color-success)';
         }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Ready';
-        }
+        resetToSingleLine(text || 'Ready');
         eqMode = 'quiet';
       }
     };
