@@ -672,20 +672,6 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       flex: 1 !important;
       height: 100% !important;
     }
-    .hud-subtitle-line {
-      font-size: 0.76rem;
-      font-weight: 500;
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      height: 1.2rem;
-      line-height: 1.2rem;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      width: 230px;
-      transition: color 0.4s ease, opacity 0.4s ease;
-      background: transparent;
-      box-sizing: border-box;
-    }
   </style>
 </head>
 <body ${isHudModeStatic ? 'class="hud-mode theme-' + hudTheme + '"' : ''}>
@@ -814,16 +800,14 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           极光频谱与环境粒子流 (Spectrum & Particles)
         </div>
         <!-- Left text container specifically for HUD Mode -->
-        <div id="hud-text-container" style="display: none; flex-direction: column; justify-content: center; width: 230px; gap: 0.15rem; flex-shrink: 0; text-align: left; overflow: hidden; position: relative; height: 100%;">
+        <div id="hud-text-container" style="display: none; flex-direction: column; justify-content: center; width: 230px; gap: 0.15rem; flex-shrink: 0; text-align: left; overflow: hidden; position: relative;">
           <div id="hud-state-label" style="font-size: 0.65rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; color: var(--color-secondary); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; z-index: 2; background: transparent;">
             <span class="status-dot" id="hud-status-dot"></span>
             <span id="hud-state-text">IDLE</span>
           </div>
           <!-- Subtext scrolling viewport wrapper -->
-          <div id="hud-text-viewport" style="width: 230px; overflow: hidden; position: relative; height: 2.4rem; z-index: 1;">
-            <div id="hud-text-scroll-container" style="display: flex; flex-direction: column; position: absolute; left: 0; top: 0; width: 100%; transition: transform 0.4s cubic-bezier(0.25, 1, 0.5, 1);">
-              <div id="hud-subtext" class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.88); opacity: 1;">Ready</div>
-            </div>
+          <div style="width: 230px; overflow: hidden; position: relative; height: 1.2rem; z-index: 1;">
+            <div id="hud-subtext" style="font-size: 0.76rem; font-weight: 500; color: rgba(255, 255, 255, 0.88); white-space: nowrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: inline-block; position: absolute; left: 0; top: 0; transform: translateX(0); width: max-content; max-width: none !important;">Ready</div>
           </div>
         </div>
         <div class="preview-area">
@@ -892,35 +876,18 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
     // Expose dynamic JSBridge interface for native app integrations
     let currentSpeechText = "";
-    let lastFullText = "";
-    let activeTimeouts = [];
 
     window.updateVoiceState = function(state, amplitude, text) {
       // state: 'listening', 'thinking', 'speaking', 'idle'
       const stateLabel = document.getElementById('hud-state-label');
       const stateText = document.getElementById('hud-state-text');
       const statusDot = document.getElementById('hud-status-dot');
-      const scrollContainer = document.getElementById('hud-text-scroll-container');
+      const subtext = document.getElementById('hud-subtext');
       
       currentAmplitude = amplitude;
       
-      function clearAllTimeouts() {
-        activeTimeouts.forEach(function(t) { clearTimeout(t); });
-        activeTimeouts = [];
-      }
-      
-      function resetToSingleLine(labelText) {
-        clearAllTimeouts();
-        lastFullText = "";
-        currentSpeechText = "";
-        if (scrollContainer) {
-          scrollContainer.style.transition = 'none';
-          scrollContainer.style.transform = 'translateY(0)';
-          scrollContainer.innerHTML = '<div id="hud-subtext" class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.88); opacity: 1;">' + labelText + '</div>';
-        }
-      }
-      
       if (state === 'listening') {
+        currentSpeechText = "";
         // Dynamic theme synchronization on wake-up!
         fetch('/api/voice-settings')
           .then(res => res.json())
@@ -936,16 +903,25 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           statusDot.style.backgroundColor = 'var(--color-danger)';
           statusDot.style.boxShadow = '0 0 8px var(--color-danger)';
         }
-        resetToSingleLine(text || 'Listening to voice...');
+        if (subtext) {
+          subtext.style.transition = 'none';
+          subtext.style.transform = 'translateX(0)';
+          subtext.innerText = text || 'Listening to voice...';
+        }
         eqMode = 'realtime';
       } else if (state === 'thinking') {
+        currentSpeechText = "";
         if (stateLabel) stateLabel.style.color = 'var(--color-warning)';
         if (stateText) stateText.innerText = 'Thinking';
         if (statusDot) {
           statusDot.style.backgroundColor = 'var(--color-warning)';
           statusDot.style.boxShadow = '0 0 8px var(--color-warning)';
         }
-        resetToSingleLine(text || 'Thinking...');
+        if (subtext) {
+          subtext.style.transition = 'none';
+          subtext.style.transform = 'translateX(0)';
+          subtext.innerText = text || 'Thinking...';
+        }
         eqMode = 'quiet';
       } else if (state === 'speaking') {
         if (stateLabel) stateLabel.style.color = 'var(--color-secondary)';
@@ -956,104 +932,48 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         }
         eqMode = 'realtime';
         
-        if (scrollContainer && text && text !== lastFullText) {
-          clearAllTimeouts();
-          lastFullText = text;
+        if (subtext && text && currentSpeechText !== text) {
+          currentSpeechText = text;
+          // 1. Reset position immediately
+          subtext.style.transition = 'none';
+          subtext.style.transform = 'translateX(0)';
+          subtext.innerText = text;
           
-          // Split full text into clean sentences using regex for Chinese and English punctuations
-          const sentences = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
-          const cleanSentences = sentences.map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+          // 2. Measure and trigger smooth marquee scroll
+          const textWidth = subtext.offsetWidth;
+          const containerWidth = 230;
+          const offset = textWidth - containerWidth;
           
-          if (cleanSentences.length === 0) {
-            resetToSingleLine('Ready');
-            return;
-          }
-          
-          function estimateSpeakingDuration(sentence) {
-            // Chinese characters count
-            const cnChars = (sentence.match(/[\u4e00-\u9fa5]/g) || []).length;
-            // English words count
-            const enWords = sentence.replace(/[\u4e00-\u9fa5]/g, '').trim().split(/\s+/).filter(function(w) { return w.length > 0; }).length;
-            // General characters/punctuation count
-            const totalLen = sentence.length;
+          if (offset > 0) {
+            // Force layout reflow so the transition starts from 0
+            subtext.offsetHeight; 
+            
+            // Calculate a premium, natural duration estimated based on character categories
+            const cnChars = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+            const enWords = text.replace(/[\u4e00-\u9fa5]/g, '').trim().split(/\s+/).filter(function(w) { return w.length > 0; }).length;
+            const totalLen = text.length;
             const otherChars = Math.max(0, totalLen - cnChars);
             
-            // 220ms per Chinese char, 300ms per English word, 150ms for others, + 350ms sentence-end pause
-            const duration = cnChars * 220 + enWords * 300 + otherChars * 150 + 350;
-            return Math.max(1200, duration);
+            const durationMs = cnChars * 220 + enWords * 300 + otherChars * 150 + 350;
+            const durationSec = Math.max(1.2, durationMs / 1000);
+            
+            subtext.style.transition = 'transform ' + durationSec + 's linear';
+            subtext.style.transform = 'translateX(-' + offset + 'px)';
           }
-          
-          function playSentence(index) {
-            if (index >= cleanSentences.length) {
-              return; // end of sentences
-            }
-            
-            const current = cleanSentences[index];
-            const next = cleanSentences[index + 1] || '';
-            
-            const lines = Array.from(scrollContainer.children);
-            
-            if (index === 0 || lines.length === 0) {
-              // Initial render
-              scrollContainer.style.transition = 'none';
-              scrollContainer.style.transform = 'translateY(0)';
-              
-              let html = '<div class="hud-subtitle-line" style="color: rgba(255, 255, 255, 1.0); opacity: 1;">' + current + '</div>';
-              if (next) {
-                html += '<div class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.35); opacity: 1;">' + next + '</div>';
-              }
-              scrollContainer.innerHTML = html;
-            } else {
-              // Cinematic sliding transition!
-              const newUpcomingDiv = document.createElement('div');
-              newUpcomingDiv.className = 'hud-subtitle-line';
-              newUpcomingDiv.style.color = 'rgba(255, 255, 255, 0.35)';
-              newUpcomingDiv.style.opacity = '0';
-              newUpcomingDiv.innerText = next;
-              scrollContainer.appendChild(newUpcomingDiv);
-              
-              newUpcomingDiv.offsetHeight; // reflow
-              
-              const updatedLines = Array.from(scrollContainer.children);
-              if (updatedLines[0]) {
-                updatedLines[0].style.opacity = '0';
-              }
-              if (updatedLines[1]) {
-                updatedLines[1].style.color = 'rgba(255, 255, 255, 1.0)';
-                updatedLines[1].style.opacity = '1';
-              }
-              newUpcomingDiv.style.opacity = '1';
-              
-              scrollContainer.style.transition = 'transform 0.45s cubic-bezier(0.25, 1, 0.5, 1)';
-              scrollContainer.style.transform = 'translateY(-1.2rem)';
-              
-              setTimeout(function() {
-                if (scrollContainer.contains(updatedLines[0])) {
-                  scrollContainer.removeChild(updatedLines[0]);
-                }
-                scrollContainer.style.transition = 'none';
-                scrollContainer.style.transform = 'translateY(0)';
-              }, 450);
-            }
-            
-            // Schedule the next transition!
-            const duration = estimateSpeakingDuration(current);
-            const timeoutId = setTimeout(function() {
-              playSentence(index + 1);
-            }, duration);
-            activeTimeouts.push(timeoutId);
-          }
-          
-          playSentence(0);
         }
       } else if (state === 'idle') {
+        currentSpeechText = "";
         if (stateLabel) stateLabel.style.color = 'var(--color-success)';
         if (stateText) stateText.innerText = 'Idle';
         if (statusDot) {
           statusDot.style.backgroundColor = 'var(--color-success)';
           statusDot.style.boxShadow = '0 0 8px var(--color-success)';
         }
-        resetToSingleLine(text || 'Ready');
+        if (subtext) {
+          subtext.style.transition = 'none';
+          subtext.style.transform = 'translateX(0)';
+          subtext.innerText = text || 'Ready';
+        }
         eqMode = 'quiet';
       }
     };
