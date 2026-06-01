@@ -495,10 +495,10 @@ stream_idle_timeout_ms = 600000
           } else {
             console.log(`[OpenCodex] No pre-compiled binary found. Falling back to swift run.`);
           }
-          // Use osascript to launch the process within the active user's graphical login session.
-          // This prevents "WindowServer Decapitation" where GUI/microphones hang when spawned from background PM2 daemons.
+          // Launch via Terminal.app using AppleScript to ensure it inherits Terminal's microphone and GUI permissions.
+          // This bypasses the background PM2 daemon sandbox, preventing indefinite startup card-locks and permission hangs.
           const escapedBarDir = barDir.replace(/"/g, '\\"');
-          startCmd = `osascript -e 'tell application "System Events" to do shell script "cd \\"${escapedBarDir}\\" && ${binPath} > /dev/null 2>&1 &"'`;
+          startCmd = `osascript -e 'tell application "Terminal" to do script "cd \\"${escapedBarDir}\\" && ${binPath} & disown && exit"'`;
         }
         exec(startCmd, (startErr) => {
           if (startErr) {
