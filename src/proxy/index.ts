@@ -473,9 +473,22 @@ stream_idle_timeout_ms = 600000
     const killCmd = "killall OpenCodexBar 2>/dev/null || true";
     exec(killCmd, (err) => {
       setTimeout(() => {
-        const startCmd = method === "swift-run"
-          ? `cd ${barDir} && nohup swift run > /tmp/opencodex-bar.log 2>&1 &`
-          : `open ${join(barDir, "OpenCodexBar.app")}`;
+        let startCmd = `open ${join(barDir, "OpenCodexBar.app")}`;
+        if (method === "swift-run") {
+          const releasePath = join(barDir, ".build/arm64-apple-macosx/release/OpenCodexBar");
+          const debugPath = join(barDir, ".build/arm64-apple-macosx/debug/OpenCodexBar");
+          let binPath = "swift run";
+          if (existsSync(releasePath)) {
+            binPath = `"${releasePath}"`;
+            console.log(`[OpenCodex] Found compiled release binary: ${releasePath}`);
+          } else if (existsSync(debugPath)) {
+            binPath = `"${debugPath}"`;
+            console.log(`[OpenCodex] Found compiled debug binary: ${debugPath}`);
+          } else {
+            console.log(`[OpenCodex] No pre-compiled binary found. Falling back to swift run.`);
+          }
+          startCmd = `cd "${barDir}" && nohup ${binPath} > /tmp/opencodex-bar.log 2>&1 &`;
+        }
         exec(startCmd, (startErr) => {
           if (startErr) {
             console.error(`[OpenCodex] Failed to start Voice Bar via ${method}: ${startErr.message}`);
