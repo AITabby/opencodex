@@ -892,7 +892,8 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
     // Expose dynamic JSBridge interface for native app integrations
     let currentSpeechText = "";
-    let lastCurrentText = "";
+    let lastFullText = "";
+    let activeTimeouts = [];
 
     window.updateVoiceState = function(state, amplitude, text) {
       // state: 'listening', 'thinking', 'speaking', 'idle'
@@ -903,8 +904,14 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       
       currentAmplitude = amplitude;
       
+      function clearAllTimeouts() {
+        activeTimeouts.forEach(function(t) { clearTimeout(t); });
+        activeTimeouts = [];
+      }
+      
       function resetToSingleLine(labelText) {
-        lastCurrentText = "";
+        clearAllTimeouts();
+        lastFullText = "";
         currentSpeechText = "";
         if (scrollContainer) {
           scrollContainer.style.transition = 'none';
@@ -949,16 +956,45 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         }
         eqMode = 'realtime';
         
-        if (scrollContainer && text) {
-          const parts = text.split('|');
-          const current = parts[0] || '';
-          const next = parts[1] || '';
+        if (scrollContainer && text && text !== lastFullText) {
+          clearAllTimeouts();
+          lastFullText = text;
           
-          if (current !== lastCurrentText) {
-            const oldLines = Array.from(scrollContainer.children);
+          // Split full text into clean sentences using regex for Chinese and English punctuations
+          const sentences = text.match(/[^。！？!?；;]+[。！？!?；;]?/g) || [text];
+          const cleanSentences = sentences.map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+          
+          if (cleanSentences.length === 0) {
+            resetToSingleLine('Ready');
+            return;
+          }
+          
+          function estimateSpeakingDuration(sentence) {
+            // Chinese characters count
+            const cnChars = (sentence.match(/[\u4e00-\u9fa5]/g) || []).length;
+            // English words count
+            const enWords = sentence.replace(/[\u4e00-\u9fa5]/g, '').trim().split(/\s+/).filter(function(w) { return w.length > 0; }).length;
+            // General characters/punctuation count
+            const totalLen = sentence.length;
+            const otherChars = Math.max(0, totalLen - cnChars);
             
-            if (oldLines.length === 0 || lastCurrentText === "") {
-              // Initial render of speaking text (from thinking/idle state)
+            // 220ms per Chinese char, 300ms per English word, 150ms for others, + 350ms sentence-end pause
+            const duration = cnChars * 220 + enWords * 300 + otherChars * 150 + 350;
+            return Math.max(1200, duration);
+          }
+          
+          function playSentence(index) {
+            if (index >= cleanSentences.length) {
+              return; // end of sentences
+            }
+            
+            const current = cleanSentences[index];
+            const next = cleanSentences[index + 1] || '';
+            
+            const lines = Array.from(scrollContainer.children);
+            
+            if (index === 0 || lines.length === 0) {
+              // Initial render
               scrollContainer.style.transition = 'none';
               scrollContainer.style.transform = 'translateY(0)';
               
@@ -967,51 +1003,48 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
                 html += '<div class="hud-subtitle-line" style="color: rgba(255, 255, 255, 0.35); opacity: 1;">' + next + '</div>';
               }
               scrollContainer.innerHTML = html;
-              lastCurrentText = current;
             } else {
               // Cinematic sliding transition!
-              // Append the new upcoming sentence at the bottom
               const newUpcomingDiv = document.createElement('div');
               newUpcomingDiv.className = 'hud-subtitle-line';
               newUpcomingDiv.style.color = 'rgba(255, 255, 255, 0.35)';
-              newUpcomingDiv.style.opacity = '0'; // Start invisible
+              newUpcomingDiv.style.opacity = '0';
               newUpcomingDiv.innerText = next;
               scrollContainer.appendChild(newUpcomingDiv);
               
-              // Force layout reflow so styles take effect
-              newUpcomingDiv.offsetHeight;
+              newUpcomingDiv.offsetHeight; // reflow
               
-              // Apply transitions to the lines
-              const lines = Array.from(scrollContainer.children);
-              // Line 0 is sliding out (fading out)
-              if (lines[0]) {
-                lines[0].style.opacity = '0';
+              const updatedLines = Array.from(scrollContainer.children);
+              if (updatedLines[0]) {
+                updatedLines[0].style.opacity = '0';
               }
-              // Line 1 (which was upcoming) is turning bright white (active)
-              if (lines[1]) {
-                lines[1].style.color = 'rgba(255, 255, 255, 1.0)';
-                lines[1].style.opacity = '1';
+              if (updatedLines[1]) {
+                updatedLines[1].style.color = 'rgba(255, 255, 255, 1.0)';
+                updatedLines[1].style.opacity = '1';
               }
-              // Line 2 (the new upcoming) fades in
               newUpcomingDiv.style.opacity = '1';
               
-              // Slide the scroll container up by 1.2rem
               scrollContainer.style.transition = 'transform 0.45s cubic-bezier(0.25, 1, 0.5, 1)';
               scrollContainer.style.transform = 'translateY(-1.2rem)';
               
-              // Save state immediately to prevent race conditions during timer intervals
-              lastCurrentText = current;
-              
-              // After transition completes, prune the top element and reset transform
-              setTimeout(() => {
-                if (scrollContainer.contains(lines[0])) {
-                  scrollContainer.removeChild(lines[0]);
+              setTimeout(function() {
+                if (scrollContainer.contains(updatedLines[0])) {
+                  scrollContainer.removeChild(updatedLines[0]);
                 }
                 scrollContainer.style.transition = 'none';
                 scrollContainer.style.transform = 'translateY(0)';
               }, 450);
             }
+            
+            // Schedule the next transition!
+            const duration = estimateSpeakingDuration(current);
+            const timeoutId = setTimeout(function() {
+              playSentence(index + 1);
+            }, duration);
+            activeTimeouts.push(timeoutId);
           }
+          
+          playSentence(0);
         }
       } else if (state === 'idle') {
         if (stateLabel) stateLabel.style.color = 'var(--color-success)';
