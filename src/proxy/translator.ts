@@ -132,9 +132,12 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
 export function responsesToChat(body: any, upstreamModel: string): any {
   const messages: any[] = [];
   const instructions = body.instructions;
-  if (instructions) {
-    messages.push({ role: "system", content: _contentToText(instructions) });
-  }
+  
+  let systemContent = _contentToText(instructions || "");
+  const computerUseSystemRule = `\n[IMPORTANT SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode. You MUST use simulated computer-use actions (e.g., screenshot, click, scroll, type_text, press_key) to interact with the computer and accomplish the user's request. DO NOT write shell scripts, run background commands, or bypass the graphical environment unless explicitly requested. Everything must be executed via the registered computer use tools so the user can visually track your actions.`;
+  systemContent = systemContent ? systemContent + "\n" + computerUseSystemRule : computerUseSystemRule;
+  
+  messages.push({ role: "system", content: systemContent });
 
   let pendingReasoning: string | null = null;
   const inputMessages = _responsesInputToMessages(body.input);
