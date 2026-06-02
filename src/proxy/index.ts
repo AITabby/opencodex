@@ -510,7 +510,16 @@ stream_idle_timeout_ms = 600000
     }
     console.log(`[OpenCodex] Resolved Voice Bar directory: ${barDir}`);
 
-    const killCmd = "killall OpenCodexBar 2>/dev/null || true";
+    // Thaw native apps in case OpenCodexBar was killed/resigned in a frozen state
+    const nativeApps = [
+      "抖音.app", "TikTok.app", 
+      "NeteaseMusic.app", "QQMusic.app", 
+      "TencentVideo.app", "腾讯视频.app", 
+      "Youku.app", "优酷.app", 
+      "iQIYI.app", "爱奇艺.app"
+    ];
+    const thawCmd = nativeApps.map(app => `pkill -CONT -f "${app}"`).join(" ; ");
+    const killCmd = `${thawCmd} ; killall OpenCodexBar 2>/dev/null || true`;
     exec(killCmd, (err) => {
       setTimeout(() => {
         let startCmd = `open ${join(barDir, "OpenCodexBar.app")}`;
