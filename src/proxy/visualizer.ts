@@ -529,6 +529,8 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     html.hud-mode,
     body.hud-mode {
       background: transparent !important;
+      backdrop-filter: none !important;
+      -webkit-backdrop-filter: none !important;
       overflow: hidden !important;
       margin: 0 !important;
       padding: 0 !important;
@@ -538,7 +540,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       outline: none !important;
       box-shadow: none !important;
       display: flex !important;
-      align-items: center !important;
+      align-items: flex-start !important;
       justify-content: center !important;
     }
     body.hud-mode :not(#hud-card):not(#hud-card *) {
@@ -556,7 +558,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       height: 100% !important;
       max-width: none !important;
       display: flex !important;
-      align-items: center !important;
+      align-items: flex-start !important;
       justify-content: center !important;
       border: none !important;
       background: transparent !important;
@@ -572,7 +574,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     }
     body.hud-mode .visualizer-grid {
       display: flex !important;
-      align-items: center !important;
+      align-items: flex-start !important;
       justify-content: center !important;
       width: 100% !important;
       height: 100% !important;
@@ -580,50 +582,82 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       background: transparent !important;
     }
     body.hud-mode #hud-card {
-      background: transparent !important;
-      border: 1px solid rgba(255, 255, 255, 0.18) !important;
-      border-radius: 38px !important;
-      padding: 0 !important; /* Set to 0 to prevent absolute children from shrinking or misaligning */
-      width: calc(100% - 32px) !important;
-      height: calc(100% - 24px) !important;
-      margin: 12px 16px !important;
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.65) !important; /* Box shadow kept here (no backdrop-filter) so WebKit renders it perfectly rounded */
+      background: #000000 !important;
+      border: none !important;
+      border-radius: 0 0 16px 16px !important; /* Flush top, rounded bottom corners to blend with notch */
+      padding: 48px 0 8px 0 !important; /* Push contents down below the 48px physical notch area */
+      width: 260px !important; /* Set explicit width matching the visual notch space */
+      height: 120px !important; /* Set explicit height matching convenience init */
+      margin: 0 !important;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
       display: flex !important;
-      flex-direction: row !important;
+      flex-direction: column !important; /* Stack vertically */
       align-items: center !important;
-      gap: 1.2rem !important;
+      justify-content: center !important;
+      gap: 0.15rem !important;
       box-sizing: border-box !important;
       position: relative !important;
       z-index: 1 !important;
-      transition: border-color 0.4s ease, box-shadow 0.4s ease !important;
+      overflow: hidden !important;
+    }
+
+    body.hud-mode #hud-card.state-draghover {
+      animation: none !important;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
+      border: none !important;
+      border-color: transparent !important;
+      transition: box-shadow 0.3s ease !important;
+    }
+    body.hud-mode #hud-card.state-dropabsorb {
+      animation: absorbSuction 0.8s cubic-bezier(0.25, 1, 0.5, 1) forwards !important;
+      border: none !important;
+      border-color: transparent !important;
+    }
+    body.hud-mode #hud-card.state-draghover #hud-text-container,
+    body.hud-mode #hud-card.state-dropabsorb #hud-text-container {
+      display: none !important;
+    }
+    @keyframes absorbSuction {
+      0% {
+        transform: scale(1);
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
+      }
+      30% {
+        transform: scale(1.04);
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
+      }
+      100% {
+        transform: scale(1);
+        box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
+      }
     }
 
     body.hud-mode #hud-card::before {
-      content: "" !important;
-      position: absolute !important;
-      /* Positioned slightly offset to fully cover border areas */
-      top: -1px !important;
-      left: -1px !important;
-      right: -1px !important;
-      bottom: -1px !important;
-      background: rgba(18, 18, 24, 0.65) !important;
-      border-radius: 38px !important;
-      backdrop-filter: blur(20px) saturate(180%) !important;
-      -webkit-backdrop-filter: blur(20px) saturate(180%) !important;
-      box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.2) !important;
-      z-index: -1 !important;
-      overflow: hidden !important;
-      transform: translate3d(0, 0, 0) !important;
-      -webkit-transform: translate3d(0, 0, 0) !important;
-      pointer-events: none !important;
+      display: none !important; /* Disable frosted glass background for notch OLED black style */
     }
 
     /* Keep the visual margin spacing since parent padding is 0 */
     body.hud-mode #hud-text-container {
-      margin-left: 1.6rem !important;
+      margin: 0 auto !important;
+      width: 230px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: center !important;
+      text-align: center !important;
     }
+    
+    body.hud-mode #hud-state-label {
+      justify-content: center !important;
+    }
+
     body.hud-mode .preview-area {
-      margin-right: 1.6rem !important;
+      margin: 0 auto !important;
+      width: 230px !important;
+      height: 40px !important;
+      flex: none !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
     }
     /* Glow theme overrides in HUD Mode */
     body.hud-mode.theme-glow #hud-card {
@@ -807,7 +841,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           </div>
           <!-- Subtext scrolling viewport wrapper -->
           <div style="width: 230px; overflow: hidden; position: relative; height: 1.2rem; z-index: 1;">
-            <div id="hud-subtext" style="font-size: 0.76rem; font-weight: 500; color: rgba(255, 255, 255, 0.88); white-space: nowrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: inline-block; position: absolute; left: 0; top: 0; transform: translateX(0); width: max-content; max-width: none !important;">Ready</div>
+            <div id="hud-subtext" style="font-size: 0.76rem; font-weight: 500; color: rgba(255, 255, 255, 0.88); white-space: nowrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: inline-block; position: absolute; left: 0; top: 0; transform: translateX(0); width: max-content; max-width: none !important; opacity: 0;"></div>
           </div>
         </div>
         <div class="preview-area">
@@ -878,11 +912,16 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     let currentSpeechText = "";
 
     window.updateVoiceState = function(state, amplitude, text) {
-      // state: 'listening', 'thinking', 'speaking', 'idle'
+      // state: 'listening', 'thinking', 'speaking', 'idle', 'draghover', 'dropabsorb'
       const stateLabel = document.getElementById('hud-state-label');
       const stateText = document.getElementById('hud-state-text');
       const statusDot = document.getElementById('hud-status-dot');
       const subtext = document.getElementById('hud-subtext');
+      
+      const hudCard = document.getElementById('hud-card');
+      if (hudCard) {
+        hudCard.className = 'hud-card-mode state-' + state;
+      }
       
       currentAmplitude = amplitude;
       
@@ -906,7 +945,8 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         if (subtext) {
           subtext.style.transition = 'none';
           subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Listening to voice...';
+          subtext.innerText = '';
+          subtext.style.opacity = '0';
         }
         eqMode = 'realtime';
       } else if (state === 'thinking') {
@@ -920,7 +960,8 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         if (subtext) {
           subtext.style.transition = 'none';
           subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Thinking...';
+          subtext.innerText = '';
+          subtext.style.opacity = '0';
         }
         eqMode = 'quiet';
       } else if (state === 'speaking') {
@@ -938,6 +979,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           subtext.style.transition = 'none';
           subtext.style.transform = 'translateX(0)';
           subtext.innerText = text;
+          subtext.style.opacity = '1';
           
           // 2. Measure and trigger smooth marquee scroll
           const textWidth = subtext.offsetWidth;
@@ -967,8 +1009,12 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         if (subtext) {
           subtext.style.transition = 'none';
           subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text || 'Ready';
+          subtext.innerText = '';
+          subtext.style.opacity = '0';
         }
+        eqMode = 'quiet';
+      } else if (state === 'draghover' || state === 'dropabsorb') {
+        currentSpeechText = "";
         eqMode = 'quiet';
       }
     };
@@ -1130,7 +1176,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         let baseVal = 0.5 + 0.3 * Math.sin(t) + 0.2 * Math.cos(t * 2.3);
         
         // Siri simulator state
-        let targetSiri = siriMode === 'simulate' ? baseVal : 0.03;
+        let targetSiri = (siriMode === 'simulate' && (eqMode === 'simulate' || eqMode === 'realtime')) ? baseVal : 0.03;
         currentAmplitude += (targetSiri - currentAmplitude) * 0.1;
       }
 

@@ -13,6 +13,9 @@ import { ScreenshotTaker } from "./cu/screenshot.js";
 import { ActionPerformer } from "./cu/actions.js";
 import { execSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 
 const TOOLS: Tool[] = [
   {
@@ -186,7 +189,36 @@ class OpenCodex {
     });
   }
 
+  private checkAndCleanupLogsDatabase() {
+    try {
+      const homeDir = os.homedir();
+      const logsPath = path.join(homeDir, ".codex", "logs_2.sqlite");
+      if (fs.existsSync(logsPath)) {
+        const stats = fs.statSync(logsPath);
+        const sizeMB = stats.size / (1024 * 1024);
+        console.log(`[OpenCodex] Checking logs_2.sqlite size: ${sizeMB.toFixed(2)} MB`);
+        if (sizeMB > 150) {
+          console.log(`[OpenCodex] logs_2.sqlite size (${sizeMB.toFixed(2)} MB) exceeds 150MB threshold. Initiating auto-cleanup...`);
+          const filesToDelete = [
+            logsPath,
+            `${logsPath}-wal`,
+            `${logsPath}-shm`
+          ];
+          for (const f of filesToDelete) {
+            if (fs.existsSync(f)) {
+              fs.unlinkSync(f);
+            }
+          }
+          console.log("[OpenCodex] Auto-cleanup complete. logs_2.sqlite has been successfully reset!");
+        }
+      }
+    } catch (err: any) {
+      console.error(`[OpenCodex] Error during logs_2.sqlite auto-cleanup:`, err.message);
+    }
+  }
+
   async start() {
+    this.checkAndCleanupLogsDatabase();
     this.proxy.start(8765);
     const url = "http://localhost:8765/dashboard";
     console.log(`[OpenCodex] Dashboard → ${url}`);
