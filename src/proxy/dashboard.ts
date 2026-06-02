@@ -642,11 +642,38 @@ export function getDashboardHtml(): string {
           <!-- Model Names -->
           <div class="form-group">
             <label for="model-names" id="i18n-label-models">Models（每行一个，格式: 供应商名:模型名）</label>
-            <textarea id="model-names" rows="5" placeholder="opencode:deepseek-v4-flash
-jdcloud:GLM-5
-iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border:1px solid var(--glass-border);padding:0.85rem 1rem;border-radius:10px;color:#fff;font-family:'JetBrains Mono',monospace;font-size:0.85rem;resize:vertical;transition:var(--transition-standard);outline:none;"></textarea>
+            <textarea id="model-names" rows="5" placeholder="opencode:deepseek-v4-flash" style="width:100%;background:rgba(0,0,0,0.25);border:1px solid var(--glass-border);padding:0.85rem 1rem;border-radius:10px;color:#fff;font-family:'JetBrains Mono',monospace;font-size:0.85rem;resize:vertical;transition:var(--transition-standard);outline:none;"></textarea>
             <p style="font-size:0.75rem;color:var(--color-text-muted);margin-top:0.3rem;" id="i18n-model-hint">Format: <b>provider:model</b> — one per line. Providers are auto-created, fill in their credentials above.</p>
           </div>
+
+          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
+
+          <!-- Vision Fallback Settings -->
+          <div class="form-group" style="display: flex; flex-direction: column; gap: 1rem; background: rgba(255, 255, 255, 0.01); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 1.25rem;">
+            <h3 style="font-size: 0.95rem; font-weight: 700; color: var(--color-primary); border-left: 3px solid var(--color-primary); padding-left: 0.5rem; margin: 0 0 0.25rem 0;" id="i18n-panel-vision-fallback-title">视觉降级服务 (Vision Fallback)</h3>
+            
+            <div class="form-group">
+              <label for="oc-api-key" id="i18n-label-oc-key">视觉降级 API 密钥 (Vision Fallback)</label>
+              <div class="input-wrapper">
+                <input type="password" id="oc-api-key" placeholder="sk-...">
+                <button type="button" class="toggle-visibility" onclick="togglePass('oc-api-key')">
+                  <svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                </button>
+              </div>
+            </div>
+
+            <div class="form-group">
+              <label for="oc-base-url" id="i18n-label-oc-url">视觉降级接口地址 (Base URL)</label>
+              <input type="text" id="oc-base-url" placeholder="https://opencode.ai/zen/go/v1">
+            </div>
+
+            <div class="form-group">
+              <label for="oc-model" id="i18n-label-oc-model">视觉降级模型</label>
+              <input type="text" id="oc-model" placeholder="mimo-v2.5">
+            </div>
+          </div>
+
+          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
 
           <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
             <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
@@ -797,9 +824,7 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
 
               <div class="form-group">
                 <label for="voice-llm-model" id="i18n-label-voice-llm-model">语音助手对话大模型 (LLM Model for Voice)</label>
-                <select id="voice-llm-model">
-                  <option value="">Default (使用 Codex 客户端默认模型)</option>
-                </select>
+                <input type="text" id="voice-llm-model" placeholder="deepseek-v4-flash">
                 <p style="font-size:0.72rem;color:var(--color-text-muted);" id="i18n-voice-llm-model-hint">Independent model selection for voice agent decisions.</p>
               </div>
 
@@ -1055,6 +1080,11 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
       setText('i18n-model-hint', t.modelHint);
       setText('i18n-btn-save-config', t.btnSaveConfig);
       
+      setText('i18n-panel-vision-fallback-title', lang === 'zh' ? '视觉降级服务 (Vision Fallback)' : 'Vision Fallback Service');
+      setText('i18n-label-oc-key', t.labelOcKey);
+      setText('i18n-label-oc-url', t.labelOcUrl);
+      setText('i18n-label-oc-model', t.labelOcModel);
+      
       setHtml('i18n-panel-models-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>${'$'}{t.panelModelsTitle}\`);
       
       setText('i18n-models-desc', t.modelsDesc);
@@ -1156,7 +1186,33 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
         // Populate provider rows
         const container = document.getElementById('providers-container');
         container.innerHTML = '';
-        (data.providers || []).forEach(p => addProviderRow(p.name, p.base_url, p.api_key));
+        
+        let opencodeProvider = null;
+        let hasOtherProviders = false;
+        (data.providers || []).forEach(p => {
+          if (p.name === 'opencode') {
+            opencodeProvider = p;
+          } else {
+            addProviderRow(p.name, p.base_url, p.api_key);
+            hasOtherProviders = true;
+          }
+        });
+        
+        // If there are no other providers configured, automatically add exactly one blank row
+        // so that there is a slot ("口子") ready for the user to configure their first model provider!
+        if (!hasOtherProviders) {
+          addProviderRow('', '', '');
+        }
+        
+        if (opencodeProvider) {
+          document.getElementById('oc-api-key').value = opencodeProvider.api_key || '';
+          document.getElementById('oc-base-url').value = opencodeProvider.base_url || 'https://opencode.ai/zen/go/v1';
+          document.getElementById('oc-model').value = opencodeProvider.vision_model || opencodeProvider.model || 'mimo-v2.5';
+        } else {
+          document.getElementById('oc-api-key').value = '';
+          document.getElementById('oc-base-url').value = 'https://opencode.ai/zen/go/v1';
+          document.getElementById('oc-model').value = 'mimo-v2.5';
+        }
 
         // Populate model names textarea from catalog
         const modelNames = (modelsData.catalog || []).map((m) => m.provider ? m.provider + ':' + m.model : m.model).join('\\n');
@@ -1174,21 +1230,7 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
         allCatalogModels = data.catalog || [];
         const activeIds = new Set(data.active || []);
 
-        // Populate voice LLM model select dropdown dynamically
-        const voiceLlmSelect = document.getElementById('voice-llm-model');
-        if (voiceLlmSelect) {
-          const prevVal = voiceLlmSelect.value;
-          voiceLlmSelect.innerHTML = '<option value="">Default (使用 Codex 客户端默认模型)</option>';
-          allCatalogModels.forEach(m => {
-            if (activeIds.has(m.id)) {
-              const opt = document.createElement('option');
-              opt.value = m.id;
-              opt.innerText = m.display_name + " (" + m.model + ")";
-              voiceLlmSelect.appendChild(opt);
-            }
-          });
-          voiceLlmSelect.value = prevVal;
-        }
+        // Voice LLM model is now a direct text input field
         
         const container = document.getElementById('models-list-container');
         container.innerHTML = '';
@@ -1244,6 +1286,17 @@ iflytek:astron-code-latest" style="width:100%;background:rgba(0,0,0,0.25);border
         base_url: row.querySelector('.prov-url').value.trim(),
         api_key: row.querySelector('.prov-key').value.trim()
       })).filter(p => p.name && p.base_url);
+
+      // Append opencode (vision fallback) provider to the list
+      const ocKey = document.getElementById('oc-api-key').value.trim();
+      const ocUrl = document.getElementById('oc-base-url').value.trim() || 'https://opencode.ai/zen/go/v1';
+      const ocModel = document.getElementById('oc-model').value.trim() || 'mimo-v2.5';
+      providers.push({
+        name: 'opencode',
+        base_url: ocUrl,
+        api_key: ocKey,
+        vision_model: ocModel
+      });
 
       // Parse model names
       const modelNames = document.getElementById('model-names').value

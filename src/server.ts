@@ -12,6 +12,7 @@ import { ProxyServer } from "./proxy/index.js";
 import { ScreenshotTaker } from "./cu/screenshot.js";
 import { ActionPerformer } from "./cu/actions.js";
 import { execSync } from "node:child_process";
+import fs from "node:fs";
 
 const TOOLS: Tool[] = [
   {
@@ -129,10 +130,11 @@ class OpenCodex {
       switch (name) {
         case "screenshot": {
           const png = await this.screenshotTaker.capture();
+          const cachePath = "/tmp/opencodex_screenshot.png";
+          fs.writeFileSync(cachePath, png);
           return {
             content: [
-              { type: "image", data: png.toString("base64"), mimeType: "image/png" },
-              { type: "text", text: `截图完成 (${(png.length / 1024).toFixed(0)} KB)` }
+              { type: "text", text: `[OpenCodexScreenshotCached: ${cachePath}] 截图完成 (${(png.length / 1024).toFixed(0)} KB)` }
             ]
           };
         }

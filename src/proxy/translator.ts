@@ -102,6 +102,15 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
     if (name in namespaceMap) {
       return [name, namespaceMap[name]];
     }
+    // Match namespace directly if we have it in the map (handles custom MCP, list_apps, etc.)
+    for (const [fName, nsName] of Object.entries(namespaceMap)) {
+      if (name === `${nsName}_${fName}`) {
+        return [fName, nsName];
+      }
+      if (name === `${nsName}__${fName}`) {
+        return [fName, nsName];
+      }
+    }
     for (const variant of _unflattenVariants(name)) {
       if (variant in namespaceMap) {
         return [variant, namespaceMap[variant]];
@@ -113,7 +122,7 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
     const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "set_value", "list_apps"];
     for (const action of actions) {
       if (name.includes(action)) {
-        return [action, "mcp__computer_use__"];
+        return [action, "mcp__computer_use"];
       }
     }
   }
@@ -122,7 +131,7 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
     const parts = name.split("__");
     if (parts.length >= 2) {
       const fnName = parts[parts.length - 1];
-      const namespace = parts.slice(0, -1).join("__") + "__";
+      const namespace = parts.slice(0, -1).join("__");
       return [fnName, namespace];
     }
   }
@@ -1008,7 +1017,67 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
   }
 }
 
+export async function replaceScreenshotPlaceholders(body: any, config?: any): Promise<void> {
+  const inputData = body.input;
+  if (!Array.isArray(inputData)) return;
+
+  for (let msgIdx = 0; msgIdx < inputData.length; msgIdx++) {
+    const msg = inputData[msgIdx];
+    if (typeof msg !== "object" || msg === null) continue;
+
+    const processValue = async (val: any): Promise<any> => {
+      if (val === undefined || val === null) return val;
+      if (typeof val === "string") {
+        const match = val.match(/\[OpenCodexScreenshotCached:\s*([^\]]+)\]/);
+        if (match) {
+          const cachePath = match[1].trim();
+          if (fs.existsSync(cachePath)) {
+            try {
+              console.error(`[OpenCodex-Bypass] Found screenshot placeholder at path: ${cachePath}`);
+              const pngData = fs.readFileSync(cachePath);
+              const b64 = pngData.toString("base64");
+              const compressed = sipsCompressB64(b64);
+              console.error(`[OpenCodex-Bypass] Loaded and compressed cached screenshot, size: ${(pngData.length/1024).toFixed(0)}KB -> ${(compressed.length/3/1024).toFixed(0)}KB`);
+
+              let desc = "";
+              if (config) {
+                const fetchedDesc = await describeImageB64(compressed, config);
+                if (fetchedDesc) {
+                  desc = fetchedDesc;
+                }
+              }
+              if (!desc) {
+                desc = "屏幕截图（已离线缓存且由于未配置视觉模型无法生成文本描述）";
+              }
+              
+              const replacement = `[截图描述: ${desc}]`;
+              return val.replace(match[0], replacement);
+            } catch (err: any) {
+              console.error(`[OpenCodex-Bypass] Error processing screenshot cache:`, err.message);
+            }
+          } else {
+            console.error(`[OpenCodex-Bypass] Cached screenshot file not found: ${cachePath}`);
+          }
+        }
+      } else if (Array.isArray(val)) {
+        for (let i = 0; i < val.length; i++) {
+          val[i] = await processValue(val[i]);
+        }
+      } else if (typeof val === "object") {
+        for (const key of Object.keys(val)) {
+          val[key] = await processValue(val[key]);
+        }
+      }
+      return val;
+    };
+
+    inputData[msgIdx] = await processValue(msg);
+  }
+}
+
 export async function processVisionBridge(body: any, config?: any): Promise<any> {
+  await replaceScreenshotPlaceholders(body, config);
+
   const inputData = body.input;
   if (!Array.isArray(inputData)) return body;
 

@@ -217,6 +217,30 @@ except Exception as e:
       try {
         this.config = JSON.parse(readFileSync(p, "utf-8"));
         console.error(`[OpenCodex] Loaded providers configuration: ${p}`);
+
+        // Clean up unused blank providers on startup
+        const catalog = this.getModelCatalog();
+        const activeProviders = new Set<string>();
+        activeProviders.add("opencode");
+        if (catalog && Array.isArray(catalog.models)) {
+          for (const m of catalog.models) {
+            if (m.provider) {
+              activeProviders.add(m.provider);
+            }
+          }
+        }
+        if (this.config.providers && Array.isArray(this.config.providers)) {
+          const originalCount = this.config.providers.length;
+          this.config.providers = this.config.providers.filter((prov: any) => {
+            if (prov.name === "opencode" || prov.name === "") return true;
+            const hasCredentials = (prov.base_url && prov.base_url.trim() !== "") || (prov.api_key && prov.api_key.trim() !== "");
+            return hasCredentials || activeProviders.has(prov.name);
+          });
+          if (this.config.providers.length < originalCount) {
+            console.error(`[OpenCodex] Startup cleanup: removed ${originalCount - this.config.providers.length} unused blank provider(s).`);
+            this.saveConfig();
+          }
+        }
         return;
       } catch (err: any) {
         console.error(`[OpenCodex] Error reading providers.json: ${err.message}`);
@@ -265,7 +289,7 @@ except Exception as e:
     }
   }
 
-  private buildCatalogFromModelNames(names: string[]): any {
+  private buildCatalogFromModelNames(names: string[], existingModels: any[] = []): any {
     const providers = new Map<string, ProviderConfig>();
     for (const p of this.config.providers) providers.set(p.name, p);
 
@@ -283,48 +307,56 @@ except Exception as e:
         providers.set(provider, { name: provider, base_url: "", api_key: "" });
         this.saveConfig();
       }
-      models.push({
-        slug: modelName,
-        model: modelName,
-        display_name: modelName,
-        provider,
-        description: `Custom model: ${modelName}${provider ? ` (${provider})` : ""}`,
-        context_window: 200000,
-        max_context_window: 1000000,
-        auto_compact_token_limit: 160000,
-        truncation_policy: { mode: "tokens", limit: 48000 },
-        default_reasoning_level: "medium",
-        supported_reasoning_levels: [{ effort: "medium", description: "Balanced" }],
-        default_reasoning_summary: "none",
-        reasoning_summary_format: "none",
-        supports_reasoning_summaries: false,
-        default_verbosity: "low",
-        support_verbosity: false,
-        apply_patch_tool_type: "freeform",
-        web_search_tool_type: "text_and_image",
-        supports_search_tool: false,
-        supports_parallel_tool_calls: true,
-        experimental_supported_tools: ["computer_use", "mcp"],
-        input_modalities: ["text", "image"],
-        supports_image_detail_original: true,
-        shell_type: "shell_command",
-        visibility: "list",
-        minimal_client_version: "0.0.1",
-        supported_in_api: true,
-        availability_nux: null,
-        upgrade: null,
-        priority: 100,
-        prefer_websockets: false,
-        available_in_plans: ["free", "plus", "pro", "team", "business", "enterprise"],
-        base_instructions: "You are a coding agent running in Codex through a local BYOK shim.",
-        model_messages: {
-          instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
-          instructions_variables: { model_name: modelName }
-        },
-        supports_computer_use: true,
-        supports_mcp: true,
-        vision_bridge_enabled: false
-      });
+      const existing = existingModels.find((m: any) => m.slug === modelName || m.model === modelName);
+      if (existing) {
+        models.push({
+          ...existing,
+          provider
+        });
+      } else {
+        models.push({
+          slug: modelName,
+          model: modelName,
+          display_name: modelName,
+          provider,
+          description: `Custom model: ${modelName}${provider ? ` (${provider})` : ""}`,
+          context_window: 200000,
+          max_context_window: 1000000,
+          auto_compact_token_limit: 160000,
+          truncation_policy: { mode: "tokens", limit: 48000 },
+          default_reasoning_level: "medium",
+          supported_reasoning_levels: [{ effort: "medium", description: "Balanced" }],
+          default_reasoning_summary: "none",
+          reasoning_summary_format: "none",
+          supports_reasoning_summaries: false,
+          default_verbosity: "low",
+          support_verbosity: false,
+          apply_patch_tool_type: "freeform",
+          web_search_tool_type: "text_and_image",
+          supports_search_tool: false,
+          supports_parallel_tool_calls: true,
+          experimental_supported_tools: ["computer_use", "mcp"],
+          input_modalities: ["text", "image"],
+          supports_image_detail_original: true,
+          shell_type: "shell_command",
+          visibility: "list",
+          minimal_client_version: "0.0.1",
+          supported_in_api: true,
+          availability_nux: null,
+          upgrade: null,
+          priority: 100,
+          prefer_websockets: false,
+          available_in_plans: ["free", "plus", "pro", "team", "business", "enterprise"],
+          base_instructions: "You are a coding agent running in Codex through a local BYOK shim.",
+          model_messages: {
+            instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+            instructions_variables: { model_name: modelName }
+          },
+          supports_computer_use: true,
+          supports_mcp: true,
+          vision_bridge_enabled: false
+        });
+      }
     }
     return { models };
   }
@@ -611,7 +643,16 @@ stream_idle_timeout_ms = 600000
         const data = JSON.parse(body);
 
         if (data.providers && Array.isArray(data.providers)) {
-          this.config.providers = data.providers;
+          const updatedProviders = data.providers.map((newP: any) => {
+            if (newP.api_key && (newP.api_key.includes("...") || newP.api_key.endsWith("..."))) {
+              const oldP = this.config.providers.find((p: any) => p.name === newP.name);
+              if (oldP && oldP.api_key) {
+                return { ...newP, api_key: oldP.api_key };
+              }
+            }
+            return newP;
+          });
+          this.config.providers = updatedProviders;
         } else {
           this.config.providers = [
             { name: data.primary.name, base_url: data.primary.base_url, api_key: data.primary.api_key },
@@ -619,16 +660,32 @@ stream_idle_timeout_ms = 600000
           ];
         }
 
-        this.saveConfig();
-
         if (data.models && Array.isArray(data.models)) {
           const existing = this.getModelCatalog();
-          const existingNames = new Set((existing.models || []).map((m: any) => m.model));
-          const merged = [...new Set([...data.models, ...existingNames])];
-          const catalog = this.buildCatalogFromModelNames(merged);
+          const catalog = this.buildCatalogFromModelNames(data.models, existing.models || []);
           this.saveModelCatalog(catalog);
-          console.log(`[OpenCodex] Merged models: ${merged.length} total (${existingNames.size} kept, ${data.models.length} from input).`);
+          console.log(`[OpenCodex] Saved models from input: ${data.models.length} total.`);
         }
+
+        // Clean up unused blank providers
+        const catalog = this.getModelCatalog();
+        const activeProviders = new Set<string>();
+        activeProviders.add("opencode");
+        if (catalog && Array.isArray(catalog.models)) {
+          for (const m of catalog.models) {
+            if (m.provider) {
+              activeProviders.add(m.provider);
+            }
+          }
+        }
+        if (this.config.providers && Array.isArray(this.config.providers)) {
+          this.config.providers = this.config.providers.filter((prov: any) => {
+            if (prov.name === "opencode" || prov.name === "") return true;
+            const hasCredentials = (prov.base_url && prov.base_url.trim() !== "") || (prov.api_key && prov.api_key.trim() !== "");
+            return hasCredentials || activeProviders.has(prov.name);
+          });
+        }
+        this.saveConfig();
 
         this.patchCodexConfig();
         if (data.restart) {
@@ -653,6 +710,7 @@ stream_idle_timeout_ms = 600000
         catalog: catalog.models?.map((m: any) => ({
           id: m.slug,
           model: m.model,
+          provider: m.provider || "",
           display_name: m.display_name,
           no_image_support: m.input_modalities ? !m.input_modalities.includes("image") : true,
           vision_bridge_enabled: !!m.vision_bridge_enabled
