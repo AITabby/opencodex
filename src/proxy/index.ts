@@ -826,8 +826,8 @@ stream_idle_timeout_ms = 600000
         tts_base_url: "https://api.openai.com/v1",
         tts_model: "tts-1",
         tts_voice: "zh-CN-XiaoxiaoNeural",
-        vad_threshold: -42.0,
-        vad_duration: 1.5,
+        vad_threshold: -35.0,
+        vad_duration: 2.0,
         voice_llm_model: "",
         hud_theme: "vortex"
       };
@@ -855,8 +855,8 @@ stream_idle_timeout_ms = 600000
           tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
           tts_model: data.tts_model || "tts-1",
           tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
-          vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -42.0,
-          vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 1.5,
+          vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -35.0,
+          vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
           voice_llm_model: data.voice_llm_model || "",
           enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
           hud_theme: data.hud_theme || "vortex"
