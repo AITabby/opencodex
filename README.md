@@ -14,6 +14,9 @@
 
 # English
 
+> [!IMPORTANT]
+> **🌟 Premium Voice Companion App:** To experience the absolute state of the art in desktop voice assistants, combine this server with the native companion client [OpenCodexBar](https://github.com/AITabby/opencodex-bar)! Run the server, compile the bar, and instantly enjoy system-wide voice hotkeys (`Option + Space`), real-time decibel Audio-Reactive VAD, and a gorgeous cinematic single-line scrolling frosted-glass visualizer capsule floating right above your Dock!
+
 **OpenCodex** is a plug-and-play local gateway that unlocks Codex Desktop for third-party APIs, featuring a premium web dashboard, custom Computer Use engine, and Vision Bridge for text-only models.
 
 ## 🌟 Key Features
@@ -55,6 +58,9 @@ Server starts, browser opens to the dashboard. Add your API key and model names,
 ---
 
 # 简体中文
+
+> [!IMPORTANT]
+> **🌟 极光语音伴侣应用：** 强烈建议配合原生伴侣客户端 [OpenCodexBar](https://github.com/AITabby/opencodex-bar) 使用！为您的 Mac 开启系统级全局语音唤醒热键（`Option + Space`）、分贝波形联动与智能静音检测（VAD），以及悬浮于 macOS Dock 栏上方的极光毛玻璃跑马灯胶囊！
 
 **OpenCodex** 是一款即插即用的本地网关，为 Codex Desktop 解锁第三方 API。配备高颜值 Web 控制台、自研 Computer Use 引擎，以及让纯文本模型也能看图操作的 Vision Bridge。
 
