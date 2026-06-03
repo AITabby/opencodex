@@ -238,134 +238,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       display: block;
     }
 
-    /* Virtual Screen for Border Glow */
-    .virtual-screen {
-      width: 90%;
-      height: 85%;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 8px;
-      position: relative;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: #000;
-      overflow: hidden;
-      box-shadow: inset 0 0 15px rgba(0,0,0,0.8);
-    }
-    .virtual-screen-content {
-      font-size: 0.75rem;
-      color: var(--color-text-muted);
-      text-transform: uppercase;
-      font-family: 'JetBrains Mono', monospace;
-      letter-spacing: 2px;
-      text-align: center;
-    }
-    
-    /* Virtual Apple Intelligence Border Glow Effect */
-    .virtual-glow-border {
-      position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      border: 2px solid transparent;
-      border-radius: 8px;
-      pointer-events: none;
-      box-shadow: inset 0 0 0px transparent;
-      transition: all 0.5s ease;
-    }
-    .virtual-screen.active .virtual-glow-border {
-      animation: borderGlowSweep 6s infinite linear, borderGlowPulse 2.5s infinite ease-in-out;
-      box-shadow: inset 0 0 10px rgba(168, 85, 247, 0.4), 0 0 15px rgba(6, 182, 212, 0.4);
-    }
-    @keyframes borderGlowPulse {
-      0%, 100% { opacity: 0.6; }
-      50% { opacity: 1; }
-    }
-    @keyframes borderGlowSweep {
-      0% {
-        border-image: linear-gradient(0deg, var(--color-primary), var(--color-secondary), var(--color-warning), var(--color-primary)) 1;
-      }
-      50% {
-        border-image: linear-gradient(180deg, var(--color-primary), var(--color-secondary), var(--color-warning), var(--color-primary)) 1;
-      }
-      100% {
-        border-image: linear-gradient(360deg, var(--color-primary), var(--color-secondary), var(--color-warning), var(--color-primary)) 1;
-      }
-    }
 
-    /* Cyberpunk Halo Spinner Preview */
-    .halo-container {
-      position: relative;
-      width: 80px;
-      height: 80px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .halo-ring {
-      position: absolute;
-      width: 100%;
-      height: 100%;
-      border: 3px solid rgba(255, 255, 255, 0.05);
-      border-radius: 50%;
-      box-sizing: border-box;
-      transition: var(--transition-standard);
-    }
-    .halo-scan-light {
-      position: absolute;
-      width: 100%;
-      height: 100%;
-      border: 3px solid transparent;
-      border-top-color: var(--color-secondary);
-      border-right-color: var(--color-primary);
-      border-radius: 50%;
-      box-sizing: border-box;
-      animation: haloRotate 1.2s infinite linear;
-      opacity: 0;
-      transition: var(--transition-standard);
-      filter: drop-shadow(0 0 5px var(--color-secondary));
-    }
-    .halo-core {
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
-      background: var(--color-success);
-      box-shadow: 0 0 15px var(--color-success);
-      transition: var(--transition-standard);
-    }
-    
-    /* Halo States styling */
-    .halo-container.idle .halo-core {
-      background: var(--color-success);
-      box-shadow: 0 0 12px var(--color-success);
-      animation: haloBreathe 2s infinite ease-in-out;
-    }
-    .halo-container.listening .halo-core {
-      background: var(--color-danger);
-      box-shadow: 0 0 20px var(--color-danger);
-      animation: haloRapidPulse 0.8s infinite ease-in-out;
-    }
-    .halo-container.sending .halo-scan-light {
-      opacity: 1;
-    }
-    .halo-container.sending .halo-core {
-      background: var(--color-warning);
-      box-shadow: 0 0 12px var(--color-warning);
-    }
-    
-    @keyframes haloRotate {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-    @keyframes haloBreathe {
-      0%, 100% { transform: scale(1); opacity: 0.8; }
-      50% { transform: scale(1.15); opacity: 1; }
-    }
-    @keyframes haloRapidPulse {
-      0%, 100% { transform: scale(1); box-shadow: 0 0 10px var(--color-danger); }
-      50% { transform: scale(1.3); box-shadow: 0 0 25px var(--color-danger); }
-    }
 
     /* Actions Panel inside Cards */
     .card-actions {
@@ -638,12 +511,16 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
     /* Keep the visual margin spacing since parent padding is 0 */
     body.hud-mode #hud-text-container {
-      margin: 0 auto !important;
+      position: absolute !important;
+      bottom: 12px !important;
+      left: 15px !important;
       width: 230px !important;
       display: flex !important;
       flex-direction: column !important;
       align-items: center !important;
       text-align: center !important;
+      z-index: 2 !important;
+      pointer-events: none !important;
     }
     
     body.hud-mode #hud-state-label {
@@ -651,45 +528,21 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     }
 
     body.hud-mode .preview-area {
-      margin: 0 auto !important;
-      width: 230px !important;
-      height: 40px !important;
-      flex: none !important;
+      position: absolute !important;
+      top: 0 !important;
+      left: 0 !important;
+      width: 100% !important;
+      height: 100% !important;
+      margin: 0 !important;
+      background: transparent !important;
+      border: none !important;
+      z-index: 0 !important;
+      pointer-events: none !important;
       display: flex !important;
       align-items: center !important;
       justify-content: center !important;
     }
-    /* Glow theme overrides in HUD Mode */
-    body.hud-mode.theme-glow #hud-card {
-      animation: capsuleGlowFlow 6s infinite alternate ease-in-out !important;
-    }
-    
-    @keyframes capsuleGlowFlow {
-      0% {
-        box-shadow: 0 0 20px rgba(6, 182, 212, 0.45), 0 0 35px rgba(168, 85, 247, 0.25), inset 0 0 8px rgba(6, 182, 212, 0.2) !important;
-        border-color: rgba(6, 182, 212, 0.6) !important;
-      }
-      50% {
-        box-shadow: 0 0 25px rgba(236, 72, 153, 0.45), 0 0 40px rgba(6, 182, 212, 0.25), inset 0 0 8px rgba(236, 72, 153, 0.2) !important;
-        border-color: rgba(236, 72, 153, 0.6) !important;
-      }
-      100% {
-        box-shadow: 0 0 20px rgba(168, 85, 247, 0.45), 0 0 35px rgba(236, 72, 153, 0.25), inset 0 0 8px rgba(168, 85, 247, 0.2) !important;
-        border-color: rgba(168, 85, 247, 0.6) !important;
-      }
-    }
-    
-    /* Halo theme overrides in HUD Mode */
-    body.hud-mode.theme-halo #hud-card {
-      box-shadow: 0 0 20px rgba(16, 185, 129, 0.25), inset 0 0 8px rgba(16, 185, 129, 0.1) !important;
-      border-color: rgba(16, 185, 129, 0.4) !important;
-      animation: borderPulseHalo 3s infinite alternate ease-in-out !important;
-    }
-    
-    @keyframes borderPulseHalo {
-      0%, 100% { border-color: rgba(16, 185, 129, 0.3) !important; }
-      50% { border-color: rgba(16, 185, 129, 0.6) !important; }
-    }
+
     body.hud-mode .status-dot {
       width: 6px;
       height: 6px;
@@ -700,12 +553,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       box-shadow: 0 0 8px var(--color-success);
       transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     }
-    body.hud-mode .preview-area {
-      background: transparent !important;
-      border: none !important;
-      flex: 1 !important;
-      height: 100% !important;
-    }
+
   </style>
 </head>
 <body ${isHudModeStatic ? 'class="hud-mode theme-' + hudTheme + '"' : ''}>
@@ -775,55 +623,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         </div>
       </div>
 
-      <!-- CARD 2: Capsule Local Glow -->
-      <div class="visualizer-card">
-        <div class="card-title card-title-glow">
-          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M9 4.5v15m6-15v15m-10.875 0h15.75c.621 0 1.125-.504 1.125-1.125V5.625c0-.621-.504-1.125-1.125-1.125H4.125C3.504 4.5 3 5.004 3 5.625v12.75c0 .621.504 1.125 1.125 1.125z"></path>
-          </svg>
-          胶囊边缘舱体流光 (Capsule Local Glow)
-        </div>
-        <div class="preview-area" style="display:flex;align-items:center;justify-content:center;padding:1.5rem 0;">
-          <div id="capsule-preview" style="background: rgba(18, 18, 24, 0.96); border: 1px solid rgba(6, 182, 212, 0.4); border-radius: 38px; padding: 1.25rem 2rem; width: 85%; box-sizing: border-box; display: flex; align-items: center; gap: 1rem; transition: border-color 0.1s ease, box-shadow 0.1s ease;">
-            <span style="width: 6px; height: 6px; background-color: var(--color-danger); border-radius: 50%; box-shadow: 0 0 8px var(--color-danger); animation: borderGlowPulse 2.5s infinite;"></span>
-            <div style="flex:1; text-align:left; font-size:0.75rem; color:#fff; font-family:-apple-system; font-weight:600; letter-spacing:1.5px;">LOCAL GLOW ACTIVE</div>
-          </div>
-        </div>
-        <div class="card-desc">
-          专为底部悬浮胶囊面板定制的边缘漫反射流光。流光在胶囊外边缘如彩虹般流淌波动，避免全屏流光带来的突兀感，科技感十足！
-        </div>
-        <div class="card-actions">
-          <button class="action-btn active" id="btn-glow-sim" onclick="setGlowMode('simulate')">模拟说话中</button>
-          <button class="action-btn" id="btn-glow-quiet" onclick="setGlowMode('quiet')">模拟静音</button>
-          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-glow" onclick="applyTheme('glow')" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
-        </div>
-      </div>
 
-      <!-- CARD 3: Cyberpunk Scanning Halo -->
-      <div class="visualizer-card">
-        <div class="card-title card-title-halo">
-          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M16.023 9.348h4.992M2.247 11.83h4.992M7.482 17.25h1.65m3.75 0h.008m-3.75-6.15h.008m3.75 0h.008m-3.75 4.075h.008m3.75 0h.008M8.288 4.144l.011.011m0 3.53l-.01-.01m3.987-4.64l.011.011M8.288 15.35l.01-.01m4.986-7.35l.01.01m1.996 1.99a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-          </svg>
-          赛博旋转扫描光晕 (Dynamic Scan Ring)
-        </div>
-        <div class="preview-area">
-          <div class="halo-container idle" id="halo">
-            <div class="halo-ring"></div>
-            <div class="halo-scan-light"></div>
-            <div class="halo-core"></div>
-          </div>
-        </div>
-        <div class="card-desc">
-          一种为小尺寸图标量身定制的高拟真动效。在 'Idle'（静置空闲）、'Listening'（分贝联动红色跳跃）和 'Processing'（蓝色旋转扫描）三种状态间平滑过渡。
-        </div>
-        <div class="card-actions">
-          <button class="action-btn active" id="btn-halo-idle" onclick="setHaloState('idle')">闲置 (Breathe)</button>
-          <button class="action-btn" id="btn-halo-list" onclick="setHaloState('listening')">聆听 (Pulse)</button>
-          <button class="action-btn" id="btn-halo-send" onclick="setHaloState('sending')">处理 (Scan)</button>
-          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-halo" onclick="applyTheme('halo')" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
-        </div>
-      </div>
 
       <!-- CARD 4: Audio Equalizer & Particle Field -->
       <div class="${isHudModeStatic ? 'hud-card-mode' : 'visualizer-card'}" id="hud-card">
@@ -880,7 +680,6 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     const canvasEq = document.getElementById('canvas-eq');
     const ctxEq = canvasEq ? canvasEq.getContext('2d') : null;
     let eqMode = 'simulate';
-    let glowMode = 'simulate'; // 'simulate' or 'quiet'
     let particles = [];
     const NUM_PARTICLES = 40;
 
@@ -931,8 +730,12 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         fetch('/api/voice-settings')
           .then(res => res.json())
           .then(data => {
-            document.body.classList.remove('theme-vortex', 'theme-siri', 'theme-glow', 'theme-halo');
-            document.body.classList.add('theme-' + (data.hud_theme || 'vortex'));
+            document.body.classList.remove('theme-vortex', 'theme-siri');
+            let theme = data.hud_theme || 'vortex';
+            if (theme !== 'vortex' && theme !== 'siri') {
+              theme = 'vortex';
+            }
+            document.body.classList.add('theme-' + theme);
           })
           .catch(err => console.error('Failed to sync theme:', err));
 
@@ -1114,29 +917,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       document.getElementById('btn-eq-quiet').classList.toggle('active', mode === 'quiet');
     }
 
-    // Glow Modes
-    function setGlowMode(mode) {
-      glowMode = mode;
-      document.getElementById('btn-glow-sim').classList.toggle('active', mode === 'simulate');
-      document.getElementById('btn-glow-quiet').classList.toggle('active', mode === 'quiet');
-    }
 
-    // Halo States
-    function setHaloState(state) {
-      const halo = document.getElementById('halo');
-      halo.className = 'halo-container ' + state;
-      
-      document.getElementById('btn-halo-idle').classList.toggle('active', state === 'idle');
-      document.getElementById('btn-halo-list').classList.toggle('active', state === 'listening');
-      document.getElementById('btn-halo-send').classList.toggle('active', state === 'sending');
-    }
-
-    // Border Glow Virtual Toggle
-    function toggleVirtualScreen() {
-      const vs = document.getElementById('vscreen');
-      vs.classList.toggle('active');
-      document.getElementById('btn-vscreen-toggle').classList.toggle('active', vs.classList.contains('active'));
-    }
 
     // Full Screen Glow Overlay
     function triggerFullscreenGlow() {
@@ -1186,21 +967,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       // 3. Draw EQ & Particles
       drawEqAndParticles();
 
-      // 4. Update Card 2 Capsule Glow Preview
-      const capsulePreview = document.getElementById('capsule-preview');
-      if (capsulePreview) {
-        let isQuiet = glowMode === 'quiet';
-        let glowAmp = isQuiet ? 0.05 : currentAmplitude;
-        
-        const cyanAlpha = 0.25 + glowAmp * 0.5;
-        const purpleAlpha = 0.12 + glowAmp * 0.4;
-        const borderCyanAlpha = 0.35 + glowAmp * 0.45;
-        const shadowGlow1 = 12 + glowAmp * 20;
-        const shadowGlow2 = 20 + glowAmp * 25;
-        
-        capsulePreview.style.boxShadow = '0 0 ' + shadowGlow1 + 'px rgba(6, 182, 212, ' + cyanAlpha + '), 0 0 ' + shadowGlow2 + 'px rgba(168, 85, 247, ' + purpleAlpha + '), inset 0 0 8px rgba(6, 182, 212, 0.2)';
-        capsulePreview.style.borderColor = 'rgba(6, 182, 212, ' + borderCyanAlpha + ')';
-      }
+
     }
 
     function drawSiriWave() {
@@ -1249,13 +1016,11 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       const height = canvasEq.height;
       
       const isSiriTheme = document.body.classList.contains('theme-siri');
-      const isGlowTheme = document.body.classList.contains('theme-glow');
-      const isHaloTheme = document.body.classList.contains('theme-halo');
 
       if (isSiriTheme) {
         // Draw Siri Wave inside the HUD Canvas!
         siriPhase += 0.08 + currentAmplitude * 0.15;
-        const midY = height / 2;
+        const midY = isHudMode ? 56 : height / 2;
         
         const waves = [
           { color: 'rgba(6, 182, 212, 0.7)', amp: 22 * currentAmplitude, speed: 0.1, freq: 0.015 },
@@ -1285,97 +1050,6 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         });
         ctxEq.shadowBlur = 0;
         return; // Don't draw vortex particles or bars!
-      }
-
-      if (isGlowTheme) {
-        // Draw a premium, sleek flowing neon audio wave string
-        siriPhase += 0.08 + currentAmplitude * 0.12;
-        const midY = height / 2;
-        ctxEq.beginPath();
-        
-        const grad = ctxEq.createLinearGradient(0, 0, width, 0);
-        grad.addColorStop(0, 'rgba(6, 182, 212, 0.95)');   // Cyan
-        grad.addColorStop(0.5, 'rgba(236, 72, 153, 0.95)'); // Pink
-        grad.addColorStop(1, 'rgba(168, 85, 247, 0.95)');   // Purple
-        
-        ctxEq.strokeStyle = grad;
-        ctxEq.lineWidth = 3.5;
-        ctxEq.shadowBlur = 18;
-        ctxEq.shadowColor = 'rgba(236, 72, 153, 0.8)';
-        
-        ctxEq.moveTo(0, midY);
-        for (let x = 0; x < width; x++) {
-          const envelope = Math.pow(Math.E, -Math.pow((x - width/2) / (width/3.2), 2));
-          const y1 = Math.sin(x * 0.018 + siriPhase) * 18 * currentAmplitude * envelope;
-          const y2 = Math.cos(x * 0.012 - siriPhase * 0.8) * 8 * currentAmplitude * envelope;
-          ctxEq.lineTo(x, midY + y1 + y2);
-        }
-        ctxEq.stroke();
-        ctxEq.shadowBlur = 0;
-        return;
-      }
-
-      if (isHaloTheme) {
-        // Draw a cyberpunk horizontal scanning grid/laser sweep and core indicators
-        const midY = height / 2;
-        const time = Date.now() * 0.003;
-        
-        // 1. Draw glowing horizontal guide laser lines
-        ctxEq.beginPath();
-        ctxEq.strokeStyle = 'rgba(16, 185, 129, 0.15)'; // Deep emerald glow
-        ctxEq.lineWidth = 1;
-        ctxEq.moveTo(0, midY - 12);
-        ctxEq.lineTo(width, midY - 12);
-        ctxEq.moveTo(0, midY + 12);
-        ctxEq.lineTo(width, midY + 12);
-        ctxEq.stroke();
-
-        // 2. Draw a high-tech glowing horizontal laser sweep that bounces left and right
-        const sweepX = (width / 2) + Math.sin(time * 1.5) * (width * 0.42);
-        const sweepHeight = 18 + currentAmplitude * 20;
-        ctxEq.beginPath();
-        const laserGrad = ctxEq.createLinearGradient(sweepX - 30, 0, sweepX + 30, 0);
-        laserGrad.addColorStop(0, 'rgba(16, 185, 129, 0)');
-        laserGrad.addColorStop(0.5, 'rgba(16, 185, 129, ' + (0.4 + currentAmplitude * 0.6) + ')');
-        laserGrad.addColorStop(1, 'rgba(16, 185, 129, 0)');
-        ctxEq.strokeStyle = laserGrad;
-        ctxEq.lineWidth = 4;
-        ctxEq.shadowBlur = 12;
-        ctxEq.shadowColor = 'rgba(16, 185, 129, 0.8)';
-        ctxEq.moveTo(sweepX, midY - sweepHeight / 2);
-        ctxEq.lineTo(sweepX, midY + sweepHeight / 2);
-        ctxEq.stroke();
-
-        // 3. Draw a circular breathing holographic scanner core in the center
-        const coreRadius = 14 + currentAmplitude * 10;
-        ctxEq.beginPath();
-        ctxEq.arc(width / 2, midY, coreRadius, 0, Math.PI * 2);
-        ctxEq.strokeStyle = 'rgba(16, 185, 129, 0.4)';
-        ctxEq.lineWidth = 1.5;
-        ctxEq.stroke();
-        
-        // Holographic core ticks (crosshairs)
-        ctxEq.beginPath();
-        ctxEq.strokeStyle = 'rgba(16, 185, 129, 0.6)';
-        ctxEq.lineWidth = 1.5;
-        ctxEq.moveTo(width / 2 - coreRadius - 4, midY);
-        ctxEq.lineTo(width / 2 - coreRadius + 2, midY);
-        ctxEq.moveTo(width / 2 + coreRadius - 2, midY);
-        ctxEq.lineTo(width / 2 + coreRadius + 4, midY);
-        ctxEq.moveTo(width / 2, midY - coreRadius - 4);
-        ctxEq.lineTo(width / 2, midY - coreRadius + 2);
-        ctxEq.moveTo(width / 2, midY + coreRadius - 2);
-        ctxEq.lineTo(width / 2, midY + coreRadius + 4);
-        ctxEq.stroke();
-
-        // Glowing center core dot
-        ctxEq.beginPath();
-        ctxEq.arc(width / 2, midY, 5 + currentAmplitude * 4, 0, Math.PI * 2);
-        ctxEq.fillStyle = 'rgba(16, 185, 129, ' + (0.7 + currentAmplitude * 0.3) + ')';
-        ctxEq.fill();
-
-        ctxEq.shadowBlur = 0;
-        return;
       }
       
       // Update & Draw Background Particles
@@ -1438,10 +1112,10 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           ampFactor = modeAmp * 0.7 + Math.max(0, noise) * modeAmp * 0.6;
         }
         
-        const maxPossibleHeight = height - 24;
+        const maxPossibleHeight = isHudMode ? 28 : height - 24;
         const barHeight = Math.max(4, ampFactor * maxPossibleHeight);
         const x = startX + i * (barWidth + gap);
-        const y = isHudMode ? (height - barHeight) / 2 : height - barHeight - 20;
+        const y = isHudMode ? 56 - barHeight / 2 : height - barHeight - 20;
         
         // Modern curved rounded pillars with a high-fidelity linear gradient
         const grad = ctxEq.createLinearGradient(x, y, x, isHudMode ? y + barHeight : height - 20);
@@ -1498,7 +1172,11 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       try {
         const response = await fetch('/api/voice-settings');
         const data = await response.json();
-        activeTheme = data.hud_theme || 'vortex';
+        let theme = data.hud_theme || 'vortex';
+        if (theme !== 'vortex' && theme !== 'siri') {
+          theme = 'vortex';
+        }
+        activeTheme = theme;
         
         document.querySelectorAll('.apply-theme-btn').forEach(btn => {
           btn.style.background = 'var(--color-primary)';
@@ -1533,10 +1211,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         if (postRes.ok) {
           const toast = document.getElementById('fullscreen-toast');
           if (toast) {
-            let themeName = '极光频谱与环境粒子流';
-            if (theme === 'siri') themeName = 'Siri 极速流体三色声波';
-            else if (theme === 'glow') themeName = '胶囊边缘舱体流光';
-            else if (theme === 'halo') themeName = '赛博旋转扫描光晕';
+            let themeName = theme === 'siri' ? 'Siri 极速流体三色声波' : '极光频谱与环境粒子流';
             
             toast.innerHTML = '🎉 <strong>一键换装成功！</strong> 已成功将 <strong>' + themeName + '</strong> 应用为悬浮卡片默认主题！';
             toast.classList.add('active');

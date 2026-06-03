@@ -684,30 +684,71 @@ export function getDashboardHtml(): string {
         </form>
       </div>
 
-      <!-- Model Catalog Customized -->
-      <div class="panel-card">
-        <div class="panel-title" id="i18n-panel-models-title">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path>
-          </svg>
-          Model Dropdown Customizer
-        </div>
-        
-        <p id="i18n-models-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
-          Select which models appear in the Codex model dropdown selector. Checkboxes with **Vision Bridge** enable universal visual pre-processing for text-only models.
-        </p>
+      <!-- Right Column -->
+      <div style="display: flex; flex-direction: column; gap: 2rem;">
+        <!-- Model Catalog Customized -->
+        <div class="panel-card" style="flex: 1; margin: 0;">
+          <div class="panel-title" id="i18n-panel-models-title">
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path>
+            </svg>
+            Model Dropdown Customizer
+          </div>
+          
+          <p id="i18n-models-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
+            Select which models appear in the Codex model dropdown selector. Checkboxes with **Vision Bridge** enable universal visual pre-processing for text-only models.
+          </p>
 
-        <div class="models-list" id="models-list-container">
-          <!-- Populated by JavaScript -->
-          <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading model lists...</div>
+          <div class="models-list" id="models-list-container">
+            <!-- Populated by JavaScript -->
+            <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading model lists...</div>
+          </div>
+
+          <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
+            <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
+            <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
+          </div>
+          
+          <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
         </div>
 
-        <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-          <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-          <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
+        <!-- macOS System Permissions Panel -->
+        <div class="panel-card" style="margin: 0;">
+          <div class="panel-title" id="i18n-panel-permissions-title">
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+            </svg>
+            macOS System Permissions (Computer Use)
+          </div>
+          
+          <p id="i18n-permissions-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
+            Ensure that Accessibility and Screen Recording permissions are authorized. Otherwise, Computer Use and SkyComputerUseClient will be silently blocked by macOS.
+          </p>
+
+          <div style="display: flex; flex-direction: column; gap: 1rem;">
+            <!-- Accessibility Status -->
+            <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
+              <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
+                <span id="i18n-permission-ax-label" style="font-size: 0.9rem; font-weight: 600;">Accessibility (辅助功能)</span>
+                <span id="i18n-permission-ax-sublabel" style="font-size: 0.72rem; color: var(--color-text-muted);">Required for mouse, keyboard, and screen control.</span>
+              </div>
+              <span id="permission-ax-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+            </div>
+
+            <!-- Screen Recording Status -->
+            <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
+              <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
+                <span id="i18n-permission-screen-label" style="font-size: 0.9rem; font-weight: 600;">Screen Recording (屏幕录制)</span>
+                <span id="i18n-permission-screen-sublabel" style="font-size: 0.72rem; color: var(--color-text-muted);">Required for screen capture and vision analysis.</span>
+              </div>
+              <span id="permission-screen-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+            </div>
+          </div>
+
+          <button type="button" class="action-btn" id="i18n-btn-fix-permissions" onclick="fixPermissions()" style="background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); box-shadow: 0 4px 15px rgba(6, 182, 212, 0.2); margin-top: 0.5rem;">
+            Fix / Request System Permissions
+          </button>
         </div>
-        
-        <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
       </div>
     </div><!-- End Row 1 (Grid-Layout) -->
 
@@ -970,7 +1011,18 @@ export function getDashboardHtml(): string {
         btnLaunchVoiceBarApp: "Open Application (.app)",
         btnVisualizerLab: "Dynamic Visualizer Lab (Aurora FX)",
         toastVoiceBarLaunching: "Launching Voice Assistant...",
-        toastVoiceBarFailed: "Failed to launch Voice Assistant"
+        toastVoiceBarFailed: "Failed to launch Voice Assistant",
+        panelPermissionsTitle: "macOS System Permissions (Computer Use)",
+        permissionsDesc: "Ensure Accessibility and Screen Recording permissions are authorized. Otherwise, Computer Use and SkyComputerUseClient will be silently blocked by macOS.",
+        permissionAxLabel: "Accessibility (辅助功能)",
+        permissionAxSublabel: "Required for mouse, keyboard, and screen control.",
+        permissionScreenLabel: "Screen Recording (屏幕录制)",
+        permissionScreenSublabel: "Required for screen capture and vision analysis.",
+        btnFixPermissions: "Fix / Request System Permissions",
+        badgeAuthorized: "Authorized",
+        badgeUnauthorized: "Unauthorized",
+        toastPermissionsFixSent: "OS prompt triggered & settings panels opened. Please authorize by dragging helper apps.",
+        toastPermissionsFailed: "Failed to request permissions"
       },
       zh: {
         title: "OpenCodex 统一网关",
@@ -1047,7 +1099,18 @@ export function getDashboardHtml(): string {
         btnLaunchVoiceBarApp: "打开应用包 (.app)",
         btnVisualizerLab: "动效设计实验室 (极酷概念)",
         toastVoiceBarLaunching: "正在启动语音助手...",
-        toastVoiceBarFailed: "启动语音助手失败"
+        toastVoiceBarFailed: "启动语音助手失败",
+        panelPermissionsTitle: "macOS 系统权限修复 (Computer Use)",
+        permissionsDesc: "使用 Computer Use 时，必须确保授权“辅助功能”与“屏幕录制”权限。否则 macOS 会静默拦截相关操作。",
+        permissionAxLabel: "辅助功能 (Accessibility)",
+        permissionAxSublabel: "控制鼠标、键盘和执行动作所需权限。",
+        permissionScreenLabel: "屏幕录制 (Screen Recording)",
+        permissionScreenSublabel: "截图和视觉理解屏幕状态所需权限。",
+        btnFixPermissions: "修复 / 申请系统权限",
+        badgeAuthorized: "已授权",
+        badgeUnauthorized: "未授权",
+        toastPermissionsFixSent: "系统授权弹窗已触发，设置和 Finder 窗口已打开，请拖拽 App 进行授权！",
+        toastPermissionsFailed: "触发系统权限失败"
       }
     };
 
@@ -1126,6 +1189,17 @@ export function getDashboardHtml(): string {
       setText('i18n-btn-launch-voice-bar', t.btnLaunchVoiceBar);
       setText('i18n-btn-launch-voice-bar-app', t.btnLaunchVoiceBarApp);
       setText('i18n-text-visualizer-lab', t.btnVisualizerLab);
+
+      setHtml('i18n-panel-permissions-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>${'$'}{t.panelPermissionsTitle}\`);
+      setText('i18n-permissions-desc', t.permissionsDesc);
+      setText('i18n-permission-ax-label', t.permissionAxLabel);
+      setText('i18n-permission-ax-sublabel', t.permissionAxSublabel);
+      setText('i18n-permission-screen-label', t.permissionScreenLabel);
+      setText('i18n-permission-screen-sublabel', t.permissionScreenSublabel);
+      setText('i18n-btn-fix-permissions', t.btnFixPermissions);
+
+      // Keep badge text translated
+      checkPermissionsStatus();
 
       const langBtn = el('lang-btn');
       if (langBtn) langBtn.innerText = lang === 'zh' ? '🌐 English' : '🌐 中文';
@@ -1596,7 +1670,66 @@ export function getDashboardHtml(): string {
     document.getElementById('stt-engine').addEventListener('change', toggleCustomFields);
     document.getElementById('tts-engine').addEventListener('change', toggleCustomFields);
 
+    async function checkPermissionsStatus() {
+      try {
+        const response = await fetch('/api/permissions');
+        const data = await response.json();
+        if (data.status === 'success' && data.permissions) {
+          const axBadge = document.getElementById('permission-ax-status');
+          const screenBadge = document.getElementById('permission-screen-status');
+          const t = i18nDict[currentLang];
+          
+          if (axBadge) {
+            if (data.permissions.accessibility) {
+              axBadge.innerText = t.badgeAuthorized || 'Authorized';
+              axBadge.style.color = 'var(--color-success)';
+              axBadge.style.background = 'rgba(16, 185, 129, 0.1)';
+              axBadge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+            } else {
+              axBadge.innerText = t.badgeUnauthorized || 'Unauthorized';
+              axBadge.style.color = '#ef4444';
+              axBadge.style.background = 'rgba(239, 68, 68, 0.1)';
+              axBadge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+            }
+          }
+          
+          if (screenBadge) {
+            if (data.permissions.screenRecording) {
+              screenBadge.innerText = t.badgeAuthorized || 'Authorized';
+              screenBadge.style.color = 'var(--color-success)';
+              screenBadge.style.background = 'rgba(16, 185, 129, 0.1)';
+              screenBadge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
+            } else {
+              screenBadge.innerText = t.badgeUnauthorized || 'Unauthorized';
+              screenBadge.style.color = '#ef4444';
+              screenBadge.style.background = 'rgba(239, 68, 68, 0.1)';
+              screenBadge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
+            }
+          }
+        }
+      } catch (err) {}
+    }
 
+    function setupPermissionsPolling() {
+      checkPermissionsStatus();
+      setInterval(checkPermissionsStatus, 3000);
+    }
+
+    async function fixPermissions() {
+      showToast(i18nDict[currentLang].toastPermissionsFixSent || 'Triggering system settings...');
+      try {
+        const response = await fetch('/api/permissions/fix', {
+          method: 'POST'
+        });
+        if (response.ok) {
+          showToast(i18nDict[currentLang].toastPermissionsFixSent || 'Settings opened.');
+        } else {
+          showToast(i18nDict[currentLang].toastPermissionsFailed || 'Failed', true);
+        }
+      } catch (err) {
+        showToast(i18nDict[currentLang].toastConnFailed, true);
+      }
+    }
 
     let voiceBarOnline = false;
 
@@ -1672,6 +1805,7 @@ export function getDashboardHtml(): string {
       await loadVoiceSettings();
       setupLogsPolling();
       setupVoiceBarPolling();
+      setupPermissionsPolling();
     };
   </script>
 </body>

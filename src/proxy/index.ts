@@ -10,7 +10,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { exec, spawn } from "node:child_process";
+import { exec, spawn, spawnSync } from "node:child_process";
 
 import {
   responsesToChat,
@@ -80,6 +80,7 @@ export class ProxyServer {
     this.ensureConfigDir();
     this.loadConfig();
     this.autoPatchCodexConfig();
+    this.autoPatchPlugins();
     this.ensurePythonScripts();
   }
 
@@ -420,7 +421,7 @@ model_catalog_json = "${catalogPath}"
       const managedProvider = `# >>> opencodex managed >>>
 [model_providers.opencodex]
 name = "OpenCodex"
-base_url = "http://localhost:8765/v1"
+base_url = "http://127.0.0.1:8765/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "dummy"
@@ -456,7 +457,7 @@ model_catalog_json = "${catalogPath}"
       const managedProvider = `# >>> opencodex managed >>>
 [model_providers.opencodex]
 name = "OpenCodex"
-base_url = "http://localhost:8765/v1"
+base_url = "http://127.0.0.1:8765/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "dummy"
@@ -470,6 +471,49 @@ stream_idle_timeout_ms = 600000
       console.log(`[OpenCodex] Patched config.toml with opencodex provider.`);
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to patch config.toml: ${err.message}`);
+    }
+  }
+
+  private autoPatchPlugins() {
+    const tomlPath = join(homedir(), ".codex", "config.toml");
+    if (!existsSync(tomlPath)) return;
+    try {
+      let content = readFileSync(tomlPath, "utf-8");
+      if (!content.includes('computer-use@openai-bundled')) {
+        console.log("[OpenCodex] Enabling computer-use@openai-bundled plugin...");
+        let lines = content.split(/\r?\n/);
+        let idx = lines.findIndex(l => l.includes("[plugins.") || l.includes("[features]"));
+        if (idx !== -1) {
+          lines.splice(idx, 0, '[plugins."computer-use@openai-bundled"]', "enabled = true", "");
+          writeFileSync(tomlPath, lines.join("\n"), "utf-8");
+          console.log("[OpenCodex] Successfully enabled computer-use@openai-bundled in config.toml.");
+        } else {
+          writeFileSync(tomlPath, content + '\n\n[plugins."computer-use@openai-bundled"]\nenabled = true\n', "utf-8");
+          console.log("[OpenCodex] Successfully appended computer-use@openai-bundled in config.toml.");
+        }
+      }
+
+      const cacheDir = join(homedir(), ".codex", "plugins", "cache", "openai-bundled", "computer-use");
+      if (!existsSync(cacheDir)) {
+        console.log("[OpenCodex] computer-use plugin assets not found. Installing via codex plugin add...");
+        const codexPath = join(homedir(), ".local", "bin", "codex");
+        const execPath = existsSync(codexPath) ? codexPath : "codex";
+
+        exec(`"${execPath}" plugin add computer-use@openai-bundled`, {
+          env: {
+            ...process.env,
+            PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
+          }
+        }, (err, stdout, stderr) => {
+          if (err) {
+            console.error(`[OpenCodex] Failed to install computer-use plugin: ${err.message}`);
+          } else {
+            console.log(`[OpenCodex] Successfully installed computer-use plugin: ${stdout.trim()}`);
+          }
+        });
+      }
+    } catch (err: any) {
+      console.error(`[OpenCodex] Failed to patch plugins: ${err.message}`);
     }
   }
 
@@ -604,6 +648,9 @@ stream_idle_timeout_ms = 600000
         try {
           const settings = JSON.parse(readFileSync(p, "utf-8"));
           hudTheme = settings.hud_theme || "vortex";
+          if (hudTheme !== "vortex" && hudTheme !== "siri") {
+            hudTheme = "vortex";
+          }
         } catch {}
       }
 
@@ -698,6 +745,7 @@ stream_idle_timeout_ms = 600000
         this.saveConfig();
 
         this.patchCodexConfig();
+        this.autoPatchPlugins();
         if (data.restart) {
           this.restartCodexDesktop();
         }
@@ -789,6 +837,52 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/permissions" && req.method === "GET") {
+      try {
+        const swiftCode = `import ApplicationServices; import Cocoa; let accessibility = AXIsProcessTrusted(); var screenRecording = false; if #available(macOS 10.15, *) { screenRecording = CGPreflightScreenCaptureAccess() } else { screenRecording = true }; print("{\\"accessibility\\": \\(accessibility), \\"screenRecording\\": \\(screenRecording)}")`;
+        const result = spawnSync("/usr/bin/swift", ["-e", swiftCode], { encoding: "utf-8" });
+        if (result.status === 0) {
+          const parsed = JSON.parse(result.stdout.trim());
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success", permissions: parsed }));
+        } else {
+          throw new Error(result.stderr || "Swift execution failed");
+        }
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/permissions/fix" && req.method === "POST") {
+      try {
+        const swiftPromptCode = `import ApplicationServices; import Cocoa; _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary); if #available(macOS 10.15, *) { _ = CGRequestScreenCaptureAccess() }`;
+        spawnSync("/usr/bin/swift", ["-e", swiftPromptCode]);
+
+        exec('open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"');
+        exec('open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"');
+
+        const appPath1 = join(homedir(), ".codex", "computer-use", "Codex Computer Use.app");
+        const appPath2 = join(appPath1, "Contents", "SharedSupport", "SkyComputerUseClient.app");
+        if (existsSync(appPath1)) {
+          exec(`open -R "${appPath1}"`);
+        }
+        if (existsSync(appPath2)) {
+          setTimeout(() => {
+            exec(`open -R "${appPath2}"`);
+          }, 800);
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", message: "Prompts triggered and folders opened." }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     if (path === "/api/restart-codex" && req.method === "POST") {
       try {
         this.restartCodexDesktop();
@@ -869,7 +963,7 @@ stream_idle_timeout_ms = 600000
           vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
           voice_llm_model: data.voice_llm_model || "",
           enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
-          hud_theme: data.hud_theme || "vortex"
+          hud_theme: ["vortex", "siri"].includes(data.hud_theme) ? data.hud_theme : "vortex"
         };
         writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
         console.error("[OpenCodex] Saved voice settings to " + p);
@@ -1480,7 +1574,7 @@ stream_idle_timeout_ms = 600000
     
     const env = {
       ...process.env,
-      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
     };
 
     const child = existsSync(uvxPath)
@@ -1602,7 +1696,7 @@ stream_idle_timeout_ms = 600000
       ...process.env,
       MINIMAX_API_KEY: apiKey,
       MINIMAX_API_HOST: apiHost,
-      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
     };
     const child = spawn("python3", ["/tmp/ocb_minimax_tts.py", text, tempOutput, voiceId], { env });
     
@@ -1640,7 +1734,7 @@ stream_idle_timeout_ms = 600000
     
     const env = {
       ...process.env,
-      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
+      PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
     };
 
     let edgeTtsCmd = "edge-tts";
