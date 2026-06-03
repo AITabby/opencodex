@@ -6,7 +6,7 @@
  */
 
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -210,6 +210,7 @@ except Exception as e:
       console.error("[OpenCodex] Failed to write helper python scripts: " + err.message);
     }
   }
+
 
   private loadConfig() {
     const p = join(this.configDir, "providers.json");
@@ -977,6 +978,16 @@ stream_idle_timeout_ms = 600000
               res.end(JSON.stringify({ error: "MiniMax synthesis failed" }));
             }
           });
+        } else if (engine === "kokoro") {
+          this.synthesizeSpeechKokoro(text, settings, (audioBuffer) => {
+            if (audioBuffer) {
+              res.writeHead(200, { "Content-Type": "audio/wav" });
+              res.end(audioBuffer);
+            } else {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Kokoro synthesis failed" }));
+            }
+          });
         } else {
           // Default to edge-tts
           this.synthesizeSpeechEdge(text, settings, (audioBuffer) => {
@@ -1622,17 +1633,29 @@ stream_idle_timeout_ms = 600000
       const hasChinese = /[\u4e00-\u9fa5]/.test(text);
       voice = hasChinese ? "zh-CN-XiaoxiaoNeural" : "en-US-AvaNeural";
     }
-    const tempOutput = "/tmp/tts_edge_web.mp3";
+    const tempOutput = "/tmp/tts_edge_web_" + Date.now() + "_" + Math.random().toString(36).slice(2) + ".mp3";
     const uvxPath = join(homedir(), ".local", "bin", "uvx");
+    const homebrewPath = "/opt/homebrew/bin/edge-tts";
+    const localBinPath = "/usr/local/bin/edge-tts";
     
     const env = {
       ...process.env,
       PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${process.env.PATH || ""}`
     };
 
-    const child = existsSync(uvxPath)
-      ? spawn(uvxPath, ["edge-tts", "--voice", voice, "--text", text, "--write-media", tempOutput], { env })
-      : spawn("edge-tts", ["--voice", voice, "--text", text, "--write-media", tempOutput], { env });
+    let edgeTtsCmd = "edge-tts";
+    let args = ["--voice", voice, "--text", text, "--write-media", tempOutput];
+    
+    if (existsSync(homebrewPath)) {
+      edgeTtsCmd = homebrewPath;
+    } else if (existsSync(localBinPath)) {
+      edgeTtsCmd = localBinPath;
+    } else if (existsSync(uvxPath)) {
+      edgeTtsCmd = uvxPath;
+      args = ["edge-tts", ...args];
+    }
+    
+    const child = spawn(edgeTtsCmd, args, { env });
 
     let errOutput = "";
     child.stderr.on("data", (chunk) => {
@@ -1647,12 +1670,48 @@ stream_idle_timeout_ms = 600000
         } catch (err: any) {
           console.error(`[OpenCodex Voice API EdgeTTS Err] Failed to read output file: ${err.message}`);
           cb(null);
+        } finally {
+          try {
+            unlinkSync(tempOutput);
+          } catch {}
         }
       } else {
         console.error(`[OpenCodex Voice API EdgeTTS Err] Exit code ${code}. Error: ${errOutput}`);
         cb(null);
+        try {
+          unlinkSync(tempOutput);
+        } catch {}
       }
     });
+  }
+
+  private async synthesizeSpeechKokoro(text: string, settings: any, cb: (data: Buffer | null) => void) {
+    try {
+      const response = await fetch("http://127.0.0.1:8766/tts", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text: text,
+          voice: settings.tts_voice || "zf_xiaoxiao",
+          speed: 1.0
+        })
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`[OpenCodex Voice API Kokoro Err] Server returned status ${response.status}: ${errText}`);
+        cb(null);
+        return;
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      cb(Buffer.from(arrayBuffer));
+    } catch (err: any) {
+      console.error(`[OpenCodex Voice API Kokoro Err] Failed to fetch Kokoro server: ${err.message}`);
+      cb(null);
+    }
   }
 }
 
