@@ -6,11 +6,12 @@
  */
 
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exec, spawn, spawnSync } from "node:child_process";
+import { WebSocketServer, WebSocket } from "ws";
 
 import {
   responsesToChat,
@@ -73,11 +74,13 @@ console.error = (...args: any[]) => {
 
 export class ProxyServer {
   private server: http.Server | null = null;
-  private config!: ProxyConfig;
+  public config!: ProxyConfig;
   private configDir = join(homedir(), ".opencodex");
+  private initializedSessions = new Set<string>();
 
   constructor() {
     this.ensureConfigDir();
+    this.ensureCheckPermsHelper();
     this.loadConfig();
     this.autoPatchCodexConfig();
     this.autoPatchPlugins();
@@ -87,6 +90,40 @@ export class ProxyServer {
   private ensureConfigDir() {
     if (!existsSync(this.configDir)) {
       mkdirSync(this.configDir, { recursive: true });
+    }
+  }
+
+  private ensureCheckPermsHelper() {
+    const helperPath = join(this.configDir, "check_perms");
+    if (!existsSync(helperPath)) {
+      console.log("[OpenCodex] Building permission checker helper...");
+      const swiftCode = `import Foundation
+import ApplicationServices
+import CoreGraphics
+
+print(AXIsProcessTrusted())
+if #available(macOS 10.15, *) {
+    print(CGPreflightScreenCaptureAccess())
+} else {
+    print(true)
+}
+`;
+      const tempSwiftFile = join(this.configDir, "temp_check_perms.swift");
+      try {
+        writeFileSync(tempSwiftFile, swiftCode, "utf-8");
+        const compileRes = spawnSync("swiftc", [tempSwiftFile, "-o", helperPath], { encoding: "utf-8" });
+        if (compileRes.status !== 0) {
+          console.error(`[OpenCodex] Failed to compile check_perms helper: ${compileRes.stderr}`);
+        } else {
+          console.log("[OpenCodex] Successfully compiled check_perms helper.");
+        }
+      } catch (err: any) {
+        console.error(`[OpenCodex] Error creating check_perms helper: ${err.message}`);
+      } finally {
+        if (existsSync(tempSwiftFile)) {
+          try { unlinkSync(tempSwiftFile); } catch {}
+        }
+      }
     }
   }
 
@@ -606,6 +643,18 @@ stream_idle_timeout_ms = 600000
         this.handle(req, res, buffer);
       });
     });
+
+    const wss = new WebSocketServer({ noServer: true });
+    this.server.on("upgrade", (request, socket, head) => {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+    });
+
+    wss.on("connection", (ws) => {
+      this.handleWebSocketConnection(ws);
+    });
+
     this.server.listen(port, "0.0.0.0");
     console.error(`[OpenCodex] Unified HTTP server listening on port ${port}`);
     console.error(`[OpenCodex] Web Dashboard UI → http://localhost:${port}/dashboard`);
@@ -763,7 +812,10 @@ stream_idle_timeout_ms = 600000
       const catalog = this.getModelCatalog();
       const active = catalog.models?.filter((m: any) => m.visibility === "list").map((m: any) => m.slug) || [];
       
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache, no-store, must-revalidate"
+      });
       res.end(JSON.stringify({
         catalog: catalog.models?.map((m: any) => ({
           id: m.slug,
@@ -781,12 +833,15 @@ stream_idle_timeout_ms = 600000
     if (path === "/api/models" && req.method === "POST") {
       try {
         const data = JSON.parse(body);
+        console.log("[OpenCodex] Received POST /api/models data:", data);
         const activeIds = data.active || [];
+        const visionBridgeIds = data.vision_bridge || [];
         const catalog = this.getModelCatalog();
         
         if (catalog.models) {
           catalog.models.forEach((m: any) => {
             m.visibility = activeIds.includes(m.slug) ? "list" : "hide";
+            m.vision_bridge_enabled = visionBridgeIds.includes(m.slug);
           });
           this.saveModelCatalog(catalog);
         }
@@ -830,6 +885,315 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/sessions" && req.method === "GET") {
+      try {
+        const sessionsMap = new Map<string, { id: string, text: string, ts: number }>();
+        
+        // 1. Scan history.jsonl
+        const historyPath = join(homedir(), ".codex", "history.jsonl");
+        if (existsSync(historyPath)) {
+          const lines = readFileSync(historyPath, "utf-8").split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const item = JSON.parse(trimmed);
+              if (item.session_id) {
+                sessionsMap.set(item.session_id, {
+                  id: item.session_id,
+                  text: item.text,
+                  ts: item.ts * 1000
+                });
+              }
+            } catch {}
+          }
+        }
+
+        // Load voice settings to get the system prompt
+        const p = join(this.configDir, "voice_settings.json");
+        let voiceSystemPrompt = "";
+        if (existsSync(p)) {
+          try {
+            const settings = JSON.parse(readFileSync(p, "utf-8"));
+            voiceSystemPrompt = settings.voice_system_prompt || "";
+          } catch {}
+        }
+        const prefixUtf = voiceSystemPrompt + "\n\n用户说：";
+        const prefixUtfClean = voiceSystemPrompt + "\n\n\u7528\u623f\u8bf4\uff1a"; // clean alternative
+
+        // 2. Scan rollout files for complete context and timestamps
+        const sessionsDir = join(homedir(), ".codex", "sessions");
+        if (existsSync(sessionsDir)) {
+          const files = findRolloutFiles(sessionsDir);
+          for (const file of files) {
+            try {
+              const content = readFileSync(file, "utf-8");
+              const lines = content.split("\n");
+              let session_id = "";
+              let ts = 0;
+              let firstUserMsg = "";
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const item = JSON.parse(trimmed);
+                if (item.type === "session_meta") {
+                  if (item.payload?.id) {
+                    session_id = item.payload.id;
+                  }
+                  if (item.payload?.timestamp) {
+                    const rawTs = item.payload.timestamp;
+                    if (typeof rawTs === "number") {
+                      ts = rawTs < 9999999999 ? rawTs * 1000 : rawTs;
+                    } else if (typeof rawTs === "string") {
+                      ts = Date.parse(rawTs) || 0;
+                    }
+                  }
+                } else if (item.type === "event_msg" && item.payload?.type === "user_message") {
+                  if (!firstUserMsg && item.payload.message) {
+                    let uMsg = item.payload.message;
+                    if (voiceSystemPrompt) {
+                      if (uMsg.startsWith(prefixUtf)) {
+                        uMsg = uMsg.slice(prefixUtf.length);
+                      } else if (uMsg.startsWith(prefixUtfClean)) {
+                        uMsg = uMsg.slice(prefixUtfClean.length);
+                      }
+                    }
+                    firstUserMsg = uMsg;
+                  }
+                }
+              }
+              if (session_id) {
+                const existing = sessionsMap.get(session_id);
+                sessionsMap.set(session_id, {
+                  id: session_id,
+                  text: firstUserMsg || (existing ? existing.text : `会话 ${session_id}`),
+                  ts: ts || (existing ? existing.ts : Date.now())
+                });
+              }
+            } catch {}
+          }
+        }
+
+        const archivedPath = join(this.configDir, "archived_sessions.json");
+        let archivedIds = new Set<string>();
+        if (existsSync(archivedPath)) {
+          try {
+            archivedIds = new Set(JSON.parse(readFileSync(archivedPath, "utf-8")));
+          } catch {}
+        }
+
+        const sessions = Array.from(sessionsMap.values()).map(s => ({
+          ...s,
+          archived: archivedIds.has(s.id)
+        })).sort((a, b) => b.ts - a.ts);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(sessions));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/detail" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        
+        // Load voice settings to get the system prompt
+        const p = join(this.configDir, "voice_settings.json");
+        let voiceSystemPrompt = "";
+        if (existsSync(p)) {
+          try {
+            const settings = JSON.parse(readFileSync(p, "utf-8"));
+            voiceSystemPrompt = settings.voice_system_prompt || "";
+          } catch {}
+        }
+        const prefixUtf = voiceSystemPrompt + "\n\n用户说：";
+        const prefixUtfClean = voiceSystemPrompt + "\n\n\u7528\u623f\u8bf4\uff1a"; // clean alternative
+
+        const sessionsDir = join(homedir(), ".codex", "sessions");
+        const rolloutFile = findRolloutFileById(sessionsDir, sid);
+        
+        const messages: any[] = [];
+        if (rolloutFile && existsSync(rolloutFile)) {
+          const lines = readFileSync(rolloutFile, "utf-8").split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const item = JSON.parse(trimmed);
+              if (item.type === "event_msg") {
+                const pType = item.payload?.type;
+                if (pType === "user_message") {
+                  let uMsg = item.payload.message || "";
+                  if (voiceSystemPrompt) {
+                    if (uMsg.startsWith(prefixUtf)) {
+                      uMsg = uMsg.slice(prefixUtf.length);
+                    } else if (uMsg.startsWith(prefixUtfClean)) {
+                      uMsg = uMsg.slice(prefixUtfClean.length);
+                    }
+                  }
+                  messages.push({
+                    role: "user",
+                    text: uMsg
+                  });
+                } else if (pType === "agent_message") {
+                  messages.push({
+                    role: "assistant",
+                    text: item.payload.message
+                  });
+                }
+              }
+            } catch {}
+          }
+        } else {
+          // Fallback to history.jsonl
+          const historyPath = join(homedir(), ".codex", "history.jsonl");
+          if (existsSync(historyPath)) {
+            const lines = readFileSync(historyPath, "utf-8").split("\n");
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed) continue;
+              try {
+                const item = JSON.parse(trimmed);
+                if (item.session_id === sid) {
+                  messages.push({
+                    role: "user",
+                    text: item.text
+                  });
+                }
+              } catch {}
+            }
+          }
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ messages }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/enter" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        const p = join(this.configDir, "voice_settings.json");
+        let settings: any = {};
+        if (existsSync(p)) {
+          try { settings = JSON.parse(readFileSync(p, "utf-8")); } catch {}
+        }
+        settings.active_session_id = sid;
+        writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
+
+        this.broadcastSession(sid);
+
+        console.error(`[Sessions] Switched active session to: ${sid}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", session_id: sid }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/clear-all" && req.method === "POST") {
+      try {
+        const historyPath = join(homedir(), ".codex", "history.jsonl");
+        if (existsSync(historyPath)) {
+          writeFileSync(historyPath, "", "utf-8");
+        }
+        const sessionsDir = join(homedir(), ".codex", "sessions");
+        deleteSessionFiles(sessionsDir);
+
+        console.error(`[Sessions] Cleared all sessions.`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/delete" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        
+        // 1. Delete from history.jsonl
+        const historyPath = join(homedir(), ".codex", "history.jsonl");
+        if (existsSync(historyPath)) {
+          const lines = readFileSync(historyPath, "utf-8").split("\n");
+          const remainingLines: string[] = [];
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const item = JSON.parse(trimmed);
+              if (item.session_id !== sid) {
+                remainingLines.push(line);
+              }
+            } catch {
+              remainingLines.push(line);
+            }
+          }
+          writeFileSync(historyPath, remainingLines.join("\n") + "\n", "utf-8");
+        }
+
+        // 2. Delete rollout file
+        const sessionsDir = join(homedir(), ".codex", "sessions");
+        const rolloutFile = findRolloutFileById(sessionsDir, sid);
+        if (rolloutFile && existsSync(rolloutFile)) {
+          try {
+            unlinkSync(rolloutFile);
+          } catch {}
+        }
+
+        console.error(`[Sessions] Deleted session: ${sid}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/archive" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        const archived = !!data.archived;
+        const archivedPath = join(this.configDir, "archived_sessions.json");
+        let archivedIds: string[] = [];
+        if (existsSync(archivedPath)) {
+          try {
+            archivedIds = JSON.parse(readFileSync(archivedPath, "utf-8"));
+          } catch {}
+        }
+        if (archived) {
+          if (!archivedIds.includes(sid)) {
+            archivedIds.push(sid);
+          }
+        } else {
+          archivedIds = archivedIds.filter(id => id !== sid);
+        }
+        writeFileSync(archivedPath, JSON.stringify(archivedIds, null, 2), "utf-8");
+        console.error(`[Sessions] Session ${sid} archive status set to ${archived}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     if (path === "/api/test-log" && req.method === "POST") {
       console.log("[OpenCodex] Test log from dashboard at " + new Date().toLocaleTimeString());
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -839,14 +1203,21 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/permissions" && req.method === "GET") {
       try {
-        const swiftCode = `import ApplicationServices; import Cocoa; let accessibility = AXIsProcessTrusted(); var screenRecording = false; if #available(macOS 10.15, *) { screenRecording = CGPreflightScreenCaptureAccess() } else { screenRecording = true }; print("{\\"accessibility\\": \\(accessibility), \\"screenRecording\\": \\(screenRecording)}")`;
-        const result = spawnSync("/usr/bin/swift", ["-e", swiftCode], { encoding: "utf-8" });
+        const helperPath = join(this.configDir, "check_perms");
+        if (!existsSync(helperPath)) {
+          this.ensureCheckPermsHelper();
+        }
+        const result = spawnSync(helperPath, [], { encoding: "utf-8" });
         if (result.status === 0) {
-          const parsed = JSON.parse(result.stdout.trim());
+          const lines = result.stdout.trim().split("\n");
+          const permissions = {
+            accessibility: lines[0] === "true",
+            screenRecording: lines[1] === "true"
+          };
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "success", permissions: parsed }));
+          res.end(JSON.stringify({ status: "success", permissions }));
         } else {
-          throw new Error(result.stderr || "Swift execution failed");
+          throw new Error(result.stderr || "Helper execution failed");
         }
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -857,14 +1228,17 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/permissions/fix" && req.method === "POST") {
       try {
-        const swiftPromptCode = `import ApplicationServices; import Cocoa; _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary); if #available(macOS 10.15, *) { _ = CGRequestScreenCaptureAccess() }`;
-        spawnSync("/usr/bin/swift", ["-e", swiftPromptCode]);
+        const appPath1 = join(homedir(), ".codex", "computer-use", "Codex Computer Use.app");
+        const appPath2 = join(appPath1, "Contents", "SharedSupport", "SkyComputerUseClient.app");
+        
+        if (existsSync(appPath1)) {
+          // Launch/open the real signed app bundle so that macOS triggers the stable permission prompt
+          exec(`open "${appPath1}"`);
+        }
 
         exec('open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"');
         exec('open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"');
 
-        const appPath1 = join(homedir(), ".codex", "computer-use", "Codex Computer Use.app");
-        const appPath2 = join(appPath1, "Contents", "SharedSupport", "SkyComputerUseClient.app");
         if (existsSync(appPath1)) {
           exec(`open -R "${appPath1}"`);
         }
@@ -930,6 +1304,10 @@ stream_idle_timeout_ms = 600000
         tts_base_url: "https://api.openai.com/v1",
         tts_model: "tts-1",
         tts_voice: "zh-CN-XiaoxiaoNeural",
+        tts_appid: "",
+        tts_resource: "",
+        tts_resource_id: "",
+        voice_system_prompt: "",
         vad_threshold: -35.0,
         vad_duration: 2.0,
         voice_llm_model: "",
@@ -959,6 +1337,10 @@ stream_idle_timeout_ms = 600000
           tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
           tts_model: data.tts_model || "tts-1",
           tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
+          tts_appid: data.tts_appid || "",
+          tts_resource: data.tts_resource || "",
+          tts_resource_id: data.tts_resource || "", // Alias for compatibility
+          voice_system_prompt: data.voice_system_prompt || "",
           vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -35.0,
           vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
           voice_llm_model: data.voice_llm_model || "",
@@ -1048,7 +1430,14 @@ stream_idle_timeout_ms = 600000
           } catch {}
         }
 
-        const engine = settings.tts_engine || "edge-tts";
+        let engine = settings.tts_engine || "";
+        if (engine === "" && settings.tts_base_url && settings.tts_base_url.includes("bytedance")) {
+          engine = "doubao";
+        }
+        if (engine === "") {
+          engine = "edge-tts";
+        }
+
         console.error(`[OpenCodex Voice API] Synthesizing speech via ${engine} for text: '${text.substring(0, 30)}...'`);
 
         if (engine === "openai-compatible") {
@@ -1059,6 +1448,17 @@ stream_idle_timeout_ms = 600000
             })
             .catch((err) => {
               console.error(`[OpenCodex Voice API TTS API Err] ${err.message}`);
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: err.message }));
+            });
+        } else if (engine === "doubao") {
+          this.synthesizeSpeechDoubao(text, settings)
+            .then((audioBuffer) => {
+              res.writeHead(200, { "Content-Type": "audio/mpeg" });
+              res.end(audioBuffer);
+            })
+            .catch((err) => {
+              console.error(`[OpenCodex Voice API Doubao TTS Err] ${err.message}`);
               res.writeHead(500, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: err.message }));
             });
@@ -1187,7 +1587,10 @@ stream_idle_timeout_ms = 600000
           api_key: p.api_key ? p.api_key.slice(0, 8) + "..." : ""
         }))
       };
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache, no-store, must-revalidate"
+      });
       res.end(JSON.stringify(safe, null, 2));
       return;
     }
@@ -1215,7 +1618,9 @@ stream_idle_timeout_ms = 600000
     }
 
     if (path === "/v1/responses" && req.method === "POST") {
-      this.handleResponses(body, res);
+      const sidHeader = req.headers["x-session-id"] || req.headers["session-id"] || "";
+      const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : sidHeader;
+      this.handleResponses(body, res, sessionId);
       return;
     }
 
@@ -1232,7 +1637,7 @@ stream_idle_timeout_ms = 600000
   //  Responses API Gateway (Used by Codex UI)
   // ══════════════════════════════════════════════
 
-  private async handleResponses(body: string, res: http.ServerResponse) {
+  private async handleResponses(body: string, res: http.ServerResponse, sessionId?: string) {
     let reqBody: any;
     try {
       reqBody = JSON.parse(body);
@@ -1240,6 +1645,38 @@ stream_idle_timeout_ms = 600000
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid JSON body" }));
       return;
+    }
+
+    if (body.includes("image_url") || body.includes("input_image") || body.includes("file_data")) {
+      console.error("[OpenCodex-DEBUG] Incoming request contains image/file data. Structure:", JSON.stringify(reqBody, (k, v) => {
+        if (typeof v === "string" && v.length > 200) return v.slice(0, 100) + "... (truncated)";
+        return v;
+      }, 2));
+    }
+
+    // Detect get_app_state output to inject delay and allow CUA session initialization (check only the most recent tool outputs at the end of history)
+    let hasGetAppStateOutput = false;
+    if (reqBody.input && Array.isArray(reqBody.input)) {
+      for (let i = reqBody.input.length - 1; i >= 0; i--) {
+        const item = reqBody.input[i];
+        if (item && item.type === "function_call_output") {
+          const outStr = typeof item.output === "string" ? item.output : JSON.stringify(item.output || "");
+          if (outStr.includes("<app_specific_instructions>") || outStr.includes("CUA App Version:")) {
+            hasGetAppStateOutput = true;
+            break;
+          }
+        } else {
+          // Once we encounter a non-tool-output item, we stop checking as we've processed the latest turn's outputs
+          break;
+        }
+      }
+    }
+    if (hasGetAppStateOutput && sessionId) {
+      if (!this.initializedSessions.has(sessionId)) {
+        this.initializedSessions.add(sessionId);
+        console.log(`[OpenCodex Proxy] Detected cold-start get_app_state output for session ${sessionId}. Injecting 1500ms delay to allow CUA session to stabilize...`);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
     }
 
     const requestedModel = reqBody.model || "";
@@ -1272,7 +1709,7 @@ stream_idle_timeout_ms = 600000
 
     console.log(`[Responses] Routing ${requestedModel} → ${provider.name}/${upstreamModel} (stream=${isStream}, visionBridge=${callVisionBridge})`);
 
-    const chatBody = responsesToChat(processedReqBody, upstreamModel);
+    const chatBody = responsesToChat(processedReqBody, upstreamModel, sessionId);
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
     try {
@@ -1779,6 +2216,221 @@ stream_idle_timeout_ms = 600000
     });
   }
 
+  private async synthesizeSpeechDoubao(text: string, settings: any): Promise<Buffer> {
+    const apiKey = settings.tts_api_key || "";
+    const baseUrl = settings.tts_base_url || "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+    const voice = settings.tts_voice || "zh_female_xiaohe_uranus_bigtts";
+    const appid = settings.tts_appid || "";
+    const resourceId = settings.tts_resource || settings.tts_resource_id || "seed-tts-2.0";
+
+    const crypto = await import("node:crypto");
+    const reqid = crypto.randomUUID();
+
+    let headers: Record<string, string> = {};
+    let bodyPayload: any = {};
+
+    // If AppID is provided, we use the legacy V1/V2 AppID + Access Key authentication format.
+    // Otherwise, we use the new V3 API Key authentication format.
+    if (appid) {
+      headers = {
+        "Content-Type": "application/json",
+        "X-Api-App-Key": appid,
+        "X-Api-Access-Key": apiKey,
+        "X-Api-Resource-Id": resourceId,
+        "X-Api-Request-Id": reqid
+      };
+
+      bodyPayload = {
+        app: {
+          appid: appid,
+          token: apiKey,
+          cluster: resourceId.includes("icl") ? "volcano_icl" : "volcano_tts"
+        },
+        user: {
+          uid: "opencodex_user"
+        },
+        audio: {
+          voice_type: voice,
+          encoding: "mp3"
+        },
+        request: {
+          reqid: reqid,
+          text: text,
+          text_type: "plain",
+          operation: "submit"
+        }
+      };
+    } else {
+      headers = {
+        "Content-Type": "application/json",
+        "X-Api-Key": apiKey,
+        "X-Api-Resource-Id": resourceId,
+        "X-Api-Request-Id": reqid
+      };
+
+      let modelVal = settings.tts_model || "seed-tts-2.0-expressive";
+      if (modelVal === "tts-1") {
+        modelVal = "seed-tts-2.0-expressive";
+      }
+
+      bodyPayload = {
+        req_params: {
+          text: text,
+          model: modelVal,
+          speaker: voice,
+          encoding: "mp3"
+        }
+      };
+    }
+
+    const response = await fetch(baseUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(bodyPayload)
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Doubao TTS API returned status ${response.status}: ${errText}`);
+    }
+
+    const resText = await response.text();
+    const lines = resText.split("\n");
+    let audioBuffer = Buffer.alloc(0);
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const json = JSON.parse(trimmed);
+        if (json.data) {
+          const chunk = Buffer.from(json.data, "base64");
+          audioBuffer = Buffer.concat([audioBuffer, chunk]);
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    if (audioBuffer.length === 0) {
+      throw new Error(`Doubao TTS synthesis returned no audio. Response was: ${resText.slice(0, 300)}`);
+    }
+
+    return audioBuffer;
+  }
+
+  private activeWsClients = new Set<WebSocket>();
+
+  public broadcastSession(sessionId: string) {
+    const payload = JSON.stringify({
+      type: "activate_session",
+      session_id: sessionId
+    });
+    for (const ws of this.activeWsClients) {
+      try {
+        ws.send(payload);
+      } catch {}
+    }
+  }
+
+  public handleWebSocketConnection(ws: WebSocket) {
+    this.activeWsClients.add(ws);
+    let audioBuffer = Buffer.alloc(0);
+    let isListening = false;
+
+    ws.on("message", async (data, isBinary) => {
+      if (isBinary) {
+        if (isListening) {
+          audioBuffer = Buffer.concat([audioBuffer, data as Buffer]);
+        }
+        return;
+      }
+
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "start_stt") {
+          audioBuffer = Buffer.alloc(0);
+          isListening = true;
+          console.error("[WebSocket STT] Listening started...");
+        } else if (msg.type === "stop_stt") {
+          isListening = false;
+          console.error(`[WebSocket STT] Listening stopped. Audio size: ${audioBuffer.length} bytes`);
+          await this.processWebSocketSTT(ws, audioBuffer);
+        } else if (msg.type === "active_session_changed") {
+          const sid = msg.session_id;
+          if (sid) {
+            const p = join(this.configDir, "voice_settings.json");
+            let settings: any = {};
+            if (existsSync(p)) {
+              try { settings = JSON.parse(readFileSync(p, "utf-8")); } catch {}
+            }
+            settings.active_session_id = sid;
+            writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
+            console.error(`[WebSocket] Client updated active_session_id to: ${sid}`);
+          }
+        }
+      } catch (err: any) {
+        console.error(`[WebSocket message err] ${err.message}`);
+      }
+    });
+
+    ws.on("close", () => {
+      this.activeWsClients.delete(ws);
+      isListening = false;
+      audioBuffer = Buffer.alloc(0);
+    });
+  }
+
+  private async processWebSocketSTT(ws: WebSocket, pcmBuffer: Buffer) {
+    try {
+      const p = join(this.configDir, "voice_settings.json");
+      let settings: any = {
+        stt_engine: "local-whisper",
+        stt_api_key: "",
+        stt_base_url: "https://api.openai.com/v1",
+        stt_model: "whisper-1"
+      };
+      if (existsSync(p)) {
+        try {
+          settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) };
+        } catch {}
+      }
+
+      const wavBuffer = pcmToWav(pcmBuffer, 16000, 1, 16);
+      const tmpWavPath = `/tmp/ws_stt_${Date.now()}.wav`;
+      writeFileSync(tmpWavPath, wavBuffer);
+
+      let text = "";
+      const isAPI = settings.stt_engine === "openai-compatible" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
+
+      if (isAPI) {
+        text = await this.transcribeAudioAPI(tmpWavPath, settings);
+      } else {
+        text = await new Promise<string>((resolve) => {
+          this.transcribeAudioLocal(tmpWavPath, (resText) => {
+            resolve(resText || "");
+          });
+        });
+      }
+
+      try {
+        unlinkSync(tmpWavPath);
+      } catch {}
+
+      console.error(`[WebSocket STT] Final text: "${text}"`);
+      ws.send(JSON.stringify({
+        type: "transcription_final",
+        text: text
+      }));
+    } catch (err: any) {
+      console.error(`[WebSocket STT err] ${err.message}`);
+      ws.send(JSON.stringify({
+        type: "transcription_final",
+        text: ""
+      }));
+    }
+  }
+
   private async synthesizeSpeechKokoro(text: string, settings: any, cb: (data: Buffer | null) => void) {
     try {
       const response = await fetch("http://127.0.0.1:8766/tts", {
@@ -1807,6 +2459,77 @@ stream_idle_timeout_ms = 600000
       cb(null);
     }
   }
+}
+
+function findRolloutFiles(dir: string, filesList: string[] = []): string[] {
+  if (!existsSync(dir)) return filesList;
+  const files = readdirSync(dir);
+  for (const file of files) {
+    const fullPath = join(dir, file);
+    try {
+      const stat = statSync(fullPath);
+      if (stat.isDirectory()) {
+        findRolloutFiles(fullPath, filesList);
+      } else if (file.startsWith("rollout-") && file.endsWith(".jsonl")) {
+        filesList.push(fullPath);
+      }
+    } catch {}
+  }
+  return filesList;
+}
+
+function findRolloutFileById(dir: string, sessionId: string): string | null {
+  if (!existsSync(dir)) return null;
+  const files = readdirSync(dir);
+  for (const file of files) {
+    const fullPath = join(dir, file);
+    try {
+      const stat = statSync(fullPath);
+      if (stat.isDirectory()) {
+        const res = findRolloutFileById(fullPath, sessionId);
+        if (res) return res;
+      } else if (file.endsWith(`-${sessionId}.jsonl`)) {
+        return fullPath;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function deleteSessionFiles(dir: string) {
+  if (!existsSync(dir)) return;
+  const files = readdirSync(dir);
+  for (const file of files) {
+    const fullPath = join(dir, file);
+    try {
+      const stat = statSync(fullPath);
+      if (stat.isDirectory()) {
+        deleteSessionFiles(fullPath);
+        rmSync(fullPath, { recursive: true, force: true });
+      } else if (file.endsWith(".jsonl")) {
+        unlinkSync(fullPath);
+      }
+    } catch {}
+  }
+}
+
+function pcmToWav(pcm: Buffer, sampleRate: number, channels: number, bitsPerSample: number): Buffer {
+  const dataSize = pcm.length;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // PCM
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * channels * (bitsPerSample / 8), 28);
+  header.writeUInt16LE(channels * (bitsPerSample / 8), 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcm]);
 }
 
 function stripManagedBlocks(content: string): string {

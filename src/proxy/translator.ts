@@ -98,6 +98,21 @@ function _unflattenVariants(name: string): string[] {
 }
 
 export function unflattenToolCall(name: string, namespaceMap?: Record<string, string>): [string, string | null] {
+  // First, prioritize standard computer use actions so they always map to mcp__computer_use
+  const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "set_value", "list_apps", "wait_for_ui"];
+  for (const action of actions) {
+    if (name === action || name === `mcp__computer_use_${action}` || name === `mcp__computer_use__${action}` || (name.endsWith(`_${action}`) && name.includes("computer"))) {
+      return [action, "mcp__computer_use"];
+    }
+  }
+
+  // Fallback check of variants for computer use actions to avoid incorrect mapping by other namespace mappings
+  for (const variant of _unflattenVariants(name)) {
+    if (actions.includes(variant)) {
+      return [variant, "mcp__computer_use"];
+    }
+  }
+
   if (namespaceMap) {
     if (name in namespaceMap) {
       return [name, namespaceMap[name]];
@@ -119,7 +134,6 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
   }
 
   if (name.includes("computer_use") || name.includes("computer-use")) {
-    const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "set_value", "list_apps"];
     for (const action of actions) {
       if (name.includes(action)) {
         return [action, "mcp__computer_use"];
@@ -138,12 +152,60 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
   return [name, null];
 }
 
-export function responsesToChat(body: any, upstreamModel: string): any {
+function cleanUserPrompt(content: string, voiceSystemPrompt: string): string {
+  if (!content || !voiceSystemPrompt) return content;
+  const prefixUtf = voiceSystemPrompt + "\n\n用户说：";
+  const prefixUtfClean = voiceSystemPrompt + "\n\n\u7528\u623f\u8bf4\uff1a"; // clean alternative
+  if (content.startsWith(prefixUtf)) {
+    return content.slice(prefixUtf.length);
+  }
+  if (content.startsWith(prefixUtfClean)) {
+    return content.slice(prefixUtfClean.length);
+  }
+  return content;
+}
+
+export function responsesToChat(body: any, upstreamModel: string, sessionId?: string): any {
   const messages: any[] = [];
   const instructions = body.instructions;
   
+  // Try to load voice settings and inject voice system prompt if it's the active voice session
+  let voiceSystemPrompt = "";
+  try {
+    const configPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+    if (fs.existsSync(configPath)) {
+      const settings = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (settings.voice_system_prompt && (!sessionId || sessionId === settings.active_session_id)) {
+        voiceSystemPrompt = settings.voice_system_prompt;
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
+
   let systemContent = _contentToText(instructions || "");
-  const computerUseSystemRule = `\n[IMPORTANT SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode. You MUST use simulated computer-use actions (e.g., screenshot, click, scroll, type_text, press_key) to interact with the computer and accomplish the user's request. DO NOT write shell scripts, run background commands, or bypass the graphical environment unless explicitly requested. Everything must be executed via the registered computer use tools so the user can visually track your actions.`;
+  if (voiceSystemPrompt) {
+    systemContent = voiceSystemPrompt + "\n\n" + systemContent;
+  }
+  const isCli = !body.client_metadata || !body.client_metadata["x-codex-installation-id"];
+  console.log(`[OpenCodex] Detected request source: ${isCli ? "CLI" : "Desktop"}`);
+
+  let chromePluginRule = "";
+  if (isCli) {
+    chromePluginRule = `- Note: You are currently running in CLI mode. The Chrome extension/browser plugin is NOT connected and NOT available (connecting to 'extension' or 'chrome' backend in Node REPL will fail with 'Browser is not available'). DO NOT attempt to use 'js' tool/node_repl for browser automation or setupBrowserRuntime. Instead, ALWAYS use Computer Use (opening Chrome with exec_command, and interacting with click/scroll/type_text) to automate browser tasks.`;
+  } else {
+    chromePluginRule = `- If you are using the Chrome plugin (via mcp__node_repl / js tool):
+  1. DO NOT import 'playwright' directly (it is not available in the Node REPL). Instead, use the pre-configured local browser runtime wrapper.
+  2. When waiting for page loads, DO NOT use the 'networkidle' state as it is unsupported; always use 'load' or 'domcontentloaded' instead.`;
+  }
+
+  const computerUseSystemRule = `\n[SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode.
+- For opening applications or navigating to URLs/websites, ALWAYS prefer using direct commands (e.g., exec_command with 'open -a "Google Chrome" "https://..."') to get instant results, rather than manually clicking and typing.
+- For UI interactions (like clicking buttons or scrolling on a page), use simulated computer-use actions (e.g., click, scroll, type_text).
+- Note that before calling any computer-use action (click, type_text, press_key, scroll) on an app, you MUST call 'get_app_state' for that app in the same turn (in parallel) or immediately before to ensure the session is active.
+- Perform as many actions as possible in a single turn. You can combine multiple tool calls (e.g., get_app_state, click, type_text) in parallel in one turn to minimize communication overhead.
+${chromePluginRule}
+- Minimize the number of turns as much as possible to ensure fast response times and high stability.`;
   systemContent = systemContent ? systemContent + "\n" + computerUseSystemRule : computerUseSystemRule;
   
   messages.push({ role: "system", content: systemContent });
@@ -164,6 +226,12 @@ export function responsesToChat(body: any, upstreamModel: string): any {
       m.reasoning_content = pendingReasoning;
       pendingReasoning = null;
     }
+    
+    // Clean up any prepended voice prompt in user messages
+    if (m.role === "user" && typeof m.content === "string" && voiceSystemPrompt) {
+      m.content = cleanUserPrompt(m.content, voiceSystemPrompt);
+    }
+    
     messages.push(m);
   }
 
@@ -915,16 +983,30 @@ function _imageHash(b64Data: string): string {
   return crypto.createHash("sha256").update(b64Data).digest("hex").slice(0, 16);
 }
 
+const COMPRESSED_CACHE = new Map<string, string>();
+
 function sipsCompressB64(b64Data: string): string {
+  if (!b64Data) return "";
+  const h = _imageHash(b64Data);
+  const cached = COMPRESSED_CACHE.get(h);
+  if (cached) {
+    return cached;
+  }
+
   const tempDir = os.tmpdir();
   const uniqueId = crypto.randomBytes(8).toString("hex");
   const tempInputPath = path.join(tempDir, `ocx_in_${uniqueId}.png`);
-  const tempOutputPath = path.join(tempDir, `ocx_out_${uniqueId}.png`);
+  const tempOutputPath = path.join(tempDir, `ocx_out_${uniqueId}.jpg`);
   try {
     fs.writeFileSync(tempInputPath, Buffer.from(b64Data, "base64"));
-    execSync(`sips -Z 1200 "${tempInputPath}" --out "${tempOutputPath}" 2>/dev/null`);
+    // Convert to highly compressed JPEG (quality=40) and scale to max 800px width/height
+    execSync(`sips -s format jpeg -s formatOptions 40 -Z 800 "${tempInputPath}" --out "${tempOutputPath}" 2>/dev/null`);
     if (fs.existsSync(tempOutputPath)) {
-      return fs.readFileSync(tempOutputPath).toString("base64");
+      const compressed = fs.readFileSync(tempOutputPath).toString("base64");
+      COMPRESSED_CACHE.set(h, compressed);
+      const compHash = _imageHash(compressed);
+      COMPRESSED_CACHE.set(compHash, compressed);
+      return compressed;
     }
   } catch {
     // fallback to original
@@ -993,11 +1075,16 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
     const response = await fetch(visionUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(payload),
+      signal: controller.signal
     });
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       console.error(`[OpenCodex-VisionBridge] OpenCode MiMo API error: ${response.status} ${response.statusText}`);
@@ -1081,12 +1168,14 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
   const inputData = body.input;
   if (!Array.isArray(inputData)) return body;
 
-  const images: { idx: number; b64: string; msgIdx: number }[] = [];
+  const images: { idx: number; b64: string; msgIdx: number; isOutput: boolean }[] = [];
 
   for (let msgIdx = 0; msgIdx < inputData.length; msgIdx++) {
     const msg = inputData[msgIdx];
     if (typeof msg !== "object" || msg === null) continue;
-    const content = msg.content;
+    const isOutput = !msg.content && Array.isArray(msg.output);
+    if (isOutput) continue; // Skip Vision Bridge description translation for tool outputs (screenshots)
+    const content = msg.content || msg.output;
     if (!Array.isArray(content)) continue;
 
     for (let i = 0; i < content.length; i++) {
@@ -1095,7 +1184,12 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
 
       let b64 = "";
       if (item.type === "input_image") {
-        const url = item.image_url?.url || "";
+        let url = "";
+        if (typeof item.image_url === "string") {
+          url = item.image_url;
+        } else if (typeof item.image_url === "object" && item.image_url !== null) {
+          url = item.image_url.url || "";
+        }
         if (url.startsWith("data:image/")) {
           b64 = url.includes(",") ? url.split(",")[1] : url;
         }
@@ -1108,39 +1202,40 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
       const compressed = sipsCompressB64(b64);
       if (compressed !== b64) {
         if (item.type === "input_image") {
-          content[i] = { ...item, image_url: { url: `data:image/png;base64,${compressed}` } };
+          if (typeof item.image_url === "string") {
+            content[i].image_url = `data:image/png;base64,${compressed}`;
+          } else {
+            content[i] = { ...item, image_url: { url: `data:image/png;base64,${compressed}` } };
+          }
         } else {
           content[i] = { ...item, file_data: compressed };
         }
         console.error(`[OpenCodex] Compressed image ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
       }
 
-      images.push({ idx: i, b64: compressed, msgIdx });
+      images.push({ idx: i, b64: compressed, msgIdx, isOutput });
     }
   }
 
   // Describe images for text-only models (vision bridge)
   if (images.length > 0 && config) {
-    let described = 0;
-    for (const { idx, b64, msgIdx } of images) {
+    const promises = images.map(async ({ idx, b64, msgIdx, isOutput }) => {
       const desc = await describeImageB64(b64, config);
+      const targetArray = isOutput ? inputData[msgIdx].output : inputData[msgIdx].content;
       if (desc) {
-        inputData[msgIdx].content[idx] = {
+        targetArray[idx] = {
           type: "input_text",
           text: `\n[截图描述: ${desc}]\n`,
         };
-        described++;
       } else {
-        inputData[msgIdx].content[idx] = {
+        targetArray[idx] = {
           type: "input_text",
           text: `\n[截图描述: 无法识别的屏幕截图]\n`,
         };
-        described++;
       }
-    }
-    if (described > 0) {
-      console.error(`[OpenCodex-VisionBridge] Replaced ${described} screenshot(s) with descriptions.`);
-    }
+    });
+    await Promise.all(promises);
+    console.error(`[OpenCodex-VisionBridge] Replaced ${images.length} screenshot(s) with descriptions in parallel.`);
   }
 
   return body;

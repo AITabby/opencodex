@@ -36,6 +36,18 @@ export class ActionPerformer {
     this.run("scroll", [String(x), String(y), String(deltaX), String(deltaY)]);
   }
 
+  async mouseDown(x: number, y: number, button = "left") {
+    this.run("mouse_down", [String(x), String(y), button === "right" ? "right" : "left"]);
+  }
+
+  async mouseUp(x: number, y: number, button = "left") {
+    this.run("mouse_up", [String(x), String(y), button === "right" ? "right" : "left"]);
+  }
+
+  async mouseMove(x: number, y: number, drag = false) {
+    this.run("mouse_move", [String(x), String(y), String(drag)]);
+  }
+
   // ─── Keyboard Actions ───
 
   async typeText(text: string) {
@@ -95,6 +107,39 @@ export class ActionPerformer {
           `let btn: CGMouseButton = ${isRight ? ".right" : ".left"}`,
           `CGEvent(mouseEventSource: nil, mouseType: ${isRight ? ".rightMouseDown" : ".leftMouseDown"}, mouseCursorPosition: p, mouseButton: btn)!.post(tap: .cghidEventTap)`,
           `CGEvent(mouseEventSource: nil, mouseType: ${isRight ? ".rightMouseUp" : ".leftMouseUp"}, mouseCursorPosition: p, mouseButton: btn)!.post(tap: .cghidEventTap)`,
+        ].join("\n");
+      }
+
+      case "mouse_down": {
+        const [x, y, b] = a;
+        const isRight = b === "right";
+        return [
+          "import Cocoa",
+          `let p = CGPoint(x: ${x}, y: ${y})`,
+          `let btn: CGMouseButton = ${isRight ? ".right" : ".left"}`,
+          `CGEvent(mouseEventSource: nil, mouseType: ${isRight ? ".rightMouseDown" : ".leftMouseDown"}, mouseCursorPosition: p, mouseButton: btn)!.post(tap: .cghidEventTap)`,
+        ].join("\n");
+      }
+
+      case "mouse_up": {
+        const [x, y, b] = a;
+        const isRight = b === "right";
+        return [
+          "import Cocoa",
+          `let p = CGPoint(x: ${x}, y: ${y})`,
+          `let btn: CGMouseButton = ${isRight ? ".right" : ".left"}`,
+          `CGEvent(mouseEventSource: nil, mouseType: ${isRight ? ".rightMouseUp" : ".leftMouseUp"}, mouseCursorPosition: p, mouseButton: btn)!.post(tap: .cghidEventTap)`,
+        ].join("\n");
+      }
+
+      case "mouse_move": {
+        const [x, y, drag] = a;
+        const isDrag = drag === "true";
+        return [
+          "import Cocoa",
+          `let p = CGPoint(x: ${x}, y: ${y})`,
+          `let ev = CGEvent(mouseEventSource: nil, mouseType: ${isDrag ? ".leftMouseDragged" : ".mouseMoved"}, mouseCursorPosition: p, mouseButton: .left)!`,
+          "ev.post(tap: .cghidEventTap)",
         ].join("\n");
       }
 

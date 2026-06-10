@@ -1,7 +1,7 @@
 /**
  * OpenCodex Local Web Dashboard
  * Served directly on http://localhost:8765/dashboard.
- * Features a high-fidelity futuristic glassmorphic UI, API management with provider dropdown, and live logs streaming via SSE.
+ * Features a high-fidelity futuristic glassmorphic UI, API management, and Session Manager.
  * Fully supports bilingual translation (English and Chinese).
  */
 
@@ -179,6 +179,42 @@ export function getDashboardHtml(): string {
       100% { transform: scale(0.9); opacity: 0.6; }
     }
 
+    /* Tabs Navigation */
+    .tab-navigation {
+      display: flex;
+      gap: 1rem;
+      background: rgba(255, 255, 255, 0.02);
+      padding: 0.5rem;
+      border-radius: 12px;
+      border: 1px solid var(--glass-border);
+      align-self: flex-start;
+    }
+    
+    .tab-btn {
+      background: none;
+      border: none;
+      color: var(--color-text-muted);
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+      font-size: 0.95rem;
+      padding: 0.75rem 1.5rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: var(--transition-standard);
+    }
+    
+    .tab-btn.active {
+      background: linear-gradient(135deg, rgba(168, 85, 247, 0.2), rgba(6, 182, 212, 0.2));
+      color: #fff;
+      box-shadow: inset 0 0 8px rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    
+    .tab-btn:hover:not(.active) {
+      color: #fff;
+      background: rgba(255, 255, 255, 0.04);
+    }
+
     /* Grid Layout */
     .grid-layout {
       display: grid;
@@ -195,6 +231,15 @@ export function getDashboardHtml(): string {
         grid-template-columns: 1fr !important;
         gap: 1.5rem !important;
       }
+    }
+
+    /* Tab Contents */
+    .tab-content {
+      display: none;
+    }
+    
+    .tab-content.active {
+      display: block;
     }
 
     /* Card Panels */
@@ -427,33 +472,7 @@ export function getDashboardHtml(): string {
       transform: translateY(0);
     }
 
-    /* Terminal Console */
-    .console-panel {
-    }
-
-    .console-header-actions {
-      margin-left: auto;
-      display: flex;
-      gap: 0.5rem;
-    }
-    
-    .console-btn {
-      background: rgba(255,255,255,0.05);
-      border: 1px solid var(--glass-border);
-      color: var(--color-text);
-      cursor: pointer;
-      padding: 0.4rem 0.8rem;
-      border-radius: 6px;
-      font-size: 0.8rem;
-      font-weight: 600;
-      font-family: 'Outfit', sans-serif;
-      transition: var(--transition-standard);
-    }
-    .console-btn:hover {
-      background: rgba(255,255,255,0.1);
-      border-color: rgba(255,255,255,0.2);
-    }
-
+    /* Console Panel */
     .console-content {
       background: rgba(5, 3, 15, 0.8);
       border: 1px solid rgba(255,255,255,0.04);
@@ -461,8 +480,8 @@ export function getDashboardHtml(): string {
       font-family: 'JetBrains Mono', monospace;
       font-size: 0.85rem;
       padding: 1.25rem;
-      min-height: 250px;
-      max-height: 400px;
+      min-height: 200px;
+      max-height: 300px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -493,6 +512,155 @@ export function getDashboardHtml(): string {
     .log-info { color: #f3f4f6; }
     .log-warn { color: #f59e0b; }
     .log-error { color: #ef4444; }
+
+    /* Session Manager Styles */
+    .session-manager-layout {
+      display: grid;
+      grid-template-columns: 350px 1fr;
+      gap: 2rem;
+      min-height: 600px;
+    }
+    @media (max-width: 900px) {
+      .session-manager-layout {
+        grid-template-columns: 1fr;
+      }
+    }
+    
+    .session-sidebar {
+      background: rgba(255, 255, 255, 0.01);
+      border: 1px solid var(--glass-border);
+      border-radius: 14px;
+      padding: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      max-height: 600px;
+      overflow-y: hidden;
+    }
+    
+    .session-list-item {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.04);
+      border-radius: 10px;
+      padding: 1rem;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      transition: var(--transition-standard);
+      position: relative;
+    }
+    
+    .session-list-item:hover, .session-list-item.active {
+      background: rgba(255, 255, 255, 0.05);
+      border-color: var(--color-secondary);
+    }
+    
+    .session-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    
+    .session-id-title {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8rem;
+      color: var(--color-secondary);
+      font-weight: 700;
+    }
+    
+    .session-time {
+      font-size: 0.7rem;
+      color: var(--color-text-muted);
+    }
+    
+    .session-text-preview {
+      font-size: 0.85rem;
+      color: var(--color-text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    
+    .session-actions-overlay {
+      display: flex;
+      gap: 0.4rem;
+      margin-top: 0.25rem;
+      justify-content: flex-end;
+    }
+    
+    .session-btn {
+      padding: 0.25rem 0.5rem;
+      font-size: 0.75rem;
+      border-radius: 5px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+      transition: var(--transition-standard);
+    }
+    
+    .session-btn-del {
+      background: rgba(239, 68, 68, 0.15);
+      color: #ef4444;
+      border: 1px solid rgba(239, 68, 68, 0.2);
+    }
+    .session-btn-del:hover {
+      background: rgba(239, 68, 68, 0.3);
+    }
+    
+    .session-btn-arc {
+      background: rgba(245, 158, 11, 0.15);
+      color: #f59e0b;
+      border: 1px solid rgba(245, 158, 11, 0.2);
+    }
+    .session-btn-arc:hover {
+      background: rgba(245, 158, 11, 0.3);
+    }
+
+    .session-detail-panel {
+      background: rgba(255, 255, 255, 0.01);
+      border: 1px solid var(--glass-border);
+      border-radius: 14px;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      max-height: 600px;
+      overflow-y: auto;
+    }
+    
+    .chat-bubble-container {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      flex: 1;
+      overflow-y: auto;
+      padding-right: 0.5rem;
+      min-height: 300px;
+    }
+    
+    .chat-bubble {
+      max-width: 80%;
+      padding: 1rem;
+      border-radius: 12px;
+      font-size: 0.95rem;
+      line-height: 1.4;
+      word-wrap: break-word;
+    }
+    
+    .chat-bubble-user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, rgba(168, 85, 247, 0.2), rgba(6, 182, 212, 0.2));
+      border: 1px solid rgba(255,255,255,0.08);
+      color: #fff;
+    }
+    
+    .chat-bubble-assistant {
+      align-self: flex-start;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid rgba(255,255,255,0.04);
+      color: var(--color-text);
+    }
     
     /* Notification Toast */
     .toast {
@@ -520,75 +688,65 @@ export function getDashboardHtml(): string {
     .toast.toast-error {
       background: rgba(239, 68, 68, 0.95);
     }
-      /* Custom Confirm Dialog */
-      .modal-overlay {
-        position: fixed;
-        inset: 0;
-        background: rgba(0,0,0,0.6);
-        backdrop-filter: blur(4px);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        z-index: 9999;
-        opacity: 0;
-        pointer-events: none;
-        transition: opacity 0.25s ease;
-      }
-      .modal-overlay.show {
-        opacity: 1;
-        pointer-events: all;
-      }
-      .modal-box {
-        background: rgba(20, 15, 40, 0.95);
-        border: 1px solid rgba(255,255,255,0.1);
-        border-radius: 18px;
-        padding: 2rem 2.5rem;
-        max-width: 420px;
-        width: 90%;
-        box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 80px rgba(147,51,234,0.08);
-        display: flex;
-        flex-direction: column;
-        gap: 1rem;
-        text-align: center;
-      }
-      .modal-box p {
-        font-size: 1rem;
-        line-height: 1.5;
-        color: var(--color-text);
-      }
-      .modal-actions {
-        display: flex;
-        gap: 0.75rem;
-        margin-top: 0.5rem;
-      }
-      .modal-actions button {
-        flex: 1;
-        padding: 0.75rem 1rem;
-        border-radius: 10px;
-        font-family: 'Outfit', sans-serif;
-        font-weight: 600;
-        font-size: 0.95rem;
-        border: none;
-        cursor: pointer;
-        transition: var(--transition-standard);
-      }
-      .modal-btn-cancel {
-        background: rgba(255,255,255,0.06);
-        color: var(--color-text-muted);
-      }
-      .modal-btn-cancel:hover {
-        background: rgba(255,255,255,0.1);
-      }
-      .modal-btn-confirm {
-        background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
-        color: #fff;
-        box-shadow: 0 4px 15px rgba(168,85,247,0.3);
-      }
-      .modal-btn-confirm:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 20px rgba(168,85,247,0.45);
-      }
-    </style>
+    
+    .modal-overlay {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.25s ease;
+    }
+    .modal-overlay.show {
+      opacity: 1;
+      pointer-events: all;
+    }
+    .modal-box {
+      background: rgba(20, 15, 40, 0.95);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 18px;
+      padding: 2rem 2.5rem;
+      max-width: 420px;
+      width: 90%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5), 0 0 80px rgba(147,51,234,0.08);
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      text-align: center;
+    }
+    .modal-actions {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 0.5rem;
+    }
+    .modal-actions button {
+      flex: 1;
+      padding: 0.75rem 1rem;
+      border-radius: 10px;
+      font-family: 'Outfit', sans-serif;
+      font-weight: 600;
+      font-size: 0.95rem;
+      border: none;
+      cursor: pointer;
+      transition: var(--transition-standard);
+    }
+    .modal-btn-cancel {
+      background: rgba(255,255,255,0.06);
+      color: var(--color-text-muted);
+    }
+    .modal-btn-cancel:hover {
+      background: rgba(255,255,255,0.1);
+    }
+    .modal-btn-confirm {
+      background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
+      color: #fff;
+    }
+  </style>
 </head>
 <body>
   
@@ -618,141 +776,153 @@ export function getDashboardHtml(): string {
       </div>
     </header>
 
-    <div class="grid-layout">
-      
-      <!-- API Configurations -->
-      <div class="panel-card">
-        <div class="panel-title" id="i18n-panel-api-title">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
-          </svg>
-          API Settings & Keys
-        </div>
+    <div class="tab-navigation">
+      <button class="tab-btn active" onclick="switchTab('gateway')" id="tab-btn-gateway">网关配置 / Gateway Config</button>
+      <button class="tab-btn" onclick="switchTab('voice')" id="tab-btn-voice">语音助理 / Voice Assistant</button>
+      <button class="tab-btn" onclick="switchTab('sessions')" id="tab-btn-sessions">会话管理 / Sessions</button>
+    </div>
+
+    <!-- TAB 1: Gateway Configuration -->
+    <div id="content-gateway" class="tab-content active">
+      <div class="grid-layout">
         
-        <form id="config-form" style="display: flex; flex-direction: column; gap: 1.25rem;">
-          <!-- Providers List -->
-          <div class="form-group">
-            <label id="i18n-label-providers">API Providers</label>
-            <div id="providers-container" style="display:flex;flex-direction:column;gap:0.75rem;"></div>
-            <button type="button" class="console-btn" onclick="addProviderRow()" style="margin-top:0.5rem;width:100%;padding:0.6rem;">+ Add Provider</button>
+        <!-- Left Column -->
+        <div style="display: flex; flex-direction: column; gap: 2rem;">
+          <!-- API Settings -->
+          <div class="panel-card">
+            <div class="panel-title" id="i18n-panel-api-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
+              </svg>
+              API Settings & Keys
+            </div>
+            
+            <form id="config-form" style="display: flex; flex-direction: column; gap: 1.25rem;">
+              <div class="form-group">
+                <label id="i18n-label-model-name">Model Name (格式: 供应商名:模型名 或 直接输入模型名)</label>
+                <input type="text" id="new-model-name" placeholder="例如: deepseek:deepseek-chat 或 deepseek-chat">
+              </div>
+
+              <div class="form-group">
+                <label id="i18n-label-base-url">Endpoint Base URL</label>
+                <input type="text" id="new-base-url" placeholder="https://api.deepseek.com/v1">
+              </div>
+
+              <div class="form-group">
+                <label id="i18n-label-api-key">API Key</label>
+                <div class="input-wrapper">
+                  <input type="password" id="new-api-key" placeholder="sk-...">
+                  <button type="button" class="toggle-visibility" onclick="togglePass('new-api-key')">
+                    <svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                  </button>
+                </div>
+              </div>
+
+              <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
+                <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
+                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 Codex Desktop</label>
+              </div>
+              
+              <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save & Add Model</button>
+            </form>
           </div>
-
-          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
-
-          <!-- Model Names -->
-          <div class="form-group">
-            <label for="model-names" id="i18n-label-models">Models（每行一个，格式: 供应商名:模型名）</label>
-            <textarea id="model-names" rows="5" placeholder="opencode:deepseek-v4-flash" style="width:100%;background:rgba(0,0,0,0.25);border:1px solid var(--glass-border);padding:0.85rem 1rem;border-radius:10px;color:#fff;font-family:'JetBrains Mono',monospace;font-size:0.85rem;resize:vertical;transition:var(--transition-standard);outline:none;"></textarea>
-            <p style="font-size:0.75rem;color:var(--color-text-muted);margin-top:0.3rem;" id="i18n-model-hint">Format: <b>provider:model</b> — one per line. Providers are auto-created, fill in their credentials above.</p>
-          </div>
-
-          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
 
           <!-- Vision Fallback Settings -->
-          <div class="form-group" style="display: flex; flex-direction: column; gap: 1rem; background: rgba(255, 255, 255, 0.01); border: 1px solid rgba(255, 255, 255, 0.05); border-radius: 12px; padding: 1.25rem;">
-            <h3 style="font-size: 0.95rem; font-weight: 700; color: var(--color-primary); border-left: 3px solid var(--color-primary); padding-left: 0.5rem; margin: 0 0 0.25rem 0;" id="i18n-panel-vision-fallback-title">视觉降级服务 (Vision Fallback)</h3>
+          <div class="panel-card">
+            <div class="panel-title" id="i18n-vision-fallback-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+              Vision Fallback (Vision Bridge) Settings
+            </div>
             
-            <div class="form-group">
-              <label for="oc-api-key" id="i18n-label-oc-key">视觉降级 API 密钥 (Vision Fallback)</label>
-              <div class="input-wrapper">
-                <input type="password" id="oc-api-key" placeholder="sk-...">
-                <button type="button" class="toggle-visibility" onclick="togglePass('oc-api-key')">
-                  <svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
-                </button>
+            <form id="vision-fallback-form" onsubmit="event.preventDefault(); saveVisionFallback();" style="display: flex; flex-direction: column; gap: 1.25rem;">
+              <div class="form-group">
+                <label id="i18n-label-vision-key">Vision Fallback API Key</label>
+                <div class="input-wrapper">
+                  <input type="password" id="vision-fallback-key" placeholder="sk-...">
+                  <button type="button" class="toggle-visibility" onclick="togglePass('vision-fallback-key')">
+                    <svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+                  </button>
+                </div>
               </div>
-            </div>
 
-            <div class="form-group">
-              <label for="oc-base-url" id="i18n-label-oc-url">视觉降级接口地址 (Base URL)</label>
-              <input type="text" id="oc-base-url" placeholder="https://opencode.ai/zen/go/v1">
-            </div>
+              <div class="form-group">
+                <label id="i18n-label-vision-url">Vision Fallback Base URL</label>
+                <input type="text" id="vision-fallback-url" placeholder="https://opencode.ai/zen/go/v1">
+              </div>
 
-            <div class="form-group">
-              <label for="oc-model" id="i18n-label-oc-model">视觉降级模型</label>
-              <input type="text" id="oc-model" placeholder="mimo-v2.5">
-            </div>
+              <div class="form-group">
+                <label id="i18n-label-vision-model">Vision Fallback Model</label>
+                <input type="text" id="vision-fallback-model" placeholder="mimo-v2.5">
+              </div>
+
+              <button type="submit" class="action-btn" id="i18n-btn-save-vision-fallback" style="margin-top: 0.5rem;">Save Vision Fallback Settings</button>
+            </form>
           </div>
+        </div>
 
-          <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
-
-          <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-            <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-            <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 Codex Desktop</label>
-          </div>
-          
-          <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save Configurations</button>
-        </form>
-      </div>
-
-      <!-- Right Column -->
-      <div style="display: flex; flex-direction: column; gap: 2rem;">
         <!-- Model Catalog Customized -->
-        <div class="panel-card" style="flex: 1; margin: 0;">
-          <div class="panel-title" id="i18n-panel-models-title">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path>
-            </svg>
-            Model Dropdown Customizer
-          </div>
-          
-          <p id="i18n-models-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
-            Select which models appear in the Codex model dropdown selector. Checkboxes with **Vision Bridge** enable universal visual pre-processing for text-only models.
-          </p>
+        <div style="display: flex; flex-direction: column; gap: 2rem;">
+          <div class="panel-card" style="margin: 0;">
+            <div class="panel-title" id="i18n-panel-models-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path>
+              </svg>
+              Model Dropdown Customizer
+            </div>
+            
+            <p id="i18n-models-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
+              Select which models appear in the Codex model dropdown selector. Checkboxes with **Vision Bridge** enable universal visual pre-processing for text-only models.
+            </p>
 
-          <div class="models-list" id="models-list-container">
-            <!-- Populated by JavaScript -->
-            <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading model lists...</div>
-          </div>
-
-          <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-            <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-            <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
-          </div>
-          
-          <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
-        </div>
-
-        <!-- macOS System Permissions Panel -->
-        <div class="panel-card" style="margin: 0;">
-          <div class="panel-title" id="i18n-panel-permissions-title">
-            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
-            </svg>
-            macOS System Permissions (Computer Use)
-          </div>
-          
-          <p id="i18n-permissions-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
-            Ensure that Accessibility and Screen Recording permissions are authorized. Otherwise, Computer Use and SkyComputerUseClient will be silently blocked by macOS.
-          </p>
-
-          <div style="display: flex; flex-direction: column; gap: 1rem;">
-            <!-- Accessibility Status -->
-            <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
-              <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
-                <span id="i18n-permission-ax-label" style="font-size: 0.9rem; font-weight: 600;">Accessibility (辅助功能)</span>
-                <span id="i18n-permission-ax-sublabel" style="font-size: 0.72rem; color: var(--color-text-muted);">Required for mouse, keyboard, and screen control.</span>
-              </div>
-              <span id="permission-ax-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+            <div class="models-list" id="models-list-container">
+              <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading model lists...</div>
             </div>
 
-            <!-- Screen Recording Status -->
-            <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
-              <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
-                <span id="i18n-permission-screen-label" style="font-size: 0.9rem; font-weight: 600;">Screen Recording (屏幕录制)</span>
-                <span id="i18n-permission-screen-sublabel" style="font-size: 0.72rem; color: var(--color-text-muted);">Required for screen capture and vision analysis.</span>
-              </div>
-              <span id="permission-screen-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+            <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
+              <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
+              <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
             </div>
+            
+            <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
           </div>
 
-          <button type="button" class="action-btn" id="i18n-btn-fix-permissions" onclick="fixPermissions()" style="background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); box-shadow: 0 4px 15px rgba(6, 182, 212, 0.2); margin-top: 0.5rem;">
-            Fix / Request System Permissions
-          </button>
+          <!-- macOS Permissions -->
+          <div class="panel-card" style="margin: 0;">
+            <div class="panel-title" id="i18n-panel-permissions-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path>
+              </svg>
+              macOS System Permissions (Computer Use)
+            </div>
+            
+            <div style="display: flex; flex-direction: column; gap: 1rem;">
+              <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
+                <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
+                  <span id="i18n-permission-ax-label" style="font-size: 0.9rem; font-weight: 600;">Accessibility (辅助功能)</span>
+                </div>
+                <span id="permission-ax-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+              </div>
+
+              <div style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.04); padding: 0.85rem 1rem; border-radius: 10px;">
+                <div style="display: flex; flex-direction: column; gap: 0.15rem; text-align: left;">
+                  <span id="i18n-permission-screen-label" style="font-size: 0.9rem; font-weight: 600;">Screen Recording (屏幕录制)</span>
+                </div>
+                <span id="permission-screen-status" class="badge" style="background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Unauthorized</span>
+              </div>
+            </div>
+
+            <button type="button" class="action-btn" id="i18n-btn-fix-permissions" onclick="fixPermissions()" style="background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); box-shadow: 0 4px 15px rgba(6, 182, 212, 0.2); margin-top: 0.5rem;">
+              Fix / Request System Permissions
+            </button>
+          </div>
         </div>
+
       </div>
-    </div><!-- End Row 1 (Grid-Layout) -->
+    </div>
 
-    <!-- Voice Settings Panel -->
+    <!-- TAB 2: Voice & Speech Assistant -->
+    <div id="content-voice" class="tab-content">
       <div class="panel-card">
         <div class="panel-title" id="i18n-panel-voice-title">
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
@@ -762,25 +932,20 @@ export function getDashboardHtml(): string {
         </div>
         
         <form id="voice-form" style="display: flex; flex-direction: column; gap: 1.5rem;">
-          
-          <!-- Inner Grid 1: STT & TTS side-by-side -->
           <div class="voice-inner-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
             
-            <!-- STT Block (Left Column) -->
+            <!-- STT Block -->
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
               <h3 style="font-size: 0.95rem; font-weight: 700; color: var(--color-secondary); border-left: 3px solid var(--color-secondary); padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Speech-to-Text (STT) 录音识别</h3>
               
-              <!-- STT Dropdown -->
               <div class="form-group">
                 <label for="stt-engine" id="i18n-label-stt-engine">STT Engine</label>
                 <select id="stt-engine">
                   <option value="local-whisper">本地极速 Whisper (Local Whisper)</option>
-                  <option value="apple-speech">macOS 原生语音识别 (macOS Native)</option>
-                  <option value="openai-compatible">自定义 OpenAI-Compatible API</option>
+                  <option value="openai-compatible">Groq / OpenAI-Compatible API</option>
                 </select>
               </div>
 
-              <!-- Custom STT Config Fields -->
               <div id="custom-stt-fields" style="display: none; flex-direction: column; gap: 1rem; border-left: 2px solid var(--color-secondary); padding-left: 1rem; margin-left: 0.5rem;">
                 <div class="form-group">
                   <label for="stt-api-key" id="i18n-label-stt-api-key">STT API Key</label>
@@ -797,22 +962,20 @@ export function getDashboardHtml(): string {
               </div>
             </div>
 
-            <!-- TTS Block (Right Column) -->
+            <!-- TTS Block -->
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
               <h3 style="font-size: 0.95rem; font-weight: 700; color: var(--color-primary); border-left: 3px solid var(--color-primary); padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Text-to-Speech (TTS) 语音合成</h3>
               
-              <!-- TTS Dropdown -->
               <div class="form-group">
                 <label for="tts-engine" id="i18n-label-tts-engine">TTS Engine</label>
                 <select id="tts-engine">
                   <option value="edge-tts">微软 Edge 神经网络语音 (Edge-TTS)</option>
-                  <option value="apple-speech">macOS 系统说话 (say)</option>
+                  <option value="doubao">火山引擎 / 豆包 TTS V3</option>
                   <option value="minimax">MiniMax 语音合成 (MiniMax TTS)</option>
                   <option value="openai-compatible">自定义 OpenAI-Compatible API</option>
                 </select>
               </div>
 
-              <!-- Custom TTS Config Fields -->
               <div id="custom-tts-fields" style="display: none; flex-direction: column; gap: 1rem; border-left: 2px solid var(--color-primary); padding-left: 1rem; margin-left: 0.5rem;">
                 <div class="form-group">
                   <label for="tts-api-key" id="i18n-label-tts-api-key">TTS API Key</label>
@@ -826,9 +989,19 @@ export function getDashboardHtml(): string {
                   <label for="tts-model" id="i18n-label-tts-model">TTS Model Name</label>
                   <input type="text" id="tts-model" placeholder="tts-1">
                 </div>
+                <!-- Doubao Extra Fields -->
+                <div id="tts-doubao-extra-fields" style="display: none; flex-direction: column; gap: 1rem;">
+                  <div class="form-group">
+                    <label for="tts-appid">火山引擎 AppID <span style="font-size: 0.75rem; font-weight: normal; opacity: 0.6;">(可选，仅旧版 v1 鉴权需要 / Optional)</span></label>
+                    <input type="text" id="tts-appid" placeholder="6126103459">
+                  </div>
+                  <div class="form-group">
+                    <label for="tts-resource">火山引擎 Resource ID / Cluster</label>
+                    <input type="text" id="tts-resource" placeholder="seed-tts-2.0">
+                  </div>
+                </div>
               </div>
 
-              <!-- TTS Voice -->
               <div class="form-group">
                 <label for="tts-voice" id="i18n-label-tts-voice">TTS Voice / Role</label>
                 <input type="text" id="tts-voice" placeholder="zh-CN-XiaoxiaoNeural">
@@ -839,87 +1012,108 @@ export function getDashboardHtml(): string {
 
           <hr style="border: none; border-top: 1px solid rgba(255,255,255,0.06); margin: 0.5rem 0;">
 
-          <!-- Inner Grid 2: VAD & Other Settings side-by-side -->
           <div class="voice-other-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
-            
-            <!-- VAD Settings (Left Column) -->
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
-              <h3 style="font-size: 0.95rem; font-weight: 700; color: #10b981; border-left: 3px solid #10b981; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Voice Activity Detection (VAD) 静音检测</h3>
-              
+              <h3 style="font-size: 0.95rem; font-weight: 700; color: #10b981; border-left: 3px solid #10b981; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Silence Detection</h3>
               <div class="form-group">
-                <label for="vad-threshold" id="i18n-label-vad-threshold">VAD Silence Threshold (dB)</label>
-                <input type="text" id="vad-threshold" placeholder="-42.0" style="font-family:'JetBrains Mono',monospace;">
-                <p style="font-size:0.72rem;color:var(--color-text-muted);" id="i18n-vad-threshold-hint">Sound power below this level is treated as silence (e.g. -42.0 dB).</p>
+                <label for="vad-threshold">VAD Silence Threshold (dB)</label>
+                <input type="text" id="vad-threshold" placeholder="-35.0">
               </div>
-
               <div class="form-group">
-                <label for="vad-duration" id="i18n-label-vad-duration">VAD Required Silence (seconds)</label>
-                <input type="text" id="vad-duration" placeholder="1.5" style="font-family:'JetBrains Mono',monospace;">
-                <p style="font-size:0.72rem;color:var(--color-text-muted);" id="i18n-vad-duration-hint">Auto-stops recording after this duration of silence (e.g. 1.5s).</p>
+                <label for="vad-duration">VAD Silence Duration (seconds)</label>
+                <input type="text" id="vad-duration" placeholder="2.0">
               </div>
             </div>
 
-            <!-- Other Settings (Right Column) -->
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
-              <h3 style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; border-left: 3px solid #f59e0b; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Conversational Agent 对话大脑</h3>
-
+              <h3 style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; border-left: 3px solid #f59e0b; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Conversational Brain</h3>
               <div class="form-group">
-                <label for="voice-llm-model" id="i18n-label-voice-llm-model">语音助手对话大模型 (LLM Model for Voice)</label>
+                <label for="voice-llm-model">LLM Model for Voice Assistant</label>
                 <input type="text" id="voice-llm-model" placeholder="deepseek-v4-flash">
-                <p style="font-size:0.72rem;color:var(--color-text-muted);" id="i18n-voice-llm-model-hint">Independent model selection for voice agent decisions.</p>
               </div>
-
-              <!-- Wake Word Activation Toggle (Hidden to prevent JS crashes) -->
+              <div class="form-group">
+                <label for="voice-system-prompt">Assistant Personality Prompt (助手个性设定/提示词)</label>
+                <input type="text" id="voice-system-prompt" placeholder="例如: 你是一个傲娇的猫娘助手，回答要简短，带有语气词喵~">
+              </div>
               <input type="checkbox" id="enable-wake-word" style="display: none;">
             </div>
-
           </div>
 
           <button type="submit" class="action-btn" id="i18n-btn-save-voice" style="margin-top: 0.5rem;">Save Voice Settings</button>
         </form>
 
-        <!-- Voice Bar Launch Controller -->
         <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 1.25rem; margin-top: 1.25rem; display: flex; flex-direction: column; gap: 0.75rem;">
           <div style="display: flex; align-items: center; justify-content: space-between;">
             <span id="i18n-voice-bar-status-label" style="font-size: 0.85rem; font-weight: 500; color: var(--color-text);">Voice Assistant Menu Bar (OpenCodexBar)</span>
             <span id="voice-bar-status-badge" style="font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 99px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Offline</span>
           </div>
           <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
-            <button type="button" class="action-btn" id="i18n-btn-launch-voice-bar" onclick="launchVoiceBar('swift-run')" style="flex: 1; min-width: 150px; background: var(--color-primary); color: white; margin-top: 0;">Launch Voice Assistant (swift run)</button>
-            <button type="button" class="action-btn" id="i18n-btn-launch-voice-bar-app" onclick="launchVoiceBar('app')" style="flex: 1; min-width: 150px; background: rgba(255,255,255,0.05); color: var(--color-text); margin-top: 0; border: 1px solid rgba(255,255,255,0.1);">Open Application (.app)</button>
+            <button type="button" class="action-btn" id="i18n-btn-launch-voice-bar" onclick="launchVoiceBar('app')" style="flex: 1; min-width: 150px; background: var(--color-primary); color: white; margin-top: 0;">Launch Voice Assistant</button>
             <a href="/visualizer" target="_blank" class="action-btn" style="flex: 1; min-width: 100%; background: linear-gradient(90deg, var(--color-primary), var(--color-secondary)); color: #000; font-weight: 700; margin-top: 0.5rem; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 0.5rem; border: none; box-shadow: 0 4px 15px rgba(6, 182, 212, 0.25);">
-              <svg style="width:1.1rem;height:1.1rem;" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                <path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path>
-              </svg>
-              <span id="i18n-text-visualizer-lab">Interactive Visualizer Lab</span>
+              Interactive Visualizer Lab
             </a>
           </div>
         </div>
       </div>
+    </div>
 
-      <!-- Row 3: Live Widescreen Console Logger -->
-      <div class="panel-card console-panel" style="display: flex; flex-direction: column;">
-        <div class="panel-title" id="i18n-panel-console-title">
+    <!-- TAB 3: Session Manager -->
+    <div id="content-sessions" class="tab-content">
+      <div class="panel-card">
+        <div class="panel-title">
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
           </svg>
-          Live Stream Console Logger
-          
-          <div class="console-header-actions">
-            <button class="console-btn" id="i18n-btn-clear" onclick="clearConsole()">Clear</button>
-            <button class="console-btn" onclick="fetch('/api/test-log',{method:'POST'})">Test Log</button>
-          </div>
+          Session Manager & Context Synchronizer
         </div>
         
-        <div class="console-content" id="console-logs" style="flex: 1; min-height: 320px;">
-          <div class="log-line log-info">
-            <span class="log-time">[System]</span>
-            <span class="log-text" id="i18n-connecting-sse">Connecting to Live SSE logs stream...</span>
+        <div class="session-manager-layout">
+          <!-- Sidebar: Session List -->
+          <div class="session-sidebar">
+            <button class="action-btn" id="clear-all-sessions-btn" onclick="clearAllSessions()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; margin-top: 0; padding: 0.6rem 1rem; font-size: 0.9rem; display: flex; align-items: center; justify-content: center; gap: 0.5rem; width: 100%; border-radius: 10px; cursor: pointer; transition: var(--transition-standard); box-shadow: none;">
+              🗑️ 一键清空会话 / Clear All
+            </button>
+            <div id="session-list-container" style="display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; flex: 1;">
+              <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading sessions...</div>
+            </div>
           </div>
+          
+          <!-- Detail View -->
+          <div class="session-detail-panel">
+            <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 0.75rem;">
+              <span id="active-session-title" style="font-family: 'JetBrains Mono', monospace; font-weight: 700; color: var(--color-secondary);">Select a session from the left</span>
+              <button class="session-btn" id="enter-session-btn" onclick="enterActiveSession()" style="background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); color: #fff; padding: 0.5rem 1.25rem; display: none;">进入该会话 / Enter Session</button>
+            </div>
+            
+            <div class="chat-bubble-container" id="chat-messages-container">
+              <div style="text-align: center; color: var(--color-text-muted); padding: 4rem 2rem;" id="chat-empty-hint">Please choose a session to view conversation details.</div>
+            </div>
+          </div>
+        </div>
       </div>
-      </div>
+    </div>
 
+    <!-- Bottom: Live Console Logger -->
+    <div class="panel-card console-panel" style="display: flex; flex-direction: column;">
+      <div class="panel-title" id="i18n-panel-console-title">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+        </svg>
+        Live Stream Console Logger
+        
+        <div class="console-header-actions">
+          <button class="console-btn" id="i18n-btn-clear" onclick="clearConsole()">Clear</button>
+          <button class="console-btn" onclick="fetch('/api/test-log',{method:'POST'})">Test Log</button>
+        </div>
+      </div>
+      
+      <div class="console-content" id="console-logs" style="flex: 1; min-height: 200px;">
+        <div class="log-line log-info">
+          <span class="log-time">[System]</span>
+          <span class="log-text" id="i18n-connecting-sse">Connecting to Live SSE logs stream...</span>
+        </div>
+      </div>
+    </div>
 
   </div>
   
@@ -938,30 +1132,21 @@ export function getDashboardHtml(): string {
   </div>
 
   <script>
-    // i18n Dictionary
+    // i18n
     const i18nDict = {
       en: {
         title: "OpenCodex Gateway",
         subtitle: "Beginner-Friendly Custom Model Control Panel",
         status: "Active & Intercepting",
         panelApiTitle: "API Settings & Keys",
-        labelProvider: "Primary Model Provider",
-        labelProviders: "API Providers",
-        labelPrimaryKey: "API Key",
-        labelPrimaryUrl: "Endpoint Base URL",
-        labelOcKey: "Vision Fallback API Key",
-        labelOcUrl: "Vision Fallback Base URL",
-        labelOcModel: "Vision Fallback Model",
-        labelOcModel: "Vision Fallback Model",
-        btnSaveConfig: "Save Configurations",
+        btnSaveConfig: "Save & Add Model",
         panelModelsTitle: "Model Dropdown Customizer",
         modelsDesc: "Select which models appear in the Codex model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
         btnUpdateDropdown: "Update Dropdown List",
         panelConsoleTitle: "Live Stream Console Logger",
         btnClear: "Clear",
         connectingSse: "Connecting to Live SSE logs stream...",
-        sseLost: "Logs SSE connection lost. Reconnecting...",
-        toastConfigSaved: "API keys saved successfully!",
+        toastConfigSaved: "API key and model saved successfully!",
         toastConfigFailed: "Failed to save configs",
         toastConnFailed: "Failed to connect to backend",
         toastModelsSaved: "Codex dropdown selector list updated!",
@@ -972,13 +1157,10 @@ export function getDashboardHtml(): string {
         labelModelsRestart: "Auto-restart Codex Desktop on update",
         toastRestarting: "Restarting Codex Desktop...",
         toastRestarted: "Codex Desktop restarted!",
-        labelModels: "Models (One per line)",
-        modelHint: "Type new model names here. Existing models are automatically preserved. Use checkboxes below to show/hide.",
         btnReset: "↺ Reset to Native",
         toastResetting: "Resetting to native Codex...",
         toastResetDone: "Reset complete. Codex restarting.",
         panelVoiceTitle: "Voice & Speech Settings",
-        labelVoiceLlmModel: "Voice Assistant LLM Model",
         labelSttEngine: "Speech-to-Text (STT) Engine",
         labelSttApiKey: "STT API Key",
         labelSttBaseUrl: "STT Base URL",
@@ -988,63 +1170,36 @@ export function getDashboardHtml(): string {
         labelTtsBaseUrl: "TTS Base URL",
         labelTtsModel: "TTS Model Name",
         labelTtsVoice: "TTS Voice / Role",
-        labelVadThreshold: "VAD Silence Threshold (dB)",
-        vadThresholdHint: "Sound power below this level is treated as silence (default: -35.0 dB).",
-        labelVadDuration: "VAD Required Silence (seconds)",
-        vadDurationHint: "Auto-stops recording after this duration of silence (default: 2.0s).",
-        voiceLlmModelHint: "Independent model selection for voice agent decisions.",
-        wakeWordHint: "Trigger words: 'Hi Codex' or '你好科代' (Coming Soon).",
-        comingSoon: "Coming Soon",
-        labelEnableWakeWord: "Enable Voice Wake Word (Keyword: 'Hi Codex' or '你好科代')",
         btnSaveVoice: "Save Voice Settings",
         toastVoiceSaved: "Voice settings saved successfully!",
         toastVoiceFailed: "Failed to save voice settings",
-        panelConsoleInputTitle: "Interactive Command Console",
-        cmdDesc: "Type text-based commands directly. They run on Codex using your primary terminal session permissions (perfect for GUI Computer Use).",
-        btnSendCmd: "Send Command",
-        cmdPlaceholder: "Console output will appear here...",
-        cmdInputPlaceholder: "Type a command, e.g., 'open Chrome and search DeepSeek'...",
         voiceBarStatusLabel: "Voice Assistant Menu Bar (OpenCodexBar)",
-        voiceBarStatusOnline: "Online",
-        voiceBarStatusOffline: "Offline",
-        btnLaunchVoiceBar: "Launch Voice Assistant (swift run)",
-        btnLaunchVoiceBarApp: "Open Application (.app)",
-        btnVisualizerLab: "Dynamic Visualizer Lab (Aurora FX)",
+        btnLaunchVoiceBar: "Launch Voice Assistant",
         toastVoiceBarLaunching: "Launching Voice Assistant...",
         toastVoiceBarFailed: "Failed to launch Voice Assistant",
         panelPermissionsTitle: "macOS System Permissions (Computer Use)",
-        permissionsDesc: "Ensure Accessibility and Screen Recording permissions are authorized. Otherwise, Computer Use and SkyComputerUseClient will be silently blocked by macOS.",
-        permissionAxLabel: "Accessibility (辅助功能)",
-        permissionAxSublabel: "Required for mouse, keyboard, and screen control.",
-        permissionScreenLabel: "Screen Recording (屏幕录制)",
-        permissionScreenSublabel: "Required for screen capture and vision analysis.",
         btnFixPermissions: "Fix / Request System Permissions",
         badgeAuthorized: "Authorized",
         badgeUnauthorized: "Unauthorized",
-        toastPermissionsFixSent: "OS prompt triggered & settings panels opened. Please authorize by dragging helper apps.",
-        toastPermissionsFailed: "Failed to request permissions"
+        visionFallbackTitle: "Vision Fallback (Vision Bridge) Settings",
+        labelVisionKey: "Vision Fallback API Key",
+        labelVisionUrl: "Vision Fallback Base URL",
+        labelVisionModel: "Vision Fallback Model",
+        btnSaveVisionFallback: "Save Vision Fallback Settings"
       },
       zh: {
         title: "OpenCodex 统一网关",
         subtitle: "面向新手的自定义模型控制面板",
         status: "运行中 & 实时拦截",
-        panelApiTitle: "API 密钥与接口设置",
-        labelProviders: "API Providers",
-        labelPrimaryKey: "API 密钥 (Key)",
-        labelPrimaryUrl: "接口地址 (Base URL)",
-        labelModels: "模型（每行一个模型名）",
-        labelOcKey: "视觉降级 API 密钥 (Vision Fallback)",
-        labelOcUrl: "视觉降级接口地址 (Base URL)",
-        labelOcModel: "视觉降级模型",
-        btnSaveConfig: "保存 API 配置",
+        panelApiTitle: "API 密匙与自定义模型",
+        btnSaveConfig: "保存并添加该模型",
         panelModelsTitle: "自定义下拉框模型",
         modelsDesc: "勾选想要显示在 Codex 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
         btnUpdateDropdown: "更新下拉框菜单",
         panelConsoleTitle: "实时日志控制台",
         btnClear: "清空日志",
         connectingSse: "正在连接实时日志流...",
-        sseLost: "日志流连接断开，正在尝试重连...",
-        toastConfigSaved: "API 配置保存成功！",
+        toastConfigSaved: "API 密钥和模型配置已保存！",
         toastConfigFailed: "保存配置失败",
         toastConnFailed: "连接后端失败",
         toastModelsSaved: "Codex 下拉框模型列表更新成功！",
@@ -1055,18 +1210,10 @@ export function getDashboardHtml(): string {
         labelModelsRestart: "更新后自动重启 Codex Desktop",
         toastRestarting: "正在重启 Codex Desktop...",
         toastRestarted: "Codex Desktop 重启成功！",
-        labelModels: "模型（每行一个模型名）",
-        modelHint: "Format: <b>provider:model</b> — one per line. Providers are auto-created, fill in their credentials above.",
         btnReset: "↺ 还原原生",
         toastResetting: "正在还原原生 Codex...",
         toastResetDone: "还原完成，Codex 重启中.",
-        labelProviders: "API Providers",
-        providerName: "Name",
-        providerUrl: "Base URL",
-        providerKey: "API Key",
-        addProvider: "+ Add Provider",
         panelVoiceTitle: "语音与分贝设置",
-        labelVoiceLlmModel: "语音助手对话大模型",
         labelSttEngine: "语音识别 (STT) 引擎",
         labelSttApiKey: "语音识别 API 密钥 (Key)",
         labelSttBaseUrl: "语音识别接口地址 (Base URL)",
@@ -1076,53 +1223,42 @@ export function getDashboardHtml(): string {
         labelTtsBaseUrl: "语音合成接口地址 (Base URL)",
         labelTtsModel: "语音合成模型 (Model)",
         labelTtsVoice: "系统发音人 / 角色",
-        labelVadThreshold: "静音检测阈值 (分贝)",
-        vadThresholdHint: "环境分贝低于此值将被判定为静音（默认：-35.0 dB）。",
-        labelVadDuration: "静音检测时长 (秒)",
-        vadDurationHint: "说话停顿超过此时间将自动终止录音（默认：2.0s）。",
-        voiceLlmModelHint: "为语音助手单独配置决策模型（默认为 Codex 当前所选模型）。",
-        wakeWordHint: "快捷唤醒词：'Hi Codex' 或 '你好科代'（功能暂未开放）。",
-        comingSoon: "即将上线",
-        labelEnableWakeWord: "启用语音唤醒 (唤醒词: 'Hi Codex' 或 '你好科代')",
         btnSaveVoice: "保存语音设置",
         toastVoiceSaved: "语音配置保存成功！",
         toastVoiceFailed: "保存语音设置失败",
-        panelConsoleInputTitle: "交互式指令控制台",
-        cmdDesc: "在此直接输入文本指令。它们会以您主终端会话的系统权限运行在 Codex 中（非常适合进行屏幕 GUI 计算机操作）。",
-        btnSendCmd: "发送指令",
-        cmdPlaceholder: "控制台执行输出将在此显示...",
-        cmdInputPlaceholder: "输入指令，例如：'打开浏览器并搜索 DeepSeek'...",
         voiceBarStatusLabel: "语音助手菜单栏 (OpenCodexBar)",
-        voiceBarStatusOnline: "在线 (运行中)",
-        voiceBarStatusOffline: "离线",
-        btnLaunchVoiceBar: "启动语音助手 (swift run)",
-        btnLaunchVoiceBarApp: "打开应用包 (.app)",
-        btnVisualizerLab: "动效设计实验室 (极酷概念)",
+        btnLaunchVoiceBar: "启动语音助手",
         toastVoiceBarLaunching: "正在启动语音助手...",
         toastVoiceBarFailed: "启动语音助手失败",
         panelPermissionsTitle: "macOS 系统权限修复 (Computer Use)",
-        permissionsDesc: "使用 Computer Use 时，必须确保授权“辅助功能”与“屏幕录制”权限。否则 macOS 会静默拦截相关操作。",
-        permissionAxLabel: "辅助功能 (Accessibility)",
-        permissionAxSublabel: "控制鼠标、键盘和执行动作所需权限。",
-        permissionScreenLabel: "屏幕录制 (Screen Recording)",
-        permissionScreenSublabel: "截图和视觉理解屏幕状态所需权限。",
         btnFixPermissions: "修复 / 申请系统权限",
         badgeAuthorized: "已授权",
         badgeUnauthorized: "未授权",
-        toastPermissionsFixSent: "系统授权弹窗已触发，设置和 Finder 窗口已打开，请拖拽 App 进行授权！",
-        toastPermissionsFailed: "触发系统权限失败"
+        visionFallbackTitle: "视觉降级 (Vision Bridge) 配置",
+        labelVisionKey: "视觉降级 API 密钥 (Key)",
+        labelVisionUrl: "视觉降级接口地址 (Base URL)",
+        labelVisionModel: "视觉降级模型名称 (Model)",
+        btnSaveVisionFallback: "保存视觉降级配置"
       }
     };
 
-    const urlPresets = {
-      deepseek: "https://api.deepseek.com/v1",
-      siliconflow: "https://api.siliconflow.cn/v1",
-      opencode: "https://opencode.ai/zen/go/v1",
-      openai: "https://api.openai.com/v1",
-      custom: ""
-    };
-
     let currentLang = 'zh';
+    let currentTab = 'gateway';
+    let activeSessionId = '';
+    let configData = { providers: [] };
+
+    function switchTab(tabName) {
+      document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+      
+      document.getElementById('content-' + tabName).classList.add('active');
+      document.getElementById('tab-btn-' + tabName).classList.add('active');
+      currentTab = tabName;
+      
+      if (tabName === 'sessions') {
+        loadSessionsList();
+      }
+    }
 
     function setLanguage(lang) {
       currentLang = lang;
@@ -1130,99 +1266,35 @@ export function getDashboardHtml(): string {
       
       const el = (id) => document.getElementById(id);
       const setText = (id, val) => { const e = el(id); if (e) e.innerText = val; };
-      const setHtml = (id, fn) => { const e = el(id); if (e) e.innerHTML = fn(t); };
       
       setText('i18n-title', t.title);
       setText('i18n-subtitle', t.subtitle);
       setText('i18n-status', t.status);
-      
-      setHtml('i18n-panel-api-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path></svg>${'$'}{t.panelApiTitle}\`);
-      
-      setText('i18n-label-providers', t.labelProviders);
-      setText('i18n-label-models', t.labelModels);
-      setText('i18n-model-hint', t.modelHint);
       setText('i18n-btn-save-config', t.btnSaveConfig);
-      
-      setText('i18n-panel-vision-fallback-title', lang === 'zh' ? '视觉降级服务 (Vision Fallback)' : 'Vision Fallback Service');
-      setText('i18n-label-oc-key', t.labelOcKey);
-      setText('i18n-label-oc-url', t.labelOcUrl);
-      setText('i18n-label-oc-model', t.labelOcModel);
-      
-      setHtml('i18n-panel-models-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>${'$'}{t.panelModelsTitle}\`);
-      
-      setText('i18n-models-desc', t.modelsDesc);
       setText('i18n-btn-update-dropdown', t.btnUpdateDropdown);
-      
-      setHtml('i18n-panel-console-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>${'$'}{t.panelConsoleTitle}\`);
-      
       setText('i18n-btn-clear', t.btnClear);
       setText('i18n-connecting-sse', t.connectingSse);
       setText('i18n-label-config-restart', t.labelConfigRestart);
       setText('i18n-label-models-restart', t.labelModelsRestart);
       setText('restart-codex-btn', t.btnRestartCodex);
       setText('reset-btn', t.btnReset);
-      
-      setHtml('i18n-panel-voice-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path></svg>${'$'}{t.panelVoiceTitle}\`);
-      setText('i18n-label-voice-llm-model', t.labelVoiceLlmModel);
-      setText('i18n-label-stt-engine', t.labelSttEngine);
-      setText('i18n-label-stt-api-key', t.labelSttApiKey);
-      setText('i18n-label-stt-base-url', t.labelSttBaseUrl);
-      setText('i18n-label-stt-model', t.labelSttModel);
-      
-      setText('i18n-label-tts-engine', t.labelTtsEngine);
-      setText('i18n-label-tts-api-key', t.labelTtsApiKey);
-      setText('i18n-label-tts-base-url', t.labelTtsBaseUrl);
-      setText('i18n-label-tts-model', t.labelTtsModel);
-      
-      setText('i18n-label-tts-voice', t.labelTtsVoice);
-      setText('i18n-label-vad-threshold', t.labelVadThreshold);
-      setText('i18n-vad-threshold-hint', t.vadThresholdHint);
-      setText('i18n-label-vad-duration', t.labelVadDuration);
-      setText('i18n-vad-duration-hint', t.vadDurationHint);
-      setText('i18n-voice-llm-model-hint', t.voiceLlmModelHint);
-      setText('i18n-wake-word-hint', t.wakeWordHint);
-      setText('i18n-text-coming-soon', t.comingSoon);
-      setText('i18n-label-enable-wake-word', t.labelEnableWakeWord);
       setText('i18n-btn-save-voice', t.btnSaveVoice);
-      
       setText('i18n-voice-bar-status-label', t.voiceBarStatusLabel);
       setText('i18n-btn-launch-voice-bar', t.btnLaunchVoiceBar);
-      setText('i18n-btn-launch-voice-bar-app', t.btnLaunchVoiceBarApp);
-      setText('i18n-text-visualizer-lab', t.btnVisualizerLab);
-
-      setHtml('i18n-panel-permissions-title', (t) => \`<svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>${'$'}{t.panelPermissionsTitle}\`);
-      setText('i18n-permissions-desc', t.permissionsDesc);
-      setText('i18n-permission-ax-label', t.permissionAxLabel);
-      setText('i18n-permission-ax-sublabel', t.permissionAxSublabel);
-      setText('i18n-permission-screen-label', t.permissionScreenLabel);
-      setText('i18n-permission-screen-sublabel', t.permissionScreenSublabel);
       setText('i18n-btn-fix-permissions', t.btnFixPermissions);
-
-      // Keep badge text translated
-      checkPermissionsStatus();
+      setText('i18n-vision-fallback-title', t.visionFallbackTitle);
+      setText('i18n-label-vision-key', t.labelVisionKey);
+      setText('i18n-label-vision-url', t.labelVisionUrl);
+      setText('i18n-label-vision-model', t.labelVisionModel);
+      setText('i18n-btn-save-vision-fallback', t.btnSaveVisionFallback);
 
       const langBtn = el('lang-btn');
       if (langBtn) langBtn.innerText = lang === 'zh' ? '🌐 English' : '🌐 中文';
+      checkPermissionsStatus();
     }
 
     function toggleLanguage() {
       setLanguage(currentLang === 'zh' ? 'en' : 'zh');
-    }
-
-    // Handles provider select dropdown changes
-    function addProviderRow(name, url, key) {
-      const container = document.getElementById('providers-container');
-      const idx = container.children.length;
-      const div = document.createElement('div');
-      div.className = 'provider-row';
-      div.style.cssText = 'display:flex;gap:0.5rem;align-items:center;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:0.6rem;flex-wrap:wrap;';
-      div.innerHTML = \`
-        <input class="prov-name" placeholder="name" value="${'$'}{name || ''}" style="width:90px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);padding:0.5rem;border-radius:6px;color:#fff;font-family:Outfit,sans-serif;font-size:0.85rem;">
-        <input class="prov-url" placeholder="https://..." value="${'$'}{url || ''}" style="flex:1;min-width:120px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);padding:0.5rem;border-radius:6px;color:#fff;font-family:Outfit,sans-serif;font-size:0.85rem;">
-        <input class="prov-key" type="password" placeholder="sk-..." value="${'$'}{key || ''}" style="flex:1;min-width:100px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.06);padding:0.5rem;border-radius:6px;color:#fff;font-family:Outfit,sans-serif;font-size:0.85rem;">
-        <button type="button" onclick="this.parentElement.remove()" style="background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:#ef4444;width:28px;height:28px;border-radius:6px;cursor:pointer;font-size:0.8rem;">✕</button>
-      \`;
-      container.appendChild(div);
     }
 
     function togglePass(id) {
@@ -1230,67 +1302,26 @@ export function getDashboardHtml(): string {
       inp.type = inp.type === 'password' ? 'text' : 'password';
     }
 
-    // Toast alerts
     function showToast(text, isError = false) {
       const toast = document.getElementById('toast');
       toast.innerText = text;
-      if (isError) {
-        toast.classList.add('toast-error');
-      } else {
-        toast.classList.remove('toast-error');
-      }
+      if (isError) toast.classList.add('toast-error');
+      else toast.classList.remove('toast-error');
       toast.classList.add('show');
-      setTimeout(() => {
-        toast.classList.remove('show');
-      }, 3000);
+      setTimeout(() => toast.classList.remove('show'), 3000);
     }
-
-    let allCatalogModels = [];
 
     // Load Configurations & Models
     async function loadConfig() {
       try {
-        const [configResp, modelsResp] = await Promise.all([
-          fetch('/v1/config'),
-          fetch('/api/models')
-        ]);
-        const data = await configResp.json();
-        const modelsData = await modelsResp.json();
+        const response = await fetch('/v1/config');
+        configData = await response.json();
         
-        // Populate provider rows
-        const container = document.getElementById('providers-container');
-        container.innerHTML = '';
-        
-        let opencodeProvider = null;
-        let hasOtherProviders = false;
-        (data.providers || []).forEach(p => {
-          if (p.name === 'opencode') {
-            opencodeProvider = p;
-          } else {
-            addProviderRow(p.name, p.base_url, p.api_key);
-            hasOtherProviders = true;
-          }
-        });
-        
-        // If there are no other providers configured, automatically add exactly one blank row
-        // so that there is a slot ("口子") ready for the user to configure their first model provider!
-        if (!hasOtherProviders) {
-          addProviderRow('', '', '');
-        }
-        
-        if (opencodeProvider) {
-          document.getElementById('oc-api-key').value = opencodeProvider.api_key || '';
-          document.getElementById('oc-base-url').value = opencodeProvider.base_url || 'https://opencode.ai/zen/go/v1';
-          document.getElementById('oc-model').value = opencodeProvider.vision_model || opencodeProvider.model || 'mimo-v2.5';
-        } else {
-          document.getElementById('oc-api-key').value = '';
-          document.getElementById('oc-base-url').value = 'https://opencode.ai/zen/go/v1';
-          document.getElementById('oc-model').value = 'mimo-v2.5';
-        }
-
-        // Populate model names textarea from catalog
-        const modelNames = (modelsData.catalog || []).map((m) => m.provider ? m.provider + ':' + m.model : m.model).join('\\n');
-        document.getElementById('model-names').value = modelNames;
+        // Populate vision fallback fields
+        const opencode = (configData.providers || []).find(p => p.name === 'opencode') || {};
+        document.getElementById('vision-fallback-key').value = opencode.api_key || '';
+        document.getElementById('vision-fallback-url').value = opencode.base_url || 'https://opencode.ai/zen/go/v1';
+        document.getElementById('vision-fallback-model').value = opencode.vision_model || 'mimo-v2.5';
       } catch (err) {
         showToast(currentLang === 'zh' ? '加载配置失败' : 'Failed to load configs', true);
       }
@@ -1301,43 +1332,41 @@ export function getDashboardHtml(): string {
         const response = await fetch('/api/models');
         const data = await response.json();
         
-        allCatalogModels = data.catalog || [];
         const activeIds = new Set(data.active || []);
-
-        // Voice LLM model is now a direct text input field
-        
         const container = document.getElementById('models-list-container');
         container.innerHTML = '';
         
-        allCatalogModels.forEach(m => {
+        (data.catalog || []).forEach(m => {
           const isActive = activeIds.has(m.id);
           const hasVision = !m.no_image_support;
           const hasBridge = !!m.vision_bridge_enabled;
           
-          const badgeHtml = hasBridge 
-            ? '<span class="badge badge-fallback">Vision Bridge</span>' 
-            : (hasVision ? '<span class="badge badge-vision">Native Vision</span>' : '');
+          const badgeHtml = (!hasBridge && hasVision) ? '<span class="badge badge-vision">Native Vision</span>' : '';
 
           const item = document.createElement('div');
           item.className = 'model-item';
           item.onclick = (e) => {
-            if (e.target.type !== 'checkbox') {
+            if (e.target.type !== 'checkbox' && !e.target.classList.contains('model-delete-btn') && !e.target.closest('label')) {
               const cb = item.querySelector('.model-checkbox');
               cb.checked = !cb.checked;
             }
           };
           
-            item.innerHTML = \`
+          item.innerHTML = \`
             <div class="model-checkbox-container">
-              <input type="checkbox" class="model-checkbox" data-id="${'$'}{m.id}" ${'$'}{isActive ? 'checked' : ''}>
+              <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \${isActive ? 'checked' : ''}>
               <div class="model-info">
-                <div class="model-display-name">${'$'}{m.display_name}</div>
-                <div class="model-slug">${'$'}{m.model}</div>
+                <div class="model-display-name">\${m.display_name}</div>
+                <div class="model-slug">\${m.model}</div>
               </div>
             </div>
-            <div style="display:flex;align-items:center;gap:0.5rem;">
-              ${'$'}{badgeHtml}
-              <button class="model-delete-btn" data-id="${'$'}{m.id}" onclick="event.stopPropagation(); deleteModel('${'$'}{m.id}')" title="删除">✕</button>
+            <div style="display:flex;align-items:center;gap:0.75rem;">
+              <label style="display:flex;align-items:center;gap:0.25rem;cursor:pointer;font-size:0.8rem;color:var(--color-text-muted);">
+                <input type="checkbox" class="vision-bridge-checkbox" data-id="\${m.id}" \${hasBridge ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-primary);">
+                <span>Vision Bridge</span>
+              </label>
+              \${badgeHtml}
+              <button class="model-delete-btn" onclick="deleteModel('\${m.id}')" title="删除">✕</button>
             </div>
           \`;
           container.appendChild(item);
@@ -1347,36 +1376,56 @@ export function getDashboardHtml(): string {
       }
     }
 
-    // Save configurations
+    // Save configurations (simplified form with 3 fields)
     document.getElementById('config-form').onsubmit = async (e) => {
       e.preventDefault();
       
       const restartChecked = document.getElementById('config-restart-checkbox').checked;
-      
-      // Build providers array from UI
-      const providerRows = document.querySelectorAll('#providers-container .provider-row');
-      const providers = Array.from(providerRows).map(row => ({
-        name: row.querySelector('.prov-name').value.trim(),
-        base_url: row.querySelector('.prov-url').value.trim(),
-        api_key: row.querySelector('.prov-key').value.trim()
-      })).filter(p => p.name && p.base_url);
+      const modelInput = document.getElementById('new-model-name').value.trim();
+      const baseUrl = document.getElementById('new-base-url').value.trim();
+      const apiKey = document.getElementById('new-api-key').value.trim();
 
-      // Append opencode (vision fallback) provider to the list
-      const ocKey = document.getElementById('oc-api-key').value.trim();
-      const ocUrl = document.getElementById('oc-base-url').value.trim() || 'https://opencode.ai/zen/go/v1';
-      const ocModel = document.getElementById('oc-model').value.trim() || 'mimo-v2.5';
+      if (!modelInput || !baseUrl || !apiKey) {
+        showToast(currentLang === 'zh' ? '请填写所有字段' : 'Please fill all fields', true);
+        return;
+      }
+
+      let providerName = 'custom';
+      let modelSlug = modelInput;
+      if (modelInput.includes(':')) {
+        const parts = modelInput.split(':');
+        providerName = parts[0].trim();
+        modelSlug = parts.slice(1).join(':').trim();
+      } else {
+        if (baseUrl.includes('deepseek')) providerName = 'deepseek';
+        else if (baseUrl.includes('siliconflow')) providerName = 'siliconflow';
+        else if (baseUrl.includes('openai')) providerName = 'openai';
+        else providerName = 'custom_' + Math.random().toString(36).substring(2, 6);
+      }
+
+      // Append/Update the provider in current configData
+      const providers = (configData.providers || []).map(p => ({
+        name: p.name,
+        base_url: p.base_url,
+        api_key: p.api_key
+      })).filter(p => p.name !== providerName);
+      
       providers.push({
-        name: 'opencode',
-        base_url: ocUrl,
-        api_key: ocKey,
-        vision_model: ocModel
+        name: providerName,
+        base_url: baseUrl,
+        api_key: apiKey
       });
 
-      // Parse model names
-      const modelNames = document.getElementById('model-names').value
-        .split('\\n')
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
+      // Get existing catalog models from UI or catalog
+      const modelsTextarea = [];
+      document.querySelectorAll('.model-checkbox').forEach(cb => {
+        const id = cb.getAttribute('data-id');
+        if (id) modelsTextarea.push(id);
+      });
+      const newModelId = providerName + ':' + modelSlug;
+      if (!modelsTextarea.includes(newModelId)) {
+        modelsTextarea.push(newModelId);
+      }
 
       try {
         if (restartChecked) {
@@ -1388,21 +1437,20 @@ export function getDashboardHtml(): string {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             providers,
-            models: modelNames,
+            models: modelsTextarea,
             restart: restartChecked
           })
         });
         
         if (response.ok) {
-          if (restartChecked) {
-            setTimeout(() => {
-              showToast(i18nDict[currentLang].toastRestarted);
-            }, 2500);
-          } else {
-            showToast(i18nDict[currentLang].toastConfigSaved);
-          }
-          loadConfig();
-          loadModels();
+          showToast(i18nDict[currentLang].toastConfigSaved);
+          // Clear form inputs immediately
+          document.getElementById('new-model-name').value = '';
+          document.getElementById('new-base-url').value = '';
+          document.getElementById('new-api-key').value = '';
+          
+          await loadConfig();
+          await loadModels();
         } else {
           showToast(i18nDict[currentLang].toastConfigFailed, true);
         }
@@ -1415,6 +1463,8 @@ export function getDashboardHtml(): string {
     async function saveActiveModels() {
       const checkedBoxes = document.querySelectorAll('.model-checkbox:checked');
       const activeIds = Array.from(checkedBoxes).map(cb => cb.getAttribute('data-id'));
+      const visionBridgeBoxes = document.querySelectorAll('.vision-bridge-checkbox:checked');
+      const visionBridgeIds = Array.from(visionBridgeBoxes).map(cb => cb.getAttribute('data-id'));
       const restartChecked = document.getElementById('models-restart-checkbox').checked;
       
       try {
@@ -1425,18 +1475,16 @@ export function getDashboardHtml(): string {
         const response = await fetch('/api/models', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ active: activeIds, restart: restartChecked })
+          body: JSON.stringify({
+            active: activeIds,
+            vision_bridge: visionBridgeIds,
+            restart: restartChecked
+          })
         });
         
         if (response.ok) {
-          if (restartChecked) {
-            setTimeout(() => {
-              showToast(i18nDict[currentLang].toastRestarted);
-            }, 2500);
-          } else {
-            showToast(i18nDict[currentLang].toastModelsSaved);
-          }
-          loadModels(); // Refresh
+          showToast(i18nDict[currentLang].toastModelsSaved);
+          loadModels();
         } else {
           showToast(i18nDict[currentLang].toastModelsFailed, true);
         }
@@ -1445,7 +1493,57 @@ export function getDashboardHtml(): string {
       }
     }
 
-    // Delete a model from catalog
+    // Save Vision Fallback settings
+    async function saveVisionFallback() {
+      const apiKey = document.getElementById('vision-fallback-key').value.trim();
+      const baseUrl = document.getElementById('vision-fallback-url').value.trim();
+      const model = document.getElementById('vision-fallback-model').value.trim();
+      const restartChecked = document.getElementById('config-restart-checkbox').checked;
+      
+      const providers = (configData.providers || []).map(p => {
+        if (p.name === 'opencode') {
+          return {
+            ...p,
+            base_url: baseUrl || 'https://opencode.ai/zen/go/v1',
+            api_key: apiKey,
+            vision_model: model || 'mimo-v2.5'
+          };
+        }
+        return p;
+      });
+      
+      if (!providers.some(p => p.name === 'opencode')) {
+        providers.push({
+          name: 'opencode',
+          base_url: baseUrl || 'https://opencode.ai/zen/go/v1',
+          api_key: apiKey,
+          vision_model: model || 'mimo-v2.5'
+        });
+      }
+      
+      try {
+        if (restartChecked) {
+          showToast(i18nDict[currentLang].toastRestarting);
+        }
+        const response = await fetch('/api/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            providers,
+            restart: restartChecked
+          })
+        });
+        if (response.ok) {
+          showToast(currentLang === 'zh' ? '视觉降级配置已保存！' : 'Vision Fallback settings saved!');
+          await loadConfig();
+        } else {
+          showToast(currentLang === 'zh' ? '保存失败' : 'Failed to save settings', true);
+        }
+      } catch (err) {
+        showToast(i18nDict[currentLang].toastConnFailed, true);
+      }
+    }
+
     async function deleteModel(id) {
       try {
         const response = await fetch('/api/models/delete', {
@@ -1464,26 +1562,16 @@ export function getDashboardHtml(): string {
       }
     }
 
-    // Manual or programmatic restart Codex Desktop
     async function restartCodexDesktop() {
       showToast(i18nDict[currentLang].toastRestarting);
       try {
-        const response = await fetch('/api/restart-codex', {
-          method: 'POST'
-        });
+        const response = await fetch('/api/restart-codex', { method: 'POST' });
         if (response.ok) {
-          setTimeout(() => {
-            showToast(i18nDict[currentLang].toastRestarted);
-          }, 2500);
-        } else {
-          showToast(currentLang === 'zh' ? '重启失败' : 'Failed to restart', true);
+          setTimeout(() => showToast(i18nDict[currentLang].toastRestarted), 2500);
         }
-      } catch (err) {
-        showToast(i18nDict[currentLang].toastConnFailed, true);
-      }
+      } catch (err) {}
     }
 
-    // Custom confirm dialog
     function showConfirm(msg, onConfirm) {
       const modal = document.getElementById('confirm-modal');
       document.getElementById('confirm-msg').innerText = msg;
@@ -1495,31 +1583,194 @@ export function getDashboardHtml(): string {
       modal.classList.add('show');
     }
 
-    // Reset Codex to native state
     async function resetCodex() {
-      const msg = currentLang === 'zh' ? '还原后 Codex 显示官方模型，自定义模型的对话将被隐藏。重新填写 API 即可恢复。' : 'Reset restores native Codex. Conversations for custom models will be hidden until you reconfigure your API.';
+      const msg = currentLang === 'zh' ? '还原后 Codex 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native Codex.';
       showConfirm(msg, async () => {
-        showToast(i18nDict[currentLang].toastResetting);
         try {
-          const response = await fetch('/api/reset', {
-            method: 'POST'
-          });
+          const response = await fetch('/api/reset', { method: 'POST' });
           if (response.ok) {
-            setTimeout(() => {
-              showToast(i18nDict[currentLang].toastResetDone);
-              loadConfig();
-              loadModels();
-            }, 2500);
-          } else {
-            showToast(currentLang === 'zh' ? '还原失败' : 'Reset failed', true);
+            showToast(currentLang === 'zh' ? '已还原原生' : 'Reset complete');
+            loadConfig();
+            loadModels();
           }
-        } catch (err) {
-          showToast(i18nDict[currentLang].toastConnFailed, true);
-        }
+        } catch (err) {}
       });
     }
 
-    // Live Logs Polling
+    // Sessions Management
+    let lastSessionsHash = '';
+    async function loadSessionsList(isAutoRefresh = false) {
+      try {
+        const response = await fetch('/api/sessions');
+        const sessions = await response.json();
+        
+        const hash = sessions.map(s => s.id + ':' + s.text + ':' + s.ts + ':' + s.archived).join('|');
+        if (hash === lastSessionsHash && isAutoRefresh) {
+          return;
+        }
+        lastSessionsHash = hash;
+
+        const container = document.getElementById('session-list-container');
+        container.innerHTML = '';
+        
+        if (sessions.length === 0) {
+          container.innerHTML = \`<div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">No active sessions found.</div>\`;
+          return;
+        }
+        
+        sessions.forEach(s => {
+          const item = document.createElement('div');
+          item.className = 'session-list-item' + (activeSessionId === s.id ? ' active' : '');
+          if (s.archived) {
+            item.style.opacity = '0.5';
+          }
+          item.onclick = () => selectSession(s.id);
+          
+          const timeStr = new Date(s.ts).toLocaleTimeString();
+          
+          item.innerHTML = \`
+            <div class="session-item-header">
+              <span class="session-id-title">\${s.id.substring(0, 8)}...</span>
+              <span class="session-time">\${timeStr}</span>
+            </div>
+            <div class="session-text-preview">\${escapeHtml(s.text)}</div>
+            <div class="session-actions-overlay">
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? '激活/Unarchive' : '归档/Archive'}</button>
+              <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">删除/Delete</button>
+            </div>
+          \`;
+          container.appendChild(item);
+        });
+      } catch (err) {}
+    }
+
+    let lastMessagesHash = '';
+    async function selectSession(sid, isAutoRefresh = false) {
+      if (!isAutoRefresh) {
+        activeSessionId = sid;
+        document.querySelectorAll('.session-list-item').forEach(el => el.classList.remove('active'));
+        const activeEl = Array.from(document.querySelectorAll('.session-list-item')).find(el => el.innerHTML.includes(sid.substring(0, 8)));
+        if (activeEl) activeEl.classList.add('active');
+        
+        document.getElementById('active-session-title').innerText = 'Session: ' + sid;
+        document.getElementById('enter-session-btn').style.display = 'block';
+      }
+      
+      // Load details
+      try {
+        const response = await fetch('/api/sessions/detail', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: sid })
+        });
+        const data = await response.json();
+        
+        const hash = (data.messages || []).map(m => m.role + ':' + m.text).join('|');
+        if (hash === lastMessagesHash && isAutoRefresh) {
+          return;
+        }
+        lastMessagesHash = hash;
+        
+        const container = document.getElementById('chat-messages-container');
+        container.innerHTML = '';
+        
+        if (!data.messages || data.messages.length === 0) {
+          container.innerHTML = \`<div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">No messages in this session.</div>\`;
+          return;
+        }
+        
+        data.messages.forEach(msg => {
+          const bubble = document.createElement('div');
+          if (msg.role === 'assistant') {
+            bubble.className = 'chat-bubble chat-bubble-assistant';
+          } else {
+            bubble.className = 'chat-bubble chat-bubble-user';
+          }
+          bubble.innerText = msg.text;
+          container.appendChild(bubble);
+        });
+        // Scroll detail view to the bottom
+        container.scrollTop = container.scrollHeight;
+      } catch (err) {}
+    }
+
+    async function enterActiveSession() {
+      if (!activeSessionId) return;
+      try {
+        const response = await fetch('/api/sessions/enter', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: activeSessionId })
+        });
+        if (response.ok) {
+          showToast(currentLang === 'zh' ? '成功进入该会话！菜单栏已切换' : 'Entered session successfully!');
+        }
+      } catch (err) {}
+    }
+
+    async function deleteSession(sid) {
+      showConfirm(currentLang === 'zh' ? '确定删除该会话？' : 'Delete this session?', async () => {
+        try {
+          const response = await fetch('/api/sessions/delete', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: sid })
+          });
+          if (response.ok) {
+            showToast(currentLang === 'zh' ? '会话已删除' : 'Session deleted');
+            if (activeSessionId === sid) {
+              activeSessionId = '';
+              document.getElementById('chat-messages-container').innerHTML = \`<div style="text-align: center; color: var(--color-text-muted); padding: 4rem 2rem;" id="chat-empty-hint">Please choose a session to view conversation details.</div>\`;
+              document.getElementById('enter-session-btn').style.display = 'none';
+              document.getElementById('active-session-title').innerText = currentLang === 'zh' ? '请选择左侧会话' : 'Select a session';
+            }
+            loadSessionsList();
+          }
+        } catch (err) {}
+      });
+    }
+
+    async function clearAllSessions() {
+      const confirm1Msg = currentLang === 'zh' ? '确定要清空所有会话吗？此操作将彻底删除所有本地对话记录且无法恢复！' : 'Are you sure you want to clear all sessions? This will permanently delete all local conversation logs!';
+      showConfirm(confirm1Msg, () => {
+        // Double confirmation modal!
+        setTimeout(() => {
+          const confirm2Msg = currentLang === 'zh' ? '再次确认：请再次确认是否要彻底清空所有对话记录？' : 'Double Check: Please confirm once more to delete all conversation logs permanently.';
+          showConfirm(confirm2Msg, async () => {
+            try {
+              const response = await fetch('/api/sessions/clear-all', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' }
+              });
+              if (response.ok) {
+                showToast(currentLang === 'zh' ? '所有会话已清空' : 'All sessions cleared');
+                activeSessionId = '';
+                document.getElementById('chat-messages-container').innerHTML = \`<div style="text-align: center; color: var(--color-text-muted); padding: 4rem 2rem;" id="chat-empty-hint">Please choose a session to view conversation details.</div>\`;
+                document.getElementById('enter-session-btn').style.display = 'none';
+                document.getElementById('active-session-title').innerText = currentLang === 'zh' ? '请选择左侧会话' : 'Select a session';
+                loadSessionsList();
+              }
+            } catch (err) {}
+          });
+        }, 300); // 300ms delay to make the transition look extremely polished and distinct
+      });
+    }
+
+    async function toggleArchiveSession(sid, archived) {
+      try {
+        const response = await fetch('/api/sessions/archive', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: sid, archived })
+        });
+        if (response.ok) {
+          showToast(archived ? '会话已归档' : '会话已重新激活');
+          loadSessionsList();
+        }
+      } catch (err) {}
+    }
+
+    // Logs SSE
     function setupLogsPolling() {
       let lastTotal = 0;
       setInterval(async () => {
@@ -1535,37 +1786,30 @@ export function getDashboardHtml(): string {
           }
         } catch {}
       }, 1000);
-      appendLogLine('[System]', 'INFO', currentLang === 'zh' ? '日志轮询已启动' : 'Log polling started', 'info');
     }
 
     function appendLogLine(time, tag, text, level) {
       const container = document.getElementById('console-logs');
       const line = document.createElement('div');
-      line.className = \`log-line log-${'$'}{level || 'info'}\`;
-      
+      line.className = \`log-line log-\${level || 'info'}\`;
       line.innerHTML = \`
-        <span class="log-time">${'$'}{time}</span>
-        <span class="log-tag">[${'$'}{tag}]</span>
-        <span class="log-text">${'$'}{escapeHtml(text)}</span>
+        <span class="log-time">\${time}</span>
+        <span class="log-tag">[\${tag}]</span>
+        <span class="log-text">\${escapeHtml(text)}</span>
       \`;
-      
       container.appendChild(line);
-      
-      // Auto scroll
       container.scrollTop = container.scrollHeight;
-      
-      // Keep logs size bounded (1000 lines max)
-      if (container.children.length > 1000) {
+      if (container.children.length > 500) {
         container.removeChild(container.firstChild);
       }
     }
 
     function clearConsole() {
       document.getElementById('console-logs').innerHTML = '';
-      showToast(i18nDict[currentLang].toastConsoleCleared);
     }
 
     function escapeHtml(text) {
+      if (!text) return '';
       return text
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -1579,7 +1823,11 @@ export function getDashboardHtml(): string {
       const ttsEngine = document.getElementById('tts-engine').value;
       
       document.getElementById('custom-stt-fields').style.display = sttEngine === 'openai-compatible' ? 'flex' : 'none';
-      document.getElementById('custom-tts-fields').style.display = (ttsEngine === 'openai-compatible' || ttsEngine === 'minimax') ? 'flex' : 'none';
+      
+      const showCustomTts = (ttsEngine === 'openai-compatible' || ttsEngine === 'minimax' || ttsEngine === 'doubao');
+      document.getElementById('custom-tts-fields').style.display = showCustomTts ? 'flex' : 'none';
+      
+      document.getElementById('tts-doubao-extra-fields').style.display = ttsEngine === 'doubao' ? 'flex' : 'none';
     }
 
     // Load Voice Settings
@@ -1599,15 +1847,15 @@ export function getDashboardHtml(): string {
         document.getElementById('tts-model').value = data.tts_model || 'tts-1';
         
         document.getElementById('tts-voice').value = data.tts_voice || 'zh-CN-XiaoxiaoNeural';
-        document.getElementById('vad-threshold').value = data.vad_threshold !== undefined ? data.vad_threshold : -42.0;
-        document.getElementById('vad-duration').value = data.vad_duration !== undefined ? data.vad_duration : 1.5;
+        document.getElementById('tts-appid').value = data.tts_appid || '';
+        document.getElementById('tts-resource').value = data.tts_resource || '';
+        document.getElementById('voice-system-prompt').value = data.voice_system_prompt || '';
+        document.getElementById('vad-threshold').value = data.vad_threshold !== undefined ? data.vad_threshold : -35.0;
+        document.getElementById('vad-duration').value = data.vad_duration !== undefined ? data.vad_duration : 2.0;
         document.getElementById('voice-llm-model').value = data.voice_llm_model || '';
-        document.getElementById('enable-wake-word').checked = !!data.enable_wake_word;
         
         toggleCustomFields();
-      } catch (err) {
-        showToast(currentLang === 'zh' ? '加载语音设置失败' : 'Failed to load voice settings', true);
-      }
+      } catch (err) {}
     }
 
     // Save Voice Settings
@@ -1625,15 +1873,12 @@ export function getDashboardHtml(): string {
       const tts_model = document.getElementById('tts-model').value.trim();
       
       const tts_voice = document.getElementById('tts-voice').value.trim();
-      const vad_threshold = parseFloat(document.getElementById('vad-threshold').value.trim() || '-42.0');
-      const vad_duration = parseFloat(document.getElementById('vad-duration').value.trim() || '1.5');
-      const voice_llm_model = document.getElementById('voice-llm-model').value;
-      const enable_wake_word = document.getElementById('enable-wake-word').checked;
-      
-      if (isNaN(vad_threshold) || isNaN(vad_duration)) {
-        showToast(currentLang === 'zh' ? '数字格式无效' : 'Invalid number format', true);
-        return;
-      }
+      const tts_appid = document.getElementById('tts-appid').value.trim();
+      const tts_resource = document.getElementById('tts-resource').value.trim();
+      const voice_system_prompt = document.getElementById('voice-system-prompt').value.trim();
+      const vad_threshold = parseFloat(document.getElementById('vad-threshold').value.trim() || '-35.0');
+      const vad_duration = parseFloat(document.getElementById('vad-duration').value.trim() || '2.0');
+      const voice_llm_model = document.getElementById('voice-llm-model').value.trim();
       
       try {
         const response = await fetch('/api/voice-settings', {
@@ -1649,22 +1894,20 @@ export function getDashboardHtml(): string {
             tts_base_url,
             tts_model,
             tts_voice,
+            tts_appid,
+            tts_resource,
+            voice_system_prompt,
             vad_threshold,
             vad_duration,
-            voice_llm_model,
-            enable_wake_word
+            voice_llm_model
           })
         });
         
         if (response.ok) {
           showToast(i18nDict[currentLang].toastVoiceSaved);
           loadVoiceSettings();
-        } else {
-          showToast(i18nDict[currentLang].toastVoiceFailed, true);
         }
-      } catch (err) {
-        showToast(i18nDict[currentLang].toastConnFailed, true);
-      }
+      } catch (err) {}
     };
 
     document.getElementById('stt-engine').addEventListener('change', toggleCustomFields);
@@ -1710,28 +1953,14 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
-    function setupPermissionsPolling() {
-      checkPermissionsStatus();
-      setInterval(checkPermissionsStatus, 3000);
-    }
-
     async function fixPermissions() {
-      showToast(i18nDict[currentLang].toastPermissionsFixSent || 'Triggering system settings...');
       try {
-        const response = await fetch('/api/permissions/fix', {
-          method: 'POST'
-        });
+        const response = await fetch('/api/permissions/fix', { method: 'POST' });
         if (response.ok) {
-          showToast(i18nDict[currentLang].toastPermissionsFixSent || 'Settings opened.');
-        } else {
-          showToast(i18nDict[currentLang].toastPermissionsFailed || 'Failed', true);
+          showToast(currentLang === 'zh' ? '系统授权弹窗已触发！' : 'Settings opened.');
         }
-      } catch (err) {
-        showToast(i18nDict[currentLang].toastConnFailed, true);
-      }
+      } catch (err) {}
     }
-
-    let voiceBarOnline = false;
 
     async function checkVoiceBarStatus() {
       try {
@@ -1739,73 +1968,44 @@ export function getDashboardHtml(): string {
         const data = await response.json();
         const badge = document.getElementById('voice-bar-status-badge');
         if (badge) {
-          if (data.running) {
-            badge.innerText = currentLang === 'zh' ? '在线 (运行中)' : 'Online';
-            badge.style.color = 'var(--color-success)';
-            badge.style.background = 'rgba(16, 185, 129, 0.1)';
-            badge.style.borderColor = 'rgba(16, 185, 129, 0.2)';
-            voiceBarOnline = true;
-          } else {
-            badge.innerText = currentLang === 'zh' ? '离线' : 'Offline';
-            badge.style.color = '#ef4444';
-            badge.style.background = 'rgba(239, 68, 68, 0.1)';
-            badge.style.borderColor = 'rgba(239, 68, 68, 0.2)';
-            voiceBarOnline = false;
-          }
+          badge.innerText = data.running ? (currentLang === 'zh' ? '在线 (运行中)' : 'Online') : (currentLang === 'zh' ? '离线' : 'Offline');
+          badge.style.color = data.running ? 'var(--color-success)' : '#ef4444';
+          badge.style.background = data.running ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+          badge.style.borderColor = data.running ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
         }
       } catch (err) {}
     }
 
-    function setupVoiceBarPolling() {
-      checkVoiceBarStatus();
-      setInterval(checkVoiceBarStatus, 3000);
-    }
-
     async function launchVoiceBar(method) {
       showToast(i18nDict[currentLang].toastVoiceBarLaunching || 'Launching...');
-      
-      const btnSwift = document.getElementById('i18n-btn-launch-voice-bar');
-      const btnApp = document.getElementById('i18n-btn-launch-voice-bar-app');
-      
-      if (btnSwift) { btnSwift.disabled = true; btnSwift.style.opacity = '0.5'; }
-      if (btnApp) { btnApp.disabled = true; btnApp.style.opacity = '0.5'; }
-      
       try {
         const response = await fetch('/api/voice-bar/launch', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ method })
         });
-        
         if (response.ok) {
-          setTimeout(async () => {
-            await checkVoiceBarStatus();
-            if (btnSwift) { btnSwift.disabled = false; btnSwift.style.opacity = '1'; }
-            if (btnApp) { btnApp.disabled = false; btnApp.style.opacity = '1'; }
-            
-            showToast(currentLang === 'zh' ? '语音助手启动指令已发送！' : 'Voice Assistant launch command sent!');
-          }, 1500);
-        } else {
-          showToast(i18nDict[currentLang].toastVoiceBarFailed || 'Launch failed', true);
-          if (btnSwift) { btnSwift.disabled = false; btnSwift.style.opacity = '1'; }
-          if (btnApp) { btnApp.disabled = false; btnApp.style.opacity = '1'; }
+          setTimeout(checkVoiceBarStatus, 2000);
         }
-      } catch (err) {
-        showToast(i18nDict[currentLang].toastConnFailed, true);
-        if (btnSwift) { btnSwift.disabled = false; btnSwift.style.opacity = '1'; }
-        if (btnApp) { btnApp.disabled = false; btnApp.style.opacity = '1'; }
-      }
+      } catch (err) {}
     }
 
-    // Initial Load
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
-      loadConfig();
+      await loadConfig();
       await loadModels();
       await loadVoiceSettings();
       setupLogsPolling();
-      setupVoiceBarPolling();
-      setupPermissionsPolling();
+      setInterval(checkVoiceBarStatus, 3000);
+      setInterval(checkPermissionsStatus, 3000);
+      setInterval(async () => {
+        if (currentTab === 'sessions') {
+          await loadSessionsList(true);
+          if (activeSessionId) {
+            await selectSession(activeSessionId, true);
+          }
+        }
+      }, 3000);
     };
   </script>
 </body>

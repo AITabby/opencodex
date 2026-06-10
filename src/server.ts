@@ -107,6 +107,45 @@ const TOOLS: Tool[] = [
       properties: { window_id: { type: "number" } },
       required: ["window_id"]
     }
+  },
+  {
+    name: "mouse_down",
+    description: "按住鼠标（左键/右键）不放。配合 mouse_move 可以实现复杂的拖拽、圈选和画图操作。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number" },
+        y: { type: "number" },
+        button: { type: "string", enum: ["left", "right"], default: "left" }
+      },
+      required: ["x", "y"]
+    }
+  },
+  {
+    name: "mouse_up",
+    description: "释放鼠标（左键/右键）。配合 mouse_down 和 mouse_move 使用。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number" },
+        y: { type: "number" },
+        button: { type: "string", enum: ["left", "right"], default: "left" }
+      },
+      required: ["x", "y"]
+    }
+  },
+  {
+    name: "mouse_move",
+    description: "移动鼠标到屏幕坐标 (x, y) 处。可选择是否按住左键移动（拖拽/画图模式）。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number" },
+        y: { type: "number" },
+        drag: { type: "boolean", default: false }
+      },
+      required: ["x", "y"]
+    }
   }
 ];
 
@@ -135,9 +174,26 @@ class OpenCodex {
           const png = await this.screenshotTaker.capture();
           const cachePath = "/tmp/opencodex_screenshot.png";
           fs.writeFileSync(cachePath, png);
+
+          let desc = "";
+          try {
+            const { describeImageB64 } = await import("./proxy/translator.js");
+            const b64 = png.toString("base64");
+            const fetchedDesc = await describeImageB64(b64, this.proxy.config);
+            if (fetchedDesc) {
+              desc = fetchedDesc;
+            }
+          } catch (err: any) {
+            console.error("[OpenCodex-ScreenshotTool] Direct describe image failed:", err.message);
+          }
+
+          const responseText = desc 
+            ? `[截图描述: ${desc}]\n(本地缓存路径: ${cachePath})`
+            : `[OpenCodexScreenshotCached: ${cachePath}] 截图完成 (${(png.length / 1024).toFixed(0)} KB)`;
+
           return {
             content: [
-              { type: "text", text: `[OpenCodexScreenshotCached: ${cachePath}] 截图完成 (${(png.length / 1024).toFixed(0)} KB)` }
+              { type: "text", text: responseText }
             ]
           };
         }
@@ -178,10 +234,20 @@ class OpenCodex {
           });
           return { content: [{ type: "text", text: `共获取到 ${windows.length} 个可见窗口:\n${lines.join("\n")}` }] };
         }
-        case "focus_window": {
-          const { window_id } = args as any;
-          await this.actionPerformer.focusWindow(window_id);
-          return { content: [{ type: "text", text: `已将焦点切换至窗口 #${window_id}` }] };
+        case "mouse_down": {
+          const { x, y, button = "left" } = args as any;
+          await this.actionPerformer.mouseDown(x, y, button);
+          return { content: [{ type: "text", text: `已在 (${x}, ${y}) 按下鼠标 ${button} 键` }] };
+        }
+        case "mouse_up": {
+          const { x, y, button = "left" } = args as any;
+          await this.actionPerformer.mouseUp(x, y, button);
+          return { content: [{ type: "text", text: `已在 (${x}, ${y}) 释放鼠标 ${button} 键` }] };
+        }
+        case "mouse_move": {
+          const { x, y, drag = false } = args as any;
+          await this.actionPerformer.mouseMove(x, y, drag);
+          return { content: [{ type: "text", text: `已将鼠标移动至 (${x}, ${y})` + (drag ? " (拖拽模式)" : "") }] };
         }
         default:
           throw new Error(`未知工具: ${name}`);
@@ -219,16 +285,20 @@ class OpenCodex {
 
   async start() {
     this.checkAndCleanupLogsDatabase();
-    this.proxy.start(8765);
+    try {
+      this.proxy.start(8765);
+    } catch (err: any) {
+      console.error(`[OpenCodex] Proxy server port conflict (could be running as a background daemon): ${err.message}`);
+    }
     const url = "http://localhost:8765/dashboard";
-    console.log(`[OpenCodex] Dashboard → ${url}`);
+    console.error(`[OpenCodex] Dashboard → ${url}`);
     // Commented out to prevent infinite browser tabs opening when MCP server restarts
     // try {
     //   execSync(`open "${url}"`, { timeout: 3000 });
     // } catch {}
     const transport = new StdioServerTransport();
     await this.mcp.connect(transport);
-    console.log("[OpenCodex] MCP Server connected and ready.");
+    console.error("[OpenCodex] MCP Server connected and ready.");
   }
 }
 
