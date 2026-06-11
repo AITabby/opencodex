@@ -1048,7 +1048,8 @@ export function getDashboardHtml(): string {
             <span id="voice-bar-status-badge" style="font-size: 0.75rem; font-weight: 600; padding: 0.2rem 0.6rem; border-radius: 99px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">Offline</span>
           </div>
           <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
-            <button type="button" class="action-btn" id="i18n-btn-launch-voice-bar" onclick="launchVoiceBar('app')" style="flex: 1; min-width: 150px; background: var(--color-primary); color: white; margin-top: 0;">Launch Voice Assistant</button>
+            <button type="button" class="action-btn" id="i18n-btn-launch-terminal" onclick="launchVoiceBar('swift-run')" style="flex: 1; min-width: 150px; background: var(--color-primary); color: white; margin-top: 0;">Launch via Terminal</button>
+            <button type="button" class="action-btn" id="i18n-btn-launch-app" onclick="launchVoiceBar('app')" style="flex: 1; min-width: 150px; background: rgba(255,255,255,0.06); border: 1px solid var(--glass-border); color: white; margin-top: 0;">Launch as App</button>
             <a href="/visualizer" target="_blank" class="action-btn" style="flex: 1; min-width: 100%; background: linear-gradient(90deg, var(--color-primary), var(--color-secondary)); color: #000; font-weight: 700; margin-top: 0.5rem; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 0.5rem; border: none; box-shadow: 0 4px 15px rgba(6, 182, 212, 0.25);">
               Interactive Visualizer Lab
             </a>
@@ -1174,7 +1175,8 @@ export function getDashboardHtml(): string {
         toastVoiceSaved: "Voice settings saved successfully!",
         toastVoiceFailed: "Failed to save voice settings",
         voiceBarStatusLabel: "Voice Assistant Menu Bar (OpenCodexBar)",
-        btnLaunchVoiceBar: "Launch Voice Assistant",
+        btnLaunchTerminal: "Launch via Terminal (Inherits Perms)",
+        btnLaunchApp: "Launch as Standalone App",
         toastVoiceBarLaunching: "Launching Voice Assistant...",
         toastVoiceBarFailed: "Failed to launch Voice Assistant",
         panelPermissionsTitle: "macOS System Permissions (Computer Use)",
@@ -1227,7 +1229,8 @@ export function getDashboardHtml(): string {
         toastVoiceSaved: "语音配置保存成功！",
         toastVoiceFailed: "保存语音设置失败",
         voiceBarStatusLabel: "语音助手菜单栏 (OpenCodexBar)",
-        btnLaunchVoiceBar: "启动语音助手",
+        btnLaunchTerminal: "通过终端命令行启动 (继承终端TCC权限)",
+        btnLaunchApp: "以独立应用启动",
         toastVoiceBarLaunching: "正在启动语音助手...",
         toastVoiceBarFailed: "启动语音助手失败",
         panelPermissionsTitle: "macOS 系统权限修复 (Computer Use)",
@@ -1280,7 +1283,8 @@ export function getDashboardHtml(): string {
       setText('reset-btn', t.btnReset);
       setText('i18n-btn-save-voice', t.btnSaveVoice);
       setText('i18n-voice-bar-status-label', t.voiceBarStatusLabel);
-      setText('i18n-btn-launch-voice-bar', t.btnLaunchVoiceBar);
+      setText('i18n-btn-launch-terminal', t.btnLaunchTerminal);
+      setText('i18n-btn-launch-app', t.btnLaunchApp);
       setText('i18n-btn-fix-permissions', t.btnFixPermissions);
       setText('i18n-vision-fallback-title', t.visionFallbackTitle);
       setText('i18n-label-vision-key', t.labelVisionKey);

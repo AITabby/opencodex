@@ -606,22 +606,20 @@ stream_idle_timeout_ms = 600000
       setTimeout(() => {
         let startCmd = `open ${join(barDir, "OpenCodexBar.app")}`;
         if (method === "swift-run") {
-          const releasePath = join(barDir, ".build/arm64-apple-macosx/release/OpenCodexBar");
-          const debugPath = join(barDir, ".build/arm64-apple-macosx/debug/OpenCodexBar");
-          let binPath = "swift run";
-          if (existsSync(releasePath)) {
-            binPath = `./.build/arm64-apple-macosx/release/OpenCodexBar`;
-            console.log(`[OpenCodex] Found compiled release binary: ${releasePath}`);
-          } else if (existsSync(debugPath)) {
-            binPath = `./.build/arm64-apple-macosx/debug/OpenCodexBar`;
-            console.log(`[OpenCodex] Found compiled debug binary: ${debugPath}`);
-          } else {
-            console.log(`[OpenCodex] No pre-compiled binary found. Falling back to swift run.`);
+          let binPath = join(barDir, ".build/arm64-apple-macosx/release/OpenCodexBar");
+          if (!existsSync(binPath)) {
+            const debugPath = join(barDir, ".build/arm64-apple-macosx/debug/OpenCodexBar");
+            if (existsSync(debugPath)) {
+              binPath = debugPath;
+            } else {
+              binPath = "swift run";
+            }
           }
-          // Launch via Terminal.app using AppleScript to ensure it inherits Terminal's microphone and GUI permissions.
-          // This bypasses the background PM2 daemon sandbox, preventing indefinite startup card-locks and permission hangs.
-          const escapedBarDir = barDir.replace(/"/g, '\\"');
-          startCmd = `osascript -e 'tell application "Terminal" to do script "cd \\"${escapedBarDir}\\" && ${binPath} & disown && exit"'`;
+          // Create a temporary launcher script that runs the binary and exits to close the Terminal window natively.
+          const scriptPath = join(barDir, "launch_opencodex_bar.sh");
+          const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
+          writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
+          startCmd = `open -a Terminal "${scriptPath}"`;
         }
         exec(startCmd, (startErr) => {
           if (startErr) {

@@ -200,10 +200,8 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   }
 
   const computerUseSystemRule = `\n[SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode.
-- For opening applications or navigating to URLs/websites, ALWAYS prefer using direct commands (e.g., exec_command with 'open -a "Google Chrome" "https://..."') to get instant results, rather than manually clicking and typing.
-- For UI interactions (like clicking buttons or scrolling on a page), use simulated computer-use actions (e.g., click, scroll, type_text).
-- Note that before calling any computer-use action (click, type_text, press_key, scroll) on an app, you MUST call 'get_app_state' for that app in the same turn (in parallel) or immediately before to ensure the session is active.
-- Perform as many actions as possible in a single turn. You can combine multiple tool calls (e.g., get_app_state, click, type_text) in parallel in one turn to minimize communication overhead.
+- You have full access to the 'computer_use' or 'mcp__computer_use' toolset (click, scroll, type_text, press_key, get_app_state, etc.).
+- When performing UI actions, ALWAYS call 'get_app_state' first if you need to know the active application, window positions, or elements on the screen.
 ${chromePluginRule}
 - Minimize the number of turns as much as possible to ensure fast response times and high stability.`;
   systemContent = systemContent ? systemContent + "\n" + computerUseSystemRule : computerUseSystemRule;
@@ -237,6 +235,13 @@ ${chromePluginRule}
 
   const mergedMessages = _mergeConsecutiveMessages(_normalizeChatRoles(messages));
   const sanitizedMessages = _sanitizeChatMessages(mergedMessages);
+
+  if (voiceSystemPrompt && sanitizedMessages.length > 0) {
+    sanitizedMessages.push({
+      role: "system",
+      content: `[System Instruction reminder: Follow this personality style for the final response: ${voiceSystemPrompt}]`
+    });
+  }
 
   const chat: any = {
     model: upstreamModel,
@@ -453,6 +458,8 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
     if (typeof tool !== "object" || tool === null) continue;
     const toolName = tool.name || (tool.function || {}).name;
     if (toolName === "js") continue; // filter js tool
+
+
 
     const tType = tool.type;
     if (tType === "function") {
