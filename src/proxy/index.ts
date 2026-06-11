@@ -615,8 +615,11 @@ stream_idle_timeout_ms = 600000
               binPath = "swift run";
             }
           }
-          const escapedBinPath = binPath.replace(/"/g, '\\"');
-          startCmd = `osascript -e 'tell application "Terminal" to do script "\\"${escapedBinPath}\\" & disown && exit"'`;
+          // Create a temporary launcher script that runs the binary and exits to close the Terminal window natively.
+          const scriptPath = join(barDir, "launch_opencodex_bar.command");
+          const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
+          writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
+          startCmd = `open -a Terminal "${scriptPath}"`;
         }
         exec(startCmd, (startErr) => {
           if (startErr) {
