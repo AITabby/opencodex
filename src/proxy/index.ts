@@ -615,11 +615,18 @@ stream_idle_timeout_ms = 600000
               binPath = "swift run";
             }
           }
-          // Create a temporary launcher script that runs the binary and exits to close the Terminal window natively.
-          const scriptPath = join(barDir, "launch_opencodex_bar.command");
-          const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
-          writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
-          startCmd = `open -a Terminal "${scriptPath}"`;
+          if (binPath === "swift run") {
+            startCmd = `cd "${barDir}" && swift run &`;
+          } else {
+            const child = spawn(binPath, [], {
+              detached: true,
+              stdio: "ignore",
+              cwd: barDir
+            });
+            child.unref();
+            console.log(`[OpenCodex] Voice Bar spawned directly from Node server: ${binPath}`);
+            return;
+          }
         }
         exec(startCmd, (startErr) => {
           if (startErr) {
