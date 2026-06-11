@@ -616,8 +616,9 @@ stream_idle_timeout_ms = 600000
             }
           }
           // Create a temporary launcher script that runs the binary and exits to close the Terminal window natively.
+          // set -m enables job control in non-interactive scripts so & disown works correctly without killing the child process.
           const scriptPath = join(barDir, "launch_opencodex_bar.sh");
-          const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
+          const scriptContent = `#!/bin/bash\nset -m\ncd "${barDir}"\n"${binPath}" &\ndisown\nexit\n`;
           writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
           startCmd = `open -a Terminal "${scriptPath}"`;
         }
