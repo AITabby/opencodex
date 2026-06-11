@@ -619,7 +619,7 @@ stream_idle_timeout_ms = 600000
           const scriptPath = join(barDir, "launch_opencodex_bar.sh");
           const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
           writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
-          startCmd = `open -a Terminal "${scriptPath}"`;
+          startCmd = `osascript -e 'tell application "Finder" to open POSIX file "${scriptPath}" using POSIX file "/System/Applications/Utilities/Terminal.app"'`;
         }
         exec(startCmd, (startErr) => {
           if (startErr) {
