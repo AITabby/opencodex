@@ -4,4 +4,5 @@ dist/
 .DS_Store
 *.log
 models/
+launch_opencodex_bar.command
 launch_opencodex_bar.sh

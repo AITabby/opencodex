@@ -616,7 +616,7 @@ stream_idle_timeout_ms = 600000
             }
           }
           // Create a temporary launcher script that runs the binary and exits to close the Terminal window natively.
-          const scriptPath = join(barDir, "launch_opencodex_bar.sh");
+          const scriptPath = join(barDir, "launch_opencodex_bar.command");
           const scriptContent = `#!/bin/bash\n"${binPath}" & disown\nexit\n`;
           writeFileSync(scriptPath, scriptContent, { mode: 0o755 });
           startCmd = `osascript -e 'tell application "Finder" to open POSIX file "${scriptPath}" using POSIX file "/System/Applications/Utilities/Terminal.app"'`;
