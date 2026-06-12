@@ -153,14 +153,15 @@ def main():
     url = f"{api_host}/v1/t2a_v2"
     
     payload = {
-        "model": "speech-01-turbo",
+        "model": "speech-2.8-turbo",
         "text": text,
         "stream": False,
         "voice_setting": {
             "voice_id": voice_id,
-            "speed": 1.0,
+            "speed": 1.6,
             "vol": 1.0,
-            "pitch": 0
+            "pitch": 2,
+            "emotion": "excited"
         },
         "audio_setting": {
             "sample_rate": 32000,
@@ -191,9 +192,13 @@ def main():
                 print(f"ERROR: MiniMax API Error: {msg}")
                 sys.exit(1)
                 
-            audio_hex = res_json.get("data")
-            if not audio_hex:
+            audio_data = res_json.get("data")
+            if not audio_data:
                 print("ERROR: No audio data returned from MiniMax")
+                sys.exit(1)
+            audio_hex = audio_data.get("audio") if isinstance(audio_data, dict) else audio_data
+            if not audio_hex:
+                print("ERROR: No audio hex string found")
                 sys.exit(1)
                 
             audio_bytes = binascii.unhexlify(audio_hex)
@@ -1100,6 +1105,28 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/sessions/new" && req.method === "POST") {
+      try {
+        const p = join(this.configDir, "voice_settings.json");
+        let settings: any = {};
+        if (existsSync(p)) {
+          try { settings = JSON.parse(readFileSync(p, "utf-8")); } catch {}
+        }
+        settings.active_session_id = "";
+        writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
+
+        this.broadcastSession("");
+
+        console.error("[Sessions] Reset active session to start a new conversation.");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", session_id: "" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     if (path === "/api/sessions/clear-all" && req.method === "POST") {
       try {
         const historyPath = join(homedir(), ".codex", "history.jsonl");
@@ -1317,8 +1344,12 @@ stream_idle_timeout_ms = 600000
           settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) };
         } catch {}
       }
+
+      const catalog = this.getModelCatalog();
+      const available_models = (catalog.models || []).map((m: any) => m.slug);
+
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(settings));
+      res.end(JSON.stringify({ ...settings, available_models }));
       return;
     }
 
@@ -1437,10 +1468,16 @@ stream_idle_timeout_ms = 600000
           engine = "edge-tts";
         }
 
-        console.error(`[OpenCodex Voice API] Synthesizing speech via ${engine} for text: '${text.substring(0, 30)}...'`);
+        // Clean all emotional expressions in parentheses & brackets before sending to TTS (e.g. （挥手）, (笑), [微笑])
+        let cleanText = text
+          .replace(/[\(\uFF08][^\)\uFF09]*[\)\uFF09]/g, "")
+          .replace(/[\[\u3010][^\]\u3011]*[\]\u3011]/g, "")
+          .trim();
+
+        console.error(`[OpenCodex Voice API] Synthesizing speech via ${engine} for text: '${cleanText.substring(0, 30)}...'`);
 
         if (engine === "openai-compatible") {
-          this.synthesizeSpeechAPI(text, settings)
+          this.synthesizeSpeechAPI(cleanText, settings)
             .then((audioBuffer) => {
               res.writeHead(200, { "Content-Type": "audio/mpeg" });
               res.end(audioBuffer);
@@ -1451,7 +1488,7 @@ stream_idle_timeout_ms = 600000
               res.end(JSON.stringify({ error: err.message }));
             });
         } else if (engine === "doubao") {
-          this.synthesizeSpeechDoubao(text, settings)
+          this.synthesizeSpeechDoubao(cleanText, settings)
             .then((audioBuffer) => {
               res.writeHead(200, { "Content-Type": "audio/mpeg" });
               res.end(audioBuffer);
@@ -1462,7 +1499,7 @@ stream_idle_timeout_ms = 600000
               res.end(JSON.stringify({ error: err.message }));
             });
         } else if (engine === "minimax") {
-          this.synthesizeSpeechMiniMax(text, settings, (audioBuffer) => {
+          this.synthesizeSpeechMiniMax(cleanText, settings, (audioBuffer) => {
             if (audioBuffer) {
               res.writeHead(200, { "Content-Type": "audio/mpeg" });
               res.end(audioBuffer);
@@ -1471,8 +1508,18 @@ stream_idle_timeout_ms = 600000
               res.end(JSON.stringify({ error: "MiniMax synthesis failed" }));
             }
           });
+        } else if (engine === "mimo") {
+          this.synthesizeSpeechMiMo(cleanText, settings, (audioBuffer) => {
+            if (audioBuffer) {
+              res.writeHead(200, { "Content-Type": "audio/mpeg" });
+              res.end(audioBuffer);
+            } else {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Xiaomi MiMo synthesis failed" }));
+            }
+          });
         } else if (engine === "kokoro") {
-          this.synthesizeSpeechKokoro(text, settings, (audioBuffer) => {
+          this.synthesizeSpeechKokoro(cleanText, settings, (audioBuffer) => {
             if (audioBuffer) {
               res.writeHead(200, { "Content-Type": "audio/wav" });
               res.end(audioBuffer);
@@ -2068,6 +2115,8 @@ stream_idle_timeout_ms = 600000
     };
 
     appendField("model", model);
+    appendField("language", "zh");
+    appendField("prompt", "简体中文");
     appendFile("file", "speech.wav", audioData);
     payload = Buffer.concat([payload, Buffer.from(`--${boundary}--\r\n`)]);
 
@@ -2127,7 +2176,7 @@ stream_idle_timeout_ms = 600000
     const apiHost = settings.tts_base_url || "https://api.minimaxi.com";
     const voiceId = settings.tts_voice || "presenter_male";
     
-    const tempOutput = "/tmp/tts_minimax_web.mp3";
+    const tempOutput = `/tmp/tts_minimax_web_${Date.now()}_${Math.random().toString(36).substring(7)}.mp3`;
     const env = {
       ...process.env,
       MINIMAX_API_KEY: apiKey,
@@ -2149,12 +2198,71 @@ stream_idle_timeout_ms = 600000
         } catch (err: any) {
           console.error(`[OpenCodex Voice API MiniMax Err] Failed to read output file: ${err.message}`);
           cb(null);
+        } finally {
+          try { unlinkSync(tempOutput); } catch {}
         }
       } else {
         console.error(`[OpenCodex Voice API MiniMax Err] Exit code ${code}. Error: ${errOutput}`);
         cb(null);
+        try { unlinkSync(tempOutput); } catch {}
       }
     });
+  }
+
+  private async synthesizeSpeechMiMo(text: string, settings: any, cb: (data: Buffer | null) => void) {
+    const apiKey = settings.tts_api_key || "";
+    const apiHost = settings.tts_base_url || "https://api.xiaomimimo.com";
+    const voiceId = settings.tts_voice || "Chloe";
+    
+    // We can allow users to inject tone style via assistant personality prompt or default to a standard one
+    const stylePrompt = settings.voice_system_prompt || "Natural, clear and friendly tone, standard pace.";
+
+    try {
+      const response = await fetch(`${apiHost}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          "api-key": apiKey,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          model: "mimo-v2.5-tts",
+          messages: [
+            {
+              role: "user",
+              content: stylePrompt
+            },
+            {
+              role: "assistant",
+              content: text
+            }
+          ],
+          audio: {
+            format: "mp3", // OpenCodex-bar handles mp3 natively
+            voice: voiceId
+          },
+          stream: false
+        })
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`[MiMo TTS Err] Http Status ${response.status}: ${errText}`);
+        return cb(null);
+      }
+
+      const resJson: any = await response.json();
+      const audioBase64 = resJson.choices?.[0]?.message?.audio?.data;
+      if (!audioBase64) {
+        console.error(`[MiMo TTS Err] No audio data found in response: ${JSON.stringify(resJson)}`);
+        return cb(null);
+      }
+
+      const audioBuffer = Buffer.from(audioBase64, "base64");
+      cb(audioBuffer);
+    } catch (err: any) {
+      console.error(`[MiMo TTS Err] Exception: ${err.message}`);
+      cb(null);
+    }
   }
 
   private synthesizeSpeechEdge(text: string, settings: any, cb: (data: Buffer | null) => void) {
@@ -2336,11 +2444,73 @@ stream_idle_timeout_ms = 600000
     this.activeWsClients.add(ws);
     let audioBuffer = Buffer.alloc(0);
     let isListening = false;
+    let lastProcessedLength = 0;
+    let chunkInterval: NodeJS.Timeout | null = null;
+    let isProcessingChunk = false;
+    let lastSpeechActivityTime = Date.now();
+    let hasSentFinal = false;
+    let lastTranscribedText = "";
+    let consecutiveSilenceCount = 0;
+
+    // Helper to clear timer
+    const clearChunkInterval = () => {
+      if (chunkInterval) {
+        clearInterval(chunkInterval);
+        chunkInterval = null;
+      }
+    };
+
+    // Semantic VAD: Decides if we can cut off early based on transcribed text and time since last sound
+    const checkSemanticVAD = async (text: string) => {
+      if (hasSentFinal) return;
+      const trimmed = text.trim();
+      if (trimmed.length < 2) return;
+
+      // Common final Chinese particles and signs
+      const endParticles = ["吗", "呢", "了", "吧", "哈", "呀", "啊", "啦", "吗？", "呢？", "吧？", "呀？", "谢谢", "就可以了", "怎么做", "怎么办", "什么意思", "。", "？", "！"];
+      const matchesEnd = endParticles.some(p => trimmed.endsWith(p));
+
+      // Calculate if the transcription has stopped growing (indicating the user paused/stopped speaking)
+      if (trimmed === lastTranscribedText) {
+        consecutiveSilenceCount++;
+      } else {
+        consecutiveSilenceCount = 0;
+        lastTranscribedText = trimmed;
+      }
+
+      // We only cut off if we detected a sentence-end particle AND a brief silence pause (at least 1 chunk duration, ~400ms)
+      if (matchesEnd && consecutiveSilenceCount >= 1) {
+        console.error(`[Semantic VAD] Finished sentence pattern detected with active pause: "${trimmed}"`);
+        triggerSpeechEnd(trimmed);
+      }
+    };
+
+    const triggerSpeechEnd = async (finalText: string) => {
+      if (hasSentFinal) return;
+      hasSentFinal = true;
+      isListening = false;
+      clearChunkInterval();
+
+      console.error(`[Semantic VAD] Triggering early speech end. Final Text: "${finalText}"`);
+
+      // 1. Tell client to stop immediately and transition to loading state
+      ws.send(JSON.stringify({
+        type: "stop_recording",
+        text: finalText
+      }));
+
+      // 2. Deliver transcription directly as final
+      ws.send(JSON.stringify({
+        type: "transcription_final",
+        text: finalText
+      }));
+    };
 
     ws.on("message", async (data, isBinary) => {
       if (isBinary) {
         if (isListening) {
           audioBuffer = Buffer.concat([audioBuffer, data as Buffer]);
+          lastSpeechActivityTime = Date.now();
         }
         return;
       }
@@ -2349,12 +2519,85 @@ stream_idle_timeout_ms = 600000
         const msg = JSON.parse(data.toString());
         if (msg.type === "start_stt") {
           audioBuffer = Buffer.alloc(0);
+          lastProcessedLength = 0;
+          lastTranscribedText = "";
+          consecutiveSilenceCount = 0;
           isListening = true;
+          isProcessingChunk = false;
+          hasSentFinal = false;
+          lastSpeechActivityTime = Date.now();
           console.error("[WebSocket STT] Listening started...");
+
+          // Periodically check/transcribe current buffer
+          clearChunkInterval();
+          chunkInterval = setInterval(async () => {
+            if (!isListening || isProcessingChunk || hasSentFinal) return;
+            // Wait for at least 1 second of audio to start slicing
+            if (audioBuffer.length < 32000) return; 
+
+            // Only transcribe if we have new data
+            if (audioBuffer.length > lastProcessedLength + 8000) {
+              isProcessingChunk = true;
+              try {
+                const currentBuffer = audioBuffer; // Capture snapshot
+                lastProcessedLength = currentBuffer.length;
+                
+                const p = join(this.configDir, "voice_settings.json");
+                let settings: any = {
+                  stt_engine: "local-whisper",
+                  stt_api_key: "",
+                  stt_base_url: "https://api.openai.com/v1",
+                  stt_model: "whisper-1"
+                };
+                if (existsSync(p)) {
+                  try { settings = { ...settings, ...JSON.parse(readFileSync(p, "utf-8")) }; } catch {}
+                }
+
+                const wavBuffer = pcmToWav(currentBuffer, 16000, 1, 16);
+                const tmpWavPath = `/tmp/ws_chunk_${Date.now()}.wav`;
+                writeFileSync(tmpWavPath, wavBuffer);
+
+                let text = "";
+                const isAPI = settings.stt_engine === "openai-compatible" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
+                if (isAPI) {
+                  text = await this.transcribeAudioAPI(tmpWavPath, settings);
+                } else {
+                  text = await new Promise<string>((resolve) => {
+                    this.transcribeAudioLocal(tmpWavPath, (resText) => {
+                      resolve(resText || "");
+                    });
+                  });
+                }
+
+                try { unlinkSync(tmpWavPath); } catch {}
+
+                if (text && text.trim().length > 0) {
+                  console.error(`[WebSocket STT Chunk] Current transcript: "${text}"`);
+                  // Notify visualizer or dashboard about progress
+                  ws.send(JSON.stringify({
+                    type: "transcription_chunk",
+                    text: text
+                  }));
+
+                  // Check if this text meets the finality criteria
+                  await checkSemanticVAD(text);
+                }
+              } catch (err: any) {
+                console.error(`[WebSocket STT Chunk Error] ${err.message}`);
+              } finally {
+                isProcessingChunk = false;
+              }
+            }
+          }, 400); // Check every 400ms
+
         } else if (msg.type === "stop_stt") {
           isListening = false;
-          console.error(`[WebSocket STT] Listening stopped. Audio size: ${audioBuffer.length} bytes`);
-          await this.processWebSocketSTT(ws, audioBuffer);
+          clearChunkInterval();
+          if (!hasSentFinal) {
+            console.error(`[WebSocket STT] Listening stopped. Final processing. Audio size: ${audioBuffer.length} bytes`);
+            await this.processWebSocketSTT(ws, audioBuffer);
+            hasSentFinal = true;
+          }
         } else if (msg.type === "active_session_changed") {
           const sid = msg.session_id;
           if (sid) {
@@ -2376,6 +2619,7 @@ stream_idle_timeout_ms = 600000
     ws.on("close", () => {
       this.activeWsClients.delete(ws);
       isListening = false;
+      clearChunkInterval();
       audioBuffer = Buffer.alloc(0);
     });
   }

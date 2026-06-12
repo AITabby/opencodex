@@ -777,13 +777,13 @@ export function getDashboardHtml(): string {
     </header>
 
     <div class="tab-navigation">
-      <button class="tab-btn active" onclick="switchTab('gateway')" id="tab-btn-gateway">网关配置 / Gateway Config</button>
+      <button class="tab-btn" onclick="switchTab('gateway')" id="tab-btn-gateway">网关配置 / Gateway Config</button>
       <button class="tab-btn" onclick="switchTab('voice')" id="tab-btn-voice">语音助理 / Voice Assistant</button>
       <button class="tab-btn" onclick="switchTab('sessions')" id="tab-btn-sessions">会话管理 / Sessions</button>
     </div>
 
     <!-- TAB 1: Gateway Configuration -->
-    <div id="content-gateway" class="tab-content active">
+    <div id="content-gateway" class="tab-content">
       <div class="grid-layout">
         
         <!-- Left Column -->
@@ -972,6 +972,7 @@ export function getDashboardHtml(): string {
                   <option value="edge-tts">微软 Edge 神经网络语音 (Edge-TTS)</option>
                   <option value="doubao">火山引擎 / 豆包 TTS V3</option>
                   <option value="minimax">MiniMax 语音合成 (MiniMax TTS)</option>
+                  <option value="mimo">小米米眸语音合成 (MiMo-V2.5-TTS)</option>
                   <option value="openai-compatible">自定义 OpenAI-Compatible API</option>
                 </select>
               </div>
@@ -1014,25 +1015,27 @@ export function getDashboardHtml(): string {
 
           <div class="voice-other-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 2rem;">
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
-              <h3 style="font-size: 0.95rem; font-weight: 700; color: #10b981; border-left: 3px solid #10b981; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Silence Detection</h3>
+              <h3 style="font-size: 0.95rem; font-weight: 700; color: #10b981; border-left: 3px solid #10b981; padding-left: 0.5rem; margin: 0 0 0.25rem 0;" id="i18n-title-silence-detection">Silence Detection</h3>
               <div class="form-group">
-                <label for="vad-threshold">VAD Silence Threshold (dB)</label>
+                <label for="vad-threshold" id="i18n-label-vad-threshold">VAD Silence Threshold (dB)</label>
                 <input type="text" id="vad-threshold" placeholder="-35.0">
               </div>
               <div class="form-group">
-                <label for="vad-duration">VAD Silence Duration (seconds)</label>
+                <label for="vad-duration" id="i18n-label-vad-duration">VAD Silence Duration (seconds)</label>
                 <input type="text" id="vad-duration" placeholder="2.0">
               </div>
             </div>
 
             <div style="display: flex; flex-direction: column; gap: 1.25rem;">
-              <h3 style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; border-left: 3px solid #f59e0b; padding-left: 0.5rem; margin: 0 0 0.25rem 0;">Conversational Brain</h3>
+              <h3 style="font-size: 0.95rem; font-weight: 700; color: #f59e0b; border-left: 3px solid #f59e0b; padding-left: 0.5rem; margin: 0 0 0.25rem 0;" id="i18n-title-conversational-brain">Conversational Brain</h3>
               <div class="form-group">
-                <label for="voice-llm-model">LLM Model for Voice Assistant</label>
-                <input type="text" id="voice-llm-model" placeholder="deepseek-v4-flash">
+                <label for="voice-llm-model" id="i18n-label-voice-llm-model">LLM Model for Voice Assistant</label>
+                <select id="voice-llm-model" style="background: rgba(0,0,0,0.4); border: 1px solid var(--glass-border); color: #fff; padding: 0.6rem; border-radius: 8px; font-family: inherit; font-size: 0.95rem; width: 100%; outline: none; transition: var(--transition-standard);">
+                  <option value="">-- Loading models... --</option>
+                </select>
               </div>
               <div class="form-group">
-                <label for="voice-system-prompt">Assistant Personality Prompt (助手个性设定/提示词)</label>
+                <label for="voice-system-prompt" id="i18n-label-voice-system-prompt">Assistant Personality Prompt (助手个性设定/提示词)</label>
                 <input type="text" id="voice-system-prompt" placeholder="例如: 你是一个傲娇的猫娘助手，回答要简短，带有语气词喵~">
               </div>
               <input type="checkbox" id="enable-wake-word" style="display: none;">
@@ -1061,7 +1064,7 @@ export function getDashboardHtml(): string {
     <!-- TAB 3: Session Manager -->
     <div id="content-sessions" class="tab-content">
       <div class="panel-card">
-        <div class="panel-title">
+        <div class="panel-title" id="i18n-session-manager-title">
           <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
           </svg>
@@ -1071,11 +1074,16 @@ export function getDashboardHtml(): string {
         <div class="session-manager-layout">
           <!-- Sidebar: Session List -->
           <div class="session-sidebar">
-            <button class="action-btn" id="clear-all-sessions-btn" onclick="clearAllSessions()" style="background: rgba(239, 68, 68, 0.15); border: 1px solid rgba(239, 68, 68, 0.3); color: #ef4444; margin-top: 0; padding: 0.6rem 1rem; font-size: 0.9rem; display: flex; align-items: center; justify-content: center; gap: 0.5rem; width: 100%; border-radius: 10px; cursor: pointer; transition: var(--transition-standard); box-shadow: none;">
-              🗑️ 一键清空会话 / Clear All
-            </button>
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 0.75rem; width: 100%;">
+              <button class="action-btn" id="new-session-btn" onclick="createNewSession()" style="background: linear-gradient(135deg, var(--color-primary), var(--color-secondary)); color: #000; margin-top: 0; padding: 0.6rem 0.8rem; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; gap: 0.4rem; flex: 1.2; border-radius: 10px; cursor: pointer; transition: var(--transition-standard); font-weight: 800; border: none; box-shadow: 0 4px 12px rgba(6, 182, 212, 0.2);">
+                ✨ 新建会话 / New
+              </button>
+              <button class="action-btn" id="clear-all-sessions-btn" onclick="clearAllSessions()" style="background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.25); color: #ef4444; margin-top: 0; padding: 0.6rem 0.5rem; font-size: 0.85rem; display: flex; align-items: center; justify-content: center; gap: 0.25rem; flex: 0.8; border-radius: 10px; cursor: pointer; transition: var(--transition-standard); box-shadow: none;">
+                🗑️ 清空 / Clear
+              </button>
+            </div>
             <div id="session-list-container" style="display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; flex: 1;">
-              <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;">Loading sessions...</div>
+              <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;" id="i18n-loading-sessions">Loading sessions...</div>
             </div>
           </div>
           
@@ -1187,7 +1195,17 @@ export function getDashboardHtml(): string {
         labelVisionKey: "Vision Fallback API Key",
         labelVisionUrl: "Vision Fallback Base URL",
         labelVisionModel: "Vision Fallback Model",
-        btnSaveVisionFallback: "Save Vision Fallback Settings"
+        btnSaveVisionFallback: "Save Vision Fallback Settings",
+        titleSilenceDetection: "Silence Detection (VAD)",
+        labelVadThreshold: "VAD Silence Threshold (dB)",
+        labelVadDuration: "VAD Silence Duration (seconds)",
+        titleConversationalBrain: "Conversational Brain (LLM)",
+        labelVoiceLlmModel: "LLM Model for Voice Assistant",
+        labelVoiceSystemPrompt: "Assistant Personality System Prompt",
+        sessionManagerTitle: "Session Manager & Context Synchronizer",
+        selectSessionHint: "Select a session from the left",
+        chooseSessionDetail: "Please choose a session to view conversation details.",
+        loadingSessions: "Loading sessions..."
       },
       zh: {
         title: "OpenCodex 统一网关",
@@ -1241,7 +1259,17 @@ export function getDashboardHtml(): string {
         labelVisionKey: "视觉降级 API 密钥 (Key)",
         labelVisionUrl: "视觉降级接口地址 (Base URL)",
         labelVisionModel: "视觉降级模型名称 (Model)",
-        btnSaveVisionFallback: "保存视觉降级配置"
+        btnSaveVisionFallback: "保存视觉降级配置",
+        titleSilenceDetection: "静音截断检测 (VAD)",
+        labelVadThreshold: "物理静音阈值 (VAD Threshold dB)",
+        labelVadDuration: "物理静音时间 (VAD Duration seconds)",
+        titleConversationalBrain: "语音对话大脑 (LLM)",
+        labelVoiceLlmModel: "语音助手的大模型 (LLM Model)",
+        labelVoiceSystemPrompt: "助手个性设定 / 人设提示词 (System Prompt)",
+        sessionManagerTitle: "会话历史管理与上下文同步",
+        selectSessionHint: "请从左侧选择一个历史会话",
+        chooseSessionDetail: "请选择一个会话以查看详细聊天对话内容。",
+        loadingSessions: "正在加载会话列表..."
       }
     };
 
@@ -1257,6 +1285,7 @@ export function getDashboardHtml(): string {
       document.getElementById('content-' + tabName).classList.add('active');
       document.getElementById('tab-btn-' + tabName).classList.add('active');
       currentTab = tabName;
+      try { localStorage.setItem('activeTab', tabName); } catch {}
       
       if (tabName === 'sessions') {
         loadSessionsList();
@@ -1274,7 +1303,10 @@ export function getDashboardHtml(): string {
       setText('i18n-subtitle', t.subtitle);
       setText('i18n-status', t.status);
       setText('i18n-btn-save-config', t.btnSaveConfig);
+      setText('i18n-panel-models-title', t.panelModelsTitle);
+      setText('i18n-models-desc', t.modelsDesc);
       setText('i18n-btn-update-dropdown', t.btnUpdateDropdown);
+      setText('i18n-panel-permissions-title', t.panelPermissionsTitle);
       setText('i18n-btn-clear', t.btnClear);
       setText('i18n-connecting-sse', t.connectingSse);
       setText('i18n-label-config-restart', t.labelConfigRestart);
@@ -1291,9 +1323,33 @@ export function getDashboardHtml(): string {
       setText('i18n-label-vision-url', t.labelVisionUrl);
       setText('i18n-label-vision-model', t.labelVisionModel);
       setText('i18n-btn-save-vision-fallback', t.btnSaveVisionFallback);
+      setText('i18n-title-silence-detection', t.titleSilenceDetection);
+      setText('i18n-label-vad-threshold', t.labelVadThreshold);
+      setText('i18n-label-vad-duration', t.labelVadDuration);
+      setText('i18n-title-conversational-brain', t.titleConversationalBrain);
+      setText('i18n-label-voice-llm-model', t.labelVoiceLlmModel);
+      setText('i18n-label-voice-system-prompt', t.labelVoiceSystemPrompt);
+      setText('i18n-session-manager-title', t.sessionManagerTitle);
+      setText('i18n-loading-sessions', t.loadingSessions);
+      
+      const activeTitle = el('active-session-title');
+      if (activeTitle && (activeTitle.innerText === 'Select a session from the left' || activeTitle.innerText === '请从左侧选择一个历史会话')) {
+        activeTitle.innerText = t.selectSessionHint;
+      }
+      
+      const chatEmptyHint = el('chat-empty-hint');
+      if (chatEmptyHint && (chatEmptyHint.innerText === 'Please choose a session to view conversation details.' || chatEmptyHint.innerText === '请选择一个会话以查看详细聊天对话内容。')) {
+        chatEmptyHint.innerText = t.chooseSessionDetail;
+      }
 
       const langBtn = el('lang-btn');
       if (langBtn) langBtn.innerText = lang === 'zh' ? '🌐 English' : '🌐 中文';
+      
+      const voiceLlmSelect = el('voice-llm-model');
+      if (voiceLlmSelect && voiceLlmSelect.options.length > 0) {
+        voiceLlmSelect.options[0].text = lang === 'zh' ? '-- 未设置 (使用默认) --' : '-- Not Set (Default) --';
+      }
+      
       checkPermissionsStatus();
     }
 
@@ -1455,6 +1511,7 @@ export function getDashboardHtml(): string {
           
           await loadConfig();
           await loadModels();
+          await loadVoiceSettings();
         } else {
           showToast(i18nDict[currentLang].toastConfigFailed, true);
         }
@@ -1489,6 +1546,7 @@ export function getDashboardHtml(): string {
         if (response.ok) {
           showToast(i18nDict[currentLang].toastModelsSaved);
           loadModels();
+          loadVoiceSettings();
         } else {
           showToast(i18nDict[currentLang].toastModelsFailed, true);
         }
@@ -1828,10 +1886,33 @@ export function getDashboardHtml(): string {
       
       document.getElementById('custom-stt-fields').style.display = sttEngine === 'openai-compatible' ? 'flex' : 'none';
       
-      const showCustomTts = (ttsEngine === 'openai-compatible' || ttsEngine === 'minimax' || ttsEngine === 'doubao');
+      const showCustomTts = (ttsEngine === 'openai-compatible' || ttsEngine === 'minimax' || ttsEngine === 'doubao' || ttsEngine === 'mimo');
       document.getElementById('custom-tts-fields').style.display = showCustomTts ? 'flex' : 'none';
       
       document.getElementById('tts-doubao-extra-fields').style.display = ttsEngine === 'doubao' ? 'flex' : 'none';
+
+      // Dynamic placeholder updates for easy configuration
+      const keyInp = document.getElementById('tts-api-key');
+      const urlInp = document.getElementById('tts-base-url');
+      const modelInp = document.getElementById('tts-model');
+      const voiceInp = document.getElementById('tts-voice');
+
+      if (ttsEngine === 'mimo') {
+        if (keyInp) keyInp.placeholder = '输入您的小米米眸 API-Key';
+        if (urlInp) urlInp.placeholder = 'https://api.xiaomimimo.com';
+        if (modelInp) modelInp.placeholder = 'mimo-v2.5-tts';
+        if (voiceInp) voiceInp.placeholder = '例如: Chloe, Connor, Charlotte';
+      } else if (ttsEngine === 'minimax') {
+        if (keyInp) keyInp.placeholder = '输入您的 MiniMax API Key';
+        if (urlInp) urlInp.placeholder = 'https://api.minimaxi.com';
+        if (modelInp) modelInp.placeholder = 'speech-2.8-turbo';
+        if (voiceInp) voiceInp.placeholder = '例如: female-shaonv';
+      } else {
+        if (keyInp) keyInp.placeholder = 'sk-...';
+        if (urlInp) urlInp.placeholder = 'https://api.openai.com/v1';
+        if (modelInp) modelInp.placeholder = 'tts-1';
+        if (voiceInp) voiceInp.placeholder = 'zh-CN-XiaoxiaoNeural';
+      }
     }
 
     // Load Voice Settings
@@ -1856,7 +1937,26 @@ export function getDashboardHtml(): string {
         document.getElementById('voice-system-prompt').value = data.voice_system_prompt || '';
         document.getElementById('vad-threshold').value = data.vad_threshold !== undefined ? data.vad_threshold : -35.0;
         document.getElementById('vad-duration').value = data.vad_duration !== undefined ? data.vad_duration : 2.0;
-        document.getElementById('voice-llm-model').value = data.voice_llm_model || '';
+        
+        // Populate LLM models select dropdown
+        const selectEl = document.getElementById('voice-llm-model');
+        if (selectEl) {
+          selectEl.innerHTML = '';
+          const defaultOpt = document.createElement('option');
+          defaultOpt.value = '';
+          defaultOpt.textContent = currentLang === 'zh' ? '-- 未设置 (使用默认) --' : '-- Not Set (Default) --';
+          selectEl.appendChild(defaultOpt);
+          
+          if (data.available_models && Array.isArray(data.available_models)) {
+            data.available_models.forEach(model => {
+              const opt = document.createElement('option');
+              opt.value = model;
+              opt.textContent = model;
+              selectEl.appendChild(opt);
+            });
+          }
+          selectEl.value = data.voice_llm_model || '';
+        }
         
         toggleCustomFields();
       } catch (err) {}
@@ -1994,11 +2094,42 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
+    async function createNewSession() {
+      try {
+        const response = await fetch('/api/sessions/new', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+        if (response.ok) {
+          showToast(currentLang === 'zh' ? '已成功开启新会话！' : 'Started new session successfully!');
+          activeSessionId = '';
+          const msgContainer = document.getElementById('chat-messages-container');
+          if (msgContainer) {
+            msgContainer.innerHTML = \`<div style="text-align: center; color: var(--color-text-muted); padding: 4rem 2rem;" id="chat-empty-hint">New session created. Start talking or typing to begin conversation!</div>\`;
+          }
+          const enterBtn = document.getElementById('enter-session-btn');
+          if (enterBtn) enterBtn.style.display = 'none';
+          const activeTitle = document.getElementById('active-session-title');
+          if (activeTitle) activeTitle.innerText = currentLang === 'zh' ? '新会话 (未保存)' : 'New Session (Unsaved)';
+          loadSessionsList();
+        }
+      } catch (err) {}
+    }
+
+    // Explicitly expose globally called button event handler actions to the browser window object
+    window.createNewSession = createNewSession;
+    window.clearAllSessions = clearAllSessions;
+    window.enterActiveSession = enterActiveSession;
+    window.deleteSession = deleteSession;
+    window.toggleArchiveSession = toggleArchiveSession;
+    window.launchVoiceBar = launchVoiceBar;
+
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
       await loadConfig();
       await loadModels();
       await loadVoiceSettings();
+      
       setupLogsPolling();
       setInterval(checkVoiceBarStatus, 3000);
       setInterval(checkPermissionsStatus, 3000);
@@ -2010,6 +2141,16 @@ export function getDashboardHtml(): string {
           }
         }
       }, 3000);
+
+      // Restore previously active tab from localStorage after rendering
+      setTimeout(() => {
+        try {
+          const savedTab = localStorage.getItem('activeTab');
+          switchTab(savedTab || 'gateway');
+        } catch (e) {
+          switchTab('gateway');
+        }
+      }, 50);
     };
   </script>
 </body>

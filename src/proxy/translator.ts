@@ -1145,12 +1145,47 @@ export async function replaceScreenshotPlaceholders(body: any, config?: any): Pr
               }
               
               const replacement = `[截图描述: ${desc}]`;
-              return val.replace(match[0], replacement);
+              val = val.replace(match[0], replacement);
             } catch (err: any) {
               console.error(`[OpenCodex-Bypass] Error processing screenshot cache:`, err.message);
             }
           } else {
             console.error(`[OpenCodex-Bypass] Cached screenshot file not found: ${cachePath}`);
+          }
+        }
+
+        // Intercept drag-dropped image files in notch client prompt (only if not already processed in history)
+        if (!val.includes("[拖入图片描述:") && !val.includes("[截图描述:")) {
+          const dragMatch = val.match(/保存在本地路径：([^\s\(\)]+\.(?:png|jpg|jpeg|gif|webp))/);
+          if (dragMatch) {
+            const dragPath = dragMatch[1].trim();
+            if (fs.existsSync(dragPath)) {
+              try {
+                console.error(`[OpenCodex-Bypass] Found drag-dropped image at path: ${dragPath}`);
+                const imgData = fs.readFileSync(dragPath);
+                const b64 = imgData.toString("base64");
+                const compressed = sipsCompressB64(b64);
+                console.error(`[OpenCodex-Bypass] Loaded and compressed drag image, size: ${(imgData.length/1024).toFixed(0)}KB -> ${(compressed.length/3/1024).toFixed(0)}KB`);
+
+                let desc = "";
+                if (config) {
+                  const fetchedDesc = await describeImageB64(compressed, config);
+                  if (fetchedDesc) {
+                    desc = fetchedDesc;
+                  }
+                }
+                if (!desc) {
+                  desc = "拖入图片（已在本地准备就绪，由于未配置视觉模型无法生成文本描述）";
+                }
+                
+                const replacement = `保存在本地路径：${dragPath} [拖入图片描述: ${desc}]`;
+                val = val.replace(dragMatch[0], replacement);
+              } catch (err: any) {
+                console.error(`[OpenCodex-Bypass] Error processing drag image:`, err.message);
+              }
+            } else {
+              console.error(`[OpenCodex-Bypass] Drag-dropped file not found on disk: ${dragPath}`);
+            }
           }
         }
       } else if (Array.isArray(val)) {
