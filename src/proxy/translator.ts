@@ -429,10 +429,19 @@ function _responsesInputToMessages(value: any): any[] {
       });
     } else if (itemType === "function_call_output") {
       flushPendingAssistantToolCalls();
+      const outputText = _contentToText(item.output || "");
+
+      // Parse get_app_state result to update CURRENT_ACTIVE_APP from actual app state,
+      // not from what the model guessed in the function call arguments.
+      const appMatch = outputText.match(/App=.*?\/([^\/]+\.app)\//);
+      if (appMatch) {
+        CURRENT_ACTIVE_APP = appMatch[1].replace(/\.app$/, "");
+      }
+
       messages.push({
         role: "tool",
         tool_call_id: item.call_id,
-        content: _contentToText(item.output || ""),
+        content: outputText,
       });
       flushDeferred();
     } else if (itemType === "reasoning") {

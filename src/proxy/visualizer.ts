@@ -455,23 +455,68 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       background: transparent !important;
     }
     body.hud-mode #hud-card {
-      background: #000000 !important;
+      background: transparent !important;
       border: none !important;
-      border-radius: 0 0 16px 16px !important; /* Flush top, rounded bottom corners to blend with notch */
-      padding: 48px 0 8px 0 !important; /* Push contents down below the 48px physical notch area */
-      width: 260px !important; /* Set explicit width matching the visual notch space */
-      height: 120px !important; /* Set explicit height matching convenience init */
+      padding: 0 !important;
+      width: 560px !important;
+      height: 38px !important;
       margin: 0 !important;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.65) !important;
+      box-shadow: none !important;
       display: flex !important;
-      flex-direction: column !important; /* Stack vertically */
       align-items: center !important;
       justify-content: center !important;
-      gap: 0.15rem !important;
-      box-sizing: border-box !important;
       position: relative !important;
       z-index: 1 !important;
-      overflow: hidden !important;
+      overflow: visible !important;
+    }
+
+    .notch-wing-left {
+      position: absolute !important;
+      top: 0 !important;
+      background: transparent !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      pointer-events: none !important;
+      z-index: 5 !important;
+      transition: none !important;
+    }
+
+    .status-indicator-led {
+      width: 7.5px !important;
+      height: 7.5px !important;
+      border-radius: 50% !important;
+      background: #ff453a;
+      box-shadow: 0 0 8px 2px #ff453a;
+      transition: all 0.3s ease !important;
+      animation: ledBreath 2s infinite ease-in-out;
+    }
+
+    @keyframes ledBreath {
+      0%, 100% { opacity: 0.55; transform: scale(0.95); }
+      50% { opacity: 1; transform: scale(1.05); }
+    }
+
+    .notch-wing-right {
+      position: absolute !important;
+      top: 0 !important;
+      background: transparent !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      gap: 2.5px !important;
+      pointer-events: none !important;
+      z-index: 5 !important;
+      transition: none !important;
+    }
+
+    .eq-bar {
+      width: 3px !important;
+      height: 3px;
+      background: linear-gradient(180deg, #a855f7 0%, #06b6d4 100%) !important;
+      border-radius: 1.5px !important;
+      transition: height 0.08s ease-in-out !important;
+      flex-shrink: 0 !important;
     }
 
     body.hud-mode #hud-card.state-draghover {
@@ -627,24 +672,23 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
       <!-- CARD 4: Audio Equalizer & Particle Field -->
       <div class="${isHudModeStatic ? 'hud-card-mode' : 'visualizer-card'}" id="hud-card">
-        <div class="card-title card-title-eq">
-          <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z"></path>
-          </svg>
-          极光频谱与环境粒子流 (Spectrum & Particles)
+        <!-- SVG Bezier Backdrop Ears -->
+        <svg class="notch-bridge-svg" viewBox="0 0 560 38" fill="none" xmlns="http://www.w3.org/2000/svg" style="position: absolute; left:0; top:0; width:560px; height:38px; pointer-events:none; z-index:2;">
+          <path d="M 0,0 L 135,0 Q 142,0 145,12 Q 147,24 150,24 Q 160,24 165,31 Q 165,38 175,38 L 385,38 Q 395,38 400,31 Q 400,24 410,24 Q 413,24 415,12 Q 418,0 425,0 L 560,0 Z" fill="#000000" />
+        </svg>
+
+        <div class="notch-wing-left" id="hud-left-wing" style="position: relative; display: flex; align-items: center; justify-content: center;">
+          <span id="hud-status-text" style="position: absolute; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.8px; white-space: nowrap; opacity: 1; transform: scale(1); transition: color 0.3s ease, text-shadow 0.3s ease, opacity 0.3s ease, transform 0.3s ease;"></span>
+          <div class="status-indicator-led" id="hud-status-led" style="position: absolute; opacity: 0; transform: scale(0.5); transition: opacity 0.3s ease, transform 0.3s ease !important;"></div>
         </div>
-        <!-- Left text container specifically for HUD Mode -->
-        <div id="hud-text-container" style="display: none; flex-direction: column; justify-content: center; width: 230px; gap: 0.15rem; flex-shrink: 0; text-align: left; overflow: hidden; position: relative;">
-          <div id="hud-state-label" style="font-size: 0.65rem; font-weight: 800; text-transform: uppercase; letter-spacing: 1.5px; color: var(--color-secondary); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; z-index: 2; background: transparent;">
-            <span class="status-dot" id="hud-status-dot"></span>
-            <span id="hud-state-text">IDLE</span>
-          </div>
-          <!-- Subtext scrolling viewport wrapper -->
-          <div style="width: 230px; overflow: hidden; position: relative; height: 1.2rem; z-index: 1;">
-            <div id="hud-subtext" style="font-size: 0.76rem; font-weight: 500; color: rgba(255, 255, 255, 0.88); white-space: nowrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: inline-block; position: absolute; left: 0; top: 0; transform: translateX(0); width: max-content; max-width: none !important; opacity: 0;"></div>
-          </div>
+        <div class="notch-wing-right" id="hud-right-wing">
+          <div class="eq-bar" id="eq-bar-1"></div>
+          <div class="eq-bar" id="eq-bar-2"></div>
+          <div class="eq-bar" id="eq-bar-3"></div>
+          <div class="eq-bar" id="eq-bar-4"></div>
+          <div class="eq-bar" id="eq-bar-5"></div>
         </div>
-        <div class="preview-area">
+        <div class="preview-area" style="display: none;">
           <canvas class="preview-canvas" id="canvas-eq"></canvas>
         </div>
         <div class="card-desc">
@@ -690,10 +734,22 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       document.documentElement.classList.add('hud-mode');
       document.body.classList.add('hud-mode');
       const hudCard = document.getElementById('hud-card');
+      const h = parseInt(urlParams.get('h') || '24', 10);
+      
       if (hudCard) {
         hudCard.classList.remove('visualizer-card');
         hudCard.classList.add('hud-card-mode');
+        hudCard.style.setProperty('height', h + 'px', 'important');
       }
+      
+      // Update dynamic notch SVG path container size
+      const svg = document.querySelector('.notch-bridge-svg');
+      if (svg) {
+        svg.setAttribute('height', h + 'px');
+        svg.style.height = h + 'px';
+        svg.setAttribute('viewBox', '0 0 560 ' + h);
+      }
+
       const hudContainer = document.getElementById('hud-text-container');
       if (hudContainer) hudContainer.style.display = 'flex';
     }
@@ -709,117 +765,65 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
     // Expose dynamic JSBridge interface for native app integrations
     let currentSpeechText = "";
+    let currentVoiceState = 'idle';
+    let currentExtension = 0; // Dynamic extension factor (0.0 to 1.0)
+    let compactMode = false;
+    let currentWingExtLeft = 0;
+    let currentWingExtRight = 0;
+
+    window.updateCompactMode = function(isCompact) {
+      compactMode = isCompact;
+    };
 
     window.updateVoiceState = function(state, amplitude, text) {
-      // state: 'listening', 'thinking', 'speaking', 'idle', 'draghover', 'dropabsorb'
-      const stateLabel = document.getElementById('hud-state-label');
-      const stateText = document.getElementById('hud-state-text');
-      const statusDot = document.getElementById('hud-status-dot');
-      const subtext = document.getElementById('hud-subtext');
-      
+      const statusTextElement = document.getElementById('hud-status-text');
+      const statusLedElement = document.getElementById('hud-status-led');
       const hudCard = document.getElementById('hud-card');
+      
+      currentVoiceState = state;
+      currentAmplitude = amplitude;
+
       if (hudCard) {
         hudCard.className = 'hud-card-mode state-' + state;
       }
       
-      currentAmplitude = amplitude;
-      
-      if (state === 'listening') {
-        currentSpeechText = "";
-        // Dynamic theme synchronization on wake-up!
-        fetch('/api/voice-settings')
-          .then(res => res.json())
-          .then(data => {
-            document.body.classList.remove('theme-vortex', 'theme-siri');
-            let theme = data.hud_theme || 'vortex';
-            if (theme !== 'vortex' && theme !== 'siri') {
-              theme = 'vortex';
-            }
-            document.body.classList.add('theme-' + theme);
-          })
-          .catch(err => console.error('Failed to sync theme:', err));
-
-        if (stateLabel) stateLabel.style.color = 'var(--color-danger)';
-        if (stateText) stateText.innerText = 'Listening';
-        if (statusDot) {
-          statusDot.style.backgroundColor = 'var(--color-danger)';
-          statusDot.style.boxShadow = '0 0 8px var(--color-danger)';
-        }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = '';
-          subtext.style.opacity = '0';
-        }
-        eqMode = 'realtime';
-      } else if (state === 'thinking') {
-        currentSpeechText = "";
-        if (stateLabel) stateLabel.style.color = 'var(--color-warning)';
-        if (stateText) stateText.innerText = 'Thinking';
-        if (statusDot) {
-          statusDot.style.backgroundColor = 'var(--color-warning)';
-          statusDot.style.boxShadow = '0 0 8px var(--color-warning)';
-        }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = '';
-          subtext.style.opacity = '0';
-        }
-        eqMode = 'quiet';
-      } else if (state === 'speaking') {
-        if (stateLabel) stateLabel.style.color = 'var(--color-secondary)';
-        if (stateText) stateText.innerText = 'Speaking';
-        if (statusDot) {
-          statusDot.style.backgroundColor = 'var(--color-secondary)';
-          statusDot.style.boxShadow = '0 0 8px var(--color-secondary)';
-        }
-        eqMode = 'realtime';
-        
-        if (subtext && text && currentSpeechText !== text) {
-          currentSpeechText = text;
-          // 1. Reset position immediately
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = text;
-          subtext.style.opacity = '1';
-          
-          // 2. Measure and trigger smooth marquee scroll
-          const textWidth = subtext.offsetWidth;
-          const containerWidth = 230;
-          const offset = textWidth - containerWidth;
-          
-          if (offset > 0) {
-            // Force layout reflow so the transition starts from 0
-            subtext.offsetHeight; 
-            
-            // Uniform speaking rate: flat 190ms per character across all text lengths and languages, plus a tiny 300ms speech initiation buffer
-            const durationMs = text.length * 190 + 300;
-            const durationSec = Math.max(1.2, durationMs / 1000);
-            
-            subtext.style.transition = 'transform ' + durationSec + 's linear';
-            subtext.style.transform = 'translateX(-' + offset + 'px)';
+      if (statusTextElement) {
+        if (state === 'listening') {
+          statusTextElement.innerText = 'Listening';
+          statusTextElement.style.color = '#ff3b30';
+          statusTextElement.style.textShadow = '0 0 6px rgba(255, 59, 48, 0.6)';
+          if (statusLedElement) {
+            statusLedElement.style.background = '#ff3b30';
+            statusLedElement.style.boxShadow = '0 0 8px 2px #ff3b30';
+          }
+        } else if (state === 'thinking') {
+          statusTextElement.innerText = 'Thinking';
+          statusTextElement.style.color = '#ffcc00';
+          statusTextElement.style.textShadow = '0 0 6px rgba(255, 204, 0, 0.6)';
+          if (statusLedElement) {
+            statusLedElement.style.background = '#ffcc00';
+            statusLedElement.style.boxShadow = '0 0 8px 2px #ffcc00';
+          }
+        } else if (state === 'speaking') {
+          statusTextElement.innerText = 'Speaking';
+          statusTextElement.style.color = '#007aff';
+          statusTextElement.style.textShadow = '0 0 6px rgba(0, 122, 255, 0.6)';
+          if (statusLedElement) {
+            statusLedElement.style.background = '#007aff';
+            statusLedElement.style.boxShadow = '0 0 8px 2px #007aff';
+          }
+        } else {
+          statusTextElement.innerText = '';
+          statusTextElement.style.color = 'transparent';
+          statusTextElement.style.textShadow = 'none';
+          if (statusLedElement) {
+            statusLedElement.style.background = '#10b981';
+            statusLedElement.style.boxShadow = '0 0 8px 2px #10b981';
           }
         }
-      } else if (state === 'idle') {
-        currentSpeechText = "";
-        if (stateLabel) stateLabel.style.color = 'var(--color-success)';
-        if (stateText) stateText.innerText = 'Idle';
-        if (statusDot) {
-          statusDot.style.backgroundColor = 'var(--color-success)';
-          statusDot.style.boxShadow = '0 0 8px var(--color-success)';
-        }
-        if (subtext) {
-          subtext.style.transition = 'none';
-          subtext.style.transform = 'translateX(0)';
-          subtext.innerText = '';
-          subtext.style.opacity = '0';
-        }
-        eqMode = 'quiet';
-      } else if (state === 'draghover' || state === 'dropabsorb') {
-        currentSpeechText = "";
-        eqMode = 'quiet';
       }
+      
+      eqMode = (state === 'listening' || state === 'speaking') ? 'realtime' : 'quiet';
     };
 
     // Initialize particle field
@@ -940,6 +944,13 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     function animate() {
       requestAnimationFrame(animate);
       
+      // Calculate target extension
+      let targetExtension = (currentVoiceState === 'idle') ? 0.0 : 1.0;
+      currentExtension += (targetExtension - currentExtension) * 0.15;
+      if (Math.abs(targetExtension - currentExtension) < 0.001) {
+        currentExtension = targetExtension;
+      }
+      
       // 1. Process Audio Data
       if (isMicConnected && analyser) {
         analyser.getByteFrequencyData(dataArray);
@@ -967,7 +978,120 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       // 3. Draw EQ & Particles
       drawEqAndParticles();
 
+      // 4. Update HUD Equalizer Bars and wing positioning at 60fps
+      if (isHudMode) {
+        const h = parseInt(urlParams.get('h') || '24', 10);
+        
+        let targetWingExtLeft = compactMode ? 10 : 70;
+        let targetWingExtRight = compactMode ? 20 : 55;
+        
+        currentWingExtLeft += (targetWingExtLeft - currentWingExtLeft) * 0.15;
+        currentWingExtRight += (targetWingExtRight - currentWingExtRight) * 0.15;
+        
+        let xLeft = 180 - currentExtension * currentWingExtLeft;
+        let xRight = 380 + currentExtension * currentWingExtRight;
 
+        const statusTextElement = document.getElementById('hud-status-text');
+        const statusLedElement = document.getElementById('hud-status-led');
+        
+        if (compactMode) {
+          if (statusTextElement) {
+            statusTextElement.style.opacity = '0';
+            statusTextElement.style.transform = 'scale(0.5)';
+            statusTextElement.style.pointerEvents = 'none';
+          }
+          if (statusLedElement) {
+            statusLedElement.style.opacity = '1';
+            statusLedElement.style.transform = 'scale(1)';
+            statusLedElement.style.pointerEvents = 'auto';
+          }
+        } else {
+          if (statusLedElement) {
+            statusLedElement.style.opacity = '0';
+            statusLedElement.style.transform = 'scale(0.5)';
+            statusLedElement.style.pointerEvents = 'none';
+          }
+          if (statusTextElement) {
+            statusTextElement.style.opacity = '1';
+            statusTextElement.style.transform = 'scale(1)';
+            statusTextElement.style.pointerEvents = 'auto';
+          }
+        }
+
+        const svg = document.querySelector('.notch-bridge-svg');
+        if (svg) {
+          const path = svg.querySelector('path');
+          if (path) {
+            let Rt = h <= 24 ? 6 : 8;
+            let Rb = h <= 24 ? 12 : 16;
+            let cpRt = Rt * 0.55228;
+            let cpRb = Rb * 0.55228;
+
+            let d = 'M 0,0 L ' + (xLeft - Rt - Rb) + ',0 ' +
+                'C ' + (xLeft - Rt - Rb + cpRt) + ',0 ' + (xLeft - Rb) + ',' + (Rt - cpRt) + ' ' + (xLeft - Rb) + ',' + Rt + ' ' +
+                'L ' + (xLeft - Rb) + ',' + (h - Rb) + ' ' +
+                'C ' + (xLeft - Rb) + ',' + (h - Rb + cpRb) + ' ' + (xLeft - cpRb) + ',' + h + ' ' + xLeft + ',' + h + ' ' +
+                'L ' + xRight + ',' + h + ' ' +
+                'C ' + (xRight + cpRb) + ',' + h + ' ' + (xRight + Rb) + ',' + (h - Rb + cpRb) + ' ' + (xRight + Rb) + ',' + (h - Rb) + ' ' +
+                'L ' + (xRight + Rb) + ',' + Rt + ' ' +
+                'C ' + (xRight + Rb) + ',' + (Rt - cpRt) + ' ' + (xRight + Rb + Rt - cpRt) + ',0 ' + (xRight + Rb + Rt) + ',0 ' +
+                'L 560,0 Z';
+            path.setAttribute('d', d);
+          }
+        }
+
+        const leftWing = document.getElementById('hud-left-wing');
+        const rightWing = document.getElementById('hud-right-wing');
+        
+        if (leftWing) {
+          leftWing.style.left = xLeft + 'px';
+          leftWing.style.width = (180 - xLeft) + 'px';
+          leftWing.style.opacity = currentExtension;
+          leftWing.style.transform = 'scale(' + (0.6 + 0.4 * currentExtension) + ')';
+          leftWing.style.setProperty('height', h + 'px', 'important');
+        }
+        
+        if (rightWing) {
+          rightWing.style.left = '380px';
+          rightWing.style.width = (xRight - 380) + 'px';
+          rightWing.style.opacity = currentExtension;
+          rightWing.style.transform = 'scale(' + (0.6 + 0.4 * currentExtension) + ')';
+          rightWing.style.setProperty('height', h + 'px', 'important');
+          rightWing.style.paddingBottom = '0px';
+        }
+
+        const factors = [0.6, 1.2, 1.6, 1.0, 0.5];
+        for (let i = 1; i <= 5; i++) {
+          const bar = document.getElementById('eq-bar-' + i);
+          if (bar) {
+            if (compactMode && i > 3) {
+              bar.style.opacity = '0';
+              bar.style.width = '0px';
+              bar.style.margin = '0px';
+              continue;
+            } else {
+              bar.style.opacity = '1';
+              bar.style.width = '3px';
+              bar.style.margin = '';
+            }
+            let targetHeight = 3;
+            if (currentVoiceState === 'listening' || currentVoiceState === 'speaking') {
+              const amp = currentAmplitude || 0;
+              const noise = Math.random() * 0.15;
+              targetHeight = Math.max(3, Math.min(18, (amp * 25 + noise * 6) * factors[i-1]));
+            } else if (currentVoiceState === 'thinking') {
+              const t = Date.now() * 0.015;
+              const wave = Math.sin(t + i * 0.8) * 0.5 + 0.5;
+              targetHeight = Math.max(3, Math.min(12, 3 + wave * 9 * factors[i-1]));
+            } else {
+              const t = Date.now() * 0.005;
+              const wave = Math.sin(t + i * 0.5) * 0.5 + 0.5;
+              targetHeight = Math.max(3, Math.min(6, 3 + wave * 3 * factors[i-1]));
+            }
+            bar.style.height = targetHeight + 'px';
+          }
+        }
+      }
     }
 
     function drawSiriWave() {

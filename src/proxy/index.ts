@@ -77,6 +77,7 @@ export class ProxyServer {
   public config!: ProxyConfig;
   private configDir = join(homedir(), ".opencodex");
   private initializedSessions = new Set<string>();
+  private currentSystemUtterance: string = "";
 
   constructor() {
     this.ensureConfigDir();
@@ -142,6 +143,7 @@ def main():
     text = sys.argv[1]
     output_path = sys.argv[2]
     voice_id = sys.argv[3] if len(sys.argv) > 3 else "presenter_male"
+    speed = float(sys.argv[4]) if len(sys.argv) > 4 else 1.5
     
     api_key = os.environ.get("MINIMAX_API_KEY")
     api_host = os.environ.get("MINIMAX_API_HOST", "https://api.minimaxi.com")
@@ -158,10 +160,10 @@ def main():
         "stream": False,
         "voice_setting": {
             "voice_id": voice_id,
-            "speed": 1.6,
+            "speed": speed,
             "vol": 1.0,
             "pitch": 2,
-            "emotion": "excited"
+            "emotion": "happy"
         },
         "audio_setting": {
             "sample_rate": 32000,
@@ -1330,6 +1332,7 @@ stream_idle_timeout_ms = 600000
         tts_base_url: "https://api.openai.com/v1",
         tts_model: "tts-1",
         tts_voice: "zh-CN-XiaoxiaoNeural",
+        tts_speed: 1.5,
         tts_appid: "",
         tts_resource: "",
         tts_resource_id: "",
@@ -1367,6 +1370,7 @@ stream_idle_timeout_ms = 600000
           tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
           tts_model: data.tts_model || "tts-1",
           tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
+          tts_speed: typeof data.tts_speed === "number" ? data.tts_speed : 1.5,
           tts_appid: data.tts_appid || "",
           tts_resource: data.tts_resource || "",
           tts_resource_id: data.tts_resource || "", // Alias for compatibility
@@ -1440,6 +1444,16 @@ stream_idle_timeout_ms = 600000
       try {
         const data = JSON.parse(body);
         const text = data.text;
+        if (text) {
+          this.currentSystemUtterance = text;
+          // Clear it after roughly the duration it takes to speak it (assuming ~250ms per character + 2s buffer)
+          const estimatedDuration = Math.max(2000, text.length * 250) + 2000;
+          setTimeout(() => {
+            if (this.currentSystemUtterance === text) {
+              this.currentSystemUtterance = "";
+            }
+          }, estimatedDuration);
+        }
         if (!text) {
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "Text is empty" }));
@@ -1729,7 +1743,14 @@ stream_idle_timeout_ms = 600000
     
     // Resolve which actual model and provider we route to
     const catalog = this.getModelCatalog();
-    const catalogEntry = catalog.models?.find((m: any) => m.slug === requestedModel);
+    let catalogEntry = catalog.models?.find((m: any) => m.slug === requestedModel);
+    
+    if (!catalogEntry && catalog.models && catalog.models.length > 0) {
+      catalogEntry = catalog.models[0];
+      console.log(`[OpenCodex Proxy] Unknown model requested in handleResponses: ${requestedModel}. Falling back to default catalog model: ${catalogEntry.slug}`);
+      reqBody.model = catalogEntry.slug;
+    }
+
     const mappedModelName = (catalogEntry && catalogEntry.model) ? catalogEntry.model : requestedModel;
 
     const provider = this.findProvider(mappedModelName, catalogEntry);
@@ -1889,8 +1910,15 @@ stream_idle_timeout_ms = 600000
     }
     const model = reqBody.model || "";
     const catalog = this.getModelCatalog();
-    const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
-    const provider = this.findProvider(model, catalogEntry);
+    let catalogEntry = catalog.models?.find((m: any) => m.slug === model);
+    
+    if (!catalogEntry && catalog.models && catalog.models.length > 0) {
+      catalogEntry = catalog.models[0];
+      console.log(`[OpenCodex Proxy] Unknown model requested in handleChat: ${model}. Falling back to default catalog model: ${catalogEntry.slug}`);
+      reqBody.model = catalogEntry.slug;
+    }
+
+    const provider = this.findProvider(reqBody.model, catalogEntry);
     
     if (!provider) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -2175,6 +2203,8 @@ stream_idle_timeout_ms = 600000
     const apiKey = settings.tts_api_key || "";
     const apiHost = settings.tts_base_url || "https://api.minimaxi.com";
     const voiceId = settings.tts_voice || "presenter_male";
+    const speed = (settings.tts_speed !== undefined) ? settings.tts_speed.toString() : 
+                  (settings.speed !== undefined) ? settings.speed.toString() : "1.5";
     
     const tempOutput = `/tmp/tts_minimax_web_${Date.now()}_${Math.random().toString(36).substring(7)}.mp3`;
     const env = {
@@ -2183,7 +2213,7 @@ stream_idle_timeout_ms = 600000
       MINIMAX_API_HOST: apiHost,
       PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
     };
-    const child = spawn("python3", ["/tmp/ocb_minimax_tts.py", text, tempOutput, voiceId], { env });
+    const child = spawn("python3", ["/tmp/ocb_minimax_tts.py", text, tempOutput, voiceId, speed], { env });
     
     let errOutput = "";
     child.stderr.on("data", (chunk) => {
@@ -2451,6 +2481,8 @@ stream_idle_timeout_ms = 600000
     let hasSentFinal = false;
     let lastTranscribedText = "";
     let consecutiveSilenceCount = 0;
+    let speechDetected = false;
+    let silenceStartTime = 0;
 
     // Helper to clear timer
     const clearChunkInterval = () => {
@@ -2466,6 +2498,32 @@ stream_idle_timeout_ms = 600000
       const trimmed = text.trim();
       if (trimmed.length < 2) return;
 
+      // Semantic AEC: Check if this is an echo of the system's TTS
+      if (this.currentSystemUtterance && this.currentSystemUtterance.length > 0) {
+        if (trimmed.length <= 2 && trimmed.match(/^[啊嗯哦哈呀啦呢罢了的得地吗？。！]+$/)) {
+          return;
+        }
+        const cleanTrimmed = trimmed.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '');
+        const cleanUtterance = this.currentSystemUtterance.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '');
+        let isEcho = false;
+        if (cleanUtterance.includes(cleanTrimmed)) {
+          isEcho = true;
+        } else if (cleanTrimmed.includes(cleanUtterance) && cleanTrimmed.length <= cleanUtterance.length + 3) {
+          isEcho = true;
+        }
+        
+        if (isEcho) {
+          console.error(`[Semantic AEC] Ignored echo text: "${trimmed}"`);
+          audioBuffer = Buffer.alloc(0); // clear buffer to drop the echo
+          return;
+        }
+        
+        console.error(`[Semantic AEC] Interruption detected! User said: "${trimmed}" while system was saying: "${this.currentSystemUtterance}"`);
+        this.currentSystemUtterance = ""; // Clear it so we don't block subsequent speech
+        triggerSpeechEnd(trimmed);
+        return;
+      }
+
       // Common final Chinese particles and signs
       const endParticles = ["吗", "呢", "了", "吧", "哈", "呀", "啊", "啦", "吗？", "呢？", "吧？", "呀？", "谢谢", "就可以了", "怎么做", "怎么办", "什么意思", "。", "？", "！"];
       const matchesEnd = endParticles.some(p => trimmed.endsWith(p));
@@ -2478,8 +2536,8 @@ stream_idle_timeout_ms = 600000
         lastTranscribedText = trimmed;
       }
 
-      // We only cut off if we detected a sentence-end particle AND a brief silence pause (at least 1 chunk duration, ~400ms)
-      if (matchesEnd && consecutiveSilenceCount >= 1) {
+      // We only cut off if we detected a sentence-end particle AND a brief silence pause (at least 2 chunk durations, ~800ms)
+      if (matchesEnd && consecutiveSilenceCount >= 2) {
         console.error(`[Semantic VAD] Finished sentence pattern detected with active pause: "${trimmed}"`);
         triggerSpeechEnd(trimmed);
       }
@@ -2509,8 +2567,39 @@ stream_idle_timeout_ms = 600000
     ws.on("message", async (data, isBinary) => {
       if (isBinary) {
         if (isListening) {
-          audioBuffer = Buffer.concat([audioBuffer, data as Buffer]);
-          lastSpeechActivityTime = Date.now();
+          const buf = data as Buffer;
+          audioBuffer = Buffer.concat([audioBuffer, buf]);
+
+          let sum = 0;
+          const int16View = new Int16Array(buf.buffer, buf.byteOffset, buf.length / 2);
+          for (let i = 0; i < int16View.length; i++) {
+            sum += int16View[i] * int16View[i];
+          }
+          const rms = Math.sqrt(sum / int16View.length);
+          const amplitude = Math.min(1.0, rms / 8000.0);
+          
+          const p = join(this.configDir, "voice_settings.json");
+          let threshold = 0.04;
+          if (existsSync(p)) {
+            try { 
+              const settings = JSON.parse(readFileSync(p, "utf-8"));
+              if (settings.vad_threshold !== undefined) {
+                threshold = Math.pow(10, parseFloat(settings.vad_threshold) / 20);
+              }
+            } catch {}
+          }
+
+          if (amplitude > threshold) {
+            speechDetected = true;
+            silenceStartTime = 0;
+            lastSpeechActivityTime = Date.now();
+          } else if (speechDetected) {
+            if (silenceStartTime === 0) {
+              silenceStartTime = Date.now();
+            } else if (Date.now() - silenceStartTime > 1000) {
+              speechDetected = false;
+            }
+          }
         }
         return;
       }
@@ -2519,21 +2608,24 @@ stream_idle_timeout_ms = 600000
         const msg = JSON.parse(data.toString());
         if (msg.type === "start_stt") {
           audioBuffer = Buffer.alloc(0);
+          this.currentSystemUtterance = "";
           lastProcessedLength = 0;
           lastTranscribedText = "";
           consecutiveSilenceCount = 0;
           isListening = true;
           isProcessingChunk = false;
           hasSentFinal = false;
+          speechDetected = false;
+          silenceStartTime = 0;
           lastSpeechActivityTime = Date.now();
           console.error("[WebSocket STT] Listening started...");
 
           // Periodically check/transcribe current buffer
           clearChunkInterval();
           chunkInterval = setInterval(async () => {
-            if (!isListening || isProcessingChunk || hasSentFinal) return;
-            // Wait for at least 1 second of audio to start slicing
-            if (audioBuffer.length < 32000) return; 
+            if (!isListening || isProcessingChunk || hasSentFinal || !speechDetected) return;
+            // Wait for at least 0.5 second of audio to start slicing
+            if (audioBuffer.length < 16000) return; 
 
             // Only transcribe if we have new data
             if (audioBuffer.length > lastProcessedLength + 8000) {
@@ -2575,7 +2667,7 @@ stream_idle_timeout_ms = 600000
                   console.error(`[WebSocket STT Chunk] Current transcript: "${text}"`);
                   // Notify visualizer or dashboard about progress
                   ws.send(JSON.stringify({
-                    type: "transcription_chunk",
+                    type: "transcription_partial",
                     text: text
                   }));
 
@@ -2595,7 +2687,7 @@ stream_idle_timeout_ms = 600000
           clearChunkInterval();
           if (!hasSentFinal) {
             console.error(`[WebSocket STT] Listening stopped. Final processing. Audio size: ${audioBuffer.length} bytes`);
-            await this.processWebSocketSTT(ws, audioBuffer);
+            await this.processWebSocketSTT(ws, audioBuffer, lastTranscribedText);
             hasSentFinal = true;
           }
         } else if (msg.type === "active_session_changed") {
@@ -2624,7 +2716,7 @@ stream_idle_timeout_ms = 600000
     });
   }
 
-  private async processWebSocketSTT(ws: WebSocket, pcmBuffer: Buffer) {
+  private async processWebSocketSTT(ws: WebSocket, pcmBuffer: Buffer, fallbackText: string = "") {
     try {
       const p = join(this.configDir, "voice_settings.json");
       let settings: any = {
@@ -2659,6 +2751,13 @@ stream_idle_timeout_ms = 600000
       try {
         unlinkSync(tmpWavPath);
       } catch {}
+
+      // Prevent Whisper hallucinations (e.g. "......", dropping words) on abrupt cutoffs
+      const cleanText = text.replace(/^[。！？\.\s]+|[。！？\.\s]+$/g, '');
+      if (cleanText.length === 0 || text.includes('......') || text.includes('。。。') || (text.length < fallbackText.length - 3 && fallbackText.length > 0)) {
+        console.error(`[WebSocket STT] Hallucination/Drop detected ("${text}"), using fallback: "${fallbackText}"`);
+        text = fallbackText;
+      }
 
       console.error(`[WebSocket STT] Final text: "${text}"`);
       ws.send(JSON.stringify({
