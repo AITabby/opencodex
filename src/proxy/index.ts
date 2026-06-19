@@ -84,6 +84,7 @@ export class ProxyServer {
     this.ensureCheckPermsHelper();
     this.loadConfig();
     this.autoPatchCodexConfig();
+    this.mergeNativeModelsIntoCatalog();
     this.autoPatchPlugins();
     this.ensurePythonScripts();
   }
@@ -332,6 +333,56 @@ except Exception as e:
       console.error(`[OpenCodex] Saved custom model catalog to ${p}`);
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to save custom model catalog: ${err.message}`);
+    }
+  }
+
+  private mergeNativeModelsIntoCatalog() {
+    const cachePath = join(homedir(), ".codex", "models_cache.json");
+    if (!existsSync(cachePath)) {
+      console.log(`[OpenCodex] Native models cache not found at ${cachePath}. Skipping merge.`);
+      return;
+    }
+
+    try {
+      const cacheData = JSON.parse(readFileSync(cachePath, "utf-8"));
+      const nativeModels = cacheData.models || [];
+      if (!Array.isArray(nativeModels) || nativeModels.length === 0) {
+        return;
+      }
+
+      const catalog = this.getModelCatalog();
+      if (!catalog.models) {
+        catalog.models = [];
+      }
+
+      let updated = false;
+
+      for (const native of nativeModels) {
+        if (!native.slug) continue;
+        
+        const idx = catalog.models.findIndex((m: any) => m.slug === native.slug);
+        
+        if (idx === -1) {
+          catalog.models.push({
+            ...native,
+            provider: "openai",
+            visibility: "list"
+          });
+          updated = true;
+        } else {
+          if (catalog.models[idx].provider !== "openai") {
+            catalog.models[idx].provider = "openai";
+            updated = true;
+          }
+        }
+      }
+
+      if (updated) {
+        this.saveModelCatalog(catalog);
+        console.log(`[OpenCodex] Successfully merged native OpenAI models into custom model catalog.`);
+      }
+    } catch (err: any) {
+      console.error(`[OpenCodex] Failed to merge native models: ${err.message}`);
     }
   }
 
