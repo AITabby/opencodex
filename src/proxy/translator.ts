@@ -202,6 +202,7 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   const computerUseSystemRule = `\n[SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode.
 - You have full access to the 'computer_use' or 'mcp__computer_use' toolset (click, scroll, type_text, press_key, get_app_state, etc.).
 - When performing UI actions, ALWAYS call 'get_app_state' first if you need to know the active application, window positions, or elements on the screen.
+- The Computer Use session persists across turns within the same conversation. You do NOT need to re-establish the session on every action — just call get_app_state to refresh the current screen state before each UI interaction.
 ${chromePluginRule}
 - Minimize the number of turns as much as possible to ensure fast response times and high stability.`;
   systemContent = systemContent ? systemContent + "\n" + computerUseSystemRule : computerUseSystemRule;
@@ -622,6 +623,7 @@ function _mergeConsecutiveMessages(messages: any[]): any[] {
 }
 
 export class ResponsesStreamState {
+  private static sessionResponseIds = new Map<string, string>();
   private responseId: string;
   private messageItemId: string;
   private model: string;
@@ -634,8 +636,15 @@ export class ResponsesStreamState {
   private reasoningBlocks: Record<string, any> = {};
   private nextOutputIndex = 0;
 
-  constructor(model: string, namespaceMap?: Record<string, string>) {
-    this.responseId = `resp_${Date.now()}`;
+  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string) {
+    // Reuse the same response ID within the same session so the Codex
+    // client doesn't treat every turn as a brand-new conversation.
+    if (sessionId && ResponsesStreamState.sessionResponseIds.has(sessionId)) {
+      this.responseId = ResponsesStreamState.sessionResponseIds.get(sessionId)!;
+    } else {
+      this.responseId = `resp_${Date.now()}`;
+      if (sessionId) ResponsesStreamState.sessionResponseIds.set(sessionId, this.responseId);
+    }
     this.messageItemId = `msg_${Date.now()}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};

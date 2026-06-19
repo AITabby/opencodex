@@ -1781,9 +1781,9 @@ stream_idle_timeout_ms = 600000
 
     try {
       if (isStream) {
-        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res);
+        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, sessionId);
       } else {
-        await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res);
+        await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, sessionId);
       }
     } catch (err: any) {
       console.error(`[Responses] Error: ${err.message}`);
@@ -1800,7 +1800,8 @@ stream_idle_timeout_ms = 600000
     requestedModel: string,
     apiKey: string,
     namespaceMap: Record<string, string>,
-    res: http.ServerResponse
+    res: http.ServerResponse,
+    sessionId?: string
   ) {
     const response = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
@@ -1821,7 +1822,7 @@ stream_idle_timeout_ms = 600000
     res.setHeader("X-Accel-Buffering", "no");
     res.writeHead(200);
 
-    const streamState = new ResponsesStreamState(requestedModel, namespaceMap);
+    const streamState = new ResponsesStreamState(requestedModel, namespaceMap, sessionId);
     await streamState.start(async (payload) => {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     });
@@ -1868,7 +1869,8 @@ stream_idle_timeout_ms = 600000
     requestedModel: string,
     apiKey: string,
     namespaceMap: Record<string, string>,
-    res: http.ServerResponse
+    res: http.ServerResponse,
+    sessionId?: string
   ) {
     const r = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
