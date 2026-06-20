@@ -650,6 +650,27 @@ export class ResponsesStreamState {
     this.namespaceMap = namespaceMap || {};
   }
 
+  getAssistantMessage(): any {
+    const content = this.messageText;
+    const toolCalls: any[] = [];
+    for (const key of Object.keys(this.toolCalls).map(Number).sort((a, b) => a - b)) {
+      const tc = this.toolCalls[key];
+      toolCalls.push({
+        id: tc.id,
+        type: "function",
+        function: {
+          name: tc.name,
+          arguments: tc.arguments
+        }
+      });
+    }
+    return {
+      role: "assistant",
+      content: content || null,
+      tool_calls: toolCalls.length > 0 ? toolCalls : undefined
+    };
+  }
+
   private _resolveNamespace(name: string): [string, string | null] {
     return unflattenToolCall(name, this.namespaceMap);
   }
@@ -684,7 +705,8 @@ export class ResponsesStreamState {
   }
 
   async writeChatDelta(writeSse: (payload: any) => Promise<void>, chunk: any): Promise<void> {
-    const choice = (chunk.choices || [{}])[0];
+    const choice = (chunk.choices && chunk.choices.length > 0) ? chunk.choices[0] : null;
+    if (!choice) return;
     const delta = choice.delta || {};
 
     const reasoning = delta.reasoning_content || delta.reasoning;
