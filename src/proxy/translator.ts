@@ -1255,10 +1255,45 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
   for (let msgIdx = 0; msgIdx < inputData.length; msgIdx++) {
     const msg = inputData[msgIdx];
     if (typeof msg !== "object" || msg === null) continue;
-    const isOutput = !msg.content && Array.isArray(msg.output);
-    if (isOutput) continue; // Skip Vision Bridge description translation for tool outputs (screenshots)
-    const content = msg.content || msg.output;
+    // Handle function_call_output items that carry MCP tool results with embedded images
+    if (msg.type === "function_call_output" && Array.isArray(msg.output)) {
+      for (let i = 0; i < msg.output.length; i++) {
+        const item = msg.output[i];
+        if (typeof item !== "object" || item === null) continue;
+
+        let b64 = "";
+        if (item.type === "image") {
+          if (item.source?.data) {
+            b64 = item.source.data;
+          } else if (item.data) {
+            b64 = item.data;
+          }
+        } else if (item.type === "input_image") {
+          let url = "";
+          if (typeof item.image_url === "string") url = item.image_url;
+          else if (item.image_url?.url) url = item.image_url.url;
+          if (url.startsWith("data:image/")) {
+            b64 = url.includes(",") ? url.split(",")[1] : url;
+          }
+        }
+        if (!b64) continue;
+
+        const compressed = sipsCompressB64(b64);
+        if (compressed !== b64) {
+          console.error(`[OpenCodex-VisionBridge] Compressed tool output image ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
+        }
+        images.push({ idx: i, b64: compressed, msgIdx, isOutput: true });
+      }
+      continue;
+    }
+
+    // Skip function_call_output items with plain string output (no images)
+    if (msg.type === "function_call_output") continue;
+
+    const content = msg.content || (Array.isArray(msg.output) ? msg.output : null);
     if (!Array.isArray(content)) continue;
+
+    const isOutput = false;
 
     for (let i = 0; i < content.length; i++) {
       const item = content[i];
@@ -1274,6 +1309,13 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
         }
         if (url.startsWith("data:image/")) {
           b64 = url.includes(",") ? url.split(",")[1] : url;
+        }
+      } else if (item.type === "image") {
+        // MCP/Anthropic-style image inside message content array
+        if (item.source?.data) {
+          b64 = item.source.data;
+        } else if (item.data) {
+          b64 = item.data;
         }
       } else if (item.type === "input_file" && item.file_data) {
         b64 = item.file_data;

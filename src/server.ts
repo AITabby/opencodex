@@ -262,9 +262,9 @@ class OpenCodex {
       if (fs.existsSync(logsPath)) {
         const stats = fs.statSync(logsPath);
         const sizeMB = stats.size / (1024 * 1024);
-        console.log(`[OpenCodex] Checking logs_2.sqlite size: ${sizeMB.toFixed(2)} MB`);
+        console.error(`[OpenCodex] Checking logs_2.sqlite size: ${sizeMB.toFixed(2)} MB`);
         if (sizeMB > 150) {
-          console.log(`[OpenCodex] logs_2.sqlite size (${sizeMB.toFixed(2)} MB) exceeds 150MB threshold. Initiating auto-cleanup...`);
+          console.error(`[OpenCodex] logs_2.sqlite size (${sizeMB.toFixed(2)} MB) exceeds 150MB threshold. Initiating auto-cleanup...`);
           const filesToDelete = [
             logsPath,
             `${logsPath}-wal`,
@@ -275,7 +275,7 @@ class OpenCodex {
               fs.unlinkSync(f);
             }
           }
-          console.log("[OpenCodex] Auto-cleanup complete. logs_2.sqlite has been successfully reset!");
+          console.error("[OpenCodex] Auto-cleanup complete. logs_2.sqlite has been successfully reset!");
         }
       }
     } catch (err: any) {

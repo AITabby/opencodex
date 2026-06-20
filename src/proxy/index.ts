@@ -905,6 +905,10 @@ stream_idle_timeout_ms = 600000
       this.handleWebSocketConnection(ws);
     });
 
+    this.server.on("error", (err: any) => {
+      console.error(`[OpenCodex] Proxy server port conflict: ${err.message}`);
+    });
+
     this.server.listen(port, "0.0.0.0");
     console.error(`[OpenCodex] Unified HTTP server listening on port ${port}`);
     console.error(`[OpenCodex] Web Dashboard UI → http://localhost:${port}/dashboard`);
@@ -3116,12 +3120,15 @@ stream_idle_timeout_ms = 600000
     const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
     const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || reqBody.client_metadata?.session_id);
 
-    const chatBody = responsesToChat(reqBody, mappedModelName, sessionId);
+    const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
+    const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
+
+    const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Construct stateful history for custom models
     const sessionIdStr = sessionId ? String(sessionId) : "default";
     let history = this.customConversationHistory.get(sessionIdStr) || [];
-    const isFirstTurn = !reqBody.previous_response_id;
+    const isFirstTurn = !processedReqBody.previous_response_id;
     if (isFirstTurn) {
       history = chatBody.messages;
     } else {
@@ -3134,7 +3141,7 @@ stream_idle_timeout_ms = 600000
     this.customConversationHistory.set(sessionIdStr, history);
     chatBody.messages = history;
 
-    const namespaceMap = extractNamespaceMap(reqBody.tools);
+    const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
     try {
       console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
