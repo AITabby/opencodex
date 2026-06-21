@@ -187,27 +187,10 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   if (voiceSystemPrompt) {
     systemContent = voiceSystemPrompt + "\n\n" + systemContent;
   }
-  const isCli = !body.client_metadata || !body.client_metadata["x-codex-installation-id"];
-  console.log(`[OpenCodex] Detected request source: ${isCli ? "CLI" : "Desktop"}`);
-
-  let chromePluginRule = "";
-  if (isCli) {
-    chromePluginRule = `- Note: You are currently running in CLI mode. The Chrome extension/browser plugin is NOT connected and NOT available (connecting to 'extension' or 'chrome' backend in Node REPL will fail with 'Browser is not available'). DO NOT attempt to use 'js' tool/node_repl for browser automation or setupBrowserRuntime. Instead, ALWAYS use Computer Use (opening Chrome with exec_command, and interacting with click/scroll/type_text) to automate browser tasks.`;
-  } else {
-    chromePluginRule = `- If you are using the Chrome plugin (via mcp__node_repl / js tool):
-  1. DO NOT import 'playwright' directly (it is not available in the Node REPL). Instead, use the pre-configured local browser runtime wrapper.
-  2. When waiting for page loads, DO NOT use the 'networkidle' state as it is unsupported; always use 'load' or 'domcontentloaded' instead.`;
-  }
-
-  const computerUseSystemRule = `\n[SYSTEM RULE]: You are operating in Voice Assistant Desktop Controller mode.
-- You have full access to the 'computer_use' or 'mcp__computer_use' toolset (click, scroll, type_text, press_key, get_app_state, etc.).
-- When performing UI actions, ALWAYS call 'get_app_state' first if you need to know the active application, window positions, or elements on the screen.
-- The Computer Use session persists across turns within the same conversation. You do NOT need to re-establish the session on every action — just call get_app_state to refresh the current screen state before each UI interaction.
-${chromePluginRule}
-- Minimize the number of turns as much as possible to ensure fast response times and high stability.`;
-  systemContent = systemContent ? systemContent + "\n" + computerUseSystemRule : computerUseSystemRule;
   
-  messages.push({ role: "system", content: systemContent });
+  if (systemContent) {
+    messages.push({ role: "system", content: systemContent });
+  }
 
   let pendingReasoning: string | null = null;
   const inputMessages = _responsesInputToMessages(body.input);
@@ -635,8 +618,10 @@ export class ResponsesStreamState {
   private toolCalls: Record<number, any> = {};
   private reasoningBlocks: Record<string, any> = {};
   private nextOutputIndex = 0;
+  private onTextChunk?: (text: string) => void;
+  private onTextDone?: (text: string) => void;
 
-  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string) {
+  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void) {
     // Reuse the same response ID within the same session so the Codex
     // client doesn't treat every turn as a brand-new conversation.
     if (sessionId && ResponsesStreamState.sessionResponseIds.has(sessionId)) {
@@ -648,6 +633,8 @@ export class ResponsesStreamState {
     this.messageItemId = `msg_${Date.now()}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};
+    this.onTextChunk = onTextChunk;
+    this.onTextDone = onTextDone;
   }
 
   getAssistantMessage(): any {
@@ -701,6 +688,9 @@ export class ResponsesStreamState {
         await this._closeTool(writeSse, tState);
       }
     }
+    if (this.onTextDone) {
+      try { this.onTextDone(this.messageText); } catch {}
+    }
     await writeSse({ type: "response.completed", response: this._response("completed", true) });
   }
 
@@ -739,6 +729,13 @@ export class ResponsesStreamState {
     }
     state.text += text;
     await writeSse({
+      type: "response.reasoning_text.delta",
+      item_id: state.id,
+      output_index: state.output_index,
+      content_index: 0,
+      delta: text,
+    });
+    await writeSse({
       type: "response.reasoning_summary_text.delta",
       item_id: state.id,
       output_index: state.output_index,
@@ -769,9 +766,12 @@ export class ResponsesStreamState {
       }
     }
 
+    if (state.name && !state.added) {
+      await this._ensureToolOpened(writeSse, state);
+    }
+
     const argDelta = fn.arguments || "";
     if (argDelta) {
-      await this._ensureToolOpened(writeSse, state);
       state.arguments += argDelta;
       await writeSse({
         type: "response.function_call_arguments.delta",
@@ -841,6 +841,9 @@ export class ResponsesStreamState {
       await this._openMessage(writeSse);
     }
     this.messageText += text;
+    if (this.onTextChunk) {
+      try { this.onTextChunk(text); } catch {}
+    }
     await writeSse({
       type: "response.output_text.delta",
       item_id: this.messageItemId,
@@ -926,14 +929,32 @@ export class ResponsesStreamState {
         type: "reasoning",
         status: "in_progress",
         summary: [],
+        content: [],
         encrypted_content: null,
       },
     });
+
+    await writeSse({
+      type: "response.content_part.added",
+      item_id: itemId,
+      output_index: outputIndex,
+      content_index: 0,
+      part: { type: "reasoning_text", text: "" },
+    });
+
     return state;
   }
 
   private async _closeReasoning(writeSse: (payload: any) => Promise<void>, state: any): Promise<void> {
     state.closed = true;
+
+    await writeSse({
+      type: "response.reasoning_text.done",
+      item_id: state.id,
+      output_index: state.output_index,
+      content_index: 0,
+      text: state.text,
+    });
 
     await writeSse({
       type: "response.reasoning_summary_text.done",
@@ -962,6 +983,7 @@ export class ResponsesStreamState {
       type: "reasoning",
       status,
       summary: state.text ? [{ type: "summary_text", text: state.text }] : [],
+      content: state.text ? [{ type: "reasoning_text", text: state.text }] : [],
       encrypted_content: encrypted,
     };
   }
@@ -1023,8 +1045,43 @@ export class ResponsesStreamState {
 //  Universal Vision Fallback Implementation
 // ══════════════════════════════════════════════
 
-const DESCRIPTION_CACHE = new Map<string, { ts: number; desc: string }>();
-const CACHE_TTL = 300 * 1000;
+const CACHE_DIR = path.join(os.homedir(), ".opencodex");
+const PERSISTENT_CACHE_PATH = path.join(CACHE_DIR, "vision_cache.json");
+
+let DESCRIPTION_CACHE = new Map<string, { ts: number; desc: string }>();
+const CACHE_TTL = 86400 * 1000; // 24 hours
+
+try {
+  if (fs.existsSync(PERSISTENT_CACHE_PATH)) {
+    const raw = fs.readFileSync(PERSISTENT_CACHE_PATH, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === "object" && parsed !== null) {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (v && typeof v === "object" && (v as any).desc) {
+          DESCRIPTION_CACHE.set(k, v as any);
+        }
+      }
+      console.error(`[OpenCodex-VisionBridge] Loaded ${DESCRIPTION_CACHE.size} persistent descriptions from ${PERSISTENT_CACHE_PATH}`);
+    }
+  }
+} catch (err: any) {
+  console.error(`[OpenCodex-VisionBridge] Failed to load persistent cache: ${err.message}`);
+}
+
+function savePersistentCache() {
+  try {
+    const obj: Record<string, any> = {};
+    for (const [k, v] of DESCRIPTION_CACHE.entries()) {
+      obj[k] = v;
+    }
+    if (!fs.existsSync(CACHE_DIR)) {
+      fs.mkdirSync(CACHE_DIR, { recursive: true });
+    }
+    fs.writeFileSync(PERSISTENT_CACHE_PATH, JSON.stringify(obj, null, 2), "utf-8");
+  } catch (err: any) {
+    console.error(`[OpenCodex-VisionBridge] Failed to save persistent cache: ${err.message}`);
+  }
+}
 
 function _imageHash(b64Data: string): string {
   return crypto.createHash("sha256").update(b64Data).digest("hex").slice(0, 16);
@@ -1142,6 +1199,7 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
     const desc = resBody?.choices?.[0]?.message?.content || "";
     if (desc) {
       DESCRIPTION_CACHE.set(h, { ts: now, desc });
+      savePersistentCache();
       return desc;
     }
     return null;
@@ -1170,14 +1228,23 @@ export async function replaceScreenshotPlaceholders(body: any, config?: any): Pr
               console.error(`[OpenCodex-Bypass] Found screenshot placeholder at path: ${cachePath}`);
               const pngData = fs.readFileSync(cachePath);
               const b64 = pngData.toString("base64");
-              const compressed = sipsCompressB64(b64);
-              console.error(`[OpenCodex-Bypass] Loaded and compressed cached screenshot, size: ${(pngData.length/1024).toFixed(0)}KB -> ${(compressed.length/3/1024).toFixed(0)}KB`);
+              
+              const origHash = _imageHash(b64);
+              const cachedVal = DESCRIPTION_CACHE.get(origHash);
+              if (cachedVal && Date.now() - cachedVal.ts < CACHE_TTL) {
+                console.error(`[OpenCodex-Bypass] Fast-path: cached placeholder description hit`);
+                val = val.replace(match[0], `[截图描述: ${cachedVal.desc}]`);
+                return val;
+              }
 
+              const compressed = sipsCompressB64(b64);
               let desc = "";
               if (config) {
                 const fetchedDesc = await describeImageB64(compressed, config);
                 if (fetchedDesc) {
                   desc = fetchedDesc;
+                  DESCRIPTION_CACHE.set(origHash, { ts: Date.now(), desc });
+                  savePersistentCache();
                 }
               }
               if (!desc) {
@@ -1204,14 +1271,23 @@ export async function replaceScreenshotPlaceholders(body: any, config?: any): Pr
                 console.error(`[OpenCodex-Bypass] Found drag-dropped image at path: ${dragPath}`);
                 const imgData = fs.readFileSync(dragPath);
                 const b64 = imgData.toString("base64");
-                const compressed = sipsCompressB64(b64);
-                console.error(`[OpenCodex-Bypass] Loaded and compressed drag image, size: ${(imgData.length/1024).toFixed(0)}KB -> ${(compressed.length/3/1024).toFixed(0)}KB`);
 
+                const origHash = _imageHash(b64);
+                const cachedVal = DESCRIPTION_CACHE.get(origHash);
+                if (cachedVal && Date.now() - cachedVal.ts < CACHE_TTL) {
+                  console.error(`[OpenCodex-Bypass] Fast-path: cached drag image description hit`);
+                  val = val.replace(dragMatch[0], `保存在本地路径：${dragPath} [拖入图片描述: ${cachedVal.desc}]`);
+                  return val;
+                }
+
+                const compressed = sipsCompressB64(b64);
                 let desc = "";
                 if (config) {
                   const fetchedDesc = await describeImageB64(compressed, config);
                   if (fetchedDesc) {
                     desc = fetchedDesc;
+                    DESCRIPTION_CACHE.set(origHash, { ts: Date.now(), desc });
+                    savePersistentCache();
                   }
                 }
                 if (!desc) {
@@ -1250,11 +1326,17 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
   const inputData = body.input;
   if (!Array.isArray(inputData)) return body;
 
-  const images: { idx: number; b64: string; msgIdx: number; isOutput: boolean }[] = [];
+  const images: { idx: number; b64: string; msgIdx: number; isOutput: boolean; origHash: string }[] = [];
+  const now = Date.now();
 
   for (let msgIdx = 0; msgIdx < inputData.length; msgIdx++) {
     const msg = inputData[msgIdx];
     if (typeof msg !== "object" || msg === null) continue;
+    
+    // Only translate images/screenshots in user messages (e.g. dragged/dropped images).
+    // Skip assistant, system, and tool output messages (no computer use screenshots should be processed).
+    if (msg.role !== "user") continue;
+
     // Handle function_call_output items that carry MCP tool results with embedded images
     if (msg.type === "function_call_output" && Array.isArray(msg.output)) {
       for (let i = 0; i < msg.output.length; i++) {
@@ -1278,11 +1360,19 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
         }
         if (!b64) continue;
 
-        const compressed = sipsCompressB64(b64);
-        if (compressed !== b64) {
-          console.error(`[OpenCodex-VisionBridge] Compressed tool output image ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
+        const origHash = _imageHash(b64);
+        const cached = DESCRIPTION_CACHE.get(origHash);
+        if (cached && now - cached.ts < CACHE_TTL) {
+          console.error(`[OpenCodex-VisionBridge] Fast-path: original image cache hit for output image hash=${origHash}`);
+          msg.output[i] = {
+            type: "input_text",
+            text: `\n[截图描述: ${cached.desc}]\n`,
+          };
+          continue;
         }
-        images.push({ idx: i, b64: compressed, msgIdx, isOutput: true });
+
+        const compressed = sipsCompressB64(b64);
+        images.push({ idx: i, b64: compressed, msgIdx, isOutput: true, origHash });
       }
       continue;
     }
@@ -1292,8 +1382,6 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
 
     const content = msg.content || (Array.isArray(msg.output) ? msg.output : null);
     if (!Array.isArray(content)) continue;
-
-    const isOutput = false;
 
     for (let i = 0; i < content.length; i++) {
       const item = content[i];
@@ -1322,6 +1410,17 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
       }
       if (!b64) continue;
 
+      const origHash = _imageHash(b64);
+      const cached = DESCRIPTION_CACHE.get(origHash);
+      if (cached && now - cached.ts < CACHE_TTL) {
+        console.error(`[OpenCodex-VisionBridge] Fast-path: original image cache hit for input image hash=${origHash}`);
+        content[i] = {
+          type: "input_text",
+          text: `\n[截图描述: ${cached.desc}]\n`,
+        };
+        continue;
+      }
+
       // Always compress with sips
       const compressed = sipsCompressB64(b64);
       if (compressed !== b64) {
@@ -1334,19 +1433,22 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
         } else {
           content[i] = { ...item, file_data: compressed };
         }
-        console.error(`[OpenCodex] Compressed image ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
       }
 
-      images.push({ idx: i, b64: compressed, msgIdx, isOutput });
+      images.push({ idx: i, b64: compressed, msgIdx, isOutput: false, origHash });
     }
   }
 
   // Describe images for text-only models (vision bridge)
   if (images.length > 0 && config) {
-    const promises = images.map(async ({ idx, b64, msgIdx, isOutput }) => {
+    const promises = images.map(async ({ idx, b64, msgIdx, isOutput, origHash }) => {
       const desc = await describeImageB64(b64, config);
       const targetArray = isOutput ? inputData[msgIdx].output : inputData[msgIdx].content;
       if (desc) {
+        // Cache under the original uncompressed image hash
+        DESCRIPTION_CACHE.set(origHash, { ts: Date.now(), desc });
+        savePersistentCache();
+
         targetArray[idx] = {
           type: "input_text",
           text: `\n[截图描述: ${desc}]\n`,
@@ -1354,7 +1456,7 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
       } else {
         targetArray[idx] = {
           type: "input_text",
-          text: `\n[截图描述: 无法识别的屏幕截图]\n`,
+          text: `\n[截图描述: 无法识别 of 屏幕截图]\n`,
         };
       }
     });

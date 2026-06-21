@@ -149,6 +149,121 @@ const TOOLS: Tool[] = [
   }
 ];
 
+class CodexMCPClient {
+  private process: any;
+  private nextId = 1;
+  private pendingRequests = new Map<number, (res: any) => void>();
+  private stdoutBuffer = "";
+
+  constructor(process: any) {
+    this.process = process;
+    this.setupStdout();
+  }
+
+  private setupStdout() {
+    this.process.stdout.on("data", (data: any) => {
+      this.stdoutBuffer += data.toString();
+      let newlineIndex;
+      while ((newlineIndex = this.stdoutBuffer.indexOf("\n")) !== -1) {
+        const line = this.stdoutBuffer.substring(0, newlineIndex).trim();
+        this.stdoutBuffer = this.stdoutBuffer.substring(newlineIndex + 1);
+        if (line) {
+          this.handleLine(line);
+        }
+      }
+    });
+  }
+
+  private handleLine(line: string) {
+    try {
+      const msg = JSON.parse(line);
+      if (msg.id !== undefined && this.pendingRequests.has(msg.id)) {
+        const resolve = this.pendingRequests.get(msg.id);
+        if (resolve) {
+          this.pendingRequests.delete(msg.id);
+          resolve(msg);
+        }
+      }
+    } catch (e: any) {
+      console.error("[CodexMCPClient] Parse line error:", e.message, line);
+    }
+  }
+
+  private write(msg: any) {
+    this.process.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
+  public callCodex(prompt: string, threadId?: string): Promise<{ threadId: string; content: string }> {
+    return new Promise((resolve, reject) => {
+      const id = this.nextId++;
+      let method = "tools/call";
+      let params: any = {};
+      
+      if (threadId) {
+        params = {
+          name: "codex-reply",
+          arguments: {
+            threadId,
+            prompt
+          }
+        };
+      } else {
+        params = {
+          name: "codex",
+          arguments: {
+            prompt
+          }
+        };
+      }
+
+      const msg = {
+        jsonrpc: "2.0",
+        method,
+        params,
+        id
+      };
+      
+      const timeout = setTimeout(() => {
+        this.pendingRequests.delete(id);
+        reject(new Error("Timeout waiting for Codex MCP response"));
+      }, 90000); // 90s timeout
+
+      this.pendingRequests.set(id, (res: any) => {
+        clearTimeout(timeout);
+        if (res.error) {
+          reject(new Error(res.error.message || "Unknown error"));
+        } else {
+          const result = res.result;
+          if (result) {
+            const struct = result.structuredContent;
+            if (struct && typeof struct.threadId === "string" && typeof struct.content === "string") {
+              resolve({ threadId: struct.threadId, content: struct.content });
+              return;
+            }
+            if (typeof result.threadId === "string" && typeof result.content === "string") {
+              resolve({ threadId: result.threadId, content: result.content });
+              return;
+            }
+            if (Array.isArray(result.content)) {
+              const text = result.content.map((c: any) => {
+                if (typeof c === "object" && c !== null) {
+                  return c.text || "";
+                }
+                return String(c);
+              }).join("\n");
+              resolve({ threadId: result.threadId || "", content: text });
+              return;
+            }
+          }
+          resolve({ threadId: "", content: "" });
+        }
+      });
+
+      this.write(msg);
+    });
+  }
+}
+
 class OpenCodex {
   private mcp: Server;
   private proxy: ProxyServer;
@@ -270,6 +385,7 @@ class OpenCodex {
             `${logsPath}-wal`,
             `${logsPath}-shm`
           ];
+
           for (const f of filesToDelete) {
             if (fs.existsSync(f)) {
               fs.unlinkSync(f);
@@ -290,6 +406,39 @@ class OpenCodex {
     } catch (err: any) {
       console.error(`[OpenCodex] Proxy server port conflict (could be running as a background daemon): ${err.message}`);
     }
+
+    // Launch codex mcp-server in background via stdio transport
+    try {
+      console.error("[OpenCodex] Starting resident codex mcp-server background daemon...");
+      const { spawn } = await import("node:child_process");
+      const execServer = spawn("/Applications/Codex.app/Contents/Resources/codex", [
+        "--dangerously-bypass-approvals-and-sandbox",
+        "mcp-server"
+      ], {
+        env: {
+          ...process.env,
+          HOME: os.homedir()
+        }
+      });
+
+      execServer.stderr.on("data", (data) => {
+        const line = data.toString().trim();
+        if (line) {
+          console.error(`[OpenCodex MCP-Server STDERR] ${line.split("\n")[0]}`);
+        }
+      });
+
+      execServer.on("close", (code) => {
+        console.error(`[OpenCodex] Background mcp-server exited with code ${code}`);
+      });
+
+      // Expose to proxy for voice session queries
+      (this.proxy as any).execServerProcess = execServer;
+      (this.proxy as any).codexMcpClient = new CodexMCPClient(execServer);
+    } catch (e: any) {
+      console.error("[OpenCodex] Failed to spawn background mcp-server:", e.message);
+    }
+
     const url = "http://localhost:8765/dashboard";
     console.error(`[OpenCodex] Dashboard → ${url}`);
     // Commented out to prevent infinite browser tabs opening when MCP server restarts

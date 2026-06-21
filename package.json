@@ -1,6 +1,6 @@
 {
   "name": "opencodex",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenCodex - The Unified Codex Desktop Unlocker, Custom Model Gateway & Computer Use Router",
   "type": "module",
   "scripts": {
