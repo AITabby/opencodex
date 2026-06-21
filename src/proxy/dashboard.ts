@@ -801,6 +801,9 @@ export function getDashboardHtml(): string {
               <div class="form-group">
                 <label id="i18n-label-model-name">Model Name (格式: 供应商名:模型名 或 直接输入模型名)</label>
                 <input type="text" id="new-model-name" placeholder="例如: deepseek:deepseek-chat 或 deepseek-chat">
+                <p id="i18n-model-alias-hint" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">
+                  支持使用别名映射规避官方同名冲突，如：gpt-5.5-custom=gpt-5.5 或 gpt-5.5-custom-&gt;gpt-5.5
+                </p>
               </div>
 
               <div class="form-group">
@@ -1148,6 +1151,9 @@ export function getDashboardHtml(): string {
         subtitle: "Beginner-Friendly Custom Model Control Panel",
         status: "Active & Intercepting",
         panelApiTitle: "API Settings & Keys",
+        labelNewModelName: "Model Name (Format: provider:model or model_name)",
+        placeholderNewModelName: "e.g., deepseek:deepseek-chat or custom-gpt-5=gpt-5",
+        modelAliasHint: "Support alias mapping to avoid official name conflicts, e.g., gpt-5.5-custom=gpt-5.5 or gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "Save & Add Model",
         panelModelsTitle: "Model Dropdown Customizer",
         modelsDesc: "Select which models appear in the Codex model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
@@ -1212,6 +1218,9 @@ export function getDashboardHtml(): string {
         subtitle: "面向新手的自定义模型控制面板",
         status: "运行中 & 实时拦截",
         panelApiTitle: "API 密匙与自定义模型",
+        labelNewModelName: "模型名称 (格式: 供应商名:模型名 或 直接输入模型名)",
+        placeholderNewModelName: "例如: deepseek:deepseek-chat 或 gpt-5.5-custom=gpt-5.5",
+        modelAliasHint: "支持使用别名映射规避官方同名冲突，如：gpt-5.5-custom=gpt-5.5 或 gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "保存并添加该模型",
         panelModelsTitle: "自定义下拉框模型",
         modelsDesc: "勾选想要显示在 Codex 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
@@ -1302,6 +1311,10 @@ export function getDashboardHtml(): string {
       setText('i18n-title', t.title);
       setText('i18n-subtitle', t.subtitle);
       setText('i18n-status', t.status);
+      setText('i18n-label-model-name', t.labelNewModelName);
+      setText('i18n-model-alias-hint', t.modelAliasHint);
+      const newModelInput = el('new-model-name');
+      if (newModelInput) newModelInput.placeholder = t.placeholderNewModelName;
       setText('i18n-btn-save-config', t.btnSaveConfig);
       setText('i18n-panel-models-title', t.panelModelsTitle);
       setText('i18n-models-desc', t.modelsDesc);

@@ -408,7 +408,29 @@ except Exception as e:
         providers.set(provider, { name: provider, base_url: "", api_key: "" });
         this.saveConfig();
       }
-      const existing = existingModels.find((m: any) => m.slug === modelName || m.model === modelName);
+
+      let backendModel = modelName;
+      let slug = modelName;
+      let separator = "";
+      if (modelName.includes("->")) separator = "->";
+      else if (modelName.includes("=")) separator = "=";
+
+      if (separator) {
+        const parts = modelName.split(separator);
+        slug = parts[0].trim();
+        backendModel = parts[1].trim();
+      }
+
+      // Prevent duplicate slugs in the newly built array
+      const existingInNew = models.find((m: any) => m.slug === slug);
+      if (existingInNew) {
+        if (backendModel !== slug) {
+          existingInNew.backend_model = backendModel;
+        }
+        continue;
+      }
+
+      const existing = existingModels.find((m: any) => m.slug === slug || m.model === slug);
       if (existing) {
         const isNative = existing.slug === "gpt-5.5" || existing.slug === "gpt-5.4-mini" || (existing.provider === "openai" && !existing.backend_provider);
         if (isNative) {
@@ -420,18 +442,22 @@ except Exception as e:
         } else {
           models.push({
             ...existing,
+            slug: slug,
+            model: slug,
+            backend_model: backendModel,
             provider: "opencodex",
             backend_provider: provider || existing.backend_provider || existing.provider
           });
         }
       } else {
         models.push({
-          slug: modelName,
-          model: modelName,
-          display_name: modelName,
+          slug: slug,
+          model: slug,
+          display_name: slug,
+          backend_model: backendModel,
           provider: "opencodex",
           backend_provider: provider,
-          description: `Custom model: ${modelName}${provider ? ` (${provider})` : ""}`,
+          description: `Custom model: ${slug}${provider ? ` (${provider})` : ""}`,
           context_window: 200000,
           max_context_window: 1000000,
           auto_compact_token_limit: 160000,
