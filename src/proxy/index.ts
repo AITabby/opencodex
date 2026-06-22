@@ -85,7 +85,9 @@ export class ProxyServer {
   private mcpRequestId = 0;
   private mcpRequests = new Map<number, { resolve: (res: any) => void; reject: (err: any) => void; onDelta?: (text: string) => void; accumulatedReply: string }>();
   private mcpStdoutBuffer = "";
-
+  private vadProcess: any = null;
+  private vadStdoutBuffer = "";
+  private vadCallbackQueue: ((res: any) => void)[] = [];
 
   constructor() {
     this.ensureConfigDir();
@@ -95,6 +97,67 @@ export class ProxyServer {
     this.mergeNativeModelsIntoCatalog();
     this.autoPatchPlugins();
     this.ensurePythonScripts();
+    this.startVADDaemon();
+  }
+
+  private startVADDaemon() {
+    if (this.vadProcess) return;
+
+    const scriptPath = "/Users/aitabby/projects/opencodex/src/proxy/silero_vad_daemon.py";
+    console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
+
+    this.vadProcess = spawn("python3", [scriptPath]);
+    this.vadStdoutBuffer = "";
+    this.vadCallbackQueue = [];
+
+    this.vadProcess.stdout.on("data", (data: Buffer) => {
+      this.vadStdoutBuffer += data.toString();
+      let lines = this.vadStdoutBuffer.split("\n");
+      this.vadStdoutBuffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const res = JSON.parse(trimmed);
+          if (res.status === "ready") {
+            console.error("[OpenCodex VAD] Daemon is warmed up and ready.");
+            continue;
+          }
+          if (res.status === "reset") {
+            const cb = this.vadCallbackQueue.shift();
+            if (cb) cb(res);
+            continue;
+          }
+          const cb = this.vadCallbackQueue.shift();
+          if (cb) cb(res);
+        } catch (e: any) {
+          console.error(`[OpenCodex VAD Daemon Parse Error] ${e.message} for line: ${trimmed}`);
+        }
+      }
+    });
+
+    this.vadProcess.stderr.on("data", (data: Buffer) => {
+      console.error(`[OpenCodex VAD Daemon Stderr] ${data.toString().trim()}`);
+    });
+
+    this.vadProcess.on("close", (code: number) => {
+      console.error(`[OpenCodex VAD Daemon Closed] Exit code: ${code}`);
+      this.vadProcess = null;
+      this.vadCallbackQueue = [];
+    });
+  }
+
+  private sendVADRequest(req: any): Promise<any> {
+    this.startVADDaemon();
+    return new Promise((resolve) => {
+      if (!this.vadProcess) {
+        resolve({ error: "VAD process not running" });
+        return;
+      }
+      this.vadCallbackQueue.push(resolve);
+      this.vadProcess.stdin.write(JSON.stringify(req) + "\n");
+    });
   }
 
   private ensureConfigDir() {
@@ -1712,7 +1775,7 @@ stream_idle_timeout_ms = 600000
         tts_base_url: "https://api.openai.com/v1",
         tts_model: "tts-1",
         tts_voice: "zh-CN-XiaoxiaoNeural",
-        tts_speed: 1.5,
+        tts_speed: 1.2,
         tts_appid: "",
         tts_resource: "",
         tts_resource_id: "",
@@ -1750,7 +1813,7 @@ stream_idle_timeout_ms = 600000
           tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
           tts_model: data.tts_model || "tts-1",
           tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
-          tts_speed: typeof data.tts_speed === "number" ? data.tts_speed : 1.5,
+          tts_speed: typeof data.tts_speed === "number" ? data.tts_speed : 1.2,
           tts_appid: data.tts_appid || "",
           tts_resource: data.tts_resource || "",
           tts_resource_id: data.tts_resource || "", // Alias for compatibility
@@ -2025,13 +2088,22 @@ stream_idle_timeout_ms = 600000
             } catch {}
           }
 
-          const success = await this.injectPromptViaCDP(prompt);
+          let success = await this.injectPromptViaCDP(prompt);
+          if (!success) {
+            console.warn("[OpenCodex Voice API] CDP injection failed. Attempting to relaunch Codex with debugging enabled...");
+            this.restartCodexDesktop();
+            // Wait 5 seconds for Codex to restart and open
+            await new Promise((resolve) => setTimeout(resolve, 5000));
+            // Retry injection
+            success = await this.injectPromptViaCDP(prompt);
+          }
+
           if (success) {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "injected", reply: "" }));
           } else {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Failed to inject prompt via CDP" }));
+            res.end(JSON.stringify({ error: "Failed to inject prompt via CDP after auto-relaunch" }));
           }
         });
       } catch (err: any) {
@@ -2180,6 +2252,7 @@ stream_idle_timeout_ms = 600000
     let reqBody: any;
     try {
       reqBody = JSON.parse(body);
+      writeFileSync("/tmp/responses_request_debug.json", JSON.stringify(reqBody, null, 2), "utf-8");
     } catch {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid JSON body" }));
@@ -2257,16 +2330,24 @@ stream_idle_timeout_ms = 600000
 
     const chatBody = responsesToChat(processedReqBody, upstreamModel, sessionId);
     
-    // Use the messages parsed directly from the client request as the source of truth.
-    // The desktop client (Codex Desktop) already maintains the conversation history and sends it in the request.
+    // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = sessionId ? String(sessionId) : "default";
     const isFirstTurn = !processedReqBody.previous_response_id;
+    
     if (isFirstTurn) {
-      this.customConversationHistory.set(sessionIdStr, []);
+      this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+    } else {
+      let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+      if (existingHistory.length === 0) {
+        this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+      } else {
+        // Extract new messages (excluding system instructions which are already at index 0 of existingHistory)
+        const newMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+        const updatedHistory = existingHistory.concat(newMessages);
+        this.customConversationHistory.set(sessionIdStr, updatedHistory);
+      }
     }
-    const history = chatBody.messages;
-    this.customConversationHistory.set(sessionIdStr, history);
-    chatBody.messages = history;
+    chatBody.messages = this.customConversationHistory.get(sessionIdStr);
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
@@ -2745,7 +2826,13 @@ stream_idle_timeout_ms = 600000
 
   private synthesizeSpeechMiniMax(text: string, settings: any, cb: (data: Buffer | null) => void) {
     const apiKey = settings.tts_api_key || "";
-    const voiceId = settings.tts_voice || "Chinese (Mandarin)_Warm_Girl";
+    const voiceId = settings.tts_voice || "presenter_female";
+    
+    let modelName = settings.tts_model || "speech-2.8-hd";
+    if (modelName === "tts-1" || modelName === "tts-1-hd" || !modelName.startsWith("speech-")) {
+      modelName = "speech-2.8-hd";
+    }
+
     const speed = (settings.tts_speed !== undefined) ? parseFloat(settings.tts_speed.toString()) : 
                   (settings.speed !== undefined) ? parseFloat(settings.speed.toString()) : 1.2;
 
@@ -2761,7 +2848,7 @@ stream_idle_timeout_ms = 600000
     wsClient.on("open", () => {
       const startPayload = {
         event: "task_start",
-        model: "speech-2.8-turbo",
+        model: modelName,
         voice_setting: {
           voice_id: voiceId,
           speed: speed,
@@ -2883,8 +2970,14 @@ stream_idle_timeout_ms = 600000
       PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${homedir()}/Library/Python/3.9/bin:${homedir()}/.local/bin:${process.env.PATH || ""}`
     };
 
+    const speed = (settings.tts_speed !== undefined) ? parseFloat(settings.tts_speed.toString()) : 1.2;
     let edgeTtsCmd = "edge-tts";
     let args = ["--voice", voice, "--text", text, "--write-media", tempOutput];
+    if (speed !== 1.0) {
+      const pct = Math.round((speed - 1.0) * 100);
+      const rateStr = pct >= 0 ? `+${pct}%` : `${pct}%`;
+      args.push("--rate", rateStr);
+    }
     
     if (existsSync(homebrewPath)) {
       edgeTtsCmd = homebrewPath;
@@ -3178,6 +3271,7 @@ stream_idle_timeout_ms = 600000
     let audioBuffer = Buffer.alloc(0);
     let isListening = false;
     let lastProcessedLength = 0;
+    let lastVADCheckedLength = 0;
     let chunkInterval: NodeJS.Timeout | null = null;
     let isProcessingChunk = false;
     let lastSpeechActivityTime = Date.now();
@@ -3218,6 +3312,7 @@ stream_idle_timeout_ms = 600000
         if (isEcho) {
           console.error(`[Semantic AEC] Ignored echo text: "${trimmed}"`);
           audioBuffer = Buffer.alloc(0); // clear buffer to drop the echo
+          lastVADCheckedLength = 0;
           return;
         }
         
@@ -3273,35 +3368,50 @@ stream_idle_timeout_ms = 600000
           const buf = data as Buffer;
           audioBuffer = Buffer.concat([audioBuffer, buf]);
 
-          let sum = 0;
-          const int16View = new Int16Array(buf.buffer, buf.byteOffset, buf.length / 2);
-          for (let i = 0; i < int16View.length; i++) {
-            sum += int16View[i] * int16View[i];
-          }
-          const rms = Math.sqrt(sum / int16View.length);
-          const amplitude = Math.min(1.0, rms / 8000.0);
-          
-          const p = join(this.configDir, "voice_settings.json");
-          let threshold = 0.04;
-          if (existsSync(p)) {
-            try { 
-              const settings = JSON.parse(readFileSync(p, "utf-8"));
-              if (settings.vad_threshold !== undefined) {
-                threshold = Math.pow(10, parseFloat(settings.vad_threshold) / 20);
+          // Run Silero VAD check if we have enough accumulated audio buffer (check every 320ms / 5120 samples)
+          const checkSize = 10240; // 5120 samples
+          if (audioBuffer.length >= checkSize && (audioBuffer.length - lastVADCheckedLength) >= 5120) {
+            lastVADCheckedLength = audioBuffer.length;
+            const startIdx = audioBuffer.length - 10240;
+            const newChunk = audioBuffer.slice(startIdx, audioBuffer.length);
+            const b64Data = newChunk.toString("base64");
+            
+            this.sendVADRequest({ action: "chunk", data: b64Data }).then(async (vadResult) => {
+              if (vadResult.error) {
+                console.error(`[Silero VAD Daemon Error] ${vadResult.error}`);
+                return;
               }
-            } catch {}
-          }
-
-          if (amplitude > threshold) {
-            speechDetected = true;
-            silenceStartTime = 0;
-            lastSpeechActivityTime = Date.now();
-          } else if (speechDetected) {
-            if (silenceStartTime === 0) {
-              silenceStartTime = Date.now();
-            } else if (Date.now() - silenceStartTime > 1000) {
-              speechDetected = false;
-            }
+              if (vadResult.has_speech) {
+                speechDetected = true;
+                
+                // Read dynamic vad_duration from settings
+                let silenceThreshold = 0.8;
+                const p = join(this.configDir, "voice_settings.json");
+                if (existsSync(p)) {
+                  try {
+                    const settings = JSON.parse(readFileSync(p, "utf-8"));
+                    if (settings.vad_duration !== undefined) {
+                      silenceThreshold = parseFloat(settings.vad_duration);
+                    }
+                  } catch {}
+                }
+                
+                // If silence at end exceeds threshold, trigger finalization
+                if (vadResult.silence_at_end >= silenceThreshold) {
+                  console.error(`[Silero VAD] Speech ended with silence duration: ${vadResult.silence_at_end.toFixed(2)}s (threshold: ${silenceThreshold}s)`);
+                  
+                  isListening = false;
+                  clearChunkInterval();
+                  if (!hasSentFinal) {
+                    console.error(`[Silero VAD] Triggering early stop stt`);
+                    hasSentFinal = true;
+                    await this.processWebSocketSTT(ws, audioBuffer, lastTranscribedText);
+                  }
+                }
+              }
+            }).catch(err => {
+              console.error(`[Silero VAD Daemon Promise Err] ${err.message}`);
+            });
           }
         }
         return;
@@ -3310,7 +3420,9 @@ stream_idle_timeout_ms = 600000
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === "start_stt") {
+          this.sendVADRequest({ action: "reset" });
           audioBuffer = Buffer.alloc(0);
+          lastVADCheckedLength = 0;
           this.currentSystemUtterance = "";
           lastProcessedLength = 0;
           lastTranscribedText = "";
@@ -3545,16 +3657,24 @@ stream_idle_timeout_ms = 600000
 
     const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
-    // Use the messages parsed directly from the client request as the source of truth.
-    // The desktop client (Codex Desktop) already maintains the conversation history and sends it in the request.
+    // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = sessionId ? String(sessionId) : "default";
     const isFirstTurn = !processedReqBody.previous_response_id;
+    
     if (isFirstTurn) {
-      this.customConversationHistory.set(sessionIdStr, []);
+      this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+    } else {
+      let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+      if (existingHistory.length === 0) {
+        this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+      } else {
+        // Extract new messages (excluding system instructions which are already at index 0 of existingHistory)
+        const newMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+        const updatedHistory = existingHistory.concat(newMessages);
+        this.customConversationHistory.set(sessionIdStr, updatedHistory);
+      }
     }
-    const history = chatBody.messages;
-    this.customConversationHistory.set(sessionIdStr, history);
-    chatBody.messages = history;
+    chatBody.messages = this.customConversationHistory.get(sessionIdStr);
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
@@ -3586,8 +3706,8 @@ stream_idle_timeout_ms = 600000
               try { wsClient.send(msg); } catch {}
             }
           },
-          () => {
-            const msg = JSON.stringify({ type: "model_done", text: "" });
+          (fullText) => {
+            const msg = JSON.stringify({ type: "model_done", text: fullText });
             for (const wsClient of this.activeWsClients) {
               try { wsClient.send(msg); } catch {}
             }
