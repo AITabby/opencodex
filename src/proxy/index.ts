@@ -2173,9 +2173,33 @@ stream_idle_timeout_ms = 600000
       try {
         const data = JSON.parse(body || "{}");
         const method = data.method === "app" ? "app" : "swift-run";
-        this.restartVoiceBar(method);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", method }));
+        
+        const checkAndLaunch = async () => {
+          let isCDPOpen = false;
+          try {
+            const cdpRes = await fetch("http://127.0.0.1:8315/json");
+            if (cdpRes.ok) {
+              isCDPOpen = true;
+            }
+          } catch (e) {}
+
+          if (!isCDPOpen) {
+            console.log("[OpenCodex] Proactively relaunching Codex with debugging enabled since port 8315 is closed...");
+            this.restartCodexDesktop();
+            // Wait 3.5 seconds for Codex to restart cleanly
+            await new Promise((resolve) => setTimeout(resolve, 3500));
+          }
+
+          this.restartVoiceBar(method);
+        };
+
+        checkAndLaunch().then(() => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success", method }));
+        }).catch((err) => {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: err.message }));
+        });
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
