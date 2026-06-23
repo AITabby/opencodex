@@ -2041,7 +2041,7 @@ stream_idle_timeout_ms = 600000
               fetch("http://127.0.0.1:8315/json")
                 .then(res => res.json())
                 .then((targets: any) => {
-                  const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html"));
+                  const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("initialRoute"));
                   if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
                     resolve("");
                     return;
@@ -3999,7 +3999,7 @@ stream_idle_timeout_ms = 600000
         fetch("http://127.0.0.1:8315/json")
           .then(res => res.json())
           .then((targets: any) => {
-            const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html"));
+            const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("initialRoute"));
             if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
               console.error("[OpenCodex CDP] Page target or debugger URL not found.");
               resolve(false);
