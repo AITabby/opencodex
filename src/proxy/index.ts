@@ -12,6 +12,18 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exec, spawn, spawnSync, execSync } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
+// @ts-ignore
+import { HttpsProxyAgent } from "https-proxy-agent";
+import { ProxyAgent, fetch } from "undici";
+
+// Auto-detect and configure outbound proxy support
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
+const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+
+if (proxyUrl) {
+  console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
+}
 
 import {
   responsesToChat,
@@ -956,7 +968,10 @@ stream_idle_timeout_ms = 600000
             }
 
             console.log(`[OpenCodex WS Proxy] Connecting to official server: ${targetUrl}`);
-            targetWs = new WebSocket(targetUrl, { headers });
+            targetWs = new WebSocket(targetUrl, { 
+              headers,
+              agent: wsAgent
+            });
             connInfo.targetWs = targetWs;
 
             targetWs.on("open", () => {
@@ -2025,7 +2040,7 @@ stream_idle_timeout_ms = 600000
             try {
               fetch("http://127.0.0.1:8315/json")
                 .then(res => res.json())
-                .then(targets => {
+                .then((targets: any) => {
                   const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html"));
                   if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
                     resolve("");
@@ -2402,7 +2417,8 @@ stream_idle_timeout_ms = 600000
     const response = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      dispatcher: fetchDispatcher
     });
 
     if (!response.ok) {
@@ -2496,7 +2512,8 @@ stream_idle_timeout_ms = 600000
     const r = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      dispatcher: fetchDispatcher
     });
 
     const rawText = await r.text();
@@ -2643,7 +2660,8 @@ stream_idle_timeout_ms = 600000
     const r = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      dispatcher: fetchDispatcher
     });
     
     const text = await r.text();
@@ -2662,7 +2680,8 @@ stream_idle_timeout_ms = 600000
     const r = await fetch(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(body)
+      body: JSON.stringify(body),
+      dispatcher: fetchDispatcher
     });
 
     if (!r.ok) {
@@ -2803,7 +2822,8 @@ stream_idle_timeout_ms = 600000
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": `multipart/form-data; boundary=${boundary}`
       },
-      body: payload
+      body: payload,
+      dispatcher: fetchDispatcher
     });
 
     if (!response.ok) {
@@ -2836,7 +2856,8 @@ stream_idle_timeout_ms = 600000
         "Authorization": `Bearer ${apiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({ model, input: text, voice })
+      body: JSON.stringify({ model, input: text, voice }),
+      dispatcher: fetchDispatcher
     });
 
     if (!response.ok) {
@@ -2954,7 +2975,8 @@ stream_idle_timeout_ms = 600000
             voice: voiceId
           },
           stream: false
-        })
+        }),
+        dispatcher: fetchDispatcher
       });
 
       if (!response.ok) {
@@ -3112,7 +3134,8 @@ stream_idle_timeout_ms = 600000
     const response = await fetch(baseUrl, {
       method: "POST",
       headers,
-      body: JSON.stringify(bodyPayload)
+      body: JSON.stringify(bodyPayload),
+      dispatcher: fetchDispatcher
     });
 
     if (!response.ok) {
@@ -3698,7 +3721,20 @@ stream_idle_timeout_ms = 600000
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
-    chatBody.messages = this.customConversationHistory.get(sessionIdStr);
+    chatBody.messages = this.customConversationHistory.get(sessionIdStr) || [];
+
+    // Sanitize empty/null content fields for MiniMax model
+    if (mappedModelName.toLowerCase().includes("minimax")) {
+      for (const m of chatBody.messages) {
+        if (m.content === null || m.content === undefined || m.content === "") {
+          m.content = " ";
+        }
+      }
+      const hasUser = chatBody.messages.some((m: any) => m.role === "user");
+      if (!hasUser) {
+        chatBody.messages.push({ role: "user", content: " " });
+      }
+    }
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
@@ -3707,7 +3743,8 @@ stream_idle_timeout_ms = 600000
       const response = await fetch(`${provider.base_url}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(chatBody)
+        body: JSON.stringify(chatBody),
+        dispatcher: fetchDispatcher
       });
 
       console.log(`[OpenCodex WS Proxy] Upstream response status: ${response.status}`);
@@ -3956,7 +3993,7 @@ stream_idle_timeout_ms = 600000
         // Query Electron page URL via CDP to find the correct debugger URL
         fetch("http://127.0.0.1:8315/json")
           .then(res => res.json())
-          .then(targets => {
+          .then((targets: any) => {
             const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html"));
             if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
               console.error("[OpenCodex CDP] Page target or debugger URL not found.");

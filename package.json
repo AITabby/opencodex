@@ -11,7 +11,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.0",
+    "https-proxy-agent": "^9.1.0",
     "node-pty": "^1.1.0",
+    "undici": "^8.5.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {

@@ -11,6 +11,11 @@ import fs from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
+import { ProxyAgent, fetch } from "undici";
+
+// Auto-detect and configure outbound proxy support for translator requests
+const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
 const SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:";
@@ -227,9 +232,18 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
     });
   }
 
+  // Sanitize empty/null content fields for MiniMax model
+  if (upstreamModel.toLowerCase().includes("minimax")) {
+    for (const m of sanitizedMessages) {
+      if (m.content === null || m.content === undefined || m.content === "") {
+        m.content = " ";
+      }
+    }
+  }
+
   const chat: any = {
     model: upstreamModel,
-    messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: "" }],
+    messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
     stream: !!body.stream,
   };
 
@@ -605,9 +619,68 @@ function _mergeConsecutiveMessages(messages: any[]): any[] {
   return merged;
 }
 
+class ThinkTagFilter {
+  private isThinking = false;
+  private buffer = "";
+
+  filter(chunk: string): string {
+    this.buffer += chunk;
+    let output = "";
+
+    while (this.buffer.length > 0) {
+      if (!this.isThinking) {
+        const thinkIndex = this.buffer.indexOf("<think>");
+        if (thinkIndex !== -1) {
+          output += this.buffer.slice(0, thinkIndex);
+          this.isThinking = true;
+          this.buffer = this.buffer.slice(thinkIndex + 7);
+        } else {
+          let foundPartial = false;
+          for (let i = 1; i < 7; i++) {
+            if (this.buffer.endsWith("<think>".slice(0, i))) {
+              output += this.buffer.slice(0, -i);
+              this.buffer = this.buffer.slice(-i);
+              foundPartial = true;
+              break;
+            }
+          }
+          if (!foundPartial) {
+            output += this.buffer;
+            this.buffer = "";
+          } else {
+            break;
+          }
+        }
+      } else {
+        const endThinkIndex = this.buffer.indexOf("</think>");
+        if (endThinkIndex !== -1) {
+          this.isThinking = false;
+          this.buffer = this.buffer.slice(endThinkIndex + 8);
+        } else {
+          let foundPartial = false;
+          for (let i = 1; i < 8; i++) {
+            if (this.buffer.endsWith("</think>".slice(0, i))) {
+              this.buffer = this.buffer.slice(-i);
+              foundPartial = true;
+              break;
+            }
+          }
+          if (!foundPartial) {
+            this.buffer = "";
+          } else {
+            break;
+          }
+        }
+      }
+    }
+    return output;
+  }
+}
+
 export class ResponsesStreamState {
   private static sessionResponseIds = new Map<string, string>();
   private responseId: string;
+  private thinkFilter = new ThinkTagFilter();
   private messageItemId: string;
   private model: string;
   private namespaceMap: Record<string, string>;
@@ -712,7 +785,10 @@ export class ResponsesStreamState {
           await this._closeReasoning(writeSse, rState);
         }
       }
-      await this._textDelta(writeSse, content);
+      const filtered = this.thinkFilter.filter(content);
+      if (filtered) {
+        await this._textDelta(writeSse, filtered);
+      }
     }
 
     const toolCalls = delta.tool_calls || [];
@@ -1186,7 +1262,8 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
       method: "POST",
       headers,
       body: JSON.stringify(payload),
-      signal: controller.signal
+      signal: controller.signal,
+      dispatcher: fetchDispatcher
     });
     clearTimeout(timeoutId);
 
