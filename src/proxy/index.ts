@@ -3452,6 +3452,11 @@ stream_idle_timeout_ms = 600000
                   if (!hasSentFinal) {
                     console.error(`[Silero VAD] Triggering early stop stt`);
                     hasSentFinal = true;
+                    // Instantly notify client to stop recording and show thinking animation
+                    ws.send(JSON.stringify({
+                      type: "stop_recording",
+                      text: lastTranscribedText
+                    }));
                     await this.processWebSocketSTT(ws, audioBuffer, lastTranscribedText);
                   }
                 }
