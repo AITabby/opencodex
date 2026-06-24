@@ -15,6 +15,7 @@ import { WebSocketServer, WebSocket } from "ws";
 // @ts-ignore
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch } from "undici";
+import zlib from "node:zlib";
 
 // Auto-detect and configure outbound proxy support
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
@@ -84,12 +85,52 @@ console.error = (...args: any[]) => {
   addLog("PROXY", txt, "warn");
 };
 
+function isSameMessage(m1: any, m2: any): boolean {
+  if (m1.role !== m2.role) return false;
+  if (m1.role === "tool") {
+    return m1.tool_call_id === m2.tool_call_id && m1.content === m2.content;
+  }
+  if (m1.role === "assistant") {
+    const contentMatch = (m1.content || "") === (m2.content || "");
+    if (!contentMatch) return false;
+    const tc1 = m1.tool_calls || [];
+    const tc2 = m2.tool_calls || [];
+    if (tc1.length !== tc2.length) return false;
+    for (let i = 0; i < tc1.length; i++) {
+      if (tc1[i].function?.name !== tc2[i].function?.name) return false;
+      if (tc1[i].function?.arguments !== tc2[i].function?.arguments) return false;
+    }
+    return true;
+  }
+  return m1.content === m2.content;
+}
+
+function mergeHistory(history: any[], incoming: any[]): any[] {
+  let overlapLength = 0;
+  for (let i = 1; i <= Math.min(history.length, incoming.length); i++) {
+    let match = true;
+    for (let j = 0; j < i; j++) {
+      const historyIndex = history.length - i + j;
+      const incomingIndex = j;
+      if (!isSameMessage(history[historyIndex], incoming[incomingIndex])) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      overlapLength = i;
+    }
+  }
+  return history.concat(incoming.slice(overlapLength));
+}
+
 export class ProxyServer {
   private server: http.Server | null = null;
   public config!: ProxyConfig;
   private configDir = join(homedir(), ".opencodex");
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
+  private customModelSessions = new Set<string>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -833,11 +874,20 @@ stream_idle_timeout_ms = 600000
         console.log(`[OpenCodex WS Proxy] Intercepting responses WebSocket upgrade: ${url.pathname}${url.search}`);
         wss.handleUpgrade(request, socket, head, (clientWs) => {
           this.desktopWsClients.add(clientWs);
-          
+          console.log("[OpenCodex WS Proxy] Upgrade request headers:", JSON.stringify(request.headers, null, 2));
           const sidHeader = request.headers["x-session-id"] || request.headers["session-id"] || request.headers["x-thread-id"] || request.headers["thread-id"] || "";
           const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || "default");
           
-          const connInfo = { clientWs, targetWs: null as WebSocket | null, headers: request.headers, lastMsg: null as any };
+          const sessionIdStr = sessionId ? String(sessionId) : "default";
+          const connInfo = { 
+            clientWs, 
+            targetWs: null as WebSocket | null, 
+            headers: request.headers, 
+            lastMsg: null as any,
+            isCustomMode: false,
+            activeSessionId: sessionIdStr,
+            isGeneratingTitle: false
+          };
           if (sessionId && sessionId !== "default") {
             this.activeConnectionsBySession.set(sessionId, connInfo);
           }
@@ -846,30 +896,204 @@ stream_idle_timeout_ms = 600000
           let clientClosed = false;
           let targetClosed = false;
           let isLocal = false;
-          let targetWs: WebSocket | null = null;
           const pendingBuffer: { data: any; isBinary: boolean }[] = [];
+
+          // Establish connection to official server immediately on upgrade to ensure fresh handshake headers
+          const isChatGptAccount = Object.keys(request.headers).some(k => k.toLowerCase() === "chatgpt-account-id");
+          let targetUrl = "";
+          if (isChatGptAccount) {
+            let subPath = url.pathname;
+            if (url.pathname.startsWith("/v1/")) {
+              subPath = url.pathname.substring(4);
+            }
+            if (!subPath.startsWith("codex/")) {
+              subPath = "codex/" + subPath;
+            }
+            targetUrl = `wss://chatgpt.com/backend-api/${subPath}${url.search}`;
+          } else {
+            targetUrl = url.pathname.startsWith("/v1/") 
+              ? `wss://api.openai.com${url.pathname}${url.search}` 
+              : `wss://chatgpt.com${url.pathname}${url.search}`;
+          }
+
+          let realToken = "";
+          const authPath = join(homedir(), ".codex", "auth.json");
+          if (existsSync(authPath)) {
+            try {
+              const authData = JSON.parse(readFileSync(authPath, "utf-8"));
+              if (authData.tokens && authData.tokens.access_token) {
+                realToken = authData.tokens.access_token;
+              }
+            } catch (e: any) {
+              console.error(`[OpenCodex WS Proxy] Failed to read auth.json for WS auth: ${e.message}`);
+            }
+          }
+
+          const headers: Record<string, string> = {};
+          let hasIncomingAuth = false;
+          for (const [key, val] of Object.entries(request.headers)) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === "host" || lowerKey === "connection" || lowerKey === "upgrade" || lowerKey.startsWith("sec-websocket-")) {
+              continue;
+            }
+            if (lowerKey === "authorization") {
+              const valStr = Array.isArray(val) ? val[0] : (val || "");
+              if (valStr && !valStr.includes("dummy") && !valStr.includes("opencodex")) {
+                hasIncomingAuth = true;
+              }
+            }
+            headers[key] = Array.isArray(val) ? val[0] : (val || "");
+          }
+
+          if (!hasIncomingAuth && realToken) {
+            headers["authorization"] = `Bearer ${realToken}`;
+          }
+
+          console.log(`[OpenCodex WS Proxy] Connecting to official server immediately: ${targetUrl}`);
+          const targetWs = new WebSocket(targetUrl, { 
+            headers,
+            agent: wsAgent
+          });
+          connInfo.targetWs = targetWs;
+
+          targetWs.on("open", () => {
+            console.log(`[OpenCodex WS Proxy] Official target connection opened for ${url.pathname}`);
+            if (targetWs.readyState === WebSocket.OPEN) {
+              for (const p of pendingBuffer) {
+                targetWs.send(p.data, { binary: p.isBinary });
+              }
+              pendingBuffer.length = 0;
+            }
+          });
+
+          let inJsonStream = false;
+
+          targetWs.on("message", (tData, tIsBinary) => {
+            const activeSid = connInfo.activeSessionId || sessionIdStr;
+            if (isLocal || connInfo.isCustomMode || this.customModelSessions.has(activeSid)) {
+              return;
+            }
+
+            let processedTData = tData;
+            if (!tIsBinary) {
+              try {
+                const payload = JSON.parse(tData.toString());
+                if (payload.type === "codex.rate_limits") {
+                  if (payload.rate_limits) {
+                    payload.rate_limits.allowed = true;
+                    payload.rate_limits.limit_reached = false;
+                    if (payload.rate_limits.primary) {
+                      payload.rate_limits.primary.used_percent = 0;
+                      payload.rate_limits.primary.limit_reached = false;
+                    }
+                  }
+                  processedTData = Buffer.from(JSON.stringify(payload), "utf-8");
+                }
+                if (payload.type === "error" && payload.error?.type === "usage_limit_reached") {
+                  return; // Ignore official rate limit block
+                }
+              } catch {}
+            }
+
+            const msgStr = processedTData.toString();
+            console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
+            
+            if (!tIsBinary) {
+              try {
+                const payload = JSON.parse(msgStr);
+                
+                // Broadcast streaming text delta to active voice clients
+                if (payload.type === "response.output_text.delta" && payload.delta) {
+                  const text = payload.delta;
+                  if (text.trim().startsWith("{")) {
+                    inJsonStream = true;
+                  }
+                  if (!inJsonStream && connInfo.lastMsg) {
+                    const msg = JSON.stringify({ type: "model_chunk", text });
+                    for (const voiceClient of this.activeWsClients) {
+                      try { voiceClient.send(msg); } catch {}
+                    }
+                  }
+                  if (inJsonStream && text.includes("}")) {
+                    inJsonStream = false;
+                  }
+                } 
+                
+                // Broadcast completion
+                else if (payload.type === "response.completed" || payload.type === "response.output_item.done") {
+                  inJsonStream = false;
+                  if (payload.type === "response.completed") {
+                    connInfo.isGeneratingTitle = false;
+                    const msg = JSON.stringify({ type: "model_done", text: "" });
+                    for (const voiceClient of this.activeWsClients) {
+                      try { voiceClient.send(msg); } catch {}
+                    }
+                  }
+                }
+              } catch {}
+            }
+
+            const isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
+
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(processedTData, { binary: tIsBinary });
+            }
+            if (!isTitleOrBackground) {
+              for (const otherWs of this.desktopWsClients) {
+                if (otherWs !== clientWs && otherWs.readyState === WebSocket.OPEN) {
+                  otherWs.send(processedTData, { binary: tIsBinary });
+                }
+              }
+            }
+          });
+
+          targetWs.on("close", (code, reason) => {
+            console.log(`[OpenCodex WS Proxy] Official target connection closed: ${code} - ${reason.toString()}`);
+            targetClosed = true;
+            if (!clientClosed) {
+              clientWs.close();
+            }
+          });
+
+          targetWs.on("error", (err) => {
+            console.error("[OpenCodex WS Proxy Target Error]", err);
+            clientWs.close();
+          });
 
           clientWs.on("message", async (data, isBinary) => {
             let processedData = data;
             if (!isBinary) {
               try {
                 const msg = JSON.parse(data.toString());
+                if (msg && msg.client_metadata?.session_id) {
+                  connInfo.activeSessionId = String(msg.client_metadata.session_id);
+                }
                 if (msg && msg.type === "response.create") {
                   connInfo.lastMsg = msg;
+                  const model = msg.model || "";
+                  if (model) {
+                    const catalog = this.getModelCatalog();
+                    const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
+                    connInfo.isCustomMode = !!catalogEntry?.backend_provider;
+                    connInfo.isGeneratingTitle = model.includes("mini") || model.includes("title");
+                  }
                 }
                 const model = msg.model || "";
                 if (model) {
                   const catalog = this.getModelCatalog();
                   const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                   const isCustomModel = !!catalogEntry?.backend_provider;
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
 
                   if (isCustomModel) {
                     isLocal = true;
+                    this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;
                   } else {
                     isLocal = false;
+                    this.customModelSessions.delete(activeSid);
                   }
                 }
 
@@ -913,165 +1137,7 @@ stream_idle_timeout_ms = 600000
               } else {
                 pendingBuffer.push({ data: processedData, isBinary });
               }
-              return;
             }
-
-            // Establish connection to official server
-            const isChatGptAccount = Object.keys(request.headers).some(k => k.toLowerCase() === "chatgpt-account-id");
-            let targetUrl = "";
-            if (isChatGptAccount) {
-              let subPath = url.pathname;
-              if (url.pathname.startsWith("/v1/")) {
-                subPath = url.pathname.substring(4);
-              }
-              if (!subPath.startsWith("codex/")) {
-                subPath = "codex/" + subPath;
-              }
-              targetUrl = `wss://chatgpt.com/backend-api/${subPath}${url.search}`;
-            } else {
-              targetUrl = url.pathname.startsWith("/v1/") 
-                ? `wss://api.openai.com${url.pathname}${url.search}` 
-                : `wss://chatgpt.com${url.pathname}${url.search}`;
-            }
-
-            let realToken = "";
-            const authPath = join(homedir(), ".codex", "auth.json");
-            if (existsSync(authPath)) {
-              try {
-                const authData = JSON.parse(readFileSync(authPath, "utf-8"));
-                if (authData.tokens && authData.tokens.access_token) {
-                  realToken = authData.tokens.access_token;
-                }
-              } catch (e: any) {
-                console.error(`[OpenCodex WS Proxy] Failed to read auth.json for WS auth: ${e.message}`);
-              }
-            }
-
-            const headers: Record<string, string> = {};
-            let hasIncomingAuth = false;
-            for (const [key, val] of Object.entries(request.headers)) {
-              const lowerKey = key.toLowerCase();
-              if (lowerKey === "host" || lowerKey === "connection" || lowerKey === "upgrade" || lowerKey.startsWith("sec-websocket-")) {
-                continue;
-              }
-              if (lowerKey === "authorization") {
-                const valStr = Array.isArray(val) ? val[0] : (val || "");
-                if (valStr && !valStr.includes("dummy") && !valStr.includes("opencodex")) {
-                  hasIncomingAuth = true;
-                }
-              }
-              headers[key] = Array.isArray(val) ? val[0] : (val || "");
-            }
-
-            if (!hasIncomingAuth && realToken) {
-              headers["authorization"] = `Bearer ${realToken}`;
-            }
-
-            console.log(`[OpenCodex WS Proxy] Connecting to official server: ${targetUrl}`);
-            targetWs = new WebSocket(targetUrl, { 
-              headers,
-              agent: wsAgent
-            });
-            connInfo.targetWs = targetWs;
-
-            targetWs.on("open", () => {
-              console.log(`[OpenCodex WS Proxy] Official target connection opened for ${url.pathname}`);
-              if (targetWs && targetWs.readyState === WebSocket.OPEN) {
-                targetWs.send(processedData, { binary: isBinary });
-                for (const p of pendingBuffer) {
-                  targetWs.send(p.data, { binary: p.isBinary });
-                }
-                pendingBuffer.length = 0;
-              }
-            });
-
-            let inJsonStream = false;
-
-            targetWs.on("message", (tData, tIsBinary) => {
-              if (isLocal) {
-                return;
-              }
-
-              let processedTData = tData;
-              if (!tIsBinary) {
-                try {
-                  const payload = JSON.parse(tData.toString());
-                  if (payload.type === "codex.rate_limits") {
-                    if (payload.rate_limits) {
-                      payload.rate_limits.allowed = true;
-                      payload.rate_limits.limit_reached = false;
-                      if (payload.rate_limits.primary) {
-                        payload.rate_limits.primary.used_percent = 0;
-                        payload.rate_limits.primary.limit_reached = false;
-                      }
-                    }
-                    processedTData = Buffer.from(JSON.stringify(payload), "utf-8");
-                  }
-                  if (payload.type === "error" && payload.error?.type === "usage_limit_reached") {
-                    return; // Ignore official rate limit block
-                  }
-                } catch {}
-              }
-
-              const msgStr = processedTData.toString();
-              console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
-              
-              if (!tIsBinary) {
-                try {
-                  const payload = JSON.parse(msgStr);
-                  
-                  // Broadcast streaming text delta to active voice clients
-                  if (payload.type === "response.output_text.delta" && payload.delta) {
-                    const text = payload.delta;
-                    if (text.trim().startsWith("{")) {
-                      inJsonStream = true;
-                    }
-                    if (!inJsonStream && connInfo.lastMsg) {
-                      const msg = JSON.stringify({ type: "model_chunk", text });
-                      for (const voiceClient of this.activeWsClients) {
-                        try { voiceClient.send(msg); } catch {}
-                      }
-                    }
-                    if (inJsonStream && text.includes("}")) {
-                      inJsonStream = false;
-                    }
-                  } 
-                  
-                  // Broadcast completion
-                  else if (payload.type === "response.completed" || payload.type === "response.output_item.done") {
-                    inJsonStream = false;
-                    if (payload.type === "response.completed") {
-                      const msg = JSON.stringify({ type: "model_done", text: "" });
-                      for (const voiceClient of this.activeWsClients) {
-                        try { voiceClient.send(msg); } catch {}
-                      }
-                    }
-                  }
-                } catch {}
-              }
-
-              if (clientWs.readyState === WebSocket.OPEN) {
-                clientWs.send(processedTData, { binary: tIsBinary });
-              }
-              for (const otherWs of this.desktopWsClients) {
-                if (otherWs !== clientWs && otherWs.readyState === WebSocket.OPEN) {
-                  otherWs.send(processedTData, { binary: tIsBinary });
-                }
-              }
-            });
-
-            targetWs.on("close", (code, reason) => {
-              console.log(`[OpenCodex WS Proxy] Official target connection closed: ${code} - ${reason.toString()}`);
-              targetClosed = true;
-              if (!clientClosed) {
-                clientWs.close();
-              }
-            });
-
-            targetWs.on("error", (err) => {
-              console.error("[OpenCodex WS Proxy Target Error]", err);
-              clientWs.close();
-            });
           });
 
           clientWs.on("close", () => {
@@ -1083,7 +1149,7 @@ stream_idle_timeout_ms = 600000
             if (this.lastActiveConnection === connInfo) {
               this.lastActiveConnection = null;
             }
-            if (!isLocal && targetWs && !targetClosed) {
+            if (targetWs && !targetClosed) {
               targetWs.close();
             }
           });
@@ -1097,7 +1163,7 @@ stream_idle_timeout_ms = 600000
             if (this.lastActiveConnection === connInfo) {
               this.lastActiveConnection = null;
             }
-            if (!isLocal && targetWs) {
+            if (targetWs) {
               targetWs.close();
             }
           });
@@ -1138,7 +1204,36 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
-    const body = rawBody.toString("utf-8");
+    let decompressedBody = rawBody;
+    const contentEncoding = req.headers["content-encoding"];
+    console.log("[OpenCodex] Request path:", req.url, "Content-Encoding:", contentEncoding, "rawBody signature:", rawBody.slice(0, 4));
+    if (contentEncoding === "gzip") {
+      try {
+        decompressedBody = zlib.gunzipSync(rawBody);
+      } catch (err: any) {
+        console.error("[OpenCodex] Failed to gunzip body:", err.message);
+      }
+    } else if (contentEncoding === "deflate") {
+      try {
+        decompressedBody = zlib.inflateSync(rawBody);
+      } catch (err: any) {
+        console.error("[OpenCodex] Failed to inflate body:", err.message);
+      }
+    } else if (contentEncoding === "br") {
+      try {
+        decompressedBody = zlib.brotliDecompressSync(rawBody);
+      } catch (err: any) {
+        console.error("[OpenCodex] Failed to brotli decompress body:", err.message);
+      }
+    } else if (contentEncoding === "zstd") {
+      try {
+        decompressedBody = execSync("zstd -d", { input: rawBody });
+      } catch (err: any) {
+        console.error("[OpenCodex] Failed to zstd decompress body:", err.message);
+      }
+    }
+
+    const body = decompressedBody.toString("utf-8");
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     const path = url.pathname;
@@ -2041,7 +2136,7 @@ stream_idle_timeout_ms = 600000
               fetch("http://127.0.0.1:8315/json")
                 .then(res => res.json())
                 .then((targets: any) => {
-                  const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("initialRoute"));
+                  const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("avatar-overlay") && !t.url.includes("initialRoute"));
                   if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
                     resolve("");
                     return;
@@ -2061,19 +2156,23 @@ stream_idle_timeout_ms = 600000
                   tempWs.on("message", (data) => {
                     try {
                       const resObj = JSON.parse(data.toString());
-                      if (resObj.id === 100 && resObj.result?.result?.value) {
-                        const href = resObj.result.result.value;
-                        const match = href.match(/[?&]thread_id=([^&]+)/);
-                        if (match && match[1]) {
-                          console.error(`[OpenCodex Voice API] Resolved Thread ID via CDP URL: ${match[1]}`);
-                          resolve(match[1]);
-                          tempWs.close();
-                          return;
+                      if (resObj.id === 100) {
+                        if (resObj.result?.result?.value) {
+                          const href = resObj.result.result.value;
+                          const match = href.match(/[?&]thread_id=([^&]+)/);
+                          if (match && match[1]) {
+                            console.error(`[OpenCodex Voice API] Resolved Thread ID via CDP URL: ${match[1]}`);
+                            resolve(match[1]);
+                            tempWs.close();
+                            return;
+                          }
                         }
+                        resolve("");
+                        tempWs.close();
                       }
-                    } catch {}
-                    resolve("");
-                    tempWs.close();
+                    } catch {
+                      // Only close/resolve on parse error if we want to fail-safe, but let's be safe
+                    }
                   });
                   tempWs.on("error", () => {
                     resolve("");
@@ -2103,22 +2202,22 @@ stream_idle_timeout_ms = 600000
             } catch {}
           }
 
-          let success = await this.injectPromptViaCDP(prompt);
-          if (!success) {
-            console.warn("[OpenCodex Voice API] CDP injection failed. Attempting to relaunch Codex with debugging enabled...");
+          let result = await this.injectPromptViaCDP(prompt);
+          if (result === "connection_failed") {
+            console.warn("[OpenCodex Voice API] CDP connection failed. Attempting to relaunch Codex with debugging enabled...");
             this.restartCodexDesktop();
             // Wait 5 seconds for Codex to restart and open
             await new Promise((resolve) => setTimeout(resolve, 5000));
             // Retry injection
-            success = await this.injectPromptViaCDP(prompt);
+            result = await this.injectPromptViaCDP(prompt);
           }
 
-          if (success) {
+          if (result === "success") {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "injected", reply: "" }));
           } else {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Failed to inject prompt via CDP after auto-relaunch" }));
+            res.end(JSON.stringify({ error: `Failed to inject prompt via CDP: ${result}` }));
           }
         });
       } catch (err: any) {
@@ -2270,7 +2369,7 @@ stream_idle_timeout_ms = 600000
     if (path === "/v1/responses" && req.method === "POST") {
       const sidHeader = req.headers["x-session-id"] || req.headers["session-id"] || "";
       const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : sidHeader;
-      this.handleResponses(body, res, sessionId);
+      this.handleResponses(body, res, sessionId, req, rawBody);
       return;
     }
 
@@ -2287,12 +2386,13 @@ stream_idle_timeout_ms = 600000
   //  Responses API Gateway (Used by Codex UI)
   // ══════════════════════════════════════════════
 
-  private async handleResponses(body: string, res: http.ServerResponse, sessionId?: string) {
+  private async handleResponses(body: string, res: http.ServerResponse, sessionId?: string, req?: http.IncomingMessage, rawBody?: Buffer) {
     let reqBody: any;
     try {
       reqBody = JSON.parse(body);
       writeFileSync("/tmp/responses_request_debug.json", JSON.stringify(reqBody, null, 2), "utf-8");
-    } catch {
+    } catch (e: any) {
+      console.error("[OpenCodex] Failed to parse responses JSON body:", e.message, "Length:", body.length, "First 200 chars:", body.slice(0, 200));
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid JSON body" }));
       return;
@@ -2322,10 +2422,12 @@ stream_idle_timeout_ms = 600000
         }
       }
     }
-    if (hasGetAppStateOutput && sessionId) {
-      if (!this.initializedSessions.has(sessionId)) {
-        this.initializedSessions.add(sessionId);
-        console.log(`[OpenCodex Proxy] Detected cold-start get_app_state output for session ${sessionId}. Injecting 1500ms delay to allow CUA session to stabilize...`);
+    const finalSessionId = sessionId || reqBody.client_metadata?.session_id;
+
+    if (hasGetAppStateOutput && finalSessionId) {
+      if (!this.initializedSessions.has(finalSessionId)) {
+        this.initializedSessions.add(finalSessionId);
+        console.log(`[OpenCodex Proxy] Detected cold-start get_app_state output for session ${finalSessionId}. Injecting 1500ms delay to allow CUA session to stabilize...`);
         await new Promise(resolve => setTimeout(resolve, 1500));
       }
     }
@@ -2340,6 +2442,79 @@ stream_idle_timeout_ms = 600000
       catalogEntry = catalog.models[0];
       console.log(`[OpenCodex Proxy] Unknown model requested in handleResponses: ${requestedModel}. Falling back to default catalog model: ${catalogEntry.slug}`);
       reqBody.model = catalogEntry.slug;
+    }
+
+    const isCustomModel = !!catalogEntry?.backend_provider;
+    if (!isCustomModel && req && rawBody) {
+      const isChatGptAccount = Object.keys(req.headers).some(k => k.toLowerCase() === "chatgpt-account-id");
+      let targetUrl = "";
+      const urlObj = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+      const pathStr = urlObj.pathname;
+      if (isChatGptAccount) {
+        let subPath = pathStr;
+        if (pathStr.startsWith("/v1/")) {
+          subPath = pathStr.substring(4);
+        }
+        if (!subPath.startsWith("codex/")) {
+          subPath = "codex/" + subPath;
+        }
+        targetUrl = `https://chatgpt.com/backend-api/${subPath}${urlObj.search}`;
+      } else {
+        targetUrl = pathStr.startsWith("/v1/")
+          ? `https://api.openai.com${pathStr}${urlObj.search}`
+          : `https://chatgpt.com${pathStr}${urlObj.search}`;
+      }
+
+      const headers: Record<string, string> = {};
+      for (const [key, val] of Object.entries(req.headers)) {
+        if (key.toLowerCase() === "host" || key.toLowerCase() === "content-length" || key.toLowerCase() === "accept-encoding") {
+          continue;
+        }
+        headers[key] = Array.isArray(val) ? val[0] : (val || "");
+      }
+      
+      let realToken = "";
+      const authPath = join(homedir(), ".codex", "auth.json");
+      if (existsSync(authPath)) {
+        try {
+          const authData = JSON.parse(readFileSync(authPath, "utf-8"));
+          if (authData.tokens && authData.tokens.access_token) {
+            realToken = authData.tokens.access_token;
+          }
+        } catch {}
+      }
+      if (realToken && !headers["authorization"]) {
+        headers["authorization"] = `Bearer ${realToken}`;
+      }
+
+      try {
+        console.log(`[OpenCodex Proxy] Forwarding HTTP ${req.method} for official model to: ${targetUrl}`);
+        const officialRes = await fetch(targetUrl, {
+          method: req.method,
+          headers,
+          body: rawBody,
+          dispatcher: fetchDispatcher
+        });
+
+        console.log(`[OpenCodex Proxy] Official server HTTP response status: ${officialRes.status}`);
+        res.writeHead(officialRes.status, {
+          "Content-Type": officialRes.headers.get("content-type") || "application/json"
+        });
+        const bodyReader = officialRes.body;
+        if (bodyReader) {
+          // @ts-ignore
+          for await (const chunk of bodyReader) {
+            res.write(chunk);
+          }
+        }
+        res.end();
+        return;
+      } catch (err: any) {
+        console.error(`[OpenCodex Proxy] Failed to forward HTTP request to official server: ${err.message}`);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Failed to forward request to official server: ${err.message}` }));
+        return;
+      }
     }
 
     const mappedModelName = (catalogEntry && catalogEntry.backend_model) ? catalogEntry.backend_model : ((catalogEntry && catalogEntry.model) ? catalogEntry.model : requestedModel);
@@ -2367,34 +2542,45 @@ stream_idle_timeout_ms = 600000
 
     console.log(`[Responses] Routing ${requestedModel} → ${provider.name}/${upstreamModel} (stream=${isStream}, visionBridge=${callVisionBridge})`);
 
-    const chatBody = responsesToChat(processedReqBody, upstreamModel, sessionId);
+    const chatBody = responsesToChat(processedReqBody, upstreamModel, finalSessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
-    const sessionIdStr = sessionId ? String(sessionId) : "default";
-    const isFirstTurn = !processedReqBody.previous_response_id;
+    const sessionIdStr = finalSessionId ? String(finalSessionId) : "default";
+    
+    if (isCustomModel) {
+      this.customModelSessions.add(sessionIdStr);
+    } else {
+      this.customModelSessions.delete(sessionIdStr);
+    }
+
+        const isFirstTurn = !processedReqBody.previous_response_id;
     
     if (isFirstTurn) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
-      let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+      const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
       if (existingHistory.length === 0) {
         this.customConversationHistory.set(sessionIdStr, chatBody.messages);
       } else {
-        // Extract new messages (excluding system instructions which are already at index 0 of existingHistory)
-        const newMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = existingHistory.concat(newMessages);
+        const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+        const updatedHistory = mergeHistory(existingHistory, incomingMessages);
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
-    chatBody.messages = this.customConversationHistory.get(sessionIdStr);
+    chatBody.messages = (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
+      if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
+        return { ...m, content: " " };
+      }
+      return m;
+    });
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
     try {
       if (isStream) {
-        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, sessionId);
+        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId);
       } else {
-        await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, sessionId);
+        await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId);
       }
     } catch (err: any) {
       console.error(`[Responses] Error: ${err.message}`);
@@ -3066,7 +3252,10 @@ stream_idle_timeout_ms = 600000
 
   private async synthesizeSpeechDoubao(text: string, settings: any): Promise<Buffer> {
     const apiKey = settings.tts_api_key || "";
-    const baseUrl = settings.tts_base_url || "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+    let baseUrl = settings.tts_base_url || "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+    if (baseUrl.includes("api.openai.com")) {
+      baseUrl = "https://openspeech.bytedance.com/api/v3/tts/unidirectional";
+    }
     const voice = settings.tts_voice || "zh_female_xiaohe_uranus_bigtts";
     const appid = settings.tts_appid || "";
     const resourceId = settings.tts_resource || settings.tts_resource_id || "seed-tts-2.0";
@@ -3117,7 +3306,7 @@ stream_idle_timeout_ms = 600000
       };
 
       let modelVal = settings.tts_model || "seed-tts-2.0-expressive";
-      if (modelVal === "tts-1") {
+      if (modelVal === "tts-1" || modelVal === "seed-tts-2.0") {
         modelVal = "seed-tts-2.0-expressive";
       }
 
@@ -3702,7 +3891,7 @@ stream_idle_timeout_ms = 600000
 
     const isStream = reqBody.stream ?? true;
     const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
-    const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || reqBody.client_metadata?.session_id);
+    const sessionId = reqBody.client_metadata?.session_id || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
 
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
     const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
@@ -3711,22 +3900,27 @@ stream_idle_timeout_ms = 600000
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = sessionId ? String(sessionId) : "default";
-    const isFirstTurn = !processedReqBody.previous_response_id;
+    this.customModelSessions.add(sessionIdStr);
+        const isFirstTurn = !processedReqBody.previous_response_id;
     
     if (isFirstTurn) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
-      let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+      const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
       if (existingHistory.length === 0) {
         this.customConversationHistory.set(sessionIdStr, chatBody.messages);
       } else {
-        // Extract new messages (excluding system instructions which are already at index 0 of existingHistory)
-        const newMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = existingHistory.concat(newMessages);
+        const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+        const updatedHistory = mergeHistory(existingHistory, incomingMessages);
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
-    chatBody.messages = this.customConversationHistory.get(sessionIdStr) || [];
+    chatBody.messages = (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
+      if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
+        return { ...m, content: " " };
+      }
+      return m;
+    });
 
     // Sanitize empty/null content fields for MiniMax model
     if (mappedModelName.toLowerCase().includes("minimax")) {
@@ -3992,17 +4186,17 @@ stream_idle_timeout_ms = 600000
     });
   }
 
-  public injectPromptViaCDP(prompt: string): Promise<boolean> {
+  public injectPromptViaCDP(prompt: string): Promise<string> {
     return new Promise((resolve) => {
       try {
         // Query Electron page URL via CDP to find the correct debugger URL
         fetch("http://127.0.0.1:8315/json")
           .then(res => res.json())
           .then((targets: any) => {
-            const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("initialRoute"));
+            const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("avatar-overlay") && !t.url.includes("initialRoute"));
             if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
               console.error("[OpenCodex CDP] Page target or debugger URL not found.");
-              resolve(false);
+              resolve("connection_failed");
               return;
             }
             
@@ -4054,29 +4248,40 @@ stream_idle_timeout_ms = 600000
               }));
             });
             
-            cdpWs.on("message", () => {
-              if (!completed) {
-                completed = true;
-                cdpWs.close();
-                resolve(true);
-              }
+            cdpWs.on("message", (data) => {
+              try {
+                const msg = JSON.parse(data.toString());
+                if (msg.id === 1) {
+                  if (!completed) {
+                    completed = true;
+                    cdpWs.close();
+                    const val = msg.result?.result?.value;
+                    console.log(`[OpenCodex CDP] Evaluation result: ${val}`);
+                    if (val === "Injected") {
+                      resolve("success");
+                    } else {
+                      resolve("element_not_found");
+                    }
+                  }
+                }
+              } catch {}
             });
             
             cdpWs.on("error", (err) => {
               console.error("[OpenCodex CDP WS Err]", err);
               if (!completed) {
                 completed = true;
-                resolve(false);
+                resolve("connection_failed");
               }
             });
           })
           .catch(err => {
             console.error("[OpenCodex CDP JSON Err]", err.message);
-            resolve(false);
+            resolve("connection_failed");
           });
       } catch (err: any) {
         console.error("[OpenCodex CDP Fail]", err.message);
-        resolve(false);
+        resolve("connection_failed");
       }
     });
   }

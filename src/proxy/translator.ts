@@ -313,6 +313,16 @@ export function chatCompletionToResponse(payload: any, requestedModel: string, n
     output.push(item);
   }
 
+  if (output.length === 0) {
+    output.push({
+      id: "msg_0",
+      type: "message",
+      status: "completed",
+      role: "assistant",
+      content: [{ type: "output_text", text: " ", annotations: [] }],
+    });
+  }
+
   return {
     id: payload.id || "resp_chat",
     object: "response",
@@ -695,15 +705,8 @@ export class ResponsesStreamState {
   private onTextDone?: (text: string) => void;
 
   constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void) {
-    // Reuse the same response ID within the same session so the Codex
-    // client doesn't treat every turn as a brand-new conversation.
-    if (sessionId && ResponsesStreamState.sessionResponseIds.has(sessionId)) {
-      this.responseId = ResponsesStreamState.sessionResponseIds.get(sessionId)!;
-    } else {
-      this.responseId = `resp_${Date.now()}`;
-      if (sessionId) ResponsesStreamState.sessionResponseIds.set(sessionId, this.responseId);
-    }
-    this.messageItemId = `msg_${Date.now()}`;
+    this.responseId = `resp_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+    this.messageItemId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};
     this.onTextChunk = onTextChunk;
@@ -1057,9 +1060,8 @@ export class ResponsesStreamState {
     return {
       id: state.id,
       type: "reasoning",
-      status,
       summary: state.text ? [{ type: "summary_text", text: state.text }] : [],
-      content: state.text ? [{ type: "reasoning_text", text: state.text }] : [],
+      content: [],
       encrypted_content: encrypted,
     };
   }
@@ -1105,6 +1107,16 @@ export class ResponsesStreamState {
       }
       collected.sort((a, b) => a[0] - b[0]);
       output = collected.map((pair) => pair[1]);
+
+      if (output.length === 0) {
+        output.push({
+          id: this.messageItemId,
+          type: "message",
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: " ", annotations: [] }],
+        });
+      }
     }
     return {
       id: this.responseId,

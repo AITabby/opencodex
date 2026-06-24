@@ -6,3 +6,6 @@ dist/
 models/
 launch_opencodex_bar.command
 launch_opencodex_bar.sh
+debug_req.json
+debug_*.json
+test_cdp.js
