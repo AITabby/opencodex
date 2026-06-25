@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="assets/demo_continuity.mp4"><strong>Watch the demo video</strong></a>
+  <a href="https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4"><strong>Watch the demo video</strong></a>
   ·
   <a href="#quick-start"><strong>Quick start</strong></a>
   ·
@@ -26,7 +26,7 @@
 </p>
 
 <p align="center">
-  <a href="assets/demo_continuity.mp4">
+  <a href="https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4">
     <img src="assets/demo_continuity.jpg" alt="OpenCodex demo video preview" width="800">
   </a>
 </p>
@@ -62,12 +62,12 @@ If OpenCodex helps you, starring the repo helps more people find it.
 
 Watch the demo:
 
-[assets/demo_continuity.mp4](assets/demo_continuity.mp4)
+[Watch demo video](https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4)
 
 The demo shows the gateway dashboard, model setup, Codex Desktop routing, GPT-to-DeepSeek switching, and the unified model switching experience.
 
 <p align="center">
-  <a href="assets/demo_continuity.mp4">
+  <a href="https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4">
     <img src="assets/demo_continuity.jpg" alt="OpenCodex demo video preview" width="800">
   </a>
 </p>
@@ -337,12 +337,12 @@ OpenCodex 的目标是在不修改 Codex App 本体的前提下扩展 Codex。
 
 观看演示：
 
-[assets/demo_continuity.mp4](assets/demo_continuity.mp4)
+[观看演示视频](https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4)
 
 演示内容包括网关控制台、模型配置、Codex Desktop 路由、从 GPT 切换到 DeepSeek，以及统一模型空间里的上下文连续性体验。
 
 <p align="center">
-  <a href="assets/demo_continuity.mp4">
+  <a href="https://raw.githubusercontent.com/AITabby/opencodex/master/assets/demo_continuity.mp4">
     <img src="assets/demo_continuity.jpg" alt="OpenCodex demo video preview" width="800">
   </a>
 </p>
