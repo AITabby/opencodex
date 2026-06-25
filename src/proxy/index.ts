@@ -156,7 +156,17 @@ export class ProxyServer {
   private startVADDaemon() {
     if (this.vadProcess) return;
 
-    const scriptPath = "/Users/aitabby/projects/opencodex/src/proxy/silero_vad_daemon.py";
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      join(moduleDir, "silero_vad_daemon.py"),
+      join(moduleDir, "..", "..", "src", "proxy", "silero_vad_daemon.py"),
+      join(process.cwd(), "src", "proxy", "silero_vad_daemon.py")
+    ];
+    const scriptPath = candidates.find((p) => existsSync(p));
+    if (!scriptPath) {
+      console.error("[OpenCodex VAD] silero_vad_daemon.py not found. Voice VAD is disabled for this session.");
+      return;
+    }
     console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
 
     this.vadProcess = spawn("python3", [scriptPath]);
@@ -896,6 +906,7 @@ stream_idle_timeout_ms = 600000
           let clientClosed = false;
           let targetClosed = false;
           let isLocal = false;
+          let routedToOfficial = false;
           const pendingBuffer: { data: any; isBinary: boolean }[] = [];
 
           // Establish connection to official server immediately on upgrade to ensure fresh handshake headers
@@ -958,6 +969,11 @@ stream_idle_timeout_ms = 600000
 
           targetWs.on("open", () => {
             console.log(`[OpenCodex WS Proxy] Official target connection opened for ${url.pathname}`);
+            if (isLocal || connInfo.isCustomMode) {
+              console.log("[OpenCodex WS Proxy] Closing unused official WS because this session is handled locally.");
+              targetWs.close(1000, "custom model handled locally");
+              return;
+            }
             if (targetWs.readyState === WebSocket.OPEN) {
               for (const p of pendingBuffer) {
                 targetWs.send(p.data, { binary: p.isBinary });
@@ -1050,14 +1066,16 @@ stream_idle_timeout_ms = 600000
           targetWs.on("close", (code, reason) => {
             console.log(`[OpenCodex WS Proxy] Official target connection closed: ${code} - ${reason.toString()}`);
             targetClosed = true;
-            if (!clientClosed) {
+            if (!clientClosed && routedToOfficial && !isLocal && !connInfo.isCustomMode) {
               clientWs.close();
             }
           });
 
           targetWs.on("error", (err) => {
             console.error("[OpenCodex WS Proxy Target Error]", err);
-            clientWs.close();
+            if (!clientClosed && routedToOfficial && !isLocal && !connInfo.isCustomMode) {
+              clientWs.close();
+            }
           });
 
           clientWs.on("message", async (data, isBinary) => {
@@ -1087,12 +1105,18 @@ stream_idle_timeout_ms = 600000
 
                   if (isCustomModel) {
                     isLocal = true;
+                    connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
+                    if (targetWs.readyState === WebSocket.OPEN || targetWs.readyState === WebSocket.CONNECTING) {
+                      console.log("[OpenCodex WS Proxy] Detaching official WS; custom model will be served by local gateway.");
+                      try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                    }
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;
                   } else {
                     isLocal = false;
+                    routedToOfficial = true;
                     this.customModelSessions.delete(activeSid);
                   }
                 }
@@ -1132,10 +1156,13 @@ stream_idle_timeout_ms = 600000
 
             if (targetWs) {
               console.log(`[OpenCodex WS Proxy] Forwarding message to official server: ${isBinary ? "Binary" : processedData.toString().slice(0, 300)}`);
+              routedToOfficial = true;
               if (targetWs.readyState === WebSocket.OPEN) {
                 targetWs.send(processedData, { binary: isBinary });
-              } else {
+              } else if (targetWs.readyState === WebSocket.CONNECTING) {
                 pendingBuffer.push({ data: processedData, isBinary });
+              } else {
+                clientWs.close();
               }
             }
           });
@@ -3861,7 +3888,7 @@ stream_idle_timeout_ms = 600000
   private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders) {
     const requestedModel = reqBody.model || "";
     try {
-      writeFileSync("/Users/aitabby/projects/opencodex/debug_req.json", JSON.stringify(reqBody, null, 2), "utf-8");
+      writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
     } catch (e) {}
     const catalog = this.getModelCatalog();
     let catalogEntry = catalog.models?.find((m: any) => m.slug === requestedModel);
