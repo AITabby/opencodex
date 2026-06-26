@@ -19,11 +19,33 @@ import zlib from "node:zlib";
 
 // Auto-detect and configure outbound proxy support
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+const noProxyList = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map(s => s.trim()).filter(Boolean);
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
-const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+const defaultFetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+
+function shouldBypassProxy(url: string): boolean {
+  if (!proxyUrl || noProxyList.length === 0) return false;
+  try {
+    const hostname = new URL(url).hostname;
+    return noProxyList.some(pattern => {
+      if (pattern === "*") return true;
+      if (hostname === pattern) return true;
+      if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
+      if (hostname.endsWith("." + pattern)) return true;
+      return false;
+    });
+  } catch { return false; }
+}
+
+function getFetchDispatcher(url: string) {
+  return shouldBypassProxy(url) ? undefined : defaultFetchDispatcher;
+}
 
 if (proxyUrl) {
   console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
+  if (noProxyList.length > 0) {
+    console.log(`[OpenCodex Proxy] No-proxy bypass list: ${noProxyList.join(", ")}`);
+  }
 }
 
 import {
@@ -1108,9 +1130,14 @@ stream_idle_timeout_ms = 600000
                     connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
-                    if (targetWs.readyState === WebSocket.OPEN || targetWs.readyState === WebSocket.CONNECTING) {
+                    if (targetWs.readyState === WebSocket.OPEN) {
                       console.log("[OpenCodex WS Proxy] Detaching official WS; custom model will be served by local gateway.");
                       try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                    } else if (targetWs.readyState === WebSocket.CONNECTING) {
+                      console.log("[OpenCodex WS Proxy] Official WS still connecting; will be handled by local gateway.");
+                      targetWs.once('open', () => {
+                        try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                      });
                     }
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;
@@ -2520,7 +2547,7 @@ stream_idle_timeout_ms = 600000
           method: req.method,
           headers,
           body: rawBody,
-          dispatcher: fetchDispatcher
+          dispatcher: getFetchDispatcher(targetUrl)
         });
 
         console.log(`[OpenCodex Proxy] Official server HTTP response status: ${officialRes.status}`);
@@ -2627,11 +2654,12 @@ stream_idle_timeout_ms = 600000
     res: http.ServerResponse,
     sessionId?: string
   ) {
-    const response = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const response = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
 
     if (!response.ok) {
@@ -2722,11 +2750,12 @@ stream_idle_timeout_ms = 600000
     res: http.ServerResponse,
     sessionId?: string
   ) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
 
     const rawText = await r.text();
@@ -2870,11 +2899,12 @@ stream_idle_timeout_ms = 600000
   }
 
   private async nonStreamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
     
     const text = await r.text();
@@ -2890,11 +2920,12 @@ stream_idle_timeout_ms = 600000
   }
 
   private async streamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
 
     if (!r.ok) {
@@ -3036,7 +3067,7 @@ stream_idle_timeout_ms = 600000
         "Content-Type": `multipart/form-data; boundary=${boundary}`
       },
       body: payload,
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(url)
     });
 
     if (!response.ok) {
@@ -3070,7 +3101,7 @@ stream_idle_timeout_ms = 600000
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ model, input: text, voice }),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(url)
     });
 
     if (!response.ok) {
@@ -3165,7 +3196,8 @@ stream_idle_timeout_ms = 600000
     const stylePrompt = settings.voice_system_prompt || "Natural, clear and friendly tone, standard pace.";
 
     try {
-      const response = await fetch(`${apiHost}/v1/chat/completions`, {
+      const ttsUrl = `${apiHost}/v1/chat/completions`;
+      const response = await fetch(ttsUrl, {
         method: "POST",
         headers: {
           "api-key": apiKey,
@@ -3189,7 +3221,7 @@ stream_idle_timeout_ms = 600000
           },
           stream: false
         }),
-        dispatcher: fetchDispatcher
+        dispatcher: getFetchDispatcher(ttsUrl)
       });
 
       if (!response.ok) {
@@ -3351,7 +3383,7 @@ stream_idle_timeout_ms = 600000
       method: "POST",
       headers,
       body: JSON.stringify(bodyPayload),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(baseUrl)
     });
 
     if (!response.ok) {
@@ -3965,12 +3997,13 @@ stream_idle_timeout_ms = 600000
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
     try {
-      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
-      const response = await fetch(`${provider.base_url}/chat/completions`, {
+      const upstreamUrl = `${provider.base_url}/chat/completions`;
+      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${upstreamUrl}`);
+      const response = await fetch(upstreamUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(chatBody),
-        dispatcher: fetchDispatcher
+        dispatcher: getFetchDispatcher(upstreamUrl)
       });
 
       console.log(`[OpenCodex WS Proxy] Upstream response status: ${response.status}`);

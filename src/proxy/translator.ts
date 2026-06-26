@@ -15,7 +15,26 @@ import { ProxyAgent, fetch } from "undici";
 
 // Auto-detect and configure outbound proxy support for translator requests
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
-const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+const noProxyList = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map(s => s.trim()).filter(Boolean);
+const defaultFetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+
+function shouldBypassProxy(url: string): boolean {
+  if (!proxyUrl || noProxyList.length === 0) return false;
+  try {
+    const hostname = new URL(url).hostname;
+    return noProxyList.some(pattern => {
+      if (pattern === "*") return true;
+      if (hostname === pattern) return true;
+      if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
+      if (hostname.endsWith("." + pattern)) return true;
+      return false;
+    });
+  } catch { return false; }
+}
+
+function getFetchDispatcher(url: string) {
+  return shouldBypassProxy(url) ? undefined : defaultFetchDispatcher;
+}
 
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
 const SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:";
@@ -1275,7 +1294,7 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
       headers,
       body: JSON.stringify(payload),
       signal: controller.signal,
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(visionUrl)
     });
     clearTimeout(timeoutId);
 
