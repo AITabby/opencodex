@@ -87,11 +87,13 @@ console.error = (...args: any[]) => {
 
 function isSameMessage(m1: any, m2: any): boolean {
   if (m1.role !== m2.role) return false;
+  const c1 = (typeof m1.content === "string" ? m1.content : "").trim();
+  const c2 = (typeof m2.content === "string" ? m2.content : "").trim();
   if (m1.role === "tool") {
-    return m1.tool_call_id === m2.tool_call_id && m1.content === m2.content;
+    return m1.tool_call_id === m2.tool_call_id && c1 === c2;
   }
   if (m1.role === "assistant") {
-    const contentMatch = (m1.content || "") === (m2.content || "");
+    const contentMatch = c1 === c2;
     if (!contentMatch) return false;
     const tc1 = m1.tool_calls || [];
     const tc2 = m2.tool_calls || [];
@@ -102,7 +104,7 @@ function isSameMessage(m1: any, m2: any): boolean {
     }
     return true;
   }
-  return m1.content === m2.content;
+  return c1 === c2;
 }
 
 function mergeHistory(history: any[], incoming: any[]): any[] {
@@ -124,6 +126,52 @@ function mergeHistory(history: any[], incoming: any[]): any[] {
   return history.concat(incoming.slice(overlapLength));
 }
 
+function alignToolMessages(msgs: any[]): any[] {
+  const toolMessagesMap = new Map<string, any>();
+  const otherMessages: any[] = [];
+  
+  for (const m of msgs) {
+    if (m.role === "tool" && m.tool_call_id) {
+      toolMessagesMap.set(m.tool_call_id, m);
+    } else {
+      otherMessages.push(m);
+    }
+  }
+  
+  const result: any[] = [];
+  const processedToolCallIds = new Set<string>();
+  
+  for (const m of otherMessages) {
+    result.push(m);
+    if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
+      for (const tc of m.tool_calls) {
+        if (tc.id) {
+          processedToolCallIds.add(tc.id);
+          const toolMsg = toolMessagesMap.get(tc.id);
+          if (toolMsg) {
+            result.push(toolMsg);
+          } else {
+            result.push({
+              role: "tool",
+              tool_call_id: tc.id,
+              content: "Tool execution completed (no output returned)."
+            });
+          }
+        }
+      }
+    }
+  }
+  
+  for (const [id, toolMsg] of toolMessagesMap.entries()) {
+    if (!processedToolCallIds.has(id)) {
+      console.warn(`[OpenCodex WS Proxy] Discarding orphaned tool message for tool_call_id: ${id}`);
+    }
+  }
+  
+  return result;
+}
+
+
 export class ProxyServer {
   private server: http.Server | null = null;
   public config!: ProxyConfig;
@@ -131,6 +179,7 @@ export class ProxyServer {
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
+  private forcedErrorSessions = new Set<string>();
   private customSessionQueues = new Map<string, Promise<void>>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
@@ -1011,7 +1060,11 @@ stream_idle_timeout_ms = 600000
             }
 
             const msgStr = processedTData.toString();
-            console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
+            if (!tIsBinary && (msgStr.includes("response.created") || msgStr.includes("response.completed"))) {
+              console.log(`[OpenCodex WS Proxy] Message from official server (FULL): ${msgStr}`);
+            } else {
+              console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
+            }
             
             if (!tIsBinary) {
               try {
@@ -1714,6 +1767,8 @@ stream_idle_timeout_ms = 600000
         deleteSessionFiles(sessionsDir);
 
         console.error(`[Sessions] Cleared all sessions.`);
+        this.customModelSessions.clear();
+        this.forcedErrorSessions.clear();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
       } catch (err: any) {
@@ -1758,6 +1813,8 @@ stream_idle_timeout_ms = 600000
         }
 
         console.error(`[Sessions] Deleted session: ${sid}`);
+        this.customModelSessions.delete(sid);
+        this.forcedErrorSessions.delete(sid);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
       } catch (err: any) {
@@ -2593,12 +2650,15 @@ stream_idle_timeout_ms = 600000
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
-    chatBody.messages = (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
-      if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
-        return { ...m, content: " " };
-      }
-      return m;
-    });
+    chatBody.messages = alignToolMessages(
+      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
+        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
+          return { ...m, content: " " };
+        }
+        return m;
+      })
+    );
+
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
@@ -3937,6 +3997,7 @@ stream_idle_timeout_ms = 600000
   }
 
   private async handleLocalResponsesWebSocketInlineQueued(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders, sessionId: any, sessionIdStr: string) {
+    const startTime = Date.now();
     const requestedModel = reqBody.model || "";
     try {
       writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
@@ -4021,6 +4082,13 @@ stream_idle_timeout_ms = 600000
             }
           }
         }));
+        ws.send(JSON.stringify({
+          type: "codex.response.metadata",
+          headers: {
+            "x-codex-safety-buffering-enabled": "true",
+            "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
+          }
+        }));
         await streamState.start(async (payload) => {
           ws.send(JSON.stringify(payload));
         });
@@ -4036,11 +4104,92 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+
+
+    const prevResponseId = processedReqBody.previous_response_id;
+    if (!prevResponseId && !this.forcedErrorSessions.has(sessionIdStr)) {
+      console.log(`[OpenCodex WS Proxy] Forcing proper failed response on first sentence for session ${sessionIdStr} to reset Codex UI state machine.`);
+      this.forcedErrorSessions.add(sessionIdStr);
+
+      const namespaceMap = extractNamespaceMap(processedReqBody.tools);
+      const responseMetadata = {
+        session_id: reqBody.client_metadata?.session_id || sessionIdStr,
+        thread_id: reqBody.client_metadata?.thread_id,
+        turn_id: reqBody.client_metadata?.turn_id,
+        "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
+      };
+
+      const streamState = new ResponsesStreamState(
+        requestedModel,
+        namespaceMap,
+        sessionId,
+        undefined,
+        undefined,
+        responseMetadata
+      );
+
+      // 1. Send rate limits
+      ws.send(JSON.stringify({
+        type: "codex.rate_limits",
+        plan_type: "plus",
+        rate_limits: {
+          allowed: true,
+          limit_reached: false,
+          primary: {
+            used_percent: 0,
+            window_minutes: 300,
+            reset_after_seconds: 3600,
+            reset_at: Math.floor(Date.now() / 1000) + 3600,
+            limit_reached: false
+          }
+        }
+      }));
+
+      // 2. Send metadata
+      ws.send(JSON.stringify({
+        type: "codex.response.metadata",
+        headers: {
+          "x-codex-safety-buffering-enabled": "true",
+          "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
+        }
+      }));
+
+      // 3. Start response (sends response.created & response.in_progress)
+      await streamState.start(async (payload) => {
+        ws.send(JSON.stringify(payload));
+      });
+
+      // 4. Send response.failed
+      const now = Math.floor(Date.now() / 1000);
+      const failedResponse = {
+        id: streamState.responseId,
+        object: "response",
+        created_at: now,
+        completed_at: null,
+        status: "failed",
+        background: false,
+        model: requestedModel,
+        output: [],
+        metadata: responseMetadata,
+        error: {
+          code: "connection_failed",
+          message: "OpenCodex: Initializing connection state. Please click retry or re-send your message."
+        }
+      };
+
+      ws.send(JSON.stringify({
+        type: "response.failed",
+        response: failedResponse,
+        sequence_number: 5
+      }));
+
+      return;
+    }
+
     const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     this.customModelSessions.add(sessionIdStr);
-    const prevResponseId = processedReqBody.previous_response_id;
     if (!prevResponseId) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
@@ -4058,12 +4207,15 @@ stream_idle_timeout_ms = 600000
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
-    chatBody.messages = (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
-      if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
-        return { ...m, content: " " };
-      }
-      return m;
-    });
+    chatBody.messages = alignToolMessages(
+      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
+        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
+          return { ...m, content: " " };
+        }
+        return m;
+      })
+    );
+
 
     // Sanitize empty/null content fields for MiniMax model
     if (mappedModelName.toLowerCase().includes("minimax")) {
@@ -4119,6 +4271,13 @@ stream_idle_timeout_ms = 600000
               reset_at: Math.floor(Date.now() / 1000) + 3600,
               limit_reached: false
             }
+          }
+        }));
+        ws.send(JSON.stringify({
+          type: "codex.response.metadata",
+          headers: {
+            "x-codex-safety-buffering-enabled": "true",
+            "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
           }
         }));
         await streamState.start(async (payload) => {
@@ -4178,6 +4337,12 @@ stream_idle_timeout_ms = 600000
           }
         } finally {
           reader.releaseLock();
+        }
+
+        const elapsed = Date.now() - startTime;
+        if (elapsed < 1500) {
+          console.log(`[OpenCodex WS Proxy] Stream finished too fast (${elapsed}ms). Delaying completion by ${1500 - elapsed}ms to align client turn state.`);
+          await new Promise(resolve => setTimeout(resolve, 1500 - elapsed));
         }
 
         console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
