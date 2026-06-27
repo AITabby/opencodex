@@ -14,32 +14,13 @@ import { exec, spawn, spawnSync, execSync } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
 // @ts-ignore
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { ProxyAgent, fetch } from "undici";
+import { fetch } from "undici";
 import zlib from "node:zlib";
+import { createFetchDispatcherSelector } from "./proxyBypass.js";
 
 // Auto-detect and configure outbound proxy support
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
-const noProxyList = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map(s => s.trim()).filter(Boolean);
+const { proxyUrl, noProxyList, getFetchDispatcher } = createFetchDispatcherSelector();
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
-const defaultFetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
-
-function shouldBypassProxy(url: string): boolean {
-  if (!proxyUrl || noProxyList.length === 0) return false;
-  try {
-    const hostname = new URL(url).hostname;
-    return noProxyList.some(pattern => {
-      if (pattern === "*") return true;
-      if (hostname === pattern) return true;
-      if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
-      if (hostname.endsWith("." + pattern)) return true;
-      return false;
-    });
-  } catch { return false; }
-}
-
-function getFetchDispatcher(url: string) {
-  return shouldBypassProxy(url) ? undefined : defaultFetchDispatcher;
-}
 
 if (proxyUrl) {
   console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
@@ -1130,14 +1111,9 @@ stream_idle_timeout_ms = 600000
                     connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
-                    if (targetWs.readyState === WebSocket.OPEN) {
+                    if (targetWs.readyState === WebSocket.OPEN || targetWs.readyState === WebSocket.CONNECTING) {
                       console.log("[OpenCodex WS Proxy] Detaching official WS; custom model will be served by local gateway.");
                       try { targetWs.close(1000, "custom model handled locally"); } catch {}
-                    } else if (targetWs.readyState === WebSocket.CONNECTING) {
-                      console.log("[OpenCodex WS Proxy] Official WS still connecting; will be handled by local gateway.");
-                      targetWs.once('open', () => {
-                        try { targetWs.close(1000, "custom model handled locally"); } catch {}
-                      });
                     }
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;

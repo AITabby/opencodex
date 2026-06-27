@@ -11,30 +11,11 @@ import fs from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import { ProxyAgent, fetch } from "undici";
+import { fetch } from "undici";
+import { createFetchDispatcherSelector } from "./proxyBypass.js";
 
 // Auto-detect and configure outbound proxy support for translator requests
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
-const noProxyList = (process.env.NO_PROXY || process.env.no_proxy || "").split(",").map(s => s.trim()).filter(Boolean);
-const defaultFetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
-
-function shouldBypassProxy(url: string): boolean {
-  if (!proxyUrl || noProxyList.length === 0) return false;
-  try {
-    const hostname = new URL(url).hostname;
-    return noProxyList.some(pattern => {
-      if (pattern === "*") return true;
-      if (hostname === pattern) return true;
-      if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
-      if (hostname.endsWith("." + pattern)) return true;
-      return false;
-    });
-  } catch { return false; }
-}
-
-function getFetchDispatcher(url: string) {
-  return shouldBypassProxy(url) ? undefined : defaultFetchDispatcher;
-}
+const { getFetchDispatcher } = createFetchDispatcherSelector();
 
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
 const SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:";
