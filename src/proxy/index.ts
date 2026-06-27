@@ -14,16 +14,19 @@ import { exec, spawn, spawnSync, execSync } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
 // @ts-ignore
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { ProxyAgent, fetch } from "undici";
+import { fetch } from "undici";
 import zlib from "node:zlib";
+import { createFetchDispatcherSelector } from "./proxyBypass.js";
 
 // Auto-detect and configure outbound proxy support
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+const { proxyUrl, noProxyList, getFetchDispatcher } = createFetchDispatcherSelector();
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
-const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 
 if (proxyUrl) {
   console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
+  if (noProxyList.length > 0) {
+    console.log(`[OpenCodex Proxy] No-proxy bypass list: ${noProxyList.join(", ")}`);
+  }
 }
 
 import {
@@ -131,7 +134,6 @@ export class ProxyServer {
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
-  private customSessionQueues = new Map<string, Promise<void>>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -971,6 +973,8 @@ stream_idle_timeout_ms = 600000
           targetWs.on("open", () => {
             console.log(`[OpenCodex WS Proxy] Official target connection opened for ${url.pathname}`);
             if (isLocal || connInfo.isCustomMode) {
+              console.log("[OpenCodex WS Proxy] Closing unused official WS because this session is handled locally.");
+              targetWs.close(1000, "custom model handled locally");
               return;
             }
             if (targetWs.readyState === WebSocket.OPEN) {
@@ -1096,7 +1100,7 @@ stream_idle_timeout_ms = 600000
                   }
                 }
                 const model = msg.model || "";
-                if (msg.type === "response.create" && model) {
+                if (model) {
                   const catalog = this.getModelCatalog();
                   const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                   const isCustomModel = !!catalogEntry?.backend_provider;
@@ -1107,6 +1111,15 @@ stream_idle_timeout_ms = 600000
                     connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
+                    if (targetWs.readyState === WebSocket.OPEN) {
+                      console.log("[OpenCodex WS Proxy] Detaching official WS; custom model will be served by local gateway.");
+                      try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                    } else if (targetWs.readyState === WebSocket.CONNECTING) {
+                      console.log("[OpenCodex WS Proxy] Official WS still connecting; will be handled by local gateway.");
+                      targetWs.once('open', () => {
+                        try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                      });
+                    }
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;
                   } else {
@@ -2515,7 +2528,7 @@ stream_idle_timeout_ms = 600000
           method: req.method,
           headers,
           body: rawBody,
-          dispatcher: fetchDispatcher
+          dispatcher: getFetchDispatcher(targetUrl)
         });
 
         console.log(`[OpenCodex Proxy] Official server HTTP response status: ${officialRes.status}`);
@@ -2575,21 +2588,17 @@ stream_idle_timeout_ms = 600000
       this.customModelSessions.delete(sessionIdStr);
     }
 
-    const prevResponseId = processedReqBody.previous_response_id;
-    if (!prevResponseId) {
+        const isFirstTurn = !processedReqBody.previous_response_id;
+    
+    if (isFirstTurn) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
       const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
       if (existingHistory.length === 0) {
         this.customConversationHistory.set(sessionIdStr, chatBody.messages);
       } else {
-        const index = existingHistory.findIndex((m: any) => m.role === "assistant" && (m.id === prevResponseId || m.response_id === prevResponseId));
-        let alignedHistory = existingHistory;
-        if (index !== -1) {
-          alignedHistory = existingHistory.slice(0, index + 1);
-        }
         const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
+        const updatedHistory = mergeHistory(existingHistory, incomingMessages);
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
@@ -2626,6 +2635,21 @@ stream_idle_timeout_ms = 600000
     res: http.ServerResponse,
     sessionId?: string
   ) {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const response = await fetch(chatUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+      dispatcher: getFetchDispatcher(chatUrl)
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      res.writeHead(response.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: errorText }));
+      return;
+    }
+
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -2655,93 +2679,46 @@ stream_idle_timeout_ms = 600000
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
     });
 
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
     try {
-      const response = await fetch(`${provider.base_url}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(body),
-        dispatcher: fetchDispatcher
-      });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        const fakeChunk = {
-          choices: [{
-            delta: {
-              content: `\n[OpenCodex Proxy Error] Failed to fetch from upstream: ${response.status} - ${errorText}\n`
-            }
-          }]
-        };
-        await streamState.writeChatDelta(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }, fakeChunk);
-        await streamState.finish(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        });
-        res.end();
-        return;
-      }
-
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n");
-          buffer = lines.pop() || "";
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === "data: [DONE]") continue;
-            if (!trimmed.startsWith("data: ")) continue;
-            try {
-              const chunk = JSON.parse(trimmed.slice(6));
-              await streamState.writeChatDelta(async (payload) => {
-                res.write(`data: ${JSON.stringify(payload)}\n\n`);
-              }, chunk);
-            } catch {
-              // ignore JSON parsing chunks error
-            }
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === "data: [DONE]") continue;
+          if (!trimmed.startsWith("data: ")) continue;
+          try {
+            const chunk = JSON.parse(trimmed.slice(6));
+            await streamState.writeChatDelta(async (payload) => {
+              res.write(`data: ${JSON.stringify(payload)}\n\n`);
+            }, chunk);
+          } catch {
+            // ignore JSON parsing chunks error
           }
         }
-      } finally {
-        reader.releaseLock();
       }
+    } finally {
+      reader.releaseLock();
+    }
 
-      await streamState.finish(async (payload) => {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      });
-      res.end();
+    await streamState.finish(async (payload) => {
+      res.write(`data: ${JSON.stringify(payload)}\n\n`);
+    });
+    res.end();
 
-      const assistantMsg = streamState.getAssistantMessage();
-      if (assistantMsg) {
-        assistantMsg.id = streamState.responseId;
-        const sessionIdStr = sessionId ? String(sessionId) : "default";
-        const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
-        this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
-      }
-    } catch (err: any) {
-      console.error(`[Responses] Streaming error: ${err.message}`);
-      try {
-        const fakeChunk = {
-          choices: [{
-            delta: {
-              content: `\n[OpenCodex Proxy Error] Request failed: ${err.message}\n`
-            }
-          }]
-        };
-        await streamState.writeChatDelta(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }, fakeChunk);
-        await streamState.finish(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        });
-      } catch {}
-      try { res.end(); } catch {}
+    const assistantMsg = streamState.getAssistantMessage();
+    if (assistantMsg) {
+      const sessionIdStr = sessionId ? String(sessionId) : "default";
+      const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
+      this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
     }
   }
 
@@ -2754,11 +2731,12 @@ stream_idle_timeout_ms = 600000
     res: http.ServerResponse,
     sessionId?: string
   ) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
 
     const rawText = await r.text();
@@ -2782,7 +2760,6 @@ stream_idle_timeout_ms = 600000
     const choice = (data.choices || [{}])[0];
     const message = choice.message;
     if (message) {
-      message.id = responseBody.id;
       const sessionIdStr = sessionId ? String(sessionId) : "default";
       const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
       this.customConversationHistory.set(sessionIdStr, currentHistory.concat(message));
@@ -2903,11 +2880,12 @@ stream_idle_timeout_ms = 600000
   }
 
   private async nonStreamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
     
     const text = await r.text();
@@ -2923,11 +2901,12 @@ stream_idle_timeout_ms = 600000
   }
 
   private async streamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const chatUrl = `${provider.base_url}/chat/completions`;
+    const r = await fetch(chatUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(chatUrl)
     });
 
     if (!r.ok) {
@@ -3069,7 +3048,7 @@ stream_idle_timeout_ms = 600000
         "Content-Type": `multipart/form-data; boundary=${boundary}`
       },
       body: payload,
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(url)
     });
 
     if (!response.ok) {
@@ -3103,7 +3082,7 @@ stream_idle_timeout_ms = 600000
         "Content-Type": "application/json"
       },
       body: JSON.stringify({ model, input: text, voice }),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(url)
     });
 
     if (!response.ok) {
@@ -3198,7 +3177,8 @@ stream_idle_timeout_ms = 600000
     const stylePrompt = settings.voice_system_prompt || "Natural, clear and friendly tone, standard pace.";
 
     try {
-      const response = await fetch(`${apiHost}/v1/chat/completions`, {
+      const ttsUrl = `${apiHost}/v1/chat/completions`;
+      const response = await fetch(ttsUrl, {
         method: "POST",
         headers: {
           "api-key": apiKey,
@@ -3222,7 +3202,7 @@ stream_idle_timeout_ms = 600000
           },
           stream: false
         }),
-        dispatcher: fetchDispatcher
+        dispatcher: getFetchDispatcher(ttsUrl)
       });
 
       if (!response.ok) {
@@ -3384,7 +3364,7 @@ stream_idle_timeout_ms = 600000
       method: "POST",
       headers,
       body: JSON.stringify(bodyPayload),
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(baseUrl)
     });
 
     if (!response.ok) {
@@ -3919,24 +3899,6 @@ stream_idle_timeout_ms = 600000
   }
 
   private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders) {
-    const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
-    const sessionId = reqBody.client_metadata?.session_id || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
-    const sessionIdStr = sessionId ? String(sessionId) : "default";
-    const previous = this.customSessionQueues.get(sessionIdStr) || Promise.resolve();
-    const current = previous
-      .catch(() => {})
-      .then(() => this.handleLocalResponsesWebSocketInlineQueued(ws, reqBody, clientHeaders, sessionId, sessionIdStr));
-    this.customSessionQueues.set(sessionIdStr, current);
-    try {
-      await current;
-    } finally {
-      if (this.customSessionQueues.get(sessionIdStr) === current) {
-        this.customSessionQueues.delete(sessionIdStr);
-      }
-    }
-  }
-
-  private async handleLocalResponsesWebSocketInlineQueued(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders, sessionId: any, sessionIdStr: string) {
     const requestedModel = reqBody.model || "";
     try {
       writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
@@ -3968,93 +3930,28 @@ stream_idle_timeout_ms = 600000
     }
 
     const isStream = reqBody.stream ?? true;
+    const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
+    const sessionId = reqBody.client_metadata?.session_id || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
 
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
     const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
 
-    const turnMetadataStr = reqBody.client_metadata?.["x-codex-turn-metadata"];
-    let isPrewarm = false;
-    if (turnMetadataStr) {
-      try {
-        const parsed = JSON.parse(turnMetadataStr);
-        if (parsed.request_kind === "prewarm") {
-          isPrewarm = true;
-        }
-      } catch {}
-    }
-    // Robust fallback: if input is empty, it is a prewarm/dummy request.
-    if (!isPrewarm && (!reqBody.input || reqBody.input.length === 0)) {
-      isPrewarm = true;
-    }
-
-    if (isPrewarm) {
-      console.log(`[OpenCodex WS Proxy] Handling prewarm request locally and instantly.`);
-      const namespaceMap = extractNamespaceMap(processedReqBody.tools);
-      const responseMetadata = {
-        session_id: reqBody.client_metadata?.session_id || sessionIdStr,
-        thread_id: reqBody.client_metadata?.thread_id,
-        turn_id: reqBody.client_metadata?.turn_id,
-        "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
-      };
-      const streamState = isStream ? new ResponsesStreamState(
-        requestedModel,
-        namespaceMap,
-        sessionId,
-        undefined,
-        undefined,
-        responseMetadata
-      ) : null;
-
-      if (streamState) {
-        ws.send(JSON.stringify({
-          type: "codex.rate_limits",
-          plan_type: "plus",
-          rate_limits: {
-            allowed: true,
-            limit_reached: false,
-            primary: {
-              used_percent: 0,
-              window_minutes: 300,
-              reset_after_seconds: 3600,
-              reset_at: Math.floor(Date.now() / 1000) + 3600,
-              limit_reached: false
-            }
-          }
-        }));
-        await streamState.start(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
-        await streamState.finish(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
-      } else {
-        const responseBody = chatCompletionToResponse({
-          choices: [{ message: { role: "assistant", content: "" } }]
-        }, requestedModel, namespaceMap);
-        ws.send(JSON.stringify(responseBody));
-      }
-      return;
-    }
-
     const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
+    const sessionIdStr = sessionId ? String(sessionId) : "default";
     this.customModelSessions.add(sessionIdStr);
-    const prevResponseId = processedReqBody.previous_response_id;
-    if (!prevResponseId) {
+        const isFirstTurn = !processedReqBody.previous_response_id;
+    
+    if (isFirstTurn) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
       const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
       if (existingHistory.length === 0) {
         this.customConversationHistory.set(sessionIdStr, chatBody.messages);
       } else {
-        const index = existingHistory.findIndex((m: any) => m.role === "assistant" && (m.id === prevResponseId || m.response_id === prevResponseId));
-        let alignedHistory = existingHistory;
-        if (index !== -1) {
-          alignedHistory = existingHistory.slice(0, index + 1);
-        }
         const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
+        const updatedHistory = mergeHistory(existingHistory, incomingMessages);
         this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
     }
@@ -4079,59 +3976,15 @@ stream_idle_timeout_ms = 600000
     }
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
-    const responseMetadata = {
-      session_id: reqBody.client_metadata?.session_id || sessionIdStr,
-      thread_id: reqBody.client_metadata?.thread_id,
-      turn_id: reqBody.client_metadata?.turn_id,
-      "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
-    };
-    const streamState = isStream ? new ResponsesStreamState(
-      requestedModel,
-      namespaceMap,
-      sessionId,
-      (textChunk) => {
-        const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
-        for (const wsClient of this.activeWsClients) {
-          try { wsClient.send(msg); } catch {}
-        }
-      },
-      (fullText) => {
-        const msg = JSON.stringify({ type: "model_done", text: fullText });
-        for (const wsClient of this.activeWsClients) {
-          try { wsClient.send(msg); } catch {}
-        }
-      },
-      responseMetadata
-    ) : null;
 
     try {
-      if (streamState) {
-        ws.send(JSON.stringify({
-          type: "codex.rate_limits",
-          plan_type: "plus",
-          rate_limits: {
-            allowed: true,
-            limit_reached: false,
-            primary: {
-              used_percent: 0,
-              window_minutes: 300,
-              reset_after_seconds: 3600,
-              reset_at: Math.floor(Date.now() / 1000) + 3600,
-              limit_reached: false
-            }
-          }
-        }));
-        await streamState.start(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
-      }
-
-      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
-      const response = await fetch(`${provider.base_url}/chat/completions`, {
+      const upstreamUrl = `${provider.base_url}/chat/completions`;
+      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${upstreamUrl}`);
+      const response = await fetch(upstreamUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(chatBody),
-        dispatcher: fetchDispatcher
+        dispatcher: getFetchDispatcher(upstreamUrl)
       });
 
       console.log(`[OpenCodex WS Proxy] Upstream response status: ${response.status}`);
@@ -4143,8 +3996,28 @@ stream_idle_timeout_ms = 600000
       }
 
       if (isStream) {
-        const activeStreamState = streamState!;
         console.log(`[OpenCodex WS Proxy] Starting stream response...`);
+        const streamState = new ResponsesStreamState(
+          requestedModel,
+          namespaceMap,
+          sessionId,
+          (textChunk) => {
+            const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
+            for (const wsClient of this.activeWsClients) {
+              try { wsClient.send(msg); } catch {}
+            }
+          },
+          (fullText) => {
+            const msg = JSON.stringify({ type: "model_done", text: fullText });
+            for (const wsClient of this.activeWsClients) {
+              try { wsClient.send(msg); } catch {}
+            }
+          }
+        );
+        await streamState.start(async (payload) => {
+          ws.send(JSON.stringify(payload));
+        });
+
         const reader = response.body!.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -4168,7 +4041,7 @@ stream_idle_timeout_ms = 600000
               if (!trimmed.startsWith("data: ")) continue;
               try {
                 const chunk = JSON.parse(trimmed.slice(6));
-                await activeStreamState.writeChatDelta(async (payload) => {
+                await streamState.writeChatDelta(async (payload) => {
                   ws.send(JSON.stringify(payload));
                 }, chunk);
               } catch (parseErr: any) {
@@ -4181,13 +4054,12 @@ stream_idle_timeout_ms = 600000
         }
 
         console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
-        await activeStreamState.finish(async (payload) => {
+        await streamState.finish(async (payload) => {
           ws.send(JSON.stringify(payload));
         });
 
-        const assistantMsg = activeStreamState.getAssistantMessage();
+        const assistantMsg = streamState.getAssistantMessage();
         if (assistantMsg) {
-          assistantMsg.id = activeStreamState.responseId;
           const sessionIdStr = sessionId ? String(sessionId) : "default";
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
           this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
@@ -4207,7 +4079,6 @@ stream_idle_timeout_ms = 600000
         const choice = (data.choices || [{}])[0];
         const message = choice.message;
         if (message) {
-          message.id = responseBody.id;
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
           this.customConversationHistory.set(sessionIdStr, currentHistory.concat(message));
         }

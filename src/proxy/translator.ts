@@ -11,11 +11,11 @@ import fs from "node:fs";
 import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
-import { ProxyAgent, fetch } from "undici";
+import { fetch } from "undici";
+import { createFetchDispatcherSelector } from "./proxyBypass.js";
 
 // Auto-detect and configure outbound proxy support for translator requests
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
-const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+const { getFetchDispatcher } = createFetchDispatcherSelector();
 
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
 const SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:";
@@ -689,7 +689,7 @@ class ThinkTagFilter {
 
 export class ResponsesStreamState {
   private static sessionResponseIds = new Map<string, string>();
-  public responseId: string;
+  private responseId: string;
   private thinkFilter = new ThinkTagFilter();
   private messageItemId: string;
   private model: string;
@@ -703,16 +703,14 @@ export class ResponsesStreamState {
   private nextOutputIndex = 0;
   private onTextChunk?: (text: string) => void;
   private onTextDone?: (text: string) => void;
-  private metadata?: any;
 
-  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void, metadata?: any) {
+  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void) {
     this.responseId = `resp_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
     this.messageItemId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};
     this.onTextChunk = onTextChunk;
     this.onTextDone = onTextDone;
-    this.metadata = metadata;
   }
 
   getAssistantMessage(): any {
@@ -742,10 +740,6 @@ export class ResponsesStreamState {
 
   async start(writeSse: (payload: any) => Promise<void>): Promise<void> {
     await writeSse({ type: "response.created", response: this._response("in_progress") });
-    await writeSse({ type: "response.in_progress", response: this._response("in_progress") });
-    if (!this.messageOpened) {
-      await this._openMessage(writeSse);
-    }
   }
 
   async finish(writeSse: (payload: any) => Promise<void>): Promise<void> {
@@ -1131,7 +1125,6 @@ export class ResponsesStreamState {
       status,
       model: this.model,
       output,
-      metadata: this.metadata,
     };
   }
 }
@@ -1282,7 +1275,7 @@ export async function describeImageB64(b64Data: string, config?: any): Promise<s
       headers,
       body: JSON.stringify(payload),
       signal: controller.signal,
-      dispatcher: fetchDispatcher
+      dispatcher: getFetchDispatcher(visionUrl)
     });
     clearTimeout(timeoutId);
 
