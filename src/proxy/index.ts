@@ -1111,9 +1111,14 @@ stream_idle_timeout_ms = 600000
                     connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
-                    if (targetWs.readyState === WebSocket.OPEN || targetWs.readyState === WebSocket.CONNECTING) {
+                    if (targetWs.readyState === WebSocket.OPEN) {
                       console.log("[OpenCodex WS Proxy] Detaching official WS; custom model will be served by local gateway.");
                       try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                    } else if (targetWs.readyState === WebSocket.CONNECTING) {
+                      console.log("[OpenCodex WS Proxy] Official WS still connecting; will be handled by local gateway.");
+                      targetWs.once('open', () => {
+                        try { targetWs.close(1000, "custom model handled locally"); } catch {}
+                      });
                     }
                     await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
                     return;
