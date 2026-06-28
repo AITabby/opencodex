@@ -411,7 +411,23 @@ class OpenCodex {
     try {
       console.error("[OpenCodex] Starting resident codex mcp-server background daemon...");
       const { spawn } = await import("node:child_process");
-      const execServer = spawn("/Applications/Codex.app/Contents/Resources/codex", [
+      let codexMcpBinary = "/Applications/Codex.app/Contents/Resources/codex";
+      if (os.platform() === "win32") {
+        const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+        const possiblePaths = [
+          path.join(localAppData, "Programs", "Codex", "resources", "codex.exe"),
+          path.join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
+          path.join(localAppData, "Programs", "Codex", "Codex.exe"),
+        ];
+        for (const p of possiblePaths) {
+          if (fs.existsSync(p)) {
+            codexMcpBinary = p;
+            break;
+          }
+        }
+      }
+
+      const execServer = spawn(codexMcpBinary, [
         "--dangerously-bypass-approvals-and-sandbox",
         "mcp-server"
       ], {

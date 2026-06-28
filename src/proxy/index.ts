@@ -837,14 +837,44 @@ stream_idle_timeout_ms = 600000
 
   public restartCodexDesktop() {
     console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
-    const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex --args --remote-debugging-port=8315';
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
-      } else {
-        console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
+    if (process.platform === "win32") {
+      const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+      const possiblePaths = [
+        join(localAppData, "Programs", "Codex", "Codex.exe"),
+        join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "Codex.exe"),
+      ];
+      let executablePath = "";
+      for (const p of possiblePaths) {
+        if (existsSync(p)) {
+          executablePath = p;
+          break;
+        }
       }
-    });
+      if (executablePath) {
+        const killCmd = 'taskkill /F /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
+        exec(killCmd, () => {
+          setTimeout(() => {
+            const child = spawn(executablePath, ["--remote-debugging-port=8315"], {
+              detached: true,
+              stdio: "ignore"
+            });
+            child.unref();
+            console.log("[OpenCodex] Codex Desktop successfully restarted on Windows.");
+          }, 1500);
+        });
+      } else {
+        console.error("[OpenCodex] Could not locate Codex.exe on Windows.");
+      }
+    } else {
+      const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex --args --remote-debugging-port=8315';
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+          console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
+        } else {
+          console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
+        }
+      });
+    }
   }
 
   public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
