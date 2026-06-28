@@ -9,3 +9,5 @@ launch_opencodex_bar.sh
 debug_req.json
 debug_*.json
 test_cdp.js
+native/windows-cu-agent/bin/
+native/windows-cu-agent/obj/

@@ -7,9 +7,15 @@ import { spawnSync, execSync } from "node:child_process";
 import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sendWindowsAction } from "./windows-agent.js";
 
 export class ScreenshotTaker {
   async capture(): Promise<Buffer> {
+    if (process.platform === "win32") {
+      const result = await sendWindowsAction("screenshot");
+      if (!result.data) throw new Error("Windows screenshot returned no image data.");
+      return Buffer.from(result.data, "base64");
+    }
     try {
       return this.swiftCapture();
     } catch (err: any) {

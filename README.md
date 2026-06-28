@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/AITabby/opencodex?style=social"></a>
-  <a href="https://github.com/AITabby/opencodex"><img alt="macOS" src="https://img.shields.io/badge/macOS-Codex%20Desktop-111111"></a>
+  <a href="https://github.com/AITabby/opencodex"><img alt="macOS and Windows" src="https://img.shields.io/badge/macOS%20%7C%20Windows-Codex%20Desktop-111111"></a>
   <a href="https://github.com/AITabby/opencodex"><img alt="Local gateway" src="https://img.shields.io/badge/local-gateway-0A7FFF"></a>
   <a href="https://github.com/AITabby/opencodex"><img alt="OpenAI compatible" src="https://img.shields.io/badge/OpenAI--compatible-models-10A37F"></a>
 </p>
@@ -198,7 +198,7 @@ In other words: OpenCodex is optimized for maximum compatibility without breakin
 - Live SSE log streaming.
 - One-click Codex restart.
 - One-click reset to native Codex.
-- Native macOS Computer Use tools using CGEvent.
+- Native Computer Use using CGEvent on macOS and Win32 on Windows.
 - Screenshot capture and compression.
 - Vision Bridge for text-only models.
 - Voice settings for STT/TTS integrations.
@@ -226,9 +226,10 @@ The companion app provides global voice hotkeys, VAD, STT/TTS integration, and a
 
 ### Prerequisites
 
-- macOS
+- macOS or Windows 10+
 - Node.js v18 or newer
 - Codex Desktop installed
+- Windows only: .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`)
 
 ### Install And Run
 
@@ -238,6 +239,8 @@ cd opencodex
 npm install
 npm start
 ```
+
+The same commands work on both systems. OpenCodex detects the operating system automatically and builds the native Windows Computer Use agent during `npm install`.
 
 Then open:
 
@@ -473,7 +476,7 @@ OpenCodex 选择了更稳的方式：
 - 实时 SSE 日志流。
 - 一键重启 Codex。
 - 一键还原原生 Codex。
-- 基于 CGEvent 的 macOS 原生 Computer Use 工具。
+- 原生 Computer Use：macOS 使用 CGEvent，Windows 使用 Win32。
 - 截图捕获和压缩。
 - 面向纯文本模型的 Vision Bridge。
 - STT/TTS 语音设置集成。
@@ -501,9 +504,10 @@ OpenCodex 选择了更稳的方式：
 
 ### 准备工作
 
-- macOS
+- macOS 或 Windows 10+
 - Node.js v18 或更新版本
 - 已安装 Codex Desktop
+- 仅 Windows：.NET 8 SDK（`winget install Microsoft.DotNet.SDK.8`）
 
 ### 安装与启动
 
@@ -513,6 +517,8 @@ cd opencodex
 npm install
 npm start
 ```
+
+macOS 和 Windows 使用完全相同的命令。OpenCodex 会自动识别操作系统，并在 Windows 的 `npm install` 过程中构建原生 Computer Use Agent。
 
 然后打开：
 

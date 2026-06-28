@@ -244,7 +244,7 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   const chat: any = {
     model: upstreamModel,
     messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
-    stream: !!body.stream,
+    stream: body.stream !== false,
   };
 
   _copyIfPresent(body, chat, "temperature");
@@ -710,12 +710,16 @@ export class ResponsesStreamState {
   private toolCalls: Record<number, any> = {};
   private reasoningBlocks: Record<string, any> = {};
   private nextOutputIndex = 0;
+  private hasStartedReasoningText = false;
+  private hasEndedReasoningText = false;
   private onTextChunk?: (text: string) => void;
   private onTextDone?: (text: string) => void;
   private metadata?: any;
   private sequenceNumber = 1;
+  private isBackground = false;
+  private sequenceNumberCallbacks?: { get: () => number, set: (seq: number) => void };
 
-  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void, metadata?: any) {
+  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void, metadata?: any, isBackground?: boolean, sequenceNumberCallbacks?: { get: () => number, set: (seq: number) => void }) {
     this.responseId = `resp_${generateRandomHex(48)}`;
     this.messageItemId = `msg_${generateRandomHex(48)}`;
     this.model = model;
@@ -723,12 +727,20 @@ export class ResponsesStreamState {
     this.onTextChunk = onTextChunk;
     this.onTextDone = onTextDone;
     this.metadata = metadata;
+    this.isBackground = !!isBackground;
+    this.sequenceNumberCallbacks = sequenceNumberCallbacks;
+    if (sequenceNumberCallbacks) {
+      this.sequenceNumber = sequenceNumberCallbacks.get();
+    }
   }
 
   private _wrap(writeSse: (payload: any) => Promise<void>): (payload: any) => Promise<void> {
     return async (payload: any) => {
       payload.sequence_number = this.sequenceNumber;
       this.sequenceNumber += 1;
+      if (this.sequenceNumberCallbacks) {
+        this.sequenceNumberCallbacks.set(this.sequenceNumber);
+      }
       await writeSse(payload);
     };
   }
@@ -762,9 +774,6 @@ export class ResponsesStreamState {
     const wrapped = this._wrap(writeSse);
     await wrapped({ type: "response.created", response: this._response("in_progress") });
     await wrapped({ type: "response.in_progress", response: this._response("in_progress") });
-    if (!this.messageOpened) {
-      await this._openMessage(wrapped);
-    }
   }
 
   async finish(writeSse: (payload: any) => Promise<void>): Promise<void> {
@@ -774,6 +783,9 @@ export class ResponsesStreamState {
       if (!rState.closed) {
         await this._closeReasoning(wrapped, rState);
       }
+    }
+    if (!this.messageOpened) {
+      await this._openMessage(wrapped);
     }
     if (this.messageOpened && !this.messageClosed) {
       await this._closeMessage(wrapped);
@@ -817,8 +829,12 @@ export class ResponsesStreamState {
           await this._closeReasoning(wrapped, rState);
         }
       }
+
       const filtered = this.thinkFilter.filter(content);
       if (filtered) {
+        if (!this.messageOpened) {
+          await this._openMessage(wrapped);
+        }
         await this._textDelta(wrapped, filtered);
       }
     }

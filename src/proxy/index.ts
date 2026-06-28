@@ -7,7 +7,7 @@
 
 import http from "node:http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exec, spawn, spawnSync, execSync } from "node:child_process";
@@ -21,6 +21,17 @@ import zlib from "node:zlib";
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+
+function resolveCodexBinary(): string {
+  if (process.platform !== "win32") return "/Applications/Codex.app/Contents/Resources/codex";
+  const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  const candidates = [
+    join(localAppData, "Programs", "Codex", "resources", "codex.exe"),
+    join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
+    join(localAppData, "Programs", "Codex", "Codex.exe")
+  ];
+  return candidates.find(existsSync) || candidates[0];
+}
 
 if (proxyUrl) {
   console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
@@ -36,6 +47,7 @@ import {
 
 import { getDashboardHtml } from "./dashboard.js";
 import { getVisualizerHtml } from "./visualizer.js";
+import { getOrbHtml } from "./orb_view.js";
 
 interface ProviderConfig {
   name: string;
@@ -60,12 +72,29 @@ export function addLog(tag: string, text: string, level: string = "info") {
   if (logBuffer.length > MAX_LOG_BUFFER) {
     logBuffer.shift();
   }
-  for (const send of activeSseClients) {
+    for (const send of activeSseClients) {
     try {
       send(payload);
     } catch {
       // ignore
     }
+  }
+}
+
+export function broadcastSessionUpdate(sessionId: string, tokens: number, contextWindow: number, model: string, isEstimated: boolean) {
+  const payload = {
+    type: "session_update",
+    sessionId,
+    tokens,
+    context_window: contextWindow,
+    model,
+    is_estimated: isEstimated,
+    timestamp: Date.now()
+  };
+  for (const send of activeSseClients) {
+    try {
+      send(payload);
+    } catch {}
   }
 }
 
@@ -126,6 +155,114 @@ function mergeHistory(history: any[], incoming: any[]): any[] {
   return history.concat(incoming.slice(overlapLength));
 }
 
+function loadHistoryFromRollout(sessionId: string): any[] {
+  if (!sessionId || sessionId === "default" || sessionId.length < 10) {
+    return [];
+  }
+  const codexDir = join(homedir(), ".codex", "sessions");
+  if (!existsSync(codexDir)) return [];
+
+  let filePath: string | null = null;
+  try {
+    const years = readdirSync(codexDir)
+      .filter(f => /^\d{4}$/.test(f))
+      .sort((a, b) => b.localeCompare(a));
+
+    for (const year of years) {
+      if (filePath) break;
+      const yearDir = join(codexDir, year);
+      try {
+        const months = readdirSync(yearDir)
+          .filter(f => /^\d{2}$/.test(f))
+          .sort((a, b) => b.localeCompare(a));
+
+        for (const month of months) {
+          if (filePath) break;
+          const monthDir = join(yearDir, month);
+          try {
+            const days = readdirSync(monthDir)
+              .filter(f => /^\d{2}$/.test(f))
+              .sort((a, b) => b.localeCompare(a));
+
+            for (const day of days) {
+              if (filePath) break;
+              const dayDir = join(monthDir, day);
+              try {
+                const files = readdirSync(dayDir);
+                const matched = files.find(f => f.endsWith(`${sessionId}.jsonl`));
+                if (matched) {
+                  filePath = join(dayDir, matched);
+                  break;
+                }
+              } catch (e) {
+                // ignore dayDir read error
+              }
+            }
+          } catch (e) {
+            // ignore monthDir read error
+          }
+        }
+      } catch (e) {
+        // ignore yearDir read error
+      }
+    }
+  } catch (err) {
+    console.error(`[OpenCodex] Error searching rollout file:`, err);
+  }
+
+  if (!filePath) {
+    return [];
+  }
+
+  const messages: any[] = [];
+  try {
+    const content = readFileSync(filePath, "utf-8");
+    const lines = content.split("\n");
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parsed = JSON.parse(trimmed);
+      if (parsed.type === "response_item" && parsed.payload && parsed.payload.type === "message") {
+        const payload = parsed.payload;
+        const role = payload.role;
+        if (role !== "user" && role !== "assistant") continue;
+
+        let textContent = "";
+        if (typeof payload.content === "string") {
+          textContent = payload.content;
+        } else if (Array.isArray(payload.content)) {
+          for (const part of payload.content) {
+            if (typeof part === "string") {
+              textContent += part;
+            } else if (part && typeof part === "object") {
+              if (part.type === "input_text" || part.type === "output_text" || part.type === "text") {
+                textContent += part.text || "";
+              }
+            }
+          }
+        }
+        
+        textContent = textContent.trim();
+        if (textContent) {
+          // Ignore background JSON title messages to prevent chat history contamination
+          if (textContent.startsWith("{") && textContent.includes('"title"')) {
+            continue;
+          }
+          messages.push({
+            role,
+            content: textContent,
+            id: payload.id || payload.messageItemId
+          });
+        }
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  return messages;
+}
+
 function alignToolMessages(msgs: any[]): any[] {
   const toolMessagesMap = new Map<string, any>();
   const otherMessages: any[] = [];
@@ -172,6 +309,46 @@ function alignToolMessages(msgs: any[]): any[] {
 }
 
 
+function estimateTokensForMessages(messages: any[]): number {
+  let tokens = 0;
+  for (const msg of messages) {
+    const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code >= 0x4e00 && code <= 0x9fff) {
+        tokens += 1.2; // Chinese character
+      } else if (text[i] === " " || text[i] === "\n") {
+        tokens += 0.5;
+      } else {
+        tokens += 0.25; // English letter/character
+      }
+    }
+    tokens += 4; // overhead
+  }
+  return Math.ceil(tokens);
+}
+
+
+function pruneMessagesToLimit(messages: any[], limit: number): any[] {
+  let estimated = estimateTokensForMessages(messages);
+  if (estimated <= limit) return messages;
+
+  console.log(`[OpenCodex WS Proxy] Context limit reached (${estimated} > ${limit}). Pruning oldest messages...`);
+  
+  // Separate system messages and chat messages
+  const systemMessages = messages.filter(m => m.role === "system");
+  let chatMessages = messages.filter(m => m.role !== "system");
+
+  // Keep pruning oldest chat messages until we are under the limit
+  while (chatMessages.length > 2 && estimated > limit) {
+    chatMessages.shift();
+    estimated = estimateTokensForMessages([...systemMessages, ...chatMessages]);
+  }
+
+  return [...systemMessages, ...chatMessages];
+}
+
+
 export class ProxyServer {
   private server: http.Server | null = null;
   public config!: ProxyConfig;
@@ -179,8 +356,17 @@ export class ProxyServer {
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
+  private sessionModelMap = new Map<string, string>();
+  private sessionSequenceNumberMap = new Map<string, number>();
+  private lastCompletedSequenceNumberMap = new Map<string, number>();
+  private lastWsMap = new Map<string, any>();
+  private sessionLastModelWasOfficial = new Map<string, boolean>();
+  private sessionActiveWs = new Map<string, WebSocket>();
   private forcedErrorSessions = new Set<string>();
-  private customSessionQueues = new Map<string, Promise<void>>();
+  private customSessionQueues = new Map<any, Promise<void>>();
+  private activeAbortControllers = new Map<string, AbortController>();
+  private sessionContextMap = new Map<string, { tokens: number, is_estimated: boolean, model?: string, context_window?: number }>();
+  private currentActiveSessionId: string = "";
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -191,6 +377,7 @@ export class ProxyServer {
   private vadProcess: any = null;
   private vadStdoutBuffer = "";
   private vadCallbackQueue: ((res: any) => void)[] = [];
+  private orbProcess: any = null;
 
   constructor() {
     this.ensureConfigDir();
@@ -219,7 +406,8 @@ export class ProxyServer {
     }
     console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
 
-    this.vadProcess = spawn("python3", [scriptPath]);
+    const python = process.platform === "win32" ? "python" : "python3";
+    this.vadProcess = spawn(python, [scriptPath]);
     this.vadStdoutBuffer = "";
     this.vadCallbackQueue = [];
 
@@ -254,6 +442,12 @@ export class ProxyServer {
       console.error(`[OpenCodex VAD Daemon Stderr] ${data.toString().trim()}`);
     });
 
+    this.vadProcess.on("error", (err: Error) => {
+      console.error(`[OpenCodex VAD] Could not start ${python}: ${err.message}`);
+      this.vadProcess = null;
+      this.vadCallbackQueue = [];
+    });
+
     this.vadProcess.on("close", (code: number) => {
       console.error(`[OpenCodex VAD Daemon Closed] Exit code: ${code}`);
       this.vadProcess = null;
@@ -280,6 +474,7 @@ export class ProxyServer {
   }
 
   private ensureCheckPermsHelper() {
+    if (process.platform !== "darwin") return;
     const helperPath = join(this.configDir, "check_perms");
     if (!existsSync(helperPath)) {
       console.log("[OpenCodex] Building permission checker helper...");
@@ -433,9 +628,9 @@ except Exception as e:
     sys.exit(1)`;
 
     try {
-      writeFileSync("/tmp/ocb_minimax_tts.py", minimaxScript, "utf-8");
-      writeFileSync("/tmp/ocb_transcribe.py", transcribeScript, "utf-8");
-      console.error("[OpenCodex] Written helper python scripts to /tmp successfully.");
+      writeFileSync(join(tmpdir(), "ocb_minimax_tts.py"), minimaxScript, "utf-8");
+      writeFileSync(join(tmpdir(), "ocb_transcribe.py"), transcribeScript, "utf-8");
+      console.error(`[OpenCodex] Written helper python scripts to ${tmpdir()} successfully.`);
     } catch (err: any) {
       console.error("[OpenCodex] Failed to write helper python scripts: " + err.message);
     }
@@ -633,6 +828,11 @@ except Exception as e:
           });
         }
       } else {
+        const contextWindow = 200000;
+        const maxContextWindow = 1000000;
+        const autoCompact = 160000;
+        const truncationLimit = 150000;
+
         models.push({
           slug: slug,
           model: slug,
@@ -641,10 +841,10 @@ except Exception as e:
           provider: "opencodex",
           backend_provider: provider,
           description: `Custom model: ${slug}${provider ? ` (${provider})` : ""}`,
-          context_window: 200000,
-          max_context_window: 1000000,
-          auto_compact_token_limit: 160000,
-          truncation_policy: { mode: "tokens", limit: 48000 },
+          context_window: contextWindow,
+          max_context_window: maxContextWindow,
+          auto_compact_token_limit: autoCompact,
+          truncation_policy: { mode: "tokens", limit: truncationLimit },
           default_reasoning_level: "medium",
           supported_reasoning_levels: [{ effort: "medium", description: "Balanced" }],
           default_reasoning_summary: "none",
@@ -815,7 +1015,9 @@ stream_idle_timeout_ms = 600000
       if (!existsSync(cacheDir)) {
         console.log("[OpenCodex] computer-use plugin assets not found. Installing via codex plugin add...");
         const codexPath = join(homedir(), ".local", "bin", "codex");
-        const execPath = existsSync(codexPath) ? codexPath : "codex";
+        const execPath = process.platform === "win32"
+          ? resolveCodexBinary()
+          : (existsSync(codexPath) ? codexPath : "codex");
 
         exec(`"${execPath}" plugin add computer-use@openai-bundled`, {
           env: {
@@ -878,6 +1080,10 @@ stream_idle_timeout_ms = 600000
   }
 
   public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
+    if (process.platform !== "darwin") {
+      console.error("[OpenCodex] OpenCodexBar is currently available on macOS only.");
+      return;
+    }
     console.log(`[OpenCodex] Restarting Voice Bar using method: ${method}`);
     
     // Resolve opencodex-bar directory path dynamically and portably
@@ -964,11 +1170,11 @@ stream_idle_timeout_ms = 600000
         console.log(`[OpenCodex WS Proxy] Intercepting responses WebSocket upgrade: ${url.pathname}${url.search}`);
         wss.handleUpgrade(request, socket, head, (clientWs) => {
           this.desktopWsClients.add(clientWs);
-          console.log("[OpenCodex WS Proxy] Upgrade request headers:", JSON.stringify(request.headers, null, 2));
+          (clientWs as any).sequenceNumber = 1;
           const sidHeader = request.headers["x-session-id"] || request.headers["session-id"] || request.headers["x-thread-id"] || request.headers["thread-id"] || "";
           const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || "default");
-          
           const sessionIdStr = sessionId ? String(sessionId) : "default";
+          this.sessionActiveWs.set(sessionIdStr, clientWs);
           const connInfo = { 
             clientWs, 
             targetWs: null as WebSocket | null, 
@@ -976,10 +1182,12 @@ stream_idle_timeout_ms = 600000
             lastMsg: null as any,
             isCustomMode: false,
             activeSessionId: sessionIdStr,
-            isGeneratingTitle: false
+            isGeneratingTitle: false,
+            sequenceNumber: 1
           };
           if (sessionId && sessionId !== "default") {
             this.activeConnectionsBySession.set(sessionId, connInfo);
+            this.currentActiveSessionId = sessionIdStr;
           }
           this.lastActiveConnection = connInfo;
 
@@ -1049,7 +1257,31 @@ stream_idle_timeout_ms = 600000
 
           targetWs.on("open", () => {
             console.log(`[OpenCodex WS Proxy] Official target connection opened for ${url.pathname}`);
-            if (isLocal || connInfo.isCustomMode) {
+            const activeSid = connInfo.activeSessionId || sessionIdStr;
+            if (isLocal || connInfo.isCustomMode || this.customModelSessions.has(activeSid)) {
+              console.log(`[OpenCodex WS Proxy] Custom model session detected on connection open. Sending instant connection handshake.`);
+              clientWs.send(JSON.stringify({
+                type: "codex.rate_limits",
+                plan_type: "plus",
+                rate_limits: {
+                  allowed: true,
+                  limit_reached: false,
+                  primary: {
+                    used_percent: 0,
+                    window_minutes: 300,
+                    reset_after_seconds: 3600,
+                    reset_at: Math.floor(Date.now() / 1000) + 3600,
+                    limit_reached: false
+                  }
+                }
+              }));
+              clientWs.send(JSON.stringify({
+                type: "codex.response.metadata",
+                headers: {
+                  "x-codex-safety-buffering-enabled": "true",
+                  "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
+                }
+              }));
               return;
             }
             if (targetWs.readyState === WebSocket.OPEN) {
@@ -1067,6 +1299,7 @@ stream_idle_timeout_ms = 600000
             if (isLocal || connInfo.isCustomMode || this.customModelSessions.has(activeSid)) {
               return;
             }
+            this.sessionLastModelWasOfficial.set(activeSid, true);
 
             let processedTData = tData;
             if (!tIsBinary) {
@@ -1099,6 +1332,14 @@ stream_idle_timeout_ms = 600000
             if (!tIsBinary) {
               try {
                 const payload = JSON.parse(msgStr);
+                if (payload && payload.sequence_number !== undefined) {
+                  const currentSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
+                  const newSeq = Math.max(currentSeq, Number(payload.sequence_number) + 1);
+                  this.sessionSequenceNumberMap.set(sessionIdStr, newSeq);
+                  if (payload.type === "response.done" || payload.type === "response.completed" || payload.type === "response.output_text.done") {
+                    this.lastCompletedSequenceNumberMap.set(sessionIdStr, Number(payload.sequence_number));
+                  }
+                }
                 
                 // Broadcast streaming text delta to active voice clients
                 if (payload.type === "response.output_text.delta" && payload.delta) {
@@ -1125,6 +1366,24 @@ stream_idle_timeout_ms = 600000
                     const msg = JSON.stringify({ type: "model_done", text: "" });
                     for (const voiceClient of this.activeWsClients) {
                       try { voiceClient.send(msg); } catch {}
+                    }
+                    
+                    const usage = payload.response?.usage;
+                    if (usage && typeof usage.input_tokens === "number") {
+                      const activeSid = connInfo.activeSessionId || sessionIdStr;
+                      const totalTokens = usage.input_tokens + (usage.output_tokens || 0);
+                      
+                      const existing = this.sessionContextMap.get(activeSid);
+                      if (!existing || totalTokens > existing.tokens || Math.abs(totalTokens - existing.tokens) < existing.tokens * 0.15 || totalTokens < 2000) {
+                        this.sessionContextMap.set(activeSid, {
+                          tokens: totalTokens,
+                          is_estimated: false,
+                          model: "official",
+                          context_window: 200000
+                        });
+                        console.log(`[OpenCodex WS Proxy] Official model usage intercepted: input=${usage.input_tokens}, output=${usage.output_tokens || 0}, total=${totalTokens}`);
+                        broadcastSessionUpdate(activeSid, totalTokens, 200000, "official", false);
+                      }
                     }
                   }
                 }
@@ -1168,6 +1427,15 @@ stream_idle_timeout_ms = 600000
                 if (msg && msg.client_metadata?.session_id) {
                   connInfo.activeSessionId = String(msg.client_metadata.session_id);
                 }
+                if (msg && msg.type === "response.cancel") {
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
+                  const controller = this.activeAbortControllers.get(activeSid);
+                  if (controller) {
+                    console.log(`[OpenCodex WS Proxy] Intercepted response.cancel for session ${activeSid}, aborting active request.`);
+                    controller.abort();
+                    this.activeAbortControllers.delete(activeSid);
+                  }
+                }
                 if (msg && msg.type === "response.create") {
                   connInfo.lastMsg = msg;
                   const model = msg.model || "";
@@ -1185,16 +1453,24 @@ stream_idle_timeout_ms = 600000
                   const isCustomModel = !!catalogEntry?.backend_provider;
                   const activeSid = connInfo.activeSessionId || sessionIdStr;
 
+                  const lastModel = this.sessionModelMap.get(activeSid);
+                  if (lastModel && lastModel !== model) {
+                    console.log(`[OpenCodex WS Proxy] Model changed from ${lastModel} to ${model}. Clearing stale history for session ${activeSid} to ensure alignment.`);
+                    this.customConversationHistory.delete(activeSid);
+                  }
+                  this.sessionModelMap.set(activeSid, model);
+
                   if (isCustomModel) {
                     isLocal = true;
                     connInfo.isCustomMode = true;
                     this.customModelSessions.add(activeSid);
                     console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
-                    await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
+                    await this.handleLocalResponsesWebSocketInline(clientWs, msg, connInfo);
                     return;
                   } else {
                     isLocal = false;
                     routedToOfficial = true;
+                    connInfo.isCustomMode = false;
                     this.customModelSessions.delete(activeSid);
                   }
                 }
@@ -1350,6 +1626,12 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/orb-view" || path === "/orb-view/") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(getOrbHtml());
+      return;
+    }
+
     if (path === "/visualizer" || path === "/visualizer/") {
       const parsedUrl = new URL(req.url || "", "http://localhost");
       const isHud = parsedUrl.searchParams.get("mode") === "hud";
@@ -1487,7 +1769,8 @@ stream_idle_timeout_ms = 600000
           provider: m.provider || "",
           display_name: m.display_name,
           no_image_support: m.input_modalities ? !m.input_modalities.includes("image") : true,
-          vision_bridge_enabled: !!m.vision_bridge_enabled
+          vision_bridge_enabled: !!m.vision_bridge_enabled,
+          context_window: m.context_window
         })) || [],
         active
       }));
@@ -1500,12 +1783,24 @@ stream_idle_timeout_ms = 600000
         console.log("[OpenCodex] Received POST /api/models data:", data);
         const activeIds = data.active || [];
         const visionBridgeIds = data.vision_bridge || [];
+        const context1mIds = data.context_1m || [];
         const catalog = this.getModelCatalog();
         
         if (catalog.models) {
           catalog.models.forEach((m: any) => {
             m.visibility = activeIds.includes(m.slug) ? "list" : "hide";
             m.vision_bridge_enabled = visionBridgeIds.includes(m.slug);
+            
+            const is1m = context1mIds.includes(m.slug);
+            if (is1m) {
+              m.context_window = 1000000;
+              m.auto_compact_token_limit = 800000;
+              m.truncation_policy = { mode: "tokens", limit: 750000 };
+            } else {
+              m.context_window = 200000;
+              m.auto_compact_token_limit = 160000;
+              m.truncation_policy = { mode: "tokens", limit: 150000 };
+            }
           });
           this.saveModelCatalog(catalog);
         }
@@ -1646,10 +1941,22 @@ stream_idle_timeout_ms = 600000
           } catch {}
         }
 
-        const sessions = Array.from(sessionsMap.values()).map(s => ({
-          ...s,
-          archived: archivedIds.has(s.id)
-        })).sort((a, b) => b.ts - a.ts);
+        const sessions = Array.from(sessionsMap.values()).map(s => {
+          const ctx = this.sessionContextMap.get(s.id) || { tokens: 0, is_estimated: true, context_window: 200000 };
+          return {
+            ...s,
+            archived: archivedIds.has(s.id),
+            tokens: ctx.tokens,
+            is_estimated: ctx.is_estimated,
+            model: ctx.model || "",
+            context_window: ctx.context_window || 200000
+          };
+        })
+        .sort((a, b) => {
+          if (a.id === this.currentActiveSessionId) return -1;
+          if (b.id === this.currentActiveSessionId) return 1;
+          return b.ts - a.ts;
+        });
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify(sessions));
@@ -1884,6 +2191,102 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/sessions/compact" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        this.sessionContextMap.delete(sid);
+
+        fetch("http://127.0.0.1:8315/json")
+          .then(res => res.json())
+          .then((targets: any) => {
+            const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("avatar-overlay") && !t.url.includes("initialRoute"));
+            if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
+              console.error("[Compact] Main Codex window page target not found via CDP");
+              return;
+            }
+            
+            const tempWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
+            tempWs.on("open", () => {
+              const evalScript = `
+                (() => {
+                  const buttons = Array.from(document.querySelectorAll('button, div, span'));
+                  let compactBtn = buttons.find(b => {
+                    const text = b.textContent || '';
+                    return text.includes('Compact conversation') || text.includes('压缩会话') || text.includes('Compact thread');
+                  });
+
+                  if (compactBtn) {
+                    compactBtn.click();
+                    return { status: 'success', detail: 'Compact button clicked directly' };
+                  }
+
+                  let settingsBtn = buttons.find(b => {
+                    const label = b.getAttribute('aria-label') || '';
+                    return label.includes('Settings') || label.includes('Thread settings') || label.includes('设置');
+                  });
+
+                  if (!settingsBtn) {
+                    settingsBtn = buttons.find(b => b.innerHTML.includes('gear') || b.innerHTML.includes('settings') || b.querySelector('svg')?.outerHTML.includes('settings'));
+                  }
+
+                  if (settingsBtn) {
+                    settingsBtn.click();
+                    setTimeout(() => {
+                      const modalButtons = Array.from(document.querySelectorAll('button, div, span'));
+                      const compactBtn2 = modalButtons.find(b => {
+                        const text = b.textContent || '';
+                        return text.includes('Compact conversation') || text.includes('压缩会话') || text.includes('Compact thread');
+                      });
+
+                      if (compactBtn2) {
+                        compactBtn2.click();
+                        setTimeout(() => {
+                          const closeBtn = Array.from(document.querySelectorAll('button')).find(b => {
+                            const label = b.getAttribute('aria-label') || '';
+                            return label.includes('Close') || label.includes('关闭') || b.textContent.includes('Close') || b.textContent.includes('关闭');
+                          });
+                          if (closeBtn) closeBtn.click();
+                        }, 100);
+                      }
+                    }, 200);
+                    return { status: 'success', detail: 'Triggered via Settings menu' };
+                  }
+                  return { status: 'failed', reason: 'Settings button not found' };
+                })()
+              `;
+              tempWs.send(JSON.stringify({
+                id: 300,
+                method: "Runtime.evaluate",
+                params: {
+                  expression: evalScript,
+                  returnByValue: true
+                }
+              }));
+            });
+            tempWs.on("message", (msgData) => {
+              try {
+                const resObj = JSON.parse(msgData.toString());
+                if (resObj.id === 300) {
+                  console.log("[Compact] CDP evaluate result:", resObj.result);
+                  tempWs.close();
+                }
+              } catch {}
+            });
+          })
+          .catch((err) => {
+            console.error("[Compact] Error querying CDP for compaction:", err.message);
+          });
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
     if (path === "/api/test-log" && req.method === "POST") {
       console.log("[OpenCodex] Test log from dashboard at " + new Date().toLocaleTimeString());
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1891,7 +2294,18 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/platform" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ platform: process.platform }));
+      return;
+    }
+
     if (path === "/api/permissions" && req.method === "GET") {
+      if (process.platform !== "darwin") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "unsupported", platform: process.platform }));
+        return;
+      }
       try {
         const helperPath = join(this.configDir, "check_perms");
         if (!existsSync(helperPath)) {
@@ -1917,6 +2331,11 @@ stream_idle_timeout_ms = 600000
     }
 
     if (path === "/api/permissions/fix" && req.method === "POST") {
+      if (process.platform !== "darwin") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "unsupported", platform: process.platform }));
+        return;
+      }
       try {
         const appPath1 = join(homedir(), ".codex", "computer-use", "Codex Computer Use.app");
         const appPath2 = join(appPath1, "Contents", "SharedSupport", "SkyComputerUseClient.app");
@@ -2069,7 +2488,7 @@ stream_idle_timeout_ms = 600000
           } catch {}
         }
 
-        const audioPath = "/tmp/stt_web_input.wav";
+        const audioPath = join(tmpdir(), "stt_web_input.wav");
         writeFileSync(audioPath, rawBody);
         console.error(`[OpenCodex Voice API] Received audio data for STT, size = ${rawBody.length} bytes`);
 
@@ -2347,7 +2766,7 @@ stream_idle_timeout_ms = 600000
         }
 
         console.error(`[OpenCodex Command Console] Executing: ${command}`);
-        const cmdPath = "/Applications/Codex.app/Contents/Resources/codex";
+        const cmdPath = resolveCodexBinary();
         const child = spawn(cmdPath, ["--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check", "-"]);
         
         let output = "";
@@ -2384,6 +2803,11 @@ stream_idle_timeout_ms = 600000
     }
 
     if (path === "/api/voice-bar/status" && req.method === "GET") {
+      if (process.platform !== "darwin") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ running: false, supported: false }));
+        return;
+      }
       exec('pgrep -x OpenCodexBar', (err, stdout) => {
         const running = !err && stdout.trim().length > 0;
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -2423,6 +2847,62 @@ stream_idle_timeout_ms = 600000
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: err.message }));
         });
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/orb/status" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ running: this.orbProcess !== null }));
+      return;
+    }
+
+    if (path === "/api/orb/launch" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body || "{}");
+        const enable = !!data.enable;
+
+        if (enable) {
+          if (this.orbProcess) {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "success", message: "Already running" }));
+            return;
+          }
+          console.log("[Orb Manager] Spawning Electron Orb Widget...");
+          const moduleDir = dirname(fileURLToPath(import.meta.url));
+          const orbScript = join(moduleDir, "orb.js");
+          
+          const electronPath = process.platform === "win32" 
+            ? join(moduleDir, "..", "..", "node_modules", ".bin", "electron.cmd")
+            : join(moduleDir, "..", "..", "node_modules", ".bin", "electron");
+          
+          this.orbProcess = spawn(electronPath, [orbScript], {
+            detached: true,
+            stdio: "ignore",
+            env: { ...process.env }
+          });
+          
+          this.orbProcess.unref();
+
+          this.orbProcess.on("exit", () => {
+            console.log("[Orb Manager] Electron Orb process exited.");
+            this.orbProcess = null;
+          });
+
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success", launched: true }));
+        } else {
+          if (this.orbProcess) {
+            console.log("[Orb Manager] Killing Electron Orb process...");
+            this.orbProcess.kill();
+            this.orbProcess = null;
+          }
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "success", killed: true }));
+        }
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -2499,7 +2979,7 @@ stream_idle_timeout_ms = 600000
     let reqBody: any;
     try {
       reqBody = JSON.parse(body);
-      writeFileSync("/tmp/responses_request_debug.json", JSON.stringify(reqBody, null, 2), "utf-8");
+      writeFileSync(join(tmpdir(), "responses_request_debug.json"), JSON.stringify(reqBody, null, 2), "utf-8");
     } catch (e: any) {
       console.error("[OpenCodex] Failed to parse responses JSON body:", e.message, "Length:", body.length, "First 200 chars:", body.slice(0, 200));
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -2663,22 +3143,24 @@ stream_idle_timeout_ms = 600000
     }
 
     const prevResponseId = processedReqBody.previous_response_id;
-    if (!prevResponseId) {
+    let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+    if (existingHistory.length === 0) {
+      existingHistory = loadHistoryFromRollout(sessionIdStr);
+    }
+
+    if (existingHistory.length === 0) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     } else {
-      const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
-      if (existingHistory.length === 0) {
-        this.customConversationHistory.set(sessionIdStr, chatBody.messages);
-      } else {
+      let alignedHistory = existingHistory;
+      if (prevResponseId) {
         const index = existingHistory.findIndex((m: any) => m.role === "assistant" && (m.id === prevResponseId || m.response_id === prevResponseId));
-        let alignedHistory = existingHistory;
         if (index !== -1) {
           alignedHistory = existingHistory.slice(0, index + 1);
         }
-        const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
-        this.customConversationHistory.set(sessionIdStr, updatedHistory);
       }
+      const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+      const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
+      this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
     chatBody.messages = alignToolMessages(
       (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
@@ -2694,7 +3176,7 @@ stream_idle_timeout_ms = 600000
 
     try {
       if (isStream) {
-        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId);
+        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId, !!processedReqBody.background);
       } else {
         await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId);
       }
@@ -2714,7 +3196,8 @@ stream_idle_timeout_ms = 600000
     apiKey: string,
     namespaceMap: Record<string, string>,
     res: http.ServerResponse,
-    sessionId?: string
+    sessionId?: string,
+    isBackground?: boolean
   ) {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
@@ -2739,7 +3222,9 @@ stream_idle_timeout_ms = 600000
         for (const wsClient of this.activeWsClients) {
           try { wsClient.send(msg); } catch {}
         }
-      }
+      },
+      undefined,
+      isBackground || requestedModel.includes("mini") || requestedModel.includes("title")
     );
     await streamState.start(async (payload) => {
       res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -3083,8 +3568,9 @@ stream_idle_timeout_ms = 600000
   }
 
   private transcribeAudioLocal(filePath: string, cb: (text: string | null) => void) {
-    const pythonCmd = "python3";
-    const args = ["/tmp/ocb_transcribe.py", filePath];
+    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    const transcribeHelper = join(tmpdir(), "ocb_transcribe.py");
+    const args = [transcribeHelper, filePath];
     const uvxPath = join(homedir(), ".local", "bin", "uvx");
     
     const env = {
@@ -3093,7 +3579,7 @@ stream_idle_timeout_ms = 600000
     };
 
     const child = existsSync(uvxPath)
-      ? spawn(uvxPath, ["--with", "openai-whisper", "python3", "/tmp/ocb_transcribe.py", filePath], { env })
+      ? spawn(uvxPath, ["--with", "openai-whisper", "python3", transcribeHelper, filePath], { env })
       : spawn(pythonCmd, args, { env });
 
     let output = "";
@@ -3342,7 +3828,7 @@ stream_idle_timeout_ms = 600000
       const hasChinese = /[\u4e00-\u9fa5]/.test(text);
       voice = hasChinese ? "zh-CN-XiaoxiaoNeural" : "en-US-AvaNeural";
     }
-    const tempOutput = "/tmp/tts_edge_web_" + Date.now() + "_" + Math.random().toString(36).slice(2) + ".mp3";
+    const tempOutput = join(tmpdir(), "tts_edge_web_" + Date.now() + "_" + Math.random().toString(36).slice(2) + ".mp3");
     const uvxPath = join(homedir(), ".local", "bin", "uvx");
     const homebrewPath = "/opt/homebrew/bin/edge-tts";
     const localBinPath = "/usr/local/bin/edge-tts";
@@ -3852,7 +4338,7 @@ stream_idle_timeout_ms = 600000
                 }
 
                 const wavBuffer = pcmToWav(currentBuffer, 16000, 1, 16);
-                const tmpWavPath = `/tmp/ws_chunk_${Date.now()}.wav`;
+                const tmpWavPath = join(tmpdir(), `ws_chunk_${Date.now()}.wav`);
                 writeFileSync(tmpWavPath, wavBuffer);
 
                 let text = "";
@@ -3938,7 +4424,7 @@ stream_idle_timeout_ms = 600000
       }
 
       const wavBuffer = pcmToWav(pcmBuffer, 16000, 1, 16);
-      const tmpWavPath = `/tmp/ws_stt_${Date.now()}.wav`;
+      const tmpWavPath = join(tmpdir(), `ws_stt_${Date.now()}.wav`);
       writeFileSync(tmpWavPath, wavBuffer);
 
       let text = "";
@@ -4008,26 +4494,60 @@ stream_idle_timeout_ms = 600000
     }
   }
 
-  private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders) {
+  private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, connInfo: any) {
+    const clientHeaders = connInfo.headers;
     const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
-    const sessionId = reqBody.client_metadata?.session_id || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
+    const sessionId = reqBody.client_metadata?.session_id || connInfo.activeSessionId || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
     const sessionIdStr = sessionId ? String(sessionId) : "default";
-    const previous = this.customSessionQueues.get(sessionIdStr) || Promise.resolve();
+
+    const activeController = this.activeAbortControllers.get(sessionIdStr);
+    if (activeController) {
+      console.log(`[OpenCodex WS Proxy] Aborting active stale request for session ${sessionIdStr} before queueing new request`);
+      activeController.abort();
+    }
+
+    const previous = this.customSessionQueues.get(ws) || Promise.resolve();
     const current = previous
       .catch(() => {})
-      .then(() => this.handleLocalResponsesWebSocketInlineQueued(ws, reqBody, clientHeaders, sessionId, sessionIdStr));
-    this.customSessionQueues.set(sessionIdStr, current);
+      .then(() => this.handleLocalResponsesWebSocketInlineQueued(ws, reqBody, connInfo, sessionId, sessionIdStr));
+    this.customSessionQueues.set(ws, current);
     try {
       await current;
     } finally {
-      if (this.customSessionQueues.get(sessionIdStr) === current) {
-        this.customSessionQueues.delete(sessionIdStr);
+      if (this.customSessionQueues.get(ws) === current) {
+        this.customSessionQueues.delete(ws);
       }
     }
   }
 
-  private async handleLocalResponsesWebSocketInlineQueued(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders, sessionId: any, sessionIdStr: string) {
+  private async handleLocalResponsesWebSocketInlineQueued(ws: WebSocket, reqBody: any, connInfo: any, sessionId: any, sessionIdStr: string) {
+    const turnMetadataStr = reqBody.client_metadata?.["x-codex-turn-metadata"];
+    let isPrewarm = false;
+    if (turnMetadataStr) {
+      try {
+        const parsed = JSON.parse(turnMetadataStr);
+        if (parsed.request_kind === "prewarm") {
+          isPrewarm = true;
+        }
+      } catch {}
+    }
+    if (!isPrewarm && (!reqBody.input || reqBody.input.length === 0)) {
+      isPrewarm = true;
+    }
+
+    if (!isPrewarm) {
+      const lastWs = this.lastWsMap.get(sessionIdStr);
+      if (!lastWs || lastWs !== ws) {
+        this.sessionSequenceNumberMap.set(sessionIdStr, 1);
+        this.lastCompletedSequenceNumberMap.set(sessionIdStr, 0);
+        console.log(`[OpenCodex WS Proxy] New custom WS connection detected for session ${sessionIdStr}. Resetting sequence number to 1.`);
+      }
+      this.lastWsMap.set(sessionIdStr, ws);
+    }
+
+    const clientHeaders = connInfo.headers;
     const startTime = Date.now();
+    let onWsClose: (() => void) | null = null;
     const requestedModel = reqBody.model || "";
     try {
       writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
@@ -4063,20 +4583,7 @@ stream_idle_timeout_ms = 600000
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
     const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
 
-    const turnMetadataStr = reqBody.client_metadata?.["x-codex-turn-metadata"];
-    let isPrewarm = false;
-    if (turnMetadataStr) {
-      try {
-        const parsed = JSON.parse(turnMetadataStr);
-        if (parsed.request_kind === "prewarm") {
-          isPrewarm = true;
-        }
-      } catch {}
-    }
-    // Robust fallback: if input is empty, it is a prewarm/dummy request.
-    if (!isPrewarm && (!reqBody.input || reqBody.input.length === 0)) {
-      isPrewarm = true;
-    }
+    // isPrewarm is already computed at the top of the function
 
     if (isPrewarm) {
       console.log(`[OpenCodex WS Proxy] Handling prewarm request locally and instantly.`);
@@ -4087,16 +4594,96 @@ stream_idle_timeout_ms = 600000
         turn_id: reqBody.client_metadata?.turn_id,
         "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
       };
-      const streamState = isStream ? new ResponsesStreamState(
-        requestedModel,
-        namespaceMap,
-        sessionId,
-        undefined,
-        undefined,
-        responseMetadata
-      ) : null;
+      const now = Math.floor(Date.now() / 1000);
+      const prewarmResponseId = `resp_prewarm_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
 
-      if (streamState) {
+      if (isStream) {
+        ws.send(JSON.stringify({
+          type: "codex.rate_limits",
+          plan_type: "plus",
+          rate_limits: {
+            allowed: true,
+            limit_reached: false,
+            primary: {
+              used_percent: 0,
+              window_minutes: 300,
+              reset_after_seconds: 3600,
+              reset_at: now + 3600,
+              limit_reached: false
+            }
+          }
+        }));
+        ws.send(JSON.stringify({
+          type: "codex.response.metadata",
+          headers: {
+            "x-codex-safety-buffering-enabled": "true",
+            "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
+          }
+        }));
+        ws.send(JSON.stringify({
+          type: "response.created",
+          sequence_number: 1,
+          response: {
+            id: prewarmResponseId,
+            object: "response",
+            created_at: now,
+            status: "in_progress",
+            model: requestedModel,
+            output: [],
+            metadata: responseMetadata
+          }
+        }));
+        ws.send(JSON.stringify({
+          type: "response.completed",
+          sequence_number: 2,
+          response: {
+            id: prewarmResponseId,
+            object: "response",
+            created_at: now,
+            completed_at: now,
+            status: "completed",
+            model: requestedModel,
+            output: [],
+            metadata: responseMetadata
+          }
+        }));
+        ws.send(JSON.stringify({
+          type: "response.done",
+          sequence_number: 3,
+          response: {
+            id: prewarmResponseId,
+            object: "response",
+            created_at: now,
+            completed_at: now,
+            status: "completed",
+            model: requestedModel,
+            output: [],
+            metadata: responseMetadata
+          }
+        }));
+      } else {
+        const responseBody = chatCompletionToResponse({
+          choices: [{ message: { role: "assistant", content: "" } }]
+        }, requestedModel, namespaceMap);
+        ws.send(JSON.stringify(responseBody));
+      }
+      return;
+    }
+
+    const controller = new AbortController();
+    this.activeAbortControllers.set(sessionIdStr, controller);
+    const signal = controller.signal;
+    onWsClose = () => {
+      console.log(`[OpenCodex WS Proxy] Client WebSocket closed. Aborting upstream request.`);
+      controller.abort();
+    };
+    ws.on("close", onWsClose);
+
+    const isResponsesApi = provider.base_url.includes("/responses");
+    if (isResponsesApi) {
+      console.log(`[OpenCodex WS Proxy] Upstream supports Responses API directly. Forwarding to: ${provider.base_url}`);
+      try {
+        // Send initial metadata similar to official responses
         ws.send(JSON.stringify({
           type: "codex.rate_limits",
           plan_type: "plus",
@@ -4119,146 +4706,99 @@ stream_idle_timeout_ms = 600000
             "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
           }
         }));
-        await streamState.start(async (payload) => {
-          ws.send(JSON.stringify(payload));
+
+        const response = await fetch(provider.base_url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`,
+            "Accept": "text/event-stream"
+          },
+          body: JSON.stringify(processedReqBody),
+          dispatcher: fetchDispatcher,
+          signal
         });
-        await streamState.finish(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
-      } else {
-        const responseBody = chatCompletionToResponse({
-          choices: [{ message: { role: "assistant", content: "" } }]
-        }, requestedModel, namespaceMap);
-        ws.send(JSON.stringify(responseBody));
+
+        console.log(`[OpenCodex WS Proxy] Upstream Responses response status: ${response.status}`);
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error(`[OpenCodex WS Proxy] Upstream Responses error: ${errorText}`);
+          ws.send(JSON.stringify({ error: { message: errorText } }));
+          return;
+        }
+
+        const reader = response.body!.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let seqOffset: number | null = null;
+        try {
+          while (true) {
+            if (ws.readyState !== WebSocket.OPEN) {
+              console.log(`[OpenCodex WS Proxy] Client WebSocket closed during streaming. Aborting Responses request.`);
+              controller.abort();
+              break;
+            }
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              const trimmed = line.trim();
+              if (!trimmed || trimmed === "data: [DONE]") continue;
+              if (!trimmed.startsWith("data: ")) continue;
+              try {
+                const chunk = JSON.parse(trimmed.slice(6));
+                if (chunk && chunk.sequence_number !== undefined) {
+                  const upstreamSeq = Number(chunk.sequence_number);
+                  if (seqOffset === null) {
+                    const expectedSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
+                    seqOffset = expectedSeq - upstreamSeq;
+                    console.log(`[OpenCodex WS Proxy] Responses API sequence offset calculated: ${seqOffset} (expected ${expectedSeq}, upstream ${upstreamSeq})`);
+                  }
+                  const rewrittenSeq = upstreamSeq + seqOffset;
+                  chunk.sequence_number = rewrittenSeq;
+                  
+                  // Update sequence number maps with rewritten values
+                  this.sessionSequenceNumberMap.set(sessionIdStr, rewrittenSeq + 1);
+                  if (chunk.type === "response.done" || chunk.type === "response.completed" || chunk.type === "response.output_text.done") {
+                    this.lastCompletedSequenceNumberMap.set(sessionIdStr, rewrittenSeq);
+                  }
+                }
+                ws.send(JSON.stringify(chunk));
+              } catch (parseErr: any) {
+                console.error(`[OpenCodex WS Proxy] Error parsing Responses chunk: ${parseErr.message}`);
+              }
+            }
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      } catch (err: any) {
+        if (err.name === "AbortError" || err.message?.includes("aborted")) {
+          console.log(`[OpenCodex WS Proxy] Upstream Responses request aborted successfully.`);
+          return;
+        }
+        console.error(`[OpenCodex WS Proxy Responses Handler Error]`, err);
+        try {
+          ws.send(JSON.stringify({ error: { message: err.message, stack: err.stack } }));
+        } catch (wsErr) {}
+      } finally {
+        ws.off("close", onWsClose);
+        this.activeAbortControllers.delete(sessionIdStr);
       }
       return;
     }
 
 
 
-    const prevResponseId = processedReqBody.previous_response_id;
-    if (!prevResponseId && !this.forcedErrorSessions.has(sessionIdStr)) {
-      console.log(`[OpenCodex WS Proxy] Forcing proper failed response on first sentence for session ${sessionIdStr} to reset Codex UI state machine.`);
-      this.forcedErrorSessions.add(sessionIdStr);
 
-      const namespaceMap = extractNamespaceMap(processedReqBody.tools);
-      const responseMetadata = {
-        session_id: reqBody.client_metadata?.session_id || sessionIdStr,
-        thread_id: reqBody.client_metadata?.thread_id,
-        turn_id: reqBody.client_metadata?.turn_id,
-        "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
-      };
-
-      const streamState = new ResponsesStreamState(
-        requestedModel,
-        namespaceMap,
-        sessionId,
-        undefined,
-        undefined,
-        responseMetadata
-      );
-
-      // 1. Send rate limits
-      ws.send(JSON.stringify({
-        type: "codex.rate_limits",
-        plan_type: "plus",
-        rate_limits: {
-          allowed: true,
-          limit_reached: false,
-          primary: {
-            used_percent: 0,
-            window_minutes: 300,
-            reset_after_seconds: 3600,
-            reset_at: Math.floor(Date.now() / 1000) + 3600,
-            limit_reached: false
-          }
-        }
-      }));
-
-      // 2. Send metadata
-      ws.send(JSON.stringify({
-        type: "codex.response.metadata",
-        headers: {
-          "x-codex-safety-buffering-enabled": "true",
-          "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
-        }
-      }));
-
-      // 3. Start response (sends response.created & response.in_progress)
-      await streamState.start(async (payload) => {
-        ws.send(JSON.stringify(payload));
-      });
-
-      // 4. Send response.failed
-      const now = Math.floor(Date.now() / 1000);
-      const failedResponse = {
-        id: streamState.responseId,
-        object: "response",
-        created_at: now,
-        completed_at: null,
-        status: "failed",
-        background: false,
-        model: requestedModel,
-        output: [],
-        metadata: responseMetadata,
-        error: {
-          code: "connection_failed",
-          message: "OpenCodex: Initializing connection state. Please click retry or re-send your message."
-        }
-      };
-
-      ws.send(JSON.stringify({
-        type: "response.failed",
-        response: failedResponse,
-        sequence_number: 5
-      }));
-
-      return;
-    }
 
     const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     this.customModelSessions.add(sessionIdStr);
-    if (!prevResponseId) {
-      this.customConversationHistory.set(sessionIdStr, chatBody.messages);
-    } else {
-      const existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
-      if (existingHistory.length === 0) {
-        this.customConversationHistory.set(sessionIdStr, chatBody.messages);
-      } else {
-        const index = existingHistory.findIndex((m: any) => m.role === "assistant" && (m.id === prevResponseId || m.response_id === prevResponseId));
-        let alignedHistory = existingHistory;
-        if (index !== -1) {
-          alignedHistory = existingHistory.slice(0, index + 1);
-        }
-        const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
-        const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
-        this.customConversationHistory.set(sessionIdStr, updatedHistory);
-      }
-    }
-    chatBody.messages = alignToolMessages(
-      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
-        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
-          return { ...m, content: " " };
-        }
-        return m;
-      })
-    );
-
-
-    // Sanitize empty/null content fields for MiniMax model
-    if (mappedModelName.toLowerCase().includes("minimax")) {
-      for (const m of chatBody.messages) {
-        if (m.content === null || m.content === undefined || m.content === "") {
-          m.content = " ";
-        }
-      }
-      const hasUser = chatBody.messages.some((m: any) => m.role === "user");
-      if (!hasUser) {
-        chatBody.messages.push({ role: "user", content: " " });
-      }
-    }
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
     const responseMetadata = {
@@ -4283,51 +4823,132 @@ stream_idle_timeout_ms = 600000
           try { wsClient.send(msg); } catch {}
         }
       },
-      responseMetadata
+      responseMetadata,
+      requestedModel.includes("mini") || requestedModel.includes("title") || !!reqBody.background,
+      {
+        get: () => this.sessionSequenceNumberMap.get(sessionIdStr) || 1,
+        set: (seq: number) => this.sessionSequenceNumberMap.set(sessionIdStr, seq)
+      }
     ) : null;
 
-    try {
-      if (streamState) {
-        ws.send(JSON.stringify({
-          type: "codex.rate_limits",
-          plan_type: "plus",
-          rate_limits: {
-            allowed: true,
-            limit_reached: false,
-            primary: {
-              used_percent: 0,
-              window_minutes: 300,
-              reset_after_seconds: 3600,
-              reset_at: Math.floor(Date.now() / 1000) + 3600,
-              limit_reached: false
-            }
-          }
-        }));
-        ws.send(JSON.stringify({
-          type: "codex.response.metadata",
-          headers: {
-            "x-codex-safety-buffering-enabled": "true",
-            "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
-          }
-        }));
-        await streamState.start(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
+    const broadcastToClients = (payload: any) => {
+      const payloadStr = JSON.stringify(payload);
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(payloadStr); } catch {}
       }
+      for (const otherWs of this.desktopWsClients) {
+        if (otherWs !== ws && otherWs.readyState === WebSocket.OPEN) {
+          try { otherWs.send(payloadStr); } catch {}
+        }
+      }
+    };
 
+    if (streamState) {
+      broadcastToClients({
+        type: "codex.rate_limits",
+        plan_type: "plus",
+        rate_limits: {
+          allowed: true,
+          limit_reached: false,
+          primary: {
+            used_percent: 0,
+            window_minutes: 300,
+            reset_after_seconds: 3600,
+            reset_at: Math.floor(Date.now() / 1000) + 3600,
+            limit_reached: false
+          }
+        }
+      });
+      broadcastToClients({
+        type: "codex.response.metadata",
+        headers: {
+          "x-codex-safety-buffering-enabled": "true",
+          "x-codex-safety-buffering-faster-model": "gpt-5.6-luna"
+        }
+      });
+      await streamState.start(async (payload) => {
+        broadcastToClients(payload);
+      });
+    }
+
+    const prevResponseId = processedReqBody.previous_response_id;
+    let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
+    if (existingHistory.length === 0) {
+      console.log(`[OpenCodex WS Proxy] Stale history empty. Waiting 350ms for client to write rollout file...`);
+      await new Promise(resolve => setTimeout(resolve, 350));
+      existingHistory = loadHistoryFromRollout(sessionIdStr);
+    }
+
+    if (existingHistory.length === 0) {
+      this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+    } else {
+      let alignedHistory = existingHistory;
+      if (prevResponseId) {
+        const index = existingHistory.findIndex((m: any) => m.role === "assistant" && (m.id === prevResponseId || m.response_id === prevResponseId));
+        if (index !== -1) {
+          alignedHistory = existingHistory.slice(0, index + 1);
+        }
+      }
+      const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+      const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
+      this.customConversationHistory.set(sessionIdStr, updatedHistory);
+    }
+    chatBody.messages = alignToolMessages(
+      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
+        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
+          return { ...m, content: " " };
+        }
+        return m;
+      })
+    );
+
+
+    // Sanitize empty/null content fields for MiniMax model
+    if (mappedModelName.toLowerCase().includes("minimax")) {
+      for (const m of chatBody.messages) {
+        if (m.content === null || m.content === undefined || m.content === "") {
+          m.content = " ";
+        }
+      }
+      const hasUser = chatBody.messages.some((m: any) => m.role === "user");
+      if (!hasUser) {
+        chatBody.messages.push({ role: "user", content: " " });
+      }
+    }
+
+    const contextWindow = catalogEntry ? (catalogEntry.context_window || 200000) : 200000;
+    const safetyLimit = Math.floor(contextWindow * 0.95);
+    chatBody.messages = pruneMessagesToLimit(chatBody.messages, safetyLimit);
+    this.customConversationHistory.set(sessionIdStr, chatBody.messages);
+    this.currentActiveSessionId = sessionIdStr;
+
+    const estimatedTokens = estimateTokensForMessages(chatBody.messages);
+    const existing = this.sessionContextMap.get(sessionIdStr);
+    if (!existing || estimatedTokens > existing.tokens || Math.abs(estimatedTokens - existing.tokens) < existing.tokens * 0.15 || estimatedTokens < 2000) {
+      this.sessionContextMap.set(sessionIdStr, {
+        tokens: estimatedTokens,
+        is_estimated: true,
+        model: requestedModel,
+        context_window: contextWindow
+      });
+      broadcastSessionUpdate(sessionIdStr, estimatedTokens, contextWindow, requestedModel, true);
+    }
+
+    try {
       console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
       const response = await fetch(`${provider.base_url}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(chatBody),
-        dispatcher: fetchDispatcher
+        dispatcher: fetchDispatcher,
+        signal
       });
 
       console.log(`[OpenCodex WS Proxy] Upstream response status: ${response.status}`);
       if (!response.ok) {
         const errorText = await response.text();
         console.error(`[OpenCodex WS Proxy] Upstream error response: ${errorText}`);
-        ws.send(JSON.stringify({ error: { message: errorText } }));
+        broadcastToClients({ error: { message: errorText } });
         return;
       }
 
@@ -4338,9 +4959,15 @@ stream_idle_timeout_ms = 600000
         const decoder = new TextDecoder();
         let buffer = "";
         let chunkCount = 0;
+        let finalUsage: any = null;
 
         try {
           while (true) {
+            if (ws.readyState !== WebSocket.OPEN) {
+              console.log(`[OpenCodex WS Proxy] Client WebSocket closed during streaming. Aborting upstream request.`);
+              controller.abort();
+              break;
+            }
             const { done, value } = await reader.read();
             if (done) {
               console.log(`[OpenCodex WS Proxy] Upstream stream reader finished. Total chunks: ${chunkCount}`);
@@ -4357,8 +4984,11 @@ stream_idle_timeout_ms = 600000
               if (!trimmed.startsWith("data: ")) continue;
               try {
                 const chunk = JSON.parse(trimmed.slice(6));
+                if (chunk.usage) {
+                  finalUsage = chunk.usage;
+                }
                 await activeStreamState.writeChatDelta(async (payload) => {
-                  ws.send(JSON.stringify(payload));
+                  broadcastToClients(payload);
                 }, chunk);
               } catch (parseErr: any) {
                 console.error(`[OpenCodex WS Proxy] Error parsing or writing delta: ${parseErr.message}`);
@@ -4377,7 +5007,7 @@ stream_idle_timeout_ms = 600000
 
         console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
         await activeStreamState.finish(async (payload) => {
-          ws.send(JSON.stringify(payload));
+          broadcastToClients(payload);
         });
 
         const assistantMsg = activeStreamState.getAssistantMessage();
@@ -4385,9 +5015,32 @@ stream_idle_timeout_ms = 600000
           assistantMsg.id = activeStreamState.responseId;
           const sessionIdStr = sessionId ? String(sessionId) : "default";
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
-          this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
+          const updatedHistory = currentHistory.concat(assistantMsg);
+          this.customConversationHistory.set(sessionIdStr, updatedHistory);
+
+          let totalTokens = 0;
+          let isEstimated = true;
+          if (finalUsage && typeof finalUsage.prompt_tokens === "number") {
+            const completionTokens = finalUsage.completion_tokens || 0;
+            totalTokens = finalUsage.prompt_tokens + completionTokens;
+            isEstimated = false;
+            console.log(`[OpenCodex WS Proxy] Usage tracked via upstream: prompt=${finalUsage.prompt_tokens}, completion=${completionTokens}, total=${totalTokens}`);
+          } else {
+            totalTokens = estimateTokensForMessages(updatedHistory);
+            console.log(`[OpenCodex WS Proxy] Usage estimated locally: total=${totalTokens}`);
+          }
+
+          this.sessionContextMap.set(sessionIdStr, {
+            tokens: totalTokens,
+            is_estimated: isEstimated,
+            model: requestedModel,
+            context_window: contextWindow
+          });
+          broadcastSessionUpdate(sessionIdStr, totalTokens, contextWindow, requestedModel, isEstimated);
         }
-        console.log(`[OpenCodex WS Proxy] Stream processing completely finished.`);
+        const lastCompletedSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
+        this.lastCompletedSequenceNumberMap.set(sessionIdStr, lastCompletedSeq - 1);
+        console.log(`[OpenCodex WS Proxy] Stream processing completely finished. Committed last completed sequence number ${lastCompletedSeq - 1}`);
       } else {
         const rawText = await response.text();
         let data: any;
@@ -4397,7 +5050,7 @@ stream_idle_timeout_ms = 600000
           data = { error: rawText.slice(0, 250) };
         }
         const responseBody = chatCompletionToResponse(data, requestedModel, namespaceMap);
-        ws.send(JSON.stringify(responseBody));
+        broadcastToClients(responseBody);
 
         const choice = (data.choices || [{}])[0];
         const message = choice.message;
@@ -4406,10 +5059,21 @@ stream_idle_timeout_ms = 600000
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
           this.customConversationHistory.set(sessionIdStr, currentHistory.concat(message));
         }
+        const lastCompletedSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
+        this.lastCompletedSequenceNumberMap.set(sessionIdStr, lastCompletedSeq - 1);
       }
     } catch (err: any) {
-      console.error(`[OpenCodex WS Proxy Local Handler Error] ${err.message}`);
-      ws.send(JSON.stringify({ error: { message: err.message } }));
+      if (err.name === "AbortError" || err.message?.includes("aborted")) {
+        console.log(`[OpenCodex WS Proxy] Upstream request aborted successfully.`);
+        return;
+      }
+      console.error(`[OpenCodex WS Proxy Local Handler Error]`, err);
+      try {
+        broadcastToClients({ error: { message: err.message, stack: err.stack } });
+      } catch (wsErr) {}
+    } finally {
+      ws.off("close", onWsClose);
+      this.activeAbortControllers.delete(sessionIdStr);
     }
   }
 
@@ -4417,7 +5081,7 @@ stream_idle_timeout_ms = 600000
     if (this.mcpProcess) return;
     console.error("[OpenCodex MCP Manager] Starting persistent codex mcp-server...");
     
-    this.mcpProcess = spawn("/Applications/Codex.app/Contents/Resources/codex", ["mcp-server"]);
+    this.mcpProcess = spawn(resolveCodexBinary(), ["mcp-server"]);
     this.mcpStdoutBuffer = "";
 
     this.mcpProcess.stdout.on("data", (chunk: Buffer) => {
@@ -4464,6 +5128,11 @@ stream_idle_timeout_ms = 600000
           }
         }
       }
+    });
+
+    this.mcpProcess.on("error", (err: Error) => {
+      console.error(`[OpenCodex MCP Manager] Failed to start: ${err.message}`);
+      this.mcpProcess = null;
     });
 
     this.mcpProcess.stderr.on("data", (chunk: Buffer) => {

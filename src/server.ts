@@ -287,7 +287,7 @@ class OpenCodex {
       switch (name) {
         case "screenshot": {
           const png = await this.screenshotTaker.capture();
-          const cachePath = "/tmp/opencodex_screenshot.png";
+          const cachePath = path.join(os.tmpdir(), "opencodex_screenshot.png");
           fs.writeFileSync(cachePath, png);
 
           let desc = "";
@@ -419,6 +419,7 @@ class OpenCodex {
           path.join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
           path.join(localAppData, "Programs", "Codex", "Codex.exe"),
         ];
+        codexMcpBinary = possiblePaths[0];
         for (const p of possiblePaths) {
           if (fs.existsSync(p)) {
             codexMcpBinary = p;

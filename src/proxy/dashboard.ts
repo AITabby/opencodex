@@ -1085,6 +1085,15 @@ export function getDashboardHtml(): string {
                 🗑️ 清空 / Clear
               </button>
             </div>
+            
+            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem;">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
+                <span style="font-size: 0.85rem; font-weight: 600; color: var(--color-text);">桌面置顶悬浮球 / Desktop Orb</span>
+                <span id="orb-status-badge" style="font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 99px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">关闭 / Offline</span>
+              </div>
+              <button class="action-btn" id="orb-toggle-btn" onclick="toggleDesktopOrb()" style="width: 100%; margin-top: 0; padding: 0.5rem; font-size: 0.8rem; background: var(--color-primary); color: white; border-radius: 8px;">开启置顶悬浮球 / Launch Orb</button>
+            </div>
+
             <div id="session-list-container" style="display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; flex: 1;">
               <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;" id="i18n-loading-sessions">Loading sessions...</div>
             </div>
@@ -1425,9 +1434,10 @@ export function getDashboardHtml(): string {
             }
           };
           
+          const is1m = m.context_window === 1000000;
           item.innerHTML = \`
             <div class="model-checkbox-container">
-              <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \${isActive ? 'checked' : ''}>
+              <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \x24{isActive ? 'checked' : ''}>
               <div class="model-info">
                 <div class="model-display-name">\${m.display_name}</div>
                 <div class="model-slug">\${m.model}</div>
@@ -1435,7 +1445,11 @@ export function getDashboardHtml(): string {
             </div>
             <div style="display:flex;align-items:center;gap:0.75rem;">
               <label style="display:flex;align-items:center;gap:0.25rem;cursor:pointer;font-size:0.8rem;color:var(--color-text-muted);">
-                <input type="checkbox" class="vision-bridge-checkbox" data-id="\${m.id}" \${hasBridge ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-primary);">
+                <input type="checkbox" class="context-1m-checkbox" data-id="\${m.id}" \x24{is1m ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-secondary);">
+                <span>1M Context</span>
+              </label>
+              <label style="display:flex;align-items:center;gap:0.25rem;cursor:pointer;font-size:0.8rem;color:var(--color-text-muted);">
+                <input type="checkbox" class="vision-bridge-checkbox" data-id="\${m.id}" \x24{hasBridge ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-primary);">
                 <span>Vision Bridge</span>
               </label>
               \${badgeHtml}
@@ -1539,6 +1553,8 @@ export function getDashboardHtml(): string {
       const activeIds = Array.from(checkedBoxes).map(cb => cb.getAttribute('data-id'));
       const visionBridgeBoxes = document.querySelectorAll('.vision-bridge-checkbox:checked');
       const visionBridgeIds = Array.from(visionBridgeBoxes).map(cb => cb.getAttribute('data-id'));
+      const context1mBoxes = document.querySelectorAll('.context-1m-checkbox:checked');
+      const context1mIds = Array.from(context1mBoxes).map(cb => cb.getAttribute('data-id'));
       const restartChecked = document.getElementById('models-restart-checkbox').checked;
       
       try {
@@ -1552,6 +1568,7 @@ export function getDashboardHtml(): string {
           body: JSON.stringify({
             active: activeIds,
             vision_bridge: visionBridgeIds,
+            context_1m: context1mIds,
             restart: restartChecked
           })
         });
@@ -1679,7 +1696,7 @@ export function getDashboardHtml(): string {
         const response = await fetch('/api/sessions');
         const sessions = await response.json();
         
-        const hash = sessions.map(s => s.id + ':' + s.text + ':' + s.ts + ':' + s.archived).join('|');
+        const hash = sessions.map(s => s.id + ':' + s.text + ':' + s.ts + ':' + s.archived + ':' + (s.tokens || 0) + ':' + (s.context_window || 0)).join('|');
         if (hash === lastSessionsHash && isAutoRefresh) {
           return;
         }
@@ -1703,12 +1720,30 @@ export function getDashboardHtml(): string {
           
           const timeStr = new Date(s.ts).toLocaleTimeString();
           
+          let contextHtml = '';
+          if (s.tokens !== undefined && s.tokens > 0) {
+            const pct = Math.min(100, Math.round(s.tokens / s.context_window * 100));
+            const color = pct > 80 ? 'var(--color-danger)' : (pct > 60 ? '#f59e0b' : 'var(--color-success)');
+            contextHtml = \`
+              <div class="session-context-info" style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.25rem; pointer-events: none;">
+                <div style="background: rgba(255,255,255,0.05); border-radius: 4px; height: 6px; overflow: hidden; position: relative; width: 100%;">
+                  <div style="width: \${pct}%; height: 100%; background: \${color}; transition: width 0.3s ease;"></div>
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-text-muted); display: flex; justify-content: space-between;">
+                  <span>\${Math.round(s.tokens / 1000)}K / \${Math.round(s.context_window / 1000)}K (\${pct}%)</span>
+                  <span>\${s.is_estimated ? 'Est.' : 'Act.'}</span>
+                </div>
+              </div>
+            \`;
+          }
+          
           item.innerHTML = \`
             <div class="session-item-header">
               <span class="session-id-title">\${s.id.substring(0, 8)}...</span>
               <span class="session-time">\${timeStr}</span>
             </div>
             <div class="session-text-preview">\${escapeHtml(s.text)}</div>
+            \${contextHtml}
             <div class="session-actions-overlay">
               <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? '激活/Unarchive' : '归档/Archive'}</button>
               <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">删除/Delete</button>
@@ -2107,6 +2142,46 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
+    let orbRunning = false;
+    async function checkOrbStatus() {
+      try {
+        const response = await fetch('/api/orb/status');
+        const data = await response.json();
+        orbRunning = !!data.running;
+        const badge = document.getElementById('orb-status-badge');
+        const btn = document.getElementById('orb-toggle-btn');
+        if (badge) {
+          badge.innerText = orbRunning ? (currentLang === 'zh' ? '运行中' : 'Running') : (currentLang === 'zh' ? '关闭' : 'Offline');
+          badge.style.color = orbRunning ? 'var(--color-success)' : '#ef4444';
+          badge.style.background = orbRunning ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+          badge.style.borderColor = orbRunning ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
+        }
+        if (btn) {
+          btn.innerText = orbRunning 
+            ? (currentLang === 'zh' ? '关闭置顶悬浮球 / Close Orb' : 'Close Desktop Orb')
+            : (currentLang === 'zh' ? '开启置顶悬浮球 / Launch Orb' : 'Launch Desktop Orb');
+          btn.style.background = orbRunning ? 'rgba(239, 68, 68, 0.15)' : 'var(--color-primary)';
+          btn.style.color = orbRunning ? '#ef4444' : 'white';
+          btn.style.border = orbRunning ? '1px solid rgba(239, 68, 68, 0.3)' : 'none';
+        }
+      } catch (err) {}
+    }
+
+    async function toggleDesktopOrb() {
+      const enable = !orbRunning;
+      showToast(enable ? '正在启动悬浮球...' : '正在关闭悬浮球...');
+      try {
+        const response = await fetch('/api/orb/launch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enable })
+        });
+        if (response.ok) {
+          setTimeout(checkOrbStatus, 1500);
+        }
+      } catch (err) {}
+    }
+
     async function createNewSession() {
       try {
         const response = await fetch('/api/sessions/new', {
@@ -2136,6 +2211,7 @@ export function getDashboardHtml(): string {
     window.deleteSession = deleteSession;
     window.toggleArchiveSession = toggleArchiveSession;
     window.launchVoiceBar = launchVoiceBar;
+    window.toggleDesktopOrb = toggleDesktopOrb;
 
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
@@ -2145,6 +2221,8 @@ export function getDashboardHtml(): string {
       
       setupLogsPolling();
       setInterval(checkVoiceBarStatus, 3000);
+      setInterval(checkOrbStatus, 3000);
+      checkOrbStatus();
       setInterval(checkPermissionsStatus, 3000);
       setInterval(async () => {
         if (currentTab === 'sessions') {
