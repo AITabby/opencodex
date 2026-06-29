@@ -1,6 +1,16 @@
 <h1 align="center">OpenCodex</h1>
 
 <p align="center">
+  <a href="#windows-beta--windows-测试版"><img alt="Windows Beta" src="https://img.shields.io/badge/Windows-测试版-orange"></a>
+</p>
+
+> ## Windows Beta / Windows 测试版
+>
+> Windows support is now included in this unified repository and passes the automated Windows build. Real-device verification is still in progress.
+>
+> Windows 支持现已整合进统一仓库，并已通过 Windows 自动构建测试，目前为测试版本，仍在进行真实设备验证。
+
+<p align="center">
   <strong>Use GPT, DeepSeek, MiniMax, OpenRouter, SiliconFlow, and other models inside Codex Desktop through one local gateway.</strong>
 </p>
 
@@ -232,6 +242,8 @@ The companion app provides global voice hotkeys, VAD, STT/TTS integration, and a
 - Windows only: .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`)
 
 ### Install And Run
+
+> Windows support is currently in beta. The commands below pass the automated Windows build, but real-device testing is still in progress.
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
@@ -510,6 +522,8 @@ OpenCodex 选择了更稳的方式：
 - 仅 Windows：.NET 8 SDK（`winget install Microsoft.DotNet.SDK.8`）
 
 ### 安装与启动
+
+> Windows 支持目前为测试版。以下命令已通过 Windows 自动构建测试，但仍在进行真实设备验证。
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
