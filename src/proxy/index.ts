@@ -1597,7 +1597,20 @@ stream_idle_timeout_ms = 600000
             headers["authorization"] = `Bearer ${realToken}`;
           }
 
+          const loggedHeaders: any = {};
+          for (const [k, v] of Object.entries(headers)) {
+            if (k.toLowerCase() === "authorization") {
+              loggedHeaders[k] = `${v.slice(0, 15)}... (len: ${v.length})`;
+            } else if (k.toLowerCase() === "cookie") {
+              loggedHeaders[k] = `${v.slice(0, 30)}... (len: ${v.length})`;
+            } else {
+              loggedHeaders[k] = v;
+            }
+          }
+          const protocols = request.headers["sec-websocket-protocol"];
+          console.log(`[OpenCodex WS Proxy] Protocols:`, protocols);
           console.log(`[OpenCodex WS Proxy] Connecting to official server immediately: ${targetUrl}`);
+          console.log(`[OpenCodex WS Proxy Upgrade Headers]:`, JSON.stringify(loggedHeaders, null, 2));
           const targetWs = new WebSocket(targetUrl, { 
             headers,
             agent: wsAgent
@@ -1667,6 +1680,13 @@ stream_idle_timeout_ms = 600000
                 }
                 if (payload.type === "error" && payload.error?.type === "usage_limit_reached") {
                   return; // Ignore official rate limit block
+                }
+                if (payload.type === "error" && payload.error?.message?.includes("Responses-Lite")) {
+                  console.log(`[OpenCodex WS Proxy] Intercepted Responses-Lite error. Translating to invalid_token to trigger client-side token refresh.`);
+                  payload.error.code = "invalid_token";
+                  payload.error.type = "invalid_request_error";
+                  payload.error.message = "The client token is expired or invalid.";
+                  processedTData = Buffer.from(JSON.stringify(payload), "utf-8");
                 }
                 if (payload.type === "error" && payload.error?.message?.includes("Previous response with id") && payload.error?.message?.includes("not found")) {
                   const activeSid = connInfo.activeSessionId || sessionIdStr;
@@ -3713,6 +3733,28 @@ stream_idle_timeout_ms = 600000
         });
 
         console.log(`[OpenCodex Proxy] Official server HTTP response status: ${officialRes.status}`);
+        if (officialRes.status === 400 || officialRes.status === 403 || officialRes.status === 401) {
+          const errText = await officialRes.text();
+          if (errText.includes("Responses-Lite")) {
+            console.log(`[OpenCodex Proxy] Intercepted HTTP Responses-Lite error. Translating to 401 Unauthorized token expired.`);
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              error: {
+                message: "The client token is expired or invalid.",
+                type: "invalid_request_error",
+                param: null,
+                code: "invalid_token"
+              }
+            }));
+            return;
+          }
+          res.writeHead(officialRes.status, {
+            "Content-Type": officialRes.headers.get("content-type") || "application/json"
+          });
+          res.end(errText);
+          return;
+        }
+
         res.writeHead(officialRes.status, {
           "Content-Type": officialRes.headers.get("content-type") || "application/json"
         });
