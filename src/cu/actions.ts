@@ -136,8 +136,6 @@ export class ActionPerformer {
   }
 
   private getScript(action: string, a: string[]): string {
-    const esc = (s: string) => s.replace(/"/g, '\\"').replace(/\\/g, "\\\\");
-
     switch (action) {
       case "click": {
         const [x, y, b] = a;
@@ -213,11 +211,14 @@ export class ActionPerformer {
       }
 
       case "type": {
-        const t = esc(a[0]);
+        const encodedText = Buffer.from(a[0] || "", "utf-8").toString("base64");
         return [
           "import Cocoa",
+          "import Foundation",
+          `let encodedText = "${encodedText}"`,
+          "guard let data = Data(base64Encoded: encodedText), let text = String(data: data, encoding: .utf8) else { exit(1) }",
           "let src = CGEventSource(stateID: .combinedSessionState)",
-          `for ch in "${t}".utf16 {`,
+          "for ch in text.utf16 {",
           "  var c = ch",
           "  let ev = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: true)!",
           "  ev.keyboardSetUnicodeString(stringLength: 1, unicodeString: &c)",

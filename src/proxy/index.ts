@@ -16,11 +16,40 @@ import { WebSocketServer, WebSocket } from "ws";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch } from "undici";
 import zlib from "node:zlib";
+import { getEncoding, type Tiktoken } from "js-tiktoken";
 
 // Auto-detect and configure outbound proxy support
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
+const MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+const REQUEST_DEBUG_ENABLED = process.env.OPENCODEX_DEBUG_REQUESTS === "1";
+
+function isTrustedBrowserOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost" || parsed.hostname === "[::1]")
+      && parsed.port === "8765";
+  } catch {
+    return false;
+  }
+}
+
+function redactSecrets<T extends Record<string, any>>(value: T): T {
+  return {
+    ...value,
+    stt_api_key: value.stt_api_key ? `${String(value.stt_api_key).slice(0, 4)}...` : "",
+    tts_api_key: value.tts_api_key ? `${String(value.tts_api_key).slice(0, 4)}...` : ""
+  };
+}
+
+function keepExistingSecret(incoming: unknown, existing: unknown): string {
+  if (incoming === undefined && typeof existing === "string") return existing;
+  const next = typeof incoming === "string" ? incoming : "";
+  if (next.includes("...") && typeof existing === "string") return existing;
+  return next;
+}
 
 function resolveCodexBinary(): string {
   if (process.platform !== "win32") return "/Applications/Codex.app/Contents/Resources/codex";
@@ -216,7 +245,16 @@ function loadHistoryFromRollout(sessionId: string): any[] {
 
   const messages: any[] = [];
   try {
-    const content = readFileSync(filePath, "utf-8");
+    let content = readFileSync(filePath, "utf-8");
+    if (content.includes("anthropic-thinking-v1:")) {
+      console.log(`[OpenCodex] Sanitizing encrypted thinking block in rollout file: ${filePath}`);
+      content = content.replace(/"encrypted_content":"anthropic-thinking-v1:[^"]*"/g, '"encrypted_content":null');
+      try {
+        writeFileSync(filePath, content, "utf-8");
+      } catch (err: any) {
+        console.error(`[OpenCodex] Failed to write sanitized rollout file: ${err.message}`);
+      }
+    }
     const lines = content.split("\n");
     for (const line of lines) {
       const trimmed = line.trim();
@@ -309,18 +347,39 @@ function alignToolMessages(msgs: any[]): any[] {
 }
 
 
-function estimateTokensForMessages(messages: any[]): number {
+type LocalTokenSource = "model_tokenizer" | "model_estimate" | "generic_estimate";
+
+interface LocalTokenEstimate {
+  tokens: number;
+  source: LocalTokenSource;
+  tokenizer: string;
+}
+
+let o200kEncoding: Tiktoken | undefined;
+let cl100kEncoding: Tiktoken | undefined;
+
+function serializeTokenizableRequest(body: any): string {
+  return JSON.stringify({
+    messages: Array.isArray(body?.messages) ? body.messages : [],
+    tools: Array.isArray(body?.tools) ? body.tools : []
+  });
+}
+
+function estimateTokensForMessages(
+  messages: any[],
+  weights: { cjk: number; whitespace: number; other: number } = { cjk: 1.2, whitespace: 0.5, other: 0.25 }
+): number {
   let tokens = 0;
   for (const msg of messages) {
     const text = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
     for (let i = 0; i < text.length; i++) {
       const code = text.charCodeAt(i);
       if (code >= 0x4e00 && code <= 0x9fff) {
-        tokens += 1.2; // Chinese character
+        tokens += weights.cjk;
       } else if (text[i] === " " || text[i] === "\n") {
-        tokens += 0.5;
+        tokens += weights.whitespace;
       } else {
-        tokens += 0.25; // English letter/character
+        tokens += weights.other;
       }
     }
     tokens += 4; // overhead
@@ -328,9 +387,78 @@ function estimateTokensForMessages(messages: any[]): number {
   return Math.ceil(tokens);
 }
 
+function estimateTokensForRequest(body: any, model: string): LocalTokenEstimate {
+  const normalizedModel = String(model || "").toLowerCase();
+  const serialized = serializeTokenizableRequest(body);
 
-function pruneMessagesToLimit(messages: any[], limit: number): any[] {
-  let estimated = estimateTokensForMessages(messages);
+  // OpenAI's recent model families use o200k_base; older GPT-3.5/4 models use cl100k_base.
+  // Tokenizing the complete serialized request also includes tool schemas, calls and results.
+  if (/(?:^|[\/:_.-])(gpt-5|gpt-4\.1|gpt-4o|o[134](?:-|$))/.test(normalizedModel)) {
+    o200kEncoding ||= getEncoding("o200k_base");
+    return {
+      tokens: o200kEncoding.encode(serialized).length,
+      source: "model_tokenizer",
+      tokenizer: "o200k_base"
+    };
+  }
+  if (/(?:^|[\/:_.-])(gpt-4(?:-|$)|gpt-3\.5)/.test(normalizedModel)) {
+    cl100kEncoding ||= getEncoding("cl100k_base");
+    return {
+      tokens: cl100kEncoding.encode(serialized).length,
+      source: "model_tokenizer",
+      tokenizer: "cl100k_base"
+    };
+  }
+
+  const profiles: Array<{
+    pattern: RegExp;
+    name: string;
+    weights: { cjk: number; whitespace: number; other: number };
+  }> = [
+    { pattern: /qwen|qwq/, name: "qwen_family", weights: { cjk: 1.0, whitespace: 0.35, other: 0.28 } },
+    { pattern: /deepseek/, name: "deepseek_family", weights: { cjk: 1.05, whitespace: 0.4, other: 0.28 } },
+    { pattern: /glm|chatglm/, name: "glm_family", weights: { cjk: 1.1, whitespace: 0.4, other: 0.3 } },
+    { pattern: /minimax|abab/, name: "minimax_family", weights: { cjk: 1.05, whitespace: 0.4, other: 0.29 } },
+    { pattern: /mimo/, name: "mimo_family", weights: { cjk: 1.05, whitespace: 0.4, other: 0.29 } }
+  ];
+  const profile = profiles.find(item => item.pattern.test(normalizedModel));
+  if (profile) {
+    return {
+      tokens: estimateTokensForMessages([{ role: "request", content: serialized }], profile.weights),
+      source: "model_estimate",
+      tokenizer: profile.name
+    };
+  }
+
+  return {
+    tokens: estimateTokensForMessages([{ role: "request", content: serialized }]),
+    source: "generic_estimate",
+    tokenizer: "generic"
+  };
+}
+
+type ContextUsageSource = "provider" | "rollout_actual" | LocalTokenSource;
+
+interface SessionContextSnapshot {
+  tokens: number;
+  is_estimated: boolean;
+  model?: string;
+  context_window?: number;
+  estimated_tokens?: number;
+  provider_prompt_tokens?: number;
+  provider_completion_tokens?: number;
+  source?: ContextUsageSource;
+  tokenizer?: string;
+}
+
+interface SessionCumulativeUsage {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+
+function pruneMessagesToLimit(messages: any[], limit: number, model: string, tools: any[] = []): any[] {
+  let estimated = estimateTokensForRequest({ messages, tools }, model).tokens;
   if (estimated <= limit) return messages;
 
   console.log(`[OpenCodex WS Proxy] Context limit reached (${estimated} > ${limit}). Pruning oldest messages...`);
@@ -342,7 +470,7 @@ function pruneMessagesToLimit(messages: any[], limit: number): any[] {
   // Keep pruning oldest chat messages until we are under the limit
   while (chatMessages.length > 2 && estimated > limit) {
     chatMessages.shift();
-    estimated = estimateTokensForMessages([...systemMessages, ...chatMessages]);
+    estimated = estimateTokensForRequest({ messages: [...systemMessages, ...chatMessages], tools }, model).tokens;
   }
 
   return [...systemMessages, ...chatMessages];
@@ -357,6 +485,7 @@ export class ProxyServer {
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
   private sessionModelMap = new Map<string, string>();
+  private sessionPrevResponseIdFailed = new Map<string, boolean>();
   private sessionSequenceNumberMap = new Map<string, number>();
   private lastCompletedSequenceNumberMap = new Map<string, number>();
   private lastWsMap = new Map<string, any>();
@@ -365,7 +494,9 @@ export class ProxyServer {
   private forcedErrorSessions = new Set<string>();
   private customSessionQueues = new Map<any, Promise<void>>();
   private activeAbortControllers = new Map<string, AbortController>();
-  private sessionContextMap = new Map<string, { tokens: number, is_estimated: boolean, model?: string, context_window?: number }>();
+  private sessionContextMap = new Map<string, SessionContextSnapshot>();
+  private sessionModelContextMap = new Map<string, SessionContextSnapshot>();
+  private sessionCumulativeUsage = new Map<string, SessionCumulativeUsage>();
   private currentActiveSessionId: string = "";
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
@@ -385,9 +516,84 @@ export class ProxyServer {
     this.loadConfig();
     this.autoPatchCodexConfig();
     this.mergeNativeModelsIntoCatalog();
+    this.upgradeReasoningLevelsInCatalog();
     this.autoPatchPlugins();
     this.ensurePythonScripts();
     this.startVADDaemon();
+  }
+
+  private contextKey(sessionId: string, model: string): string {
+    return `${sessionId}\u0000${model}`;
+  }
+
+  private getModelContextWindow(model: string): number {
+    const catalog = this.getModelCatalog();
+    const entry = catalog.models?.find((item: any) => item.slug === model);
+    return entry?.context_window || 200000;
+  }
+
+  private clearSessionUsage(sessionId: string): void {
+    this.sessionContextMap.delete(sessionId);
+    const prefix = `${sessionId}\u0000`;
+    for (const key of this.sessionModelContextMap.keys()) {
+      if (key.startsWith(prefix)) this.sessionModelContextMap.delete(key);
+    }
+    for (const key of this.sessionCumulativeUsage.keys()) {
+      if (key.startsWith(prefix)) this.sessionCumulativeUsage.delete(key);
+    }
+  }
+
+  private updateContextUsage(
+    sessionId: string,
+    model: string,
+    requestBody: any,
+    contextWindow: number,
+    providerUsage?: any
+  ): SessionContextSnapshot {
+    const localEstimate = estimateTokensForRequest(requestBody, model);
+    const estimatedTokens = localEstimate.tokens;
+    const providerPromptTokens = Number.isFinite(providerUsage?.prompt_tokens)
+      ? Number(providerUsage.prompt_tokens)
+      : Number.isFinite(providerUsage?.input_tokens)
+        ? Number(providerUsage.input_tokens)
+        : undefined;
+    const providerCompletionTokens = Number.isFinite(providerUsage?.completion_tokens)
+      ? Number(providerUsage.completion_tokens)
+      : Number.isFinite(providerUsage?.output_tokens)
+        ? Number(providerUsage.output_tokens)
+        : undefined;
+    const providerContextTokens = providerPromptTokens === undefined
+      ? undefined
+      : providerPromptTokens + (providerCompletionTokens || 0);
+    const tokens = providerContextTokens ?? estimatedTokens;
+    const source: ContextUsageSource = providerContextTokens === undefined
+      ? localEstimate.source
+      : "provider";
+    const snapshot: SessionContextSnapshot = {
+      tokens,
+      is_estimated: source !== "provider",
+      model,
+      context_window: contextWindow,
+      estimated_tokens: estimatedTokens,
+      provider_prompt_tokens: providerPromptTokens,
+      provider_completion_tokens: providerCompletionTokens,
+      source,
+      tokenizer: localEstimate.tokenizer
+    };
+    this.sessionModelContextMap.set(this.contextKey(sessionId, model), snapshot);
+    this.sessionContextMap.set(sessionId, snapshot);
+
+    if (providerPromptTokens !== undefined || providerCompletionTokens !== undefined) {
+      const cumulativeKey = this.contextKey(sessionId, model);
+      const cumulative = this.sessionCumulativeUsage.get(cumulativeKey) || { input_tokens: 0, output_tokens: 0 };
+      cumulative.input_tokens += providerPromptTokens || 0;
+      cumulative.output_tokens += providerCompletionTokens || 0;
+      this.sessionCumulativeUsage.set(cumulativeKey, cumulative);
+    }
+
+    broadcastSessionUpdate(sessionId, tokens, contextWindow, model, snapshot.is_estimated);
+    console.log(`[OpenCodex Context] session=${sessionId} model=${model} effective=${tokens} estimated=${estimatedTokens} provider=${providerContextTokens ?? "n/a"} source=${source} tokenizer=${localEstimate.tokenizer}`);
+    return snapshot;
   }
 
   private startVADDaemon() {
@@ -686,7 +892,7 @@ except Exception as e:
   private saveConfig() {
     const p = join(this.configDir, "providers.json");
     try {
-      writeFileSync(p, JSON.stringify(this.config, null, 2), "utf-8");
+      writeFileSync(p, JSON.stringify(this.config, null, 2), { encoding: "utf-8", mode: 0o600 });
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to save config: ${err.message}`);
     }
@@ -712,6 +918,30 @@ except Exception as e:
       console.error(`[OpenCodex] Saved custom model catalog to ${p}`);
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to save custom model catalog: ${err.message}`);
+    }
+  }
+
+  private upgradeReasoningLevelsInCatalog() {
+    const catalog = this.getModelCatalog();
+    if (!catalog || !Array.isArray(catalog.models)) return;
+    let updated = false;
+    for (const model of catalog.models) {
+      const isCustomModel = model.provider === "opencodex" || !!model.backend_provider || model.slug.startsWith("mimo") || model.slug.includes("deepseek") || model.slug.includes("qwen");
+      if (isCustomModel) {
+        if (!model.supported_reasoning_levels || !model.supported_reasoning_levels.some((l: any) => l.effort === "xhigh")) {
+          model.supported_reasoning_levels = [
+            { effort: "low", description: "Lighter reasoning" },
+            { effort: "medium", description: "Balanced reasoning" },
+            { effort: "high", description: "Greater reasoning depth" },
+            { effort: "xhigh", description: "Extra high reasoning depth" }
+          ];
+          model.default_reasoning_level = "medium";
+          updated = true;
+        }
+      }
+    }
+    if (updated) {
+      this.saveModelCatalog(catalog);
     }
   }
 
@@ -846,7 +1076,12 @@ except Exception as e:
           auto_compact_token_limit: autoCompact,
           truncation_policy: { mode: "tokens", limit: truncationLimit },
           default_reasoning_level: "medium",
-          supported_reasoning_levels: [{ effort: "medium", description: "Balanced" }],
+          supported_reasoning_levels: [
+            { effort: "low", description: "Lighter reasoning" },
+            { effort: "medium", description: "Balanced reasoning" },
+            { effort: "high", description: "Greater reasoning depth" },
+            { effort: "xhigh", description: "Extra high reasoning depth" }
+          ],
           default_reasoning_summary: "none",
           reasoning_summary_format: "none",
           supports_reasoning_summaries: false,
@@ -1150,12 +1385,119 @@ stream_idle_timeout_ms = 600000
     });
   }
 
+  private async fetchActualTokensFromCodex(): Promise<Map<string, { tokens: number, context_window: number }>> {
+    return new Promise((resolve) => {
+      const tokenMap = new Map<string, { tokens: number, context_window: number }>();
+      let settled = false;
+      let tempWs: WebSocket | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        try { tempWs?.close(); } catch {}
+        resolve(tokenMap);
+      };
+      const timeout = setTimeout(finish, 2000);
+      fetch("http://127.0.0.1:8315/json")
+        .then(res => res.json())
+        .then((targets: any) => {
+          const pageTarget = targets.find((t: any) => t.type === "page" && t.url.includes("index.html") && !t.url.includes("avatar-overlay") && !t.url.includes("initialRoute"));
+          if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
+            finish();
+            return;
+          }
+          const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+          tempWs = ws;
+          ws.on("open", () => {
+            const evalScript = `
+              (() => {
+                const root = window.__codexRoot;
+                if (!root || !root._internalRoot) return [];
+                const startNode = root._internalRoot.current;
+                let foundConvs = null;
+                
+                function traverse(node) {
+                  if (foundConvs) return;
+                  let s = node.memoizedState;
+                  while (s) {
+                    const val = s.memoizedState;
+                    if (val && typeof val === 'object' && val.conversations instanceof Map) {
+                      foundConvs = val.conversations;
+                      return;
+                    }
+                    s = s.next;
+                  }
+                  if (node.child) traverse(node.child);
+                  if (node.sibling) traverse(node.sibling);
+                }
+                traverse(startNode);
+                if (!foundConvs) return [];
+                
+                const list = [];
+                for (const [id, conv] of foundConvs.entries()) {
+                  if (conv.latestTokenUsageInfo) {
+                    list.push({
+                      id,
+                      total: conv.latestTokenUsageInfo.total?.totalTokens || 0,
+                      last: conv.latestTokenUsageInfo.last?.totalTokens || 0,
+                      limit: conv.latestTokenUsageInfo.modelContextWindow || 200000
+                    });
+                  }
+                }
+                return list;
+              })()
+            `;
+            ws.send(JSON.stringify({
+              id: 400,
+              method: "Runtime.evaluate",
+              params: {
+                expression: evalScript,
+                returnByValue: true
+              }
+            }));
+          });
+          ws.on("message", (msgData) => {
+            try {
+              const resObj = JSON.parse(msgData.toString());
+              if (resObj.id === 400 && resObj.result?.result?.value) {
+                const list = resObj.result.result.value;
+                for (const item of list) {
+                  tokenMap.set(item.id, {
+                    tokens: item.last || item.total,
+                    context_window: item.limit
+                  });
+                }
+              }
+            } catch {}
+            finish();
+          });
+          ws.on("error", finish);
+          ws.on("close", finish);
+        })
+        .catch(finish);
+    });
+  }
+
   start(port: number) {
     this.initCodexMcp();
     this.server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
-      req.on("data", (chunk) => chunks.push(chunk));
+      let receivedBytes = 0;
+      let rejected = false;
+      req.on("data", (chunk: Buffer) => {
+        if (rejected) return;
+        receivedBytes += chunk.length;
+        if (receivedBytes > MAX_REQUEST_BODY_BYTES) {
+          rejected = true;
+          res.writeHead(413, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Request body too large" }));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+      });
       req.on("end", () => {
+        if (rejected) return;
         const buffer = Buffer.concat(chunks);
         this.handle(req, res, buffer);
       });
@@ -1163,6 +1505,12 @@ stream_idle_timeout_ms = 600000
 
     const wss = new WebSocketServer({ noServer: true });
     this.server.on("upgrade", (request, socket, head) => {
+      const origin = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+      if (!isTrustedBrowserOrigin(origin)) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       const isResponsesWs = url.pathname.startsWith("/v1/responses") || url.pathname.includes("responses");
 
@@ -1174,6 +1522,7 @@ stream_idle_timeout_ms = 600000
           const sidHeader = request.headers["x-session-id"] || request.headers["session-id"] || request.headers["x-thread-id"] || request.headers["thread-id"] || "";
           const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || "default");
           const sessionIdStr = sessionId ? String(sessionId) : "default";
+          (clientWs as any).sessionId = sessionIdStr;
           this.sessionActiveWs.set(sessionIdStr, clientWs);
           const connInfo = { 
             clientWs, 
@@ -1319,6 +1668,41 @@ stream_idle_timeout_ms = 600000
                 if (payload.type === "error" && payload.error?.type === "usage_limit_reached") {
                   return; // Ignore official rate limit block
                 }
+                if (payload.type === "error" && payload.error?.message?.includes("Previous response with id") && payload.error?.message?.includes("not found")) {
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
+                  this.sessionPrevResponseIdFailed.set(activeSid, true);
+                  console.log(`[OpenCodex WS Proxy] Intercepted Previous response not found error. Flagged session ${activeSid} for ID stripping on retry.`);
+                }
+                if (payload.type === "event_msg" && payload.payload?.type === "token_count") {
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
+                  let existing = this.sessionContextMap.get(activeSid);
+                  if (!existing || existing.tokens <= 0) {
+                    try {
+                      const history = loadHistoryFromRollout(activeSid);
+                      const estimated = estimateTokensForRequest({ messages: history }, "").tokens;
+                      existing = {
+                        tokens: estimated,
+                        is_estimated: true,
+                        model: payload.payload.info.model || "official",
+                        context_window: payload.payload.info.model_context_window || 1000000
+                      };
+                      this.sessionContextMap.set(activeSid, existing);
+                      console.log(`[OpenCodex WS Proxy] Restored session token baseline from rollout: ${estimated} tokens`);
+                    } catch (err: any) {
+                      console.error(`[OpenCodex WS Proxy] Failed to restore token baseline: ${err.message}`);
+                    }
+                  }
+                  if (existing && existing.tokens > 0) {
+                    console.log(`[OpenCodex WS Proxy] Sanitizing official token_count frame. Replacing ${payload.payload.info.total_token_usage.total_tokens} with unified session tokens: ${existing.tokens}`);
+                    payload.payload.info.total_token_usage.total_tokens = existing.tokens;
+                    payload.payload.info.total_token_usage.input_tokens = Math.max(0, existing.tokens - (payload.payload.info.total_token_usage.output_tokens || 0));
+                    if (payload.payload.info.last_token_usage) {
+                      payload.payload.info.last_token_usage.total_tokens = existing.tokens;
+                      payload.payload.info.last_token_usage.input_tokens = Math.max(0, existing.tokens - (payload.payload.info.last_token_usage.output_tokens || 0));
+                    }
+                    processedTData = Buffer.from(JSON.stringify(payload), "utf-8");
+                  }
+                }
               } catch {}
             }
 
@@ -1374,15 +1758,23 @@ stream_idle_timeout_ms = 600000
                       const totalTokens = usage.input_tokens + (usage.output_tokens || 0);
                       
                       const existing = this.sessionContextMap.get(activeSid);
+                      const modelSlug = payload.response?.model || "gpt-5.5";
+                      const catalog = this.getModelCatalog();
+                      const catalogEntry = catalog.models?.find((m: any) => m.slug === modelSlug);
+                      const contextWindow = catalogEntry?.context_window || 1000000;
+
                       if (!existing || totalTokens > existing.tokens || Math.abs(totalTokens - existing.tokens) < existing.tokens * 0.15 || totalTokens < 2000) {
                         this.sessionContextMap.set(activeSid, {
                           tokens: totalTokens,
                           is_estimated: false,
-                          model: "official",
-                          context_window: 200000
+                          model: modelSlug,
+                          context_window: contextWindow,
+                          provider_prompt_tokens: usage.input_tokens,
+                          provider_completion_tokens: usage.output_tokens || 0,
+                          source: "provider"
                         });
-                        console.log(`[OpenCodex WS Proxy] Official model usage intercepted: input=${usage.input_tokens}, output=${usage.output_tokens || 0}, total=${totalTokens}`);
-                        broadcastSessionUpdate(activeSid, totalTokens, 200000, "official", false);
+                        console.log(`[OpenCodex WS Proxy] Official model usage intercepted for ${modelSlug}: input=${usage.input_tokens}, output=${usage.output_tokens || 0}, total=${totalTokens}, limit=${contextWindow}`);
+                        broadcastSessionUpdate(activeSid, totalTokens, contextWindow, modelSlug, false);
                       }
                     }
                   }
@@ -1397,7 +1789,7 @@ stream_idle_timeout_ms = 600000
             }
             if (!isTitleOrBackground) {
               for (const otherWs of this.desktopWsClients) {
-                if (otherWs !== clientWs && otherWs.readyState === WebSocket.OPEN) {
+                if (otherWs !== clientWs && (otherWs as any).sessionId === activeSid && otherWs.readyState === WebSocket.OPEN) {
                   otherWs.send(processedTData, { binary: tIsBinary });
                 }
               }
@@ -1438,6 +1830,23 @@ stream_idle_timeout_ms = 600000
                 }
                 if (msg && msg.type === "response.create") {
                   connInfo.lastMsg = msg;
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
+                  if (msg.response && msg.response.reasoning_effort === "xhigh") {
+                    console.log(`[OpenCodex WS Proxy] Mapping official reasoning_effort 'xhigh' to 'high' for session ${activeSid}`);
+                    msg.response.reasoning_effort = "high";
+                    processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                  }
+                  const shouldStripPrevId = this.sessionPrevResponseIdFailed.get(activeSid);
+                  const clientPrevId = msg.previous_response_id || (msg.response && msg.response.previous_response_id);
+                  if (shouldStripPrevId && clientPrevId) {
+                    console.log(`[OpenCodex WS Proxy] Stripping previous_response_id (${clientPrevId}) from retry request in session ${activeSid} to recover from desync.`);
+                    delete msg.previous_response_id;
+                    if (msg.response) {
+                      delete msg.response.previous_response_id;
+                    }
+                    processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                    this.sessionPrevResponseIdFailed.delete(activeSid);
+                  }
                   const model = msg.model || "";
                   if (model) {
                     const catalog = this.getModelCatalog();
@@ -1475,10 +1884,36 @@ stream_idle_timeout_ms = 600000
                   }
                 }
 
+                // If forwarding to official server, strip any non-text components (images, files) from incoming client inputs to prevent OpenAI server payload crashes
+                if (msg && msg.type === "conversation.item.create" && msg.item && Array.isArray(msg.item.content)) {
+                  const originalLength = msg.item.content.length;
+                  msg.item.content = msg.item.content.filter((part: any) => {
+                    if (!part) return false;
+                    const type = String(part.type || "").toLowerCase();
+                    return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+                  });
+                  if (msg.item.content.length !== originalLength) {
+                    console.log(`[OpenCodex WS Proxy] Intercepted conversation.item.create. Stripped non-text parts from client payload to prevent official server crash.`);
+                    processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                  }
+                }
+
                 // If forwarding to official server, sanitize encrypted_content from client inputs
                 if (msg && Array.isArray(msg.input)) {
                   let mutated = false;
                   for (const item of msg.input) {
+                    if (item && item.type === "message" && Array.isArray(item.content)) {
+                      const originalLength = item.content.length;
+                      item.content = item.content.filter((part: any) => {
+                        if (!part) return false;
+                        const type = String(part.type || "").toLowerCase();
+                        return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+                      });
+                      if (item.content.length !== originalLength) {
+                        mutated = true;
+                        console.log(`[OpenCodex WS Proxy] Stripped non-text parts from message item in response.create input array.`);
+                      }
+                    }
                     if (item && item.type === "reasoning" && typeof item.encrypted_content === "string") {
                       if (item.encrypted_content.startsWith("anthropic-thinking-v1:")) {
                         const prefix = "anthropic-thinking-v1:";
@@ -1565,7 +2000,7 @@ stream_idle_timeout_ms = 600000
       console.error(`[OpenCodex] Proxy server port conflict: ${err.message}`);
     });
 
-    this.server.listen(port, "0.0.0.0");
+    this.server.listen(port, "127.0.0.1");
     console.error(`[OpenCodex] Unified HTTP server listening on port ${port}`);
     console.error(`[OpenCodex] Web Dashboard UI → http://localhost:${port}/dashboard`);
   }
@@ -1575,7 +2010,14 @@ stream_idle_timeout_ms = 600000
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse, rawBody: Buffer) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    const origin = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    if (!isTrustedBrowserOrigin(origin)) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Untrusted browser origin" }));
+      return;
+    }
+    if (origin) res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, session_id");
     
@@ -1608,7 +2050,7 @@ stream_idle_timeout_ms = 600000
       }
     } else if (contentEncoding === "zstd") {
       try {
-        decompressedBody = execSync("zstd -d", { input: rawBody });
+        decompressedBody = execSync("zstd -d", { input: rawBody, maxBuffer: 100 * 1024 * 1024 });
       } catch (err: any) {
         console.error("[OpenCodex] Failed to zstd decompress body:", err.message);
       }
@@ -1846,9 +2288,31 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/sessions" && req.method === "GET") {
       try {
+        const actualTokens = await this.fetchActualTokensFromCodex();
         const sessionsMap = new Map<string, { id: string, text: string, ts: number }>();
+        const rolloutContextMap = new Map<string, SessionContextSnapshot>();
         
-        // 1. Scan history.jsonl
+        // 1. Scan session_index.jsonl
+        const sessionIndexPath = join(homedir(), ".codex", "session_index.jsonl");
+        if (existsSync(sessionIndexPath)) {
+          const lines = readFileSync(sessionIndexPath, "utf-8").split("\n");
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const item = JSON.parse(trimmed);
+              if (item.id) {
+                sessionsMap.set(item.id, {
+                  id: item.id,
+                  text: item.thread_name || `会话 ${item.id}`,
+                  ts: Date.parse(item.updated_at) || Date.now()
+                });
+              }
+            } catch {}
+          }
+        }
+
+        // 2. Scan history.jsonl
         const historyPath = join(homedir(), ".codex", "history.jsonl");
         if (existsSync(historyPath)) {
           const lines = readFileSync(historyPath, "utf-8").split("\n");
@@ -1857,7 +2321,7 @@ stream_idle_timeout_ms = 600000
             if (!trimmed) continue;
             try {
               const item = JSON.parse(trimmed);
-              if (item.session_id) {
+              if (item.session_id && !sessionsMap.has(item.session_id)) {
                 sessionsMap.set(item.session_id, {
                   id: item.session_id,
                   text: item.text,
@@ -1868,20 +2332,27 @@ stream_idle_timeout_ms = 600000
           }
         }
 
-        // Load voice settings to get the system prompt
+        // Load voice settings to get the system prompt and active session
         const p = join(this.configDir, "voice_settings.json");
         let voiceSystemPrompt = "";
+        let fileActiveSessionId = "";
         if (existsSync(p)) {
           try {
             const settings = JSON.parse(readFileSync(p, "utf-8"));
             voiceSystemPrompt = settings.voice_system_prompt || "";
+            fileActiveSessionId = settings.active_session_id || "";
           } catch {}
+        }
+        if (fileActiveSessionId) {
+          this.currentActiveSessionId = fileActiveSessionId;
         }
         const prefixUtf = voiceSystemPrompt + "\n\n用户说：";
         const prefixUtfClean = voiceSystemPrompt + "\n\n\u7528\u623f\u8bf4\uff1a"; // clean alternative
 
         // 2. Scan rollout files for complete context and timestamps
         const sessionsDir = join(homedir(), ".codex", "sessions");
+        let mostRecentlyActiveSessionId = "";
+        let mostRecentActivityTs = 0;
         if (existsSync(sessionsDir)) {
           const files = findRolloutFiles(sessionsDir);
           for (const file of files) {
@@ -1890,11 +2361,20 @@ stream_idle_timeout_ms = 600000
               const lines = content.split("\n");
               let session_id = "";
               let ts = 0;
+              let lastActivityTs = 0;
               let firstUserMsg = "";
+              let latestModel = "";
+              let rolloutContext: SessionContextSnapshot | undefined;
               for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed) continue;
                 const item = JSON.parse(trimmed);
+                if (item.timestamp) {
+                  const itemTs = typeof item.timestamp === "number"
+                    ? (item.timestamp < 9999999999 ? item.timestamp * 1000 : item.timestamp)
+                    : Date.parse(item.timestamp) || 0;
+                  lastActivityTs = Math.max(lastActivityTs, itemTs);
+                }
                 if (item.type === "session_meta") {
                   if (item.payload?.id) {
                     session_id = item.payload.id;
@@ -1907,8 +2387,26 @@ stream_idle_timeout_ms = 600000
                       ts = Date.parse(rawTs) || 0;
                     }
                   }
-                } else if (item.type === "event_msg" && item.payload?.type === "user_message") {
-                  if (!firstUserMsg && item.payload.message) {
+                } else if (item.type === "turn_context" && item.payload?.model) {
+                  latestModel = String(item.payload.model);
+                } else if (item.type === "event_msg") {
+                  if (item.payload?.type === "token_count" && item.payload?.info) {
+                    const info = item.payload.info;
+                    const lastUsage = info.last_token_usage;
+                    const lastTokens = Number(lastUsage?.total_tokens);
+                    const contextWindow = Number(info.model_context_window);
+                    if (Number.isFinite(lastTokens) && lastTokens >= 0) {
+                      rolloutContext = {
+                        tokens: lastTokens,
+                        is_estimated: false,
+                        model: latestModel || undefined,
+                        context_window: Number.isFinite(contextWindow) && contextWindow > 0 ? contextWindow : 200000,
+                        provider_prompt_tokens: Number.isFinite(lastUsage?.input_tokens) ? Number(lastUsage.input_tokens) : undefined,
+                        provider_completion_tokens: Number.isFinite(lastUsage?.output_tokens) ? Number(lastUsage.output_tokens) : undefined,
+                        source: "rollout_actual"
+                      };
+                    }
+                  } else if (item.payload?.type === "user_message" && !firstUserMsg && item.payload.message) {
                     let uMsg = item.payload.message;
                     if (voiceSystemPrompt) {
                       if (uMsg.startsWith(prefixUtf)) {
@@ -1923,14 +2421,23 @@ stream_idle_timeout_ms = 600000
               }
               if (session_id) {
                 const existing = sessionsMap.get(session_id);
+                const activityTs = Math.max(ts, lastActivityTs, existing?.ts || 0);
                 sessionsMap.set(session_id, {
                   id: session_id,
-                  text: firstUserMsg || (existing ? existing.text : `会话 ${session_id}`),
-                  ts: ts || (existing ? existing.ts : Date.now())
+                  text: (existing && existing.text && !existing.text.startsWith("会话 ")) ? existing.text : (firstUserMsg || (existing ? existing.text : `会话 ${session_id}`)),
+                  ts: activityTs || Date.now()
                 });
+                if (rolloutContext) rolloutContextMap.set(session_id, rolloutContext);
+                if (activityTs > mostRecentActivityTs) {
+                  mostRecentActivityTs = activityTs;
+                  mostRecentlyActiveSessionId = session_id;
+                }
               }
             } catch {}
           }
+        }
+        if (!fileActiveSessionId && mostRecentlyActiveSessionId) {
+          this.currentActiveSessionId = mostRecentlyActiveSessionId;
         }
 
         const archivedPath = join(this.configDir, "archived_sessions.json");
@@ -1942,14 +2449,63 @@ stream_idle_timeout_ms = 600000
         }
 
         const sessions = Array.from(sessionsMap.values()).map(s => {
-          const ctx = this.sessionContextMap.get(s.id) || { tokens: 0, is_estimated: true, context_window: 200000 };
+          const actual = actualTokens.get(s.id);
+          const rolloutContext = rolloutContextMap.get(s.id);
+          let ctx = this.sessionContextMap.get(s.id);
+          
+          if (actual) {
+            ctx = {
+              ...ctx,
+              tokens: actual.tokens,
+              is_estimated: false,
+              model: ctx?.model || "",
+              context_window: actual.context_window,
+              source: "provider"
+            };
+            this.sessionContextMap.set(s.id, ctx);
+          } else if (rolloutContext) {
+            ctx = {
+              ...ctx,
+              ...rolloutContext,
+              model: rolloutContext.model || ctx?.model || ""
+            };
+            this.sessionContextMap.set(s.id, ctx);
+          } else if (!ctx) {
+            try {
+              const history = loadHistoryFromRollout(s.id);
+              const localEstimate = estimateTokensForRequest({ messages: history }, "");
+              ctx = {
+                tokens: localEstimate.tokens,
+                is_estimated: true,
+                model: "",
+                context_window: 200000,
+                estimated_tokens: localEstimate.tokens,
+                source: localEstimate.source,
+                tokenizer: localEstimate.tokenizer
+              };
+              this.sessionContextMap.set(s.id, ctx);
+            } catch {}
+          }
+
+          if (!ctx) {
+            ctx = { tokens: 0, is_estimated: true, context_window: 200000 };
+          }
+
           return {
             ...s,
             archived: archivedIds.has(s.id),
             tokens: ctx.tokens,
             is_estimated: ctx.is_estimated,
             model: ctx.model || "",
-            context_window: ctx.context_window || 200000
+            context_window: ctx.context_window || 200000,
+            estimated_tokens: ctx.estimated_tokens,
+            provider_prompt_tokens: ctx.provider_prompt_tokens,
+            provider_completion_tokens: ctx.provider_completion_tokens,
+            token_source: ctx.source || (ctx.is_estimated ? "estimated" : "provider"),
+            tokenizer: ctx.tokenizer,
+            cumulative_usage: ctx.model
+              ? this.sessionCumulativeUsage.get(this.contextKey(s.id, ctx.model))
+              : undefined
           };
         })
         .sort((a, b) => {
@@ -2058,7 +2614,7 @@ stream_idle_timeout_ms = 600000
           try { settings = JSON.parse(readFileSync(p, "utf-8")); } catch {}
         }
         settings.active_session_id = sid;
-        writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
+        writeFileSync(p, JSON.stringify(settings, null, 2), { encoding: "utf-8", mode: 0o600 });
 
         this.broadcastSession(sid);
 
@@ -2100,12 +2656,19 @@ stream_idle_timeout_ms = 600000
         if (existsSync(historyPath)) {
           writeFileSync(historyPath, "", "utf-8");
         }
+        const sessionIndexPath = join(homedir(), ".codex", "session_index.jsonl");
+        if (existsSync(sessionIndexPath)) {
+          writeFileSync(sessionIndexPath, "", "utf-8");
+        }
         const sessionsDir = join(homedir(), ".codex", "sessions");
         deleteSessionFiles(sessionsDir);
 
         console.error(`[Sessions] Cleared all sessions.`);
         this.customModelSessions.clear();
         this.forcedErrorSessions.clear();
+        this.sessionContextMap.clear();
+        this.sessionModelContextMap.clear();
+        this.sessionCumulativeUsage.clear();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
       } catch (err: any) {
@@ -2119,6 +2682,7 @@ stream_idle_timeout_ms = 600000
       try {
         const data = JSON.parse(body);
         const sid = data.id;
+        this.clearSessionUsage(sid);
         
         // 1. Delete from history.jsonl
         const historyPath = join(homedir(), ".codex", "history.jsonl");
@@ -2140,7 +2704,27 @@ stream_idle_timeout_ms = 600000
           writeFileSync(historyPath, remainingLines.join("\n") + "\n", "utf-8");
         }
 
-        // 2. Delete rollout file
+        // 2. Delete from session_index.jsonl
+        const sessionIndexPath = join(homedir(), ".codex", "session_index.jsonl");
+        if (existsSync(sessionIndexPath)) {
+          const lines = readFileSync(sessionIndexPath, "utf-8").split("\n");
+          const remainingLines: string[] = [];
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+              const item = JSON.parse(trimmed);
+              if (item.id !== sid) {
+                remainingLines.push(line);
+              }
+            } catch {
+              remainingLines.push(line);
+            }
+          }
+          writeFileSync(sessionIndexPath, remainingLines.join("\n") + "\n", "utf-8");
+        }
+
+        // 3. Delete rollout file
         const sessionsDir = join(homedir(), ".codex", "sessions");
         const rolloutFile = findRolloutFileById(sessionsDir, sid);
         if (rolloutFile && existsSync(rolloutFile)) {
@@ -2195,7 +2779,8 @@ stream_idle_timeout_ms = 600000
       try {
         const data = JSON.parse(body);
         const sid = data.id;
-        this.sessionContextMap.delete(sid);
+        this.clearSessionUsage(sid);
+        this.customConversationHistory.delete(sid);
 
         fetch("http://127.0.0.1:8315/json")
           .then(res => res.json())
@@ -2210,49 +2795,33 @@ stream_idle_timeout_ms = 600000
             tempWs.on("open", () => {
               const evalScript = `
                 (() => {
-                  const buttons = Array.from(document.querySelectorAll('button, div, span'));
-                  let compactBtn = buttons.find(b => {
-                    const text = b.textContent || '';
-                    return text.includes('Compact conversation') || text.includes('压缩会话') || text.includes('Compact thread');
+                  const editor = document.querySelector('.ProseMirror');
+                  if (!editor) {
+                    return { status: 'failed', reason: 'ProseMirror editor not found' };
+                  }
+
+                  editor.focus();
+                  
+                  // Use document.execCommand to safely insert text into ProseMirror's state
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('delete', false, null);
+                  document.execCommand('insertText', false, '/compact');
+
+                  // Dispatch Enter key events to trigger Codex slash command execution
+                  const createEnterEvent = (type) => new KeyboardEvent(type, {
+                    key: 'Enter',
+                    code: 'Enter',
+                    keyCode: 13,
+                    which: 13,
+                    bubbles: true,
+                    cancelable: true
                   });
 
-                  if (compactBtn) {
-                    compactBtn.click();
-                    return { status: 'success', detail: 'Compact button clicked directly' };
-                  }
+                  editor.dispatchEvent(createEnterEvent('keydown'));
+                  editor.dispatchEvent(createEnterEvent('keypress'));
+                  editor.dispatchEvent(createEnterEvent('keyup'));
 
-                  let settingsBtn = buttons.find(b => {
-                    const label = b.getAttribute('aria-label') || '';
-                    return label.includes('Settings') || label.includes('Thread settings') || label.includes('设置');
-                  });
-
-                  if (!settingsBtn) {
-                    settingsBtn = buttons.find(b => b.innerHTML.includes('gear') || b.innerHTML.includes('settings') || b.querySelector('svg')?.outerHTML.includes('settings'));
-                  }
-
-                  if (settingsBtn) {
-                    settingsBtn.click();
-                    setTimeout(() => {
-                      const modalButtons = Array.from(document.querySelectorAll('button, div, span'));
-                      const compactBtn2 = modalButtons.find(b => {
-                        const text = b.textContent || '';
-                        return text.includes('Compact conversation') || text.includes('压缩会话') || text.includes('Compact thread');
-                      });
-
-                      if (compactBtn2) {
-                        compactBtn2.click();
-                        setTimeout(() => {
-                          const closeBtn = Array.from(document.querySelectorAll('button')).find(b => {
-                            const label = b.getAttribute('aria-label') || '';
-                            return label.includes('Close') || label.includes('关闭') || b.textContent.includes('Close') || b.textContent.includes('关闭');
-                          });
-                          if (closeBtn) closeBtn.click();
-                        }, 100);
-                      }
-                    }, 200);
-                    return { status: 'success', detail: 'Triggered via Settings menu' };
-                  }
-                  return { status: 'failed', reason: 'Settings button not found' };
+                  return { status: 'success', detail: 'Sent native /compact slash command to Codex' };
                 })()
               `;
               tempWs.send(JSON.stringify({
@@ -2433,7 +3002,7 @@ stream_idle_timeout_ms = 600000
       const available_models = (catalog.models || []).map((m: any) => m.slug);
 
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ...settings, available_models }));
+      res.end(JSON.stringify({ ...redactSecrets(settings), available_models }));
       return;
     }
 
@@ -2441,13 +3010,17 @@ stream_idle_timeout_ms = 600000
       try {
         const data = JSON.parse(body);
         const p = join(this.configDir, "voice_settings.json");
+        let existingSettings: Record<string, any> = {};
+        if (existsSync(p)) {
+          try { existingSettings = JSON.parse(readFileSync(p, "utf-8")); } catch {}
+        }
         const settings = {
           stt_engine: data.stt_engine || "local-whisper",
-          stt_api_key: data.stt_api_key || "",
+          stt_api_key: keepExistingSecret(data.stt_api_key, existingSettings.stt_api_key),
           stt_base_url: data.stt_base_url || "https://api.openai.com/v1",
           stt_model: data.stt_model || "whisper-1",
           tts_engine: data.tts_engine || "edge-tts",
-          tts_api_key: data.tts_api_key || "",
+          tts_api_key: keepExistingSecret(data.tts_api_key, existingSettings.tts_api_key),
           tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
           tts_model: data.tts_model || "tts-1",
           tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
@@ -2465,7 +3038,7 @@ stream_idle_timeout_ms = 600000
         writeFileSync(p, JSON.stringify(settings, null, 2), "utf-8");
         console.error("[OpenCodex] Saved voice settings to " + p);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", settings }));
+        res.end(JSON.stringify({ status: "success", settings: redactSecrets(settings) }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -2854,6 +3427,33 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/orb/reset" && req.method === "POST") {
+      console.log(`[OpenCodex] Resetting active streams and unlocking client UI...`);
+      for (const controller of this.activeAbortControllers.values()) {
+        try { controller.abort(); } catch {}
+      }
+      this.activeAbortControllers.clear();
+      
+      const payload = {
+        type: "event_msg",
+        payload: {
+          type: "task_complete",
+          completed_at: Math.floor(Date.now() / 1000),
+          duration_ms: 1000
+        }
+      };
+      
+      for (const client of this.desktopWsClients) {
+        try {
+          client.send(JSON.stringify(payload));
+        } catch {}
+      }
+      
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "success", message: "Client unlocked successfully" }));
+      return;
+    }
+
     if (path === "/api/orb/status" && req.method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ running: this.orbProcess !== null }));
@@ -2866,10 +3466,12 @@ stream_idle_timeout_ms = 600000
         const enable = !!data.enable;
 
         if (enable) {
+          try {
+            execSync("pkill -f 'dist/proxy/orb.js' || true");
+          } catch {}
           if (this.orbProcess) {
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", message: "Already running" }));
-            return;
+            try { this.orbProcess.kill(); } catch {}
+            this.orbProcess = null;
           }
           console.log("[Orb Manager] Spawning Electron Orb Widget...");
           const moduleDir = dirname(fileURLToPath(import.meta.url));
@@ -2979,7 +3581,9 @@ stream_idle_timeout_ms = 600000
     let reqBody: any;
     try {
       reqBody = JSON.parse(body);
-      writeFileSync(join(tmpdir(), "responses_request_debug.json"), JSON.stringify(reqBody, null, 2), "utf-8");
+      if (REQUEST_DEBUG_ENABLED) {
+        writeFileSync(join(tmpdir(), "responses_request_debug.json"), JSON.stringify(reqBody, null, 2), { encoding: "utf-8", mode: 0o600 });
+      }
     } catch (e: any) {
       console.error("[OpenCodex] Failed to parse responses JSON body:", e.message, "Length:", body.length, "First 200 chars:", body.slice(0, 200));
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -3076,12 +3680,35 @@ stream_idle_timeout_ms = 600000
         headers["authorization"] = `Bearer ${realToken}`;
       }
 
+      let forwardedBody: any = rawBody;
+      if (reqBody && Array.isArray(reqBody.input)) {
+        let mutated = false;
+        for (const item of reqBody.input) {
+          if (item && item.type === "message" && Array.isArray(item.content)) {
+            const originalLength = item.content.length;
+            item.content = item.content.filter((part: any) => {
+              if (!part) return false;
+              const type = String(part.type || "").toLowerCase();
+              return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+            });
+            if (item.content.length !== originalLength) {
+              mutated = true;
+              console.log(`[OpenCodex Proxy] Stripped non-text parts from message item in official model HTTP request.`);
+            }
+          }
+        }
+        if (mutated) {
+          forwardedBody = JSON.stringify(reqBody);
+          delete headers["content-encoding"];
+        }
+      }
+
       try {
         console.log(`[OpenCodex Proxy] Forwarding HTTP ${req.method} for official model to: ${targetUrl}`);
         const officialRes = await fetch(targetUrl, {
           method: req.method,
           headers,
-          body: rawBody,
+          body: forwardedBody,
           dispatcher: fetchDispatcher
         });
 
@@ -3143,9 +3770,21 @@ stream_idle_timeout_ms = 600000
     }
 
     const prevResponseId = processedReqBody.previous_response_id;
+    // Prefer memory cache to avoid async disk I/O race conditions, reload from rollout if empty or desynced
     let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
-    if (existingHistory.length === 0) {
+    const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+
+    if (existingHistory.length > 0 && incomingMessages.length > 1) {
+      const prevIncoming = incomingMessages[incomingMessages.length - 2];
+      const found = existingHistory.some((m: any) => isSameMessage(m, prevIncoming));
+      if (!found) {
+        console.log(`[OpenCodex] Cache desync detected for session ${sessionIdStr}. Reloading from rollout...`);
+        existingHistory = loadHistoryFromRollout(sessionIdStr);
+        this.sessionContextMap.delete(sessionIdStr);
+      }
+    } else if (existingHistory.length === 0) {
       existingHistory = loadHistoryFromRollout(sessionIdStr);
+      this.sessionContextMap.delete(sessionIdStr);
     }
 
     if (existingHistory.length === 0) {
@@ -3158,7 +3797,6 @@ stream_idle_timeout_ms = 600000
           alignedHistory = existingHistory.slice(0, index + 1);
         }
       }
-      const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
       const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
       this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
@@ -3171,7 +3809,9 @@ stream_idle_timeout_ms = 600000
       })
     );
 
-
+    const contextWindow = catalogEntry?.context_window || 200000;
+    this.currentActiveSessionId = sessionIdStr;
+    this.updateContextUsage(sessionIdStr, requestedModel, chatBody, contextWindow);
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
     try {
@@ -3260,6 +3900,7 @@ stream_idle_timeout_ms = 600000
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let finalUsage: any = null;
 
       try {
         while (true) {
@@ -3275,6 +3916,7 @@ stream_idle_timeout_ms = 600000
             if (!trimmed.startsWith("data: ")) continue;
             try {
               const chunk = JSON.parse(trimmed.slice(6));
+              if (chunk.usage) finalUsage = chunk.usage;
               await streamState.writeChatDelta(async (payload) => {
                 res.write(`data: ${JSON.stringify(payload)}\n\n`);
               }, chunk);
@@ -3287,18 +3929,31 @@ stream_idle_timeout_ms = 600000
         reader.releaseLock();
       }
 
-      await streamState.finish(async (payload) => {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      });
-      res.end();
-
       const assistantMsg = streamState.getAssistantMessage();
+      let responseUsage: { input_tokens: number; output_tokens: number; total_tokens: number } | undefined;
       if (assistantMsg) {
         assistantMsg.id = streamState.responseId;
         const sessionIdStr = sessionId ? String(sessionId) : "default";
         const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
-        this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
+        const updatedHistory = currentHistory.concat(assistantMsg);
+        this.customConversationHistory.set(sessionIdStr, updatedHistory);
+        const snapshot = this.updateContextUsage(
+          sessionIdStr,
+          requestedModel,
+          { ...body, messages: updatedHistory },
+          this.getModelContextWindow(requestedModel),
+          finalUsage
+        );
+        responseUsage = {
+          input_tokens: snapshot.provider_prompt_tokens ?? estimateTokensForRequest(body, requestedModel).tokens,
+          output_tokens: snapshot.provider_completion_tokens ?? estimateTokensForRequest({ messages: [assistantMsg] }, requestedModel).tokens,
+          total_tokens: snapshot.tokens
+        };
       }
+      await streamState.finish(async (payload) => {
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+      }, responseUsage);
+      res.end();
     } catch (err: any) {
       console.error(`[Responses] Streaming error: ${err.message}`);
       try {
@@ -3360,7 +4015,15 @@ stream_idle_timeout_ms = 600000
       message.id = responseBody.id;
       const sessionIdStr = sessionId ? String(sessionId) : "default";
       const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
-      this.customConversationHistory.set(sessionIdStr, currentHistory.concat(message));
+      const updatedHistory = currentHistory.concat(message);
+      this.customConversationHistory.set(sessionIdStr, updatedHistory);
+      this.updateContextUsage(
+        sessionIdStr,
+        requestedModel,
+        { ...body, messages: updatedHistory },
+        this.getModelContextWindow(requestedModel),
+        data.usage
+      );
     }
   }
 
@@ -4550,7 +5213,9 @@ stream_idle_timeout_ms = 600000
     let onWsClose: (() => void) | null = null;
     const requestedModel = reqBody.model || "";
     try {
-      writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
+      if (REQUEST_DEBUG_ENABLED) {
+        writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), { encoding: "utf-8", mode: 0o600 });
+      }
     } catch (e) {}
     const catalog = this.getModelCatalog();
     let catalogEntry = catalog.models?.find((m: any) => m.slug === requestedModel);
@@ -4837,7 +5502,7 @@ stream_idle_timeout_ms = 600000
         try { ws.send(payloadStr); } catch {}
       }
       for (const otherWs of this.desktopWsClients) {
-        if (otherWs !== ws && otherWs.readyState === WebSocket.OPEN) {
+        if (otherWs !== ws && (otherWs as any).sessionId === sessionIdStr && otherWs.readyState === WebSocket.OPEN) {
           try { otherWs.send(payloadStr); } catch {}
         }
       }
@@ -4872,11 +5537,26 @@ stream_idle_timeout_ms = 600000
     }
 
     const prevResponseId = processedReqBody.previous_response_id;
+    // Prefer memory cache to avoid async disk I/O race conditions, reload from rollout if empty or desynced
     let existingHistory = this.customConversationHistory.get(sessionIdStr) || [];
-    if (existingHistory.length === 0) {
-      console.log(`[OpenCodex WS Proxy] Stale history empty. Waiting 350ms for client to write rollout file...`);
-      await new Promise(resolve => setTimeout(resolve, 350));
+    const incomingMessages = chatBody.messages.filter((m: any) => m.role !== "system");
+
+    if (existingHistory.length > 0 && incomingMessages.length > 1) {
+      const prevIncoming = incomingMessages[incomingMessages.length - 2];
+      const found = existingHistory.some((m: any) => isSameMessage(m, prevIncoming));
+      if (!found) {
+        console.log(`[OpenCodex WS Proxy] Cache desync detected for session ${sessionIdStr}. Reloading from rollout...`);
+        existingHistory = loadHistoryFromRollout(sessionIdStr);
+        this.sessionContextMap.delete(sessionIdStr);
+      }
+    } else if (existingHistory.length === 0) {
       existingHistory = loadHistoryFromRollout(sessionIdStr);
+      this.sessionContextMap.delete(sessionIdStr);
+      if (existingHistory.length === 0) {
+        console.log(`[OpenCodex WS Proxy] Stale history empty. Waiting 350ms for client to write rollout file...`);
+        await new Promise(resolve => setTimeout(resolve, 350));
+        existingHistory = loadHistoryFromRollout(sessionIdStr);
+      }
     }
 
     if (existingHistory.length === 0) {
@@ -4918,21 +5598,11 @@ stream_idle_timeout_ms = 600000
 
     const contextWindow = catalogEntry ? (catalogEntry.context_window || 200000) : 200000;
     const safetyLimit = Math.floor(contextWindow * 0.95);
-    chatBody.messages = pruneMessagesToLimit(chatBody.messages, safetyLimit);
+    chatBody.messages = pruneMessagesToLimit(chatBody.messages, safetyLimit, requestedModel, chatBody.tools);
     this.customConversationHistory.set(sessionIdStr, chatBody.messages);
     this.currentActiveSessionId = sessionIdStr;
 
-    const estimatedTokens = estimateTokensForMessages(chatBody.messages);
-    const existing = this.sessionContextMap.get(sessionIdStr);
-    if (!existing || estimatedTokens > existing.tokens || Math.abs(estimatedTokens - existing.tokens) < existing.tokens * 0.15 || estimatedTokens < 2000) {
-      this.sessionContextMap.set(sessionIdStr, {
-        tokens: estimatedTokens,
-        is_estimated: true,
-        model: requestedModel,
-        context_window: contextWindow
-      });
-      broadcastSessionUpdate(sessionIdStr, estimatedTokens, contextWindow, requestedModel, true);
-    }
+    this.updateContextUsage(sessionIdStr, requestedModel, chatBody, contextWindow);
 
     try {
       console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
@@ -5005,39 +5675,33 @@ stream_idle_timeout_ms = 600000
           await new Promise(resolve => setTimeout(resolve, 1500 - elapsed));
         }
 
-        console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
-        await activeStreamState.finish(async (payload) => {
-          broadcastToClients(payload);
-        });
-
         const assistantMsg = activeStreamState.getAssistantMessage();
+        let totalTokens = 0;
+        let inputTokens = 0;
+        let outputTokens = 0;
+
         if (assistantMsg) {
           assistantMsg.id = activeStreamState.responseId;
           const sessionIdStr = sessionId ? String(sessionId) : "default";
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
           const updatedHistory = currentHistory.concat(assistantMsg);
           this.customConversationHistory.set(sessionIdStr, updatedHistory);
-
-          let totalTokens = 0;
-          let isEstimated = true;
-          if (finalUsage && typeof finalUsage.prompt_tokens === "number") {
-            const completionTokens = finalUsage.completion_tokens || 0;
-            totalTokens = finalUsage.prompt_tokens + completionTokens;
-            isEstimated = false;
-            console.log(`[OpenCodex WS Proxy] Usage tracked via upstream: prompt=${finalUsage.prompt_tokens}, completion=${completionTokens}, total=${totalTokens}`);
-          } else {
-            totalTokens = estimateTokensForMessages(updatedHistory);
-            console.log(`[OpenCodex WS Proxy] Usage estimated locally: total=${totalTokens}`);
-          }
-
-          this.sessionContextMap.set(sessionIdStr, {
-            tokens: totalTokens,
-            is_estimated: isEstimated,
-            model: requestedModel,
-            context_window: contextWindow
-          });
-          broadcastSessionUpdate(sessionIdStr, totalTokens, contextWindow, requestedModel, isEstimated);
+          const snapshot = this.updateContextUsage(
+            sessionIdStr,
+            requestedModel,
+            { ...chatBody, messages: updatedHistory },
+            contextWindow,
+            finalUsage
+          );
+          totalTokens = snapshot.tokens;
+          inputTokens = snapshot.provider_prompt_tokens ?? estimateTokensForRequest(chatBody, requestedModel).tokens;
+          outputTokens = snapshot.provider_completion_tokens ?? estimateTokensForRequest({ messages: [assistantMsg] }, requestedModel).tokens;
         }
+
+        console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
+        await activeStreamState.finish(async (payload) => {
+          broadcastToClients(payload);
+        }, assistantMsg ? { input_tokens: inputTokens, output_tokens: outputTokens, total_tokens: totalTokens } : undefined);
         const lastCompletedSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
         this.lastCompletedSequenceNumberMap.set(sessionIdStr, lastCompletedSeq - 1);
         console.log(`[OpenCodex WS Proxy] Stream processing completely finished. Committed last completed sequence number ${lastCompletedSeq - 1}`);
@@ -5057,7 +5721,15 @@ stream_idle_timeout_ms = 600000
         if (message) {
           message.id = responseBody.id;
           const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
-          this.customConversationHistory.set(sessionIdStr, currentHistory.concat(message));
+          const updatedHistory = currentHistory.concat(message);
+          this.customConversationHistory.set(sessionIdStr, updatedHistory);
+          this.updateContextUsage(
+            sessionIdStr,
+            requestedModel,
+            { ...chatBody, messages: updatedHistory },
+            contextWindow,
+            data.usage
+          );
         }
         const lastCompletedSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
         this.lastCompletedSequenceNumberMap.set(sessionIdStr, lastCompletedSeq - 1);

@@ -246,6 +246,9 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
     messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
     stream: body.stream !== false,
   };
+  if (chat.stream) {
+    chat.stream_options = { include_usage: true };
+  }
 
   _copyIfPresent(body, chat, "temperature");
   _copyIfPresent(body, chat, "top_p");
@@ -255,7 +258,13 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
     _copyIfPresent(body, chat, "max_tokens");
   }
   _copyIfPresent(body, chat, "parallel_tool_calls");
-  _copyIfPresent(body, chat, "reasoning_effort");
+  if (body.reasoning_effort !== undefined) {
+    if (body.reasoning_effort === "xhigh") {
+      chat.reasoning_effort = "high";
+    } else {
+      chat.reasoning_effort = body.reasoning_effort;
+    }
+  }
 
   const tools = _responsesToolsToChatTools(body.tools);
   if (tools && tools.length > 0) {
@@ -776,7 +785,7 @@ export class ResponsesStreamState {
     await wrapped({ type: "response.in_progress", response: this._response("in_progress") });
   }
 
-  async finish(writeSse: (payload: any) => Promise<void>): Promise<void> {
+  async finish(writeSse: (payload: any) => Promise<void>, usage?: { input_tokens: number, output_tokens: number, total_tokens: number }): Promise<void> {
     const wrapped = this._wrap(writeSse);
     for (const key of Object.keys(this.reasoningBlocks)) {
       const rState = this.reasoningBlocks[key];
@@ -805,9 +814,35 @@ export class ResponsesStreamState {
     if (this.onTextDone) {
       try { this.onTextDone(this.messageText); } catch {}
     }
-    const finalResp = this._response("completed", true);
+    const finalResp = this._response("completed", true, usage);
     await wrapped({ type: "response.completed", response: finalResp });
     await wrapped({ type: "response.done", response: finalResp });
+
+    if (usage) {
+      await wrapped({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            last_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            model_context_window: finalResp.usage?.model_context_window || 200000
+          }
+        }
+      });
+    }
   }
 
   async writeChatDelta(writeSse: (payload: any) => Promise<void>, chunk: any): Promise<void> {
@@ -1097,18 +1132,12 @@ export class ResponsesStreamState {
   }
 
   private _reasoningItem(state: any, status: string): any {
-    const payload = {
-      type: "thinking",
-      thinking: state.text || "",
-      signature: state.signature || "",
-    };
-    const encrypted = _encodeThinkingPayload(payload);
     return {
       id: state.id,
       type: "reasoning",
       summary: state.text ? [{ type: "summary_text", text: state.text }] : [],
       content: [],
-      encrypted_content: encrypted,
+      encrypted_content: null,
     };
   }
 
@@ -1139,7 +1168,7 @@ export class ResponsesStreamState {
     return item;
   }
 
-  private _response(status: string, final = false): any {
+  private _response(status: string, final = false, usage?: { input_tokens: number, output_tokens: number, total_tokens: number }): any {
     let output: any[] = [];
     const now = Math.floor(Date.now() / 1000);
     if (final) {
@@ -1176,7 +1205,11 @@ export class ResponsesStreamState {
       model: this.model,
       output,
       metadata: this.metadata,
-      usage: {
+      usage: usage ? {
+        total_tokens: usage.total_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens
+      } : {
         total_tokens: 100,
         input_tokens: 50,
         output_tokens: 50

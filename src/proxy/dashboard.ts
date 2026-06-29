@@ -1731,7 +1731,7 @@ export function getDashboardHtml(): string {
                 </div>
                 <div style="font-size: 0.75rem; color: var(--color-text-muted); display: flex; justify-content: space-between;">
                   <span>\${Math.round(s.tokens / 1000)}K / \${Math.round(s.context_window / 1000)}K (\${pct}%)</span>
-                  <span>\${s.is_estimated ? 'Est.' : 'Act.'}</span>
+                  <span>\${({ provider: 'Actual', rollout_actual: 'Session actual', model_tokenizer: 'Tokenizer', model_estimate: 'Model est.', generic_estimate: 'Generic est.' })[s.token_source] || (s.is_estimated ? 'Est.' : 'Act.')}</span>
                 </div>
               </div>
             \`;

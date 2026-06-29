@@ -7,10 +7,10 @@ function createWindow() {
   const { width, height } = primaryDisplay.workAreaSize;
 
   // Position at bottom right by default
-  const winWidth = 70;
-  const winHeight = 70;
-  const x = width - winWidth - 20;
-  const y = height - winHeight - 20;
+  const winWidth = 100;
+  const winHeight = 100;
+  const x = width - winWidth - 10;
+  const y = height - winHeight - 10;
 
   win = new BrowserWindow({
     width: winWidth,
@@ -30,6 +30,7 @@ function createWindow() {
   });
 
   // Always keep on top, even over fullscreen windows on Mac/Windows
+  win.setHasShadow(false);
   win.setAlwaysOnTop(true, "screen-saver");
   win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
