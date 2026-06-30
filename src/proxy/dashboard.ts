@@ -1170,10 +1170,10 @@ export function getDashboardHtml(): string {
       <p style="margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--color-text-muted);">选择您希望导出的格式： / Select your export format:</p>
       <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem;">
         <button onclick="executeExport('openai')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(147, 51, 234, 0.15); border: 1px solid rgba(147, 51, 234, 0.3); color: var(--color-primary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
-          🌐 Standard JSON (OpenAI / AutoGen)
+          🌐 Standard JSON (OpenAI / LangChain)
         </button>
         <button onclick="executeExport('anthropic')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(6, 182, 212, 0.15); border: 1px solid rgba(6, 182, 212, 0.3); color: var(--color-secondary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
-          💬 Claude JSON (OpenClaw / Hermes)
+          💬 Claude API Format (Anthropic)
         </button>
         <button onclick="executeExport('markdown')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--color-success); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
           📝 Markdown (Notion / Notes)
