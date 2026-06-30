@@ -6,7 +6,7 @@
  */
 
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync, appendFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -256,10 +256,14 @@ function loadHistoryFromRollout(sessionId: string): any[] {
       }
     }
     const lines = content.split("\n");
+    let detectedModel = "";
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       const parsed = JSON.parse(trimmed);
+      if (parsed.type === "turn_context" && parsed.payload?.model) {
+        detectedModel = String(parsed.payload.model);
+      }
       if (parsed.type === "response_item" && parsed.payload && parsed.payload.type === "message") {
         const payload = parsed.payload;
         const role = payload.role;
@@ -293,6 +297,9 @@ function loadHistoryFromRollout(sessionId: string): any[] {
           });
         }
       }
+    }
+    if (detectedModel) {
+      (messages as any).model = detectedModel;
     }
   } catch (err) {
     // ignore
@@ -1699,11 +1706,12 @@ stream_idle_timeout_ms = 600000
                   if (!existing || existing.tokens <= 0) {
                     try {
                       const history = loadHistoryFromRollout(activeSid);
-                      const estimated = estimateTokensForRequest({ messages: history }, "").tokens;
+                      const detectedModel = (history as any).model || "";
+                      const estimated = estimateTokensForRequest({ messages: history }, detectedModel).tokens;
                       existing = {
                         tokens: estimated,
                         is_estimated: true,
-                        model: payload.payload.info.model || "official",
+                        model: payload.payload.info.model || detectedModel || "official",
                         context_window: payload.payload.info.model_context_window || 1000000
                       };
                       this.sessionContextMap.set(activeSid, existing);
@@ -2493,12 +2501,16 @@ stream_idle_timeout_ms = 600000
           } else if (!ctx) {
             try {
               const history = loadHistoryFromRollout(s.id);
-              const localEstimate = estimateTokensForRequest({ messages: history }, "");
+              const detectedModel = (history as any).model || "";
+              const catalog = this.getModelCatalog();
+              const catalogEntry = catalog.models?.find((m: any) => m.slug === detectedModel);
+              const contextWindow = catalogEntry?.context_window || 200000;
+              const localEstimate = estimateTokensForRequest({ messages: history }, detectedModel);
               ctx = {
                 tokens: localEstimate.tokens,
                 is_estimated: true,
-                model: "",
-                context_window: 200000,
+                model: detectedModel,
+                context_window: contextWindow,
                 estimated_tokens: localEstimate.tokens,
                 source: localEstimate.source,
                 tokenizer: localEstimate.tokenizer
@@ -2788,6 +2800,163 @@ stream_idle_timeout_ms = 600000
         console.error(`[Sessions] Session ${sid} archive status set to ${archived}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/export" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const sid = data.id;
+        const format = data.format || "openai";
+
+        const history = loadHistoryFromRollout(sid);
+        if (!history || history.length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "No history found for session" }));
+          return;
+        }
+
+        let outputContent = "";
+        let filename = `session_${sid}`;
+
+        if (format === "markdown") {
+          outputContent = `# Codex Conversation Session: ${sid}\n\n`;
+          for (const msg of history) {
+            const roleName = msg.role === "user" ? "User" : (msg.role === "assistant" ? "Assistant" : msg.role);
+            outputContent += `### **${roleName}**:\n${msg.content}\n\n---\n\n`;
+          }
+          filename += ".md";
+          res.writeHead(200, {
+            "Content-Type": "text/markdown; charset=utf-8",
+            "Content-Disposition": `attachment; filename="${filename}"`
+          });
+          res.end(outputContent);
+        } else if (format === "anthropic") {
+          let systemPrompt = "";
+          const messages: any[] = [];
+          for (const msg of history) {
+            if (msg.role === "system") {
+              systemPrompt += (systemPrompt ? "\n" : "") + msg.content;
+            } else {
+              messages.push({
+                role: msg.role === "assistant" ? "assistant" : "user",
+                content: msg.content
+              });
+            }
+          }
+          filename += "_anthropic.json";
+          res.writeHead(200, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Disposition": `attachment; filename="${filename}"`
+          });
+          res.end(JSON.stringify({ system: systemPrompt, messages }, null, 2));
+        } else {
+          filename += "_openai.json";
+          res.writeHead(200, {
+            "Content-Type": "application/json; charset=utf-8",
+            "Content-Disposition": `attachment; filename="${filename}"`
+          });
+          res.end(JSON.stringify(history, null, 2));
+        }
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/import" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const importedMessages = data.messages;
+        const threadName = data.name || `导入会话 ${new Date().toLocaleDateString()}`;
+        if (!Array.isArray(importedMessages) || importedMessages.length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid imported messages list" }));
+          return;
+        }
+
+        const newSid = "019f" + Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("").slice(0, 32);
+        const now = new Date();
+        const yearStr = now.getFullYear().toString();
+        const monthStr = (now.getMonth() + 1).toString().padStart(2, "0");
+        const dayStr = now.getDate().toString().padStart(2, "0");
+        
+        const sessionsDir = join(homedir(), ".codex", "sessions");
+        const targetDir = join(sessionsDir, yearStr, monthStr, dayStr);
+        if (!existsSync(targetDir)) {
+          mkdirSync(targetDir, { recursive: true });
+        }
+        const filePath = join(targetDir, `${newSid}.jsonl`);
+        const lines: string[] = [];
+        
+        lines.push(JSON.stringify({
+          type: "session_meta",
+          timestamp: now.toISOString(),
+          payload: { id: newSid, timestamp: now.toISOString() }
+        }));
+
+        let messageCount = 0;
+        for (const msg of importedMessages) {
+          const role = msg.role || "user";
+          const content = msg.content || "";
+          if (!content) continue;
+
+          const timestamp = new Date(now.getTime() + messageCount * 1000).toISOString();
+          
+          if (role === "user") {
+            lines.push(JSON.stringify({
+              type: "turn_context",
+              timestamp,
+              payload: {
+                model: "gpt-4o",
+                messages: [{ role: "user", content }]
+              }
+            }));
+            
+            lines.push(JSON.stringify({
+              type: "event_msg",
+              timestamp,
+              payload: {
+                type: "user_message",
+                message: content,
+                id: `msg_user_${messageCount}`
+              }
+            }));
+          } else {
+            lines.push(JSON.stringify({
+              type: "response_item",
+              timestamp,
+              payload: {
+                role: "assistant",
+                content: [{ type: "text", text: content }],
+                id: `msg_assistant_${messageCount}`,
+                messageItemId: `msg_assistant_${messageCount}`
+              }
+            }));
+          }
+          messageCount++;
+        }
+
+        writeFileSync(filePath, lines.join("\n") + "\n", "utf-8");
+        console.log(`[OpenCodex Import] Created rollout session file: ${filePath}`);
+
+        const sessionIndexPath = join(homedir(), ".codex", "session_index.jsonl");
+        const indexLine = JSON.stringify({
+          id: newSid,
+          thread_name: threadName,
+          updated_at: now.toISOString()
+        }) + "\n";
+        
+        appendFileSync(sessionIndexPath, indexLine, "utf-8");
+        console.log(`[OpenCodex Import] Registered session in index: ${sessionIndexPath}`);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", id: newSid, name: threadName }));
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));

@@ -1086,6 +1086,17 @@ export function getDashboardHtml(): string {
               </button>
             </div>
             
+            <div style="background: rgba(255,255,255,0.02); border: 1px dashed rgba(255,255,255,0.12); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem; text-align: center; cursor: pointer; transition: var(--transition-standard);" 
+                 id="import-dropzone" 
+                 onclick="triggerImportFileInput()"
+                 ondragover="handleDragOver(event)" 
+                 ondragleave="handleDragLeave(event)"
+                 ondrop="handleFileDrop(event)">
+              <span style="font-size: 0.8rem; color: var(--color-secondary); font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 0.25rem;">📥 导入对话 / Import JSON</span>
+              <div style="font-size: 0.65rem; color: var(--color-text-muted); margin-top: 4px;">拖拽或点击上传对话 JSON / Click or Drop File</div>
+              <input type="file" id="import-file-input" style="display: none;" accept=".json" onchange="handleImportFileSelect(event)">
+            </div>
+
             <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem;">
               <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
                 <span style="font-size: 0.85rem; font-weight: 600; color: var(--color-text);">桌面置顶悬浮球 / Desktop Orb</span>
@@ -1148,6 +1159,27 @@ export function getDashboardHtml(): string {
       <div class="modal-actions">
         <button class="modal-btn-cancel" id="confirm-cancel">Cancel</button>
         <button class="modal-btn-confirm" id="confirm-ok">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="export-modal">
+    <div class="modal-box" style="width: 320px; max-width: 90%;">
+      <h3 style="margin-bottom: 1rem; font-weight: 600; font-size: 1.1rem; color: var(--color-text);">📤 导出对话历史 / Export Chat History</h3>
+      <p style="margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--color-text-muted);">选择您希望导出的格式： / Select your export format:</p>
+      <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem;">
+        <button onclick="executeExport('openai')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(147, 51, 234, 0.15); border: 1px solid rgba(147, 51, 234, 0.3); color: var(--color-primary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          🌐 Standard JSON (OpenAI / AutoGen)
+        </button>
+        <button onclick="executeExport('anthropic')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(6, 182, 212, 0.15); border: 1px solid rgba(6, 182, 212, 0.3); color: var(--color-secondary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          💬 Claude JSON (OpenClaw / Hermes)
+        </button>
+        <button onclick="executeExport('markdown')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--color-success); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          📝 Markdown (Notion / Notes)
+        </button>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" onclick="document.getElementById('export-modal').classList.remove('show')" style="width: 100%; border-radius: 8px; padding: 0.6rem;">关闭 / Close</button>
       </div>
     </div>
   </div>
@@ -1745,6 +1777,7 @@ export function getDashboardHtml(): string {
             <div class="session-text-preview">\${escapeHtml(s.text)}</div>
             \${contextHtml}
             <div class="session-actions-overlay">
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); showExportModal('\${s.id}')" style="background: rgba(6, 182, 212, 0.15); color: var(--color-secondary); border-color: rgba(6, 182, 212, 0.25);">📤 导出/Export</button>
               <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? '激活/Unarchive' : '归档/Archive'}</button>
               <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">删除/Delete</button>
             </div>
@@ -2204,7 +2237,123 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
+    let exportTargetSessionId = '';
+    function showExportModal(sid) {
+      exportTargetSessionId = sid;
+      document.getElementById('export-modal').classList.add('show');
+    }
+
+    async function executeExport(format) {
+      document.getElementById('export-modal').classList.remove('show');
+      if (!exportTargetSessionId) return;
+      try {
+        const response = await fetch('/api/sessions/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: exportTargetSessionId, format })
+        });
+        if (response.ok) {
+          const blob = await response.blob();
+          const disp = response.headers.get('Content-Disposition');
+          let filename = \`session_\${exportTargetSessionId}.\${format === 'markdown' ? 'md' : 'json'}\`;
+          if (disp && disp.includes('filename="')) {
+            filename = disp.split('filename="')[1].split('"')[0];
+          }
+          const link = document.createElement('a');
+          link.href = window.URL.createObjectURL(blob);
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          showToast(currentLang === 'zh' ? '导出成功' : 'Exported successfully');
+        } else {
+          showToast(currentLang === 'zh' ? '导出失败' : 'Export failed');
+        }
+      } catch (err) {
+        showToast(currentLang === 'zh' ? '导出出错' : 'Export error');
+      }
+    }
+
+    function triggerImportFileInput() {
+      document.getElementById('import-file-input').click();
+    }
+
+    function handleImportFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) processImportFile(file);
+    }
+
+    function handleDragOver(e) {
+      e.preventDefault();
+      document.getElementById('import-dropzone').style.borderColor = 'var(--color-secondary)';
+      document.getElementById('import-dropzone').style.background = 'rgba(6, 182, 212, 0.05)';
+    }
+
+    function handleDragLeave(e) {
+      e.preventDefault();
+      document.getElementById('import-dropzone').style.borderColor = 'rgba(255,255,255,0.12)';
+      document.getElementById('import-dropzone').style.background = 'rgba(255,255,255,0.02)';
+    }
+
+    function handleFileDrop(e) {
+      e.preventDefault();
+      handleDragLeave(e);
+      const file = e.dataTransfer.files[0];
+      if (file) processImportFile(file);
+    }
+
+    function processImportFile(file) {
+      if (!file.name.endsWith('.json')) {
+        showToast(currentLang === 'zh' ? '仅支持 .json 对话格式' : 'Only .json chat format is supported');
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        try {
+          const raw = JSON.parse(e.target.result);
+          let messages = [];
+          if (Array.isArray(raw)) {
+            messages = raw;
+          } else if (raw && Array.isArray(raw.messages)) {
+            if (raw.system) {
+              messages.push({ role: 'system', content: raw.system });
+            }
+            messages = messages.concat(raw.messages);
+          } else {
+            showToast(currentLang === 'zh' ? '不支持的文件格式结构' : 'Unsupported file structure');
+            return;
+          }
+
+          const threadName = file.name.replace('.json', '');
+          const response = await fetch('/api/sessions/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages, name: threadName })
+          });
+          if (response.ok) {
+            const resData = await response.json();
+            showToast(currentLang === 'zh' ? '导入成功！' : 'Imported successfully!');
+            loadSessionsList();
+            if (resData.id) selectSession(resData.id);
+          } else {
+            showToast(currentLang === 'zh' ? '导入失败' : 'Import failed');
+          }
+        } catch (err) {
+          showToast(currentLang === 'zh' ? '解析 JSON 出错' : 'Error parsing JSON');
+        }
+      };
+      reader.readAsText(file);
+    }
+
     // Explicitly expose globally called button event handler actions to the browser window object
+    window.showExportModal = showExportModal;
+    window.executeExport = executeExport;
+    window.triggerImportFileInput = triggerImportFileInput;
+    window.handleImportFileSelect = handleImportFileSelect;
+    window.handleDragOver = handleDragOver;
+    window.handleDragLeave = handleDragLeave;
+    window.handleFileDrop = handleFileDrop;
+
     window.createNewSession = createNewSession;
     window.clearAllSessions = clearAllSessions;
     window.enterActiveSession = enterActiveSession;
