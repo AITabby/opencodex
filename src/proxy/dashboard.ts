@@ -590,13 +590,14 @@ export function getDashboardHtml(): string {
     }
     
     .session-btn {
-      padding: 0.25rem 0.5rem;
-      font-size: 0.75rem;
+      padding: 0.25rem 0.45rem;
+      font-size: 0.7rem;
       border-radius: 5px;
       border: none;
       cursor: pointer;
       font-weight: 600;
       transition: var(--transition-standard);
+      white-space: nowrap;
     }
     
     .session-btn-del {
@@ -1252,7 +1253,21 @@ export function getDashboardHtml(): string {
         sessionManagerTitle: "Session Manager & Context Synchronizer",
         selectSessionHint: "Select a session from the left",
         chooseSessionDetail: "Please choose a session to view conversation details.",
-        loadingSessions: "Loading sessions..."
+        loadingSessions: "Loading sessions...",
+        importDropzoneTitle: "📥 Import JSON",
+        importDropzoneDesc: "Click or drag & drop dialogue JSON file",
+        btnExport: "Export",
+        btnArchive: "Archive",
+        btnUnarchive: "Activate",
+        btnDelete: "Delete",
+        toastExportSuccess: "Exported successfully",
+        toastExportFailed: "Export failed",
+        toastExportError: "Export error",
+        toastImportSuccess: "Imported successfully!",
+        toastImportFailed: "Import failed",
+        toastInvalidFormat: "Only .json chat format is supported",
+        toastUnsupportedStructure: "Unsupported file structure",
+        toastJsonError: "Error parsing JSON"
       },
       zh: {
         title: "OpenCodex 统一网关",
@@ -1319,7 +1334,21 @@ export function getDashboardHtml(): string {
         sessionManagerTitle: "会话历史管理与上下文同步",
         selectSessionHint: "请从左侧选择一个历史会话",
         chooseSessionDetail: "请选择一个会话以查看详细聊天对话内容。",
-        loadingSessions: "正在加载会话列表..."
+        loadingSessions: "正在加载会话列表...",
+        importDropzoneTitle: "📥 导入对话 / Import JSON",
+        importDropzoneDesc: "拖拽或点击上传对话 JSON / Click or Drop File",
+        btnExport: "导出",
+        btnArchive: "归档",
+        btnUnarchive: "激活",
+        btnDelete: "删除",
+        toastExportSuccess: "导出成功",
+        toastExportFailed: "导出失败",
+        toastExportError: "导出出错",
+        toastImportSuccess: "导入成功！",
+        toastImportFailed: "导入失败",
+        toastInvalidFormat: "仅支持 .json 对话格式",
+        toastUnsupportedStructure: "不支持的文件格式结构",
+        toastJsonError: "解析 JSON 出错"
       }
     };
 
@@ -1385,6 +1414,8 @@ export function getDashboardHtml(): string {
       setText('i18n-label-voice-system-prompt', t.labelVoiceSystemPrompt);
       setText('i18n-session-manager-title', t.sessionManagerTitle);
       setText('i18n-loading-sessions', t.loadingSessions);
+      setText('i18n-import-title', t.importDropzoneTitle);
+      setText('i18n-import-desc', t.importDropzoneDesc);
       
       const activeTitle = el('active-session-title');
       if (activeTitle && (activeTitle.innerText === 'Select a session from the left' || activeTitle.innerText === '请从左侧选择一个历史会话')) {
@@ -1405,6 +1436,7 @@ export function getDashboardHtml(): string {
       }
       
       checkPermissionsStatus();
+      try { loadSessionsList(); } catch {}
     }
 
     function toggleLanguage() {
@@ -1777,9 +1809,9 @@ export function getDashboardHtml(): string {
             <div class="session-text-preview">\${escapeHtml(s.text)}</div>
             \${contextHtml}
             <div class="session-actions-overlay">
-              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); showExportModal('\${s.id}')" style="background: rgba(6, 182, 212, 0.15); color: var(--color-secondary); border-color: rgba(6, 182, 212, 0.25);">📤 导出/Export</button>
-              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? '激活/Unarchive' : '归档/Archive'}</button>
-              <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">删除/Delete</button>
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); showExportModal('\${s.id}')" style="background: rgba(6, 182, 212, 0.15); color: var(--color-secondary); border-color: rgba(6, 182, 212, 0.25);">📤 \${i18nDict[currentLang].btnExport || 'Export'}</button>
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? (i18nDict[currentLang].btnUnarchive || 'Unarchive') : (i18nDict[currentLang].btnArchive || 'Archive')}</button>
+              <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">\${i18nDict[currentLang].btnDelete || 'Delete'}</button>
             </div>
           \`;
           container.appendChild(item);
@@ -2265,12 +2297,12 @@ export function getDashboardHtml(): string {
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
-          showToast(currentLang === 'zh' ? '导出成功' : 'Exported successfully');
+          showToast(i18nDict[currentLang].toastExportSuccess || 'Exported successfully');
         } else {
-          showToast(currentLang === 'zh' ? '导出失败' : 'Export failed');
+          showToast(i18nDict[currentLang].toastExportFailed || 'Export failed');
         }
       } catch (err) {
-        showToast(currentLang === 'zh' ? '导出出错' : 'Export error');
+        showToast(i18nDict[currentLang].toastExportError || 'Export error');
       }
     }
 
@@ -2304,7 +2336,7 @@ export function getDashboardHtml(): string {
 
     function processImportFile(file) {
       if (!file.name.endsWith('.json')) {
-        showToast(currentLang === 'zh' ? '仅支持 .json 对话格式' : 'Only .json chat format is supported');
+        showToast(i18nDict[currentLang].toastInvalidFormat || 'Only .json chat format is supported');
         return;
       }
       const reader = new FileReader();
@@ -2320,7 +2352,7 @@ export function getDashboardHtml(): string {
             }
             messages = messages.concat(raw.messages);
           } else {
-            showToast(currentLang === 'zh' ? '不支持的文件格式结构' : 'Unsupported file structure');
+            showToast(i18nDict[currentLang].toastUnsupportedStructure || 'Unsupported file structure');
             return;
           }
 
@@ -2332,14 +2364,14 @@ export function getDashboardHtml(): string {
           });
           if (response.ok) {
             const resData = await response.json();
-            showToast(currentLang === 'zh' ? '导入成功！' : 'Imported successfully!');
+            showToast(i18nDict[currentLang].toastImportSuccess || 'Imported successfully!');
             loadSessionsList();
             if (resData.id) selectSession(resData.id);
           } else {
-            showToast(currentLang === 'zh' ? '导入失败' : 'Import failed');
+            showToast(i18nDict[currentLang].toastImportFailed || 'Import failed');
           }
         } catch (err) {
-          showToast(currentLang === 'zh' ? '解析 JSON 出错' : 'Error parsing JSON');
+          showToast(i18nDict[currentLang].toastJsonError || 'Error parsing JSON');
         }
       };
       reader.readAsText(file);
