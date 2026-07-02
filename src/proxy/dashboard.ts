@@ -1087,15 +1087,19 @@ export function getDashboardHtml(): string {
               </button>
             </div>
             
+            <button class="action-btn" id="scan-memory-btn" onclick="scanLocalAgents()" style="width: 100%; margin: 0 0 0.65rem 0; padding: 0.6rem; font-size: 0.8rem; background: rgba(168, 85, 247, 0.16); border: 1px solid rgba(168, 85, 247, 0.3); color: var(--color-primary); border-radius: 8px;">
+              扫描本机 Agent / Scan Local Agents
+            </button>
+
             <div style="background: rgba(255,255,255,0.02); border: 1px dashed rgba(255,255,255,0.12); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem; text-align: center; cursor: pointer; transition: var(--transition-standard);" 
                  id="import-dropzone" 
                  onclick="triggerImportFileInput()"
                  ondragover="handleDragOver(event)" 
                  ondragleave="handleDragLeave(event)"
                  ondrop="handleFileDrop(event)">
-              <span style="font-size: 0.8rem; color: var(--color-secondary); font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 0.25rem;">📥 导入对话 / Import JSON</span>
-              <div style="font-size: 0.65rem; color: var(--color-text-muted); margin-top: 4px;">拖拽或点击上传对话 JSON / Click or Drop File</div>
-              <input type="file" id="import-file-input" style="display: none;" accept=".json" onchange="handleImportFileSelect(event)">
+              <span style="font-size: 0.8rem; color: var(--color-secondary); font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 0.25rem;" id="i18n-import-title">📥 导入对话 / Import Memory</span>
+              <div style="font-size: 0.65rem; color: var(--color-text-muted); margin-top: 4px;" id="i18n-import-desc">JSON · JSONL · SQLite · Markdown</div>
+              <input type="file" id="import-file-input" style="display: none;" accept=".json,.jsonl,.db,.sqlite,.sqlite3,.md,.markdown" onchange="handleImportFileSelect(event)">
             </div>
 
             <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem;">
@@ -1169,6 +1173,9 @@ export function getDashboardHtml(): string {
       <h3 style="margin-bottom: 1rem; font-weight: 600; font-size: 1.1rem; color: var(--color-text);">📤 导出对话历史 / Export Chat History</h3>
       <p style="margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--color-text-muted);">选择您希望导出的格式： / Select your export format:</p>
       <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem;">
+        <button onclick="executeExport('memory')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--color-success); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          🧠 OpenCodex Memory Package
+        </button>
         <button onclick="executeExport('openai')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(147, 51, 234, 0.15); border: 1px solid rgba(147, 51, 234, 0.3); color: var(--color-primary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
           🌐 Standard JSON (OpenAI / LangChain)
         </button>
@@ -1181,6 +1188,30 @@ export function getDashboardHtml(): string {
       </div>
       <div class="modal-actions">
         <button class="modal-btn-cancel" onclick="document.getElementById('export-modal').classList.remove('show')" style="width: 100%; border-radius: 8px; padding: 0.6rem;">关闭 / Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="import-session-modal">
+    <div class="modal-box" style="width: 420px; max-width: 92%;">
+      <h3 id="import-session-modal-title" style="margin-bottom: 0.75rem; font-weight: 600; font-size: 1.05rem; color: var(--color-text);">选择要导入的会话</h3>
+      <p id="import-session-modal-desc" style="margin-bottom: 1rem; font-size: 0.8rem; color: var(--color-text-muted);">该文件包含多个会话，请选择一条。</p>
+      <select id="import-session-select" style="width: 100%; padding: 0.7rem; margin-bottom: 1rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.16); background: var(--color-bg-secondary); color: var(--color-text); font-size: 0.8rem;"></select>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" onclick="cancelImportSessionSelection()">取消 / Cancel</button>
+        <button class="modal-btn-confirm" onclick="confirmImportSessionSelection()">导入 / Import</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="memory-scan-modal">
+    <div class="modal-box" style="width: 680px; max-width: 94%; max-height: 82vh; display: flex; flex-direction: column;">
+      <h3 id="memory-scan-modal-title" style="margin-bottom: 0.35rem; font-weight: 600; font-size: 1.05rem; color: var(--color-text);">本机 Agent 记忆</h3>
+      <p id="memory-scan-modal-desc" style="margin-bottom: 0.85rem; font-size: 0.78rem; color: var(--color-text-muted);">选择需要导入到 Codex 的会话。</p>
+      <div id="memory-scan-results" style="overflow-y: auto; min-height: 180px; max-height: 56vh; padding-right: 0.25rem;"></div>
+      <div class="modal-actions" style="margin-top: 1rem;">
+        <button class="modal-btn-cancel" onclick="closeMemoryScanModal()">关闭 / Close</button>
+        <button class="modal-btn-confirm" id="memory-scan-import-btn" onclick="importSelectedMemorySources()">导入选中 / Import Selected</button>
       </div>
     </div>
   </div>
@@ -1254,8 +1285,8 @@ export function getDashboardHtml(): string {
         selectSessionHint: "Select a session from the left",
         chooseSessionDetail: "Please choose a session to view conversation details.",
         loadingSessions: "Loading sessions...",
-        importDropzoneTitle: "📥 Import JSON",
-        importDropzoneDesc: "Click or drag & drop dialogue JSON file",
+        importDropzoneTitle: "📥 Import Memory",
+        importDropzoneDesc: "JSON · JSONL · SQLite · Markdown",
         btnExport: "Export",
         btnArchive: "Archive",
         btnUnarchive: "Activate",
@@ -1264,10 +1295,21 @@ export function getDashboardHtml(): string {
         toastExportFailed: "Export failed",
         toastExportError: "Export error",
         toastImportSuccess: "Imported successfully!",
+        toastImportRestarting: "Import complete. Restarting Codex Desktop...",
         toastImportFailed: "Import failed",
-        toastInvalidFormat: "Only .json chat format is supported",
+        toastInvalidFormat: "Use JSON, JSONL, SQLite, or Markdown",
         toastUnsupportedStructure: "Unsupported file structure",
-        toastJsonError: "Error parsing JSON"
+        toastJsonError: "Error reading import file",
+        importSessionTitle: "Select a session",
+        importSessionDesc: "This file contains multiple sessions. Choose one to import.",
+        btnScanMemory: "Scan Local Agents",
+        scanningMemory: "Scanning local agent data...",
+        memoryScanTitle: "Local Agent Memory",
+        memoryScanDesc: "Choose sessions to import into Codex.",
+        noMemorySources: "No supported local agent sessions were found. Use manual file import below.",
+        importSelected: "Import Selected",
+        selectAtLeastOne: "Select at least one session",
+        scanFailed: "Local agent scan failed"
       },
       zh: {
         title: "OpenCodex 统一网关",
@@ -1335,8 +1377,8 @@ export function getDashboardHtml(): string {
         selectSessionHint: "请从左侧选择一个历史会话",
         chooseSessionDetail: "请选择一个会话以查看详细聊天对话内容。",
         loadingSessions: "正在加载会话列表...",
-        importDropzoneTitle: "📥 导入对话 / Import JSON",
-        importDropzoneDesc: "拖拽或点击上传对话 JSON / Click or Drop File",
+        importDropzoneTitle: "📥 导入对话 / Import Memory",
+        importDropzoneDesc: "JSON · JSONL · SQLite · Markdown",
         btnExport: "导出",
         btnArchive: "归档",
         btnUnarchive: "激活",
@@ -1345,10 +1387,21 @@ export function getDashboardHtml(): string {
         toastExportFailed: "导出失败",
         toastExportError: "导出出错",
         toastImportSuccess: "导入成功！",
+        toastImportRestarting: "导入完成，正在自动重启 Codex Desktop...",
         toastImportFailed: "导入失败",
-        toastInvalidFormat: "仅支持 .json 对话格式",
+        toastInvalidFormat: "支持 JSON、JSONL、SQLite 或 Markdown",
         toastUnsupportedStructure: "不支持的文件格式结构",
-        toastJsonError: "解析 JSON 出错"
+        toastJsonError: "读取导入文件出错",
+        importSessionTitle: "选择要导入的会话",
+        importSessionDesc: "该文件包含多个会话，请选择一条。",
+        btnScanMemory: "扫描本机 Agent",
+        scanningMemory: "正在扫描本机 Agent 数据...",
+        memoryScanTitle: "本机 Agent 记忆",
+        memoryScanDesc: "选择需要导入到 Codex 的会话。",
+        noMemorySources: "没有发现可识别的本机 Agent 会话，请使用下方手动文件导入。",
+        importSelected: "导入选中",
+        selectAtLeastOne: "请至少选择一条会话",
+        scanFailed: "扫描本机 Agent 失败"
       }
     };
 
@@ -1416,6 +1469,12 @@ export function getDashboardHtml(): string {
       setText('i18n-loading-sessions', t.loadingSessions);
       setText('i18n-import-title', t.importDropzoneTitle);
       setText('i18n-import-desc', t.importDropzoneDesc);
+      setText('import-session-modal-title', t.importSessionTitle);
+      setText('import-session-modal-desc', t.importSessionDesc);
+      setText('scan-memory-btn', t.btnScanMemory);
+      setText('memory-scan-modal-title', t.memoryScanTitle);
+      setText('memory-scan-modal-desc', t.memoryScanDesc);
+      setText('memory-scan-import-btn', t.importSelected);
       
       const activeTitle = el('active-session-title');
       if (activeTitle && (activeTitle.innerText === 'Select a session from the left' || activeTitle.innerText === '请从左侧选择一个历史会话')) {
@@ -2297,9 +2356,15 @@ export function getDashboardHtml(): string {
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
+          window.URL.revokeObjectURL(link.href);
           showToast(i18nDict[currentLang].toastExportSuccess || 'Exported successfully');
         } else {
-          showToast(i18nDict[currentLang].toastExportFailed || 'Export failed');
+          let message = i18nDict[currentLang].toastExportFailed || 'Export failed';
+          try {
+            const errorData = await response.json();
+            if (errorData.error) message += ': ' + errorData.error;
+          } catch {}
+          showToast(message);
         }
       } catch (err) {
         showToast(i18nDict[currentLang].toastExportError || 'Export error');
@@ -2310,9 +2375,142 @@ export function getDashboardHtml(): string {
       document.getElementById('import-file-input').click();
     }
 
+    function closeMemoryScanModal() {
+      document.getElementById('memory-scan-modal').classList.remove('show');
+    }
+
+    function renderMemoryScanResults(agents) {
+      const container = document.getElementById('memory-scan-results');
+      container.innerHTML = '';
+      const t = i18nDict[currentLang];
+      if (!agents || agents.length === 0) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding: 2.5rem 1rem; text-align: center; color: var(--color-text-muted); font-size: 0.82rem;';
+        empty.textContent = t.noMemorySources;
+        container.appendChild(empty);
+        return;
+      }
+
+      agents.forEach((agent, agentIndex) => {
+        const section = document.createElement('div');
+        section.style.cssText = 'padding: 0.7rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);';
+        const header = document.createElement('label');
+        header.style.cssText = 'display: flex; align-items: center; gap: 0.55rem; font-weight: 700; color: var(--color-text); cursor: pointer; margin-bottom: 0.45rem;';
+        const selectAgent = document.createElement('input');
+        selectAgent.type = 'checkbox';
+        selectAgent.dataset.agentIndex = String(agentIndex);
+        selectAgent.addEventListener('change', () => {
+          section.querySelectorAll('.memory-session-checkbox').forEach(input => {
+            input.checked = selectAgent.checked;
+          });
+        });
+        const title = document.createElement('span');
+        title.textContent = agent.name + ' (' + agent.session_count + ')';
+        header.appendChild(selectAgent);
+        header.appendChild(title);
+        section.appendChild(header);
+
+        (agent.sources || []).forEach(source => {
+          const pathLine = document.createElement('div');
+          pathLine.style.cssText = 'font-size: 0.67rem; color: var(--color-text-muted); margin: 0.3rem 0 0.35rem 1.6rem; word-break: break-all;';
+          pathLine.textContent = source.display_path + ' · ' + source.format.toUpperCase();
+          section.appendChild(pathLine);
+
+          (source.sessions || []).forEach(session => {
+            const row = document.createElement('label');
+            row.style.cssText = 'display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.4rem 0.45rem; margin-left: 1.2rem; border-radius: 6px; cursor: pointer;';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'memory-session-checkbox';
+            checkbox.dataset.sourceId = source.source_id;
+            checkbox.dataset.sessionId = session.id;
+            const text = document.createElement('span');
+            text.style.cssText = 'min-width: 0; font-size: 0.76rem; color: var(--color-text); line-height: 1.35;';
+            const details = [session.source, session.model].filter(Boolean).join(' · ');
+            const count = session.message_count ? session.message_count + ' messages' : '';
+            text.textContent = session.title + ([details, count].filter(Boolean).length ? ' · ' + [details, count].filter(Boolean).join(' · ') : '');
+            row.appendChild(checkbox);
+            row.appendChild(text);
+            section.appendChild(row);
+          });
+        });
+        container.appendChild(section);
+      });
+    }
+
+    async function scanLocalAgents() {
+      const modal = document.getElementById('memory-scan-modal');
+      const results = document.getElementById('memory-scan-results');
+      const scanButton = document.getElementById('scan-memory-btn');
+      modal.classList.add('show');
+      results.innerHTML = '';
+      const loading = document.createElement('div');
+      loading.style.cssText = 'padding: 3rem 1rem; text-align: center; color: var(--color-text-muted);';
+      loading.textContent = i18nDict[currentLang].scanningMemory;
+      results.appendChild(loading);
+      scanButton.disabled = true;
+      try {
+        const response = await fetch('/api/memory-sources/scan');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Scan failed');
+        renderMemoryScanResults(data.agents || []);
+      } catch (error) {
+        results.innerHTML = '';
+        const failed = document.createElement('div');
+        failed.style.cssText = 'padding: 3rem 1rem; text-align: center; color: #ef4444;';
+        failed.textContent = (i18nDict[currentLang].scanFailed || 'Scan failed') + ': ' + error.message;
+        results.appendChild(failed);
+      } finally {
+        scanButton.disabled = false;
+      }
+    }
+
+    async function importSelectedMemorySources() {
+      const selected = Array.from(document.querySelectorAll('.memory-session-checkbox:checked'));
+      if (selected.length === 0) {
+        showToast(i18nDict[currentLang].selectAtLeastOne || 'Select at least one session');
+        return;
+      }
+      const button = document.getElementById('memory-scan-import-btn');
+      button.disabled = true;
+      let importedCount = 0;
+      try {
+        for (let index = 0; index < selected.length; index++) {
+          button.textContent = (index + 1) + ' / ' + selected.length;
+          const checkbox = selected[index];
+          const response = await fetch('/api/memory-sources/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              source_id: checkbox.dataset.sourceId,
+              session_id: checkbox.dataset.sessionId,
+              restart: false
+            })
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Import failed');
+          importedCount++;
+        }
+        closeMemoryScanModal();
+        showToast((i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...') + ' (' + importedCount + ')');
+        await fetch('/api/restart-codex', { method: 'POST' });
+      } catch (error) {
+        showToast((i18nDict[currentLang].toastImportFailed || 'Import failed') + ': ' + error.message);
+        if (importedCount > 0) {
+          try {
+            await fetch('/api/restart-codex', { method: 'POST' });
+          } catch {}
+        }
+      } finally {
+        button.disabled = false;
+        button.textContent = i18nDict[currentLang].importSelected || 'Import Selected';
+      }
+    }
+
     function handleImportFileSelect(e) {
       const file = e.target.files[0];
       if (file) processImportFile(file);
+      e.target.value = '';
     }
 
     function handleDragOver(e) {
@@ -2334,57 +2532,109 @@ export function getDashboardHtml(): string {
       if (file) processImportFile(file);
     }
 
-    function processImportFile(file) {
-      if (!file.name.endsWith('.json')) {
-        showToast(i18nDict[currentLang].toastInvalidFormat || 'Only .json chat format is supported');
+    let pendingImportPayload = null;
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    async function submitImportPayload(payload) {
+      const response = await fetch('/api/sessions/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      let responseData = {};
+      try { responseData = await response.json(); } catch {}
+
+      if (response.status === 409 && responseData.requires_session_selection) {
+        pendingImportPayload = payload;
+        const select = document.getElementById('import-session-select');
+        select.innerHTML = '';
+        (responseData.sessions || []).forEach(session => {
+          const option = document.createElement('option');
+          option.value = session.id;
+          const details = [session.source, session.model].filter(Boolean).join(' · ');
+          const count = session.message_count ? ' · ' + session.message_count + ' messages' : '';
+          option.textContent = session.title + (details ? ' · ' + details : '') + count;
+          select.appendChild(option);
+        });
+        document.getElementById('import-session-modal').classList.add('show');
         return;
       }
-      const reader = new FileReader();
-      reader.onload = async (e) => {
-        try {
-          const raw = JSON.parse(e.target.result);
-          let messages = [];
-          if (Array.isArray(raw)) {
-            messages = raw;
-          } else if (raw && Array.isArray(raw.messages)) {
-            if (raw.system) {
-              messages.push({ role: 'system', content: raw.system });
-            }
-            messages = messages.concat(raw.messages);
-          } else {
-            showToast(i18nDict[currentLang].toastUnsupportedStructure || 'Unsupported file structure');
-            return;
-          }
 
-          const threadName = file.name.replace('.json', '');
-          const response = await fetch('/api/sessions/import', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages, name: threadName })
-          });
-          if (response.ok) {
-            const resData = await response.json();
-            showToast(i18nDict[currentLang].toastImportSuccess || 'Imported successfully!');
-            loadSessionsList();
-            if (resData.id) selectSession(resData.id);
-          } else {
-            showToast(i18nDict[currentLang].toastImportFailed || 'Import failed');
-          }
-        } catch (err) {
-          showToast(i18nDict[currentLang].toastJsonError || 'Error parsing JSON');
-        }
-      };
-      reader.readAsText(file);
+      if (!response.ok) {
+        let message = i18nDict[currentLang].toastImportFailed || 'Import failed';
+        if (responseData.error) message += ': ' + responseData.error;
+        showToast(message);
+        return;
+      }
+
+      pendingImportPayload = null;
+      const baseMessage = responseData.restarted
+        ? (i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...')
+        : (i18nDict[currentLang].toastImportSuccess || 'Imported successfully!');
+      showToast(baseMessage + ' (' + (responseData.message_count || 0) + ')');
+      if (!responseData.restarted) {
+        loadSessionsList();
+        if (responseData.id) selectSession(responseData.id);
+      }
+    }
+
+    async function confirmImportSessionSelection() {
+      if (!pendingImportPayload) return;
+      const select = document.getElementById('import-session-select');
+      const selectedSessionId = select.value;
+      document.getElementById('import-session-modal').classList.remove('show');
+      await submitImportPayload({ ...pendingImportPayload, session_id: selectedSessionId });
+    }
+
+    function cancelImportSessionSelection() {
+      pendingImportPayload = null;
+      document.getElementById('import-session-modal').classList.remove('show');
+    }
+
+    async function processImportFile(file) {
+      if (!/\.(json|jsonl|db|sqlite|sqlite3|md|markdown)$/i.test(file.name)) {
+        showToast(i18nDict[currentLang].toastInvalidFormat || 'Unsupported import format');
+        return;
+      }
+      if (file.size > 48 * 1024 * 1024) {
+        showToast(currentLang === 'zh' ? '文件不能超过 48 MB' : 'File must be 48 MB or smaller');
+        return;
+      }
+      try {
+        const buffer = await file.arrayBuffer();
+        await submitImportPayload({
+          file_name: file.name,
+          file_base64: arrayBufferToBase64(buffer),
+          name: file.name.replace(/\.(json|jsonl|db|sqlite|sqlite3|md|markdown)$/i, ''),
+          restart: true
+        });
+      } catch {
+        showToast(i18nDict[currentLang].toastJsonError || 'Error reading import file');
+      }
     }
 
     // Explicitly expose globally called button event handler actions to the browser window object
     window.showExportModal = showExportModal;
     window.executeExport = executeExport;
     window.triggerImportFileInput = triggerImportFileInput;
+    window.scanLocalAgents = scanLocalAgents;
+    window.closeMemoryScanModal = closeMemoryScanModal;
+    window.importSelectedMemorySources = importSelectedMemorySources;
     window.handleImportFileSelect = handleImportFileSelect;
     window.handleDragOver = handleDragOver;
     window.handleDragLeave = handleDragLeave;
     window.handleFileDrop = handleFileDrop;
+    window.confirmImportSessionSelection = confirmImportSessionSelection;
+    window.cancelImportSessionSelection = cancelImportSessionSelection;
 
     window.createNewSession = createNewSession;
     window.clearAllSessions = clearAllSessions;

@@ -205,6 +205,7 @@ In other words: OpenCodex is optimized for maximum compatibility without breakin
 - Add, delete, and toggle custom models.
 - Native GPT pass-through.
 - Third-party model protocol conversion.
+- Conversation memory import/export through the Codex app-server.
 - Live SSE log streaming.
 - One-click Codex restart.
 - One-click reset to native Codex.
@@ -212,6 +213,20 @@ In other words: OpenCodex is optimized for maximum compatibility without breakin
 - Screenshot capture and compression.
 - Vision Bridge for text-only models.
 - Voice settings for STT/TTS integrations.
+
+## Conversation Memory Bridge
+
+The Dashboard can scan common local Agent data directories, group discovered conversations by Agent, and let the user select which sessions to import. It combines known Agent detectors with generic JSON, JSONL, SQLite, and Markdown structure detection. If a source cannot be detected automatically, manual file import remains available.
+
+Dedicated local adapters currently support Claude Code, OpenCode, Antigravity, and Hermes. Claude Code imports readable user/assistant messages from `~/.claude/projects`, while excluding sidechain records, tool results, and system events.
+
+The Dashboard can also export a Codex thread as an OpenCodex Memory Package, OpenAI-compatible message JSON, Anthropic message JSON, or Markdown. Imports accept JSON, JSONL, SQLite, and Markdown, including OpenCodex packages, common OpenAI/Anthropic message files, ChatGPT/Claude conversation JSON, Codex-style JSONL, and Hermes `state.db`.
+
+Imports are created through Codex's own app-server and injected as model-visible history. OpenCodex does not fabricate session IDs or write a fake rollout file. This keeps the imported thread compatible with Codex's local session store while allowing official GPT pass-through and third-party models to continue from the imported memory.
+
+The scan and parsing process stays local. Nothing is uploaded, and no conversation is imported until the user selects it. When a SQLite or JSONL file contains multiple conversations, the Dashboard asks which session to import. For Hermes, selecting `~/.hermes/state.db` is enough; `sessions.json` is not required because the SQLite database already contains both session metadata and messages.
+
+The bridge transfers conversation memory, not a provider's private server-side conversation. Provider response IDs, hidden chain-of-thought, remote caches, and unavailable local files cannot be cloned across services.
 
 ## Vision Bridge
 
@@ -485,6 +500,7 @@ OpenCodex 选择了更稳的方式：
 - 添加、删除、自定义显示模型。
 - 官方 GPT 穿透。
 - 第三方模型协议转换。
+- 通过 Codex app-server 导入、导出对话记忆。
 - 实时 SSE 日志流。
 - 一键重启 Codex。
 - 一键还原原生 Codex。
@@ -492,6 +508,20 @@ OpenCodex 选择了更稳的方式：
 - 截图捕获和压缩。
 - 面向纯文本模型的 Vision Bridge。
 - STT/TTS 语音设置集成。
+
+## 对话记忆桥接
+
+Dashboard 可以自动扫描常见的本地 Agent 数据目录，按 Agent 分类展示发现的会话，再由用户勾选需要导入的内容。扫描器同时使用已知 Agent 检测规则和通用 JSON、JSONL、SQLite、Markdown 结构识别；自动检测不到时，仍然可以使用手动文件导入。
+
+目前已经提供专用本地适配的 Agent 包括 Claude Code、OpenCode、Antigravity 和 Hermes。Claude Code 会从 `~/.claude/projects` 读取用户与助手的有效消息，同时过滤 sidechain、工具结果和系统事件。
+
+Dashboard 也可以把 Codex 会话导出为 OpenCodex Memory Package、OpenAI-compatible 消息 JSON、Anthropic 消息 JSON 或 Markdown。导入支持 JSON、JSONL、SQLite 和 Markdown，包括 OpenCodex 记忆包、常见 OpenAI/Anthropic 消息文件、ChatGPT/Claude conversation JSON、Codex 风格 JSONL，以及 Hermes 的 `state.db`。
+
+导入过程通过 Codex 自己的 app-server 创建 thread，再把历史消息注入为模型可见上下文。OpenCodex 不再伪造 session ID，也不再手写假的 rollout 文件，因此导入后的会话仍由 Codex 自己的本地会话系统管理，官方 GPT 穿透和第三方模型都可以读取这份导入记忆继续对话。
+
+扫描和解析全部在本机完成，不会上传数据，也不会在用户勾选前导入任何会话。如果 SQLite 或 JSONL 文件包含多条会话，Dashboard 会先让用户选择具体导入哪一条。对于 Hermes，只需要选择 `~/.hermes/state.db`，不需要额外上传 `sessions.json`，因为 `state.db` 内已经包含会话元数据和实际消息。
+
+这里迁移的是对话记忆，不是复制某个提供商私有的服务端会话。provider response ID、隐藏思维链、远端缓存以及另一台机器上不存在的本地文件无法跨服务复制。
 
 ## Vision Bridge 视觉降级
 

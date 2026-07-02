@@ -1,6 +1,6 @@
 {
   "name": "opencodex",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "OpenCodex - The Unified Codex Desktop Unlocker, Custom Model Gateway & Computer Use Router",
   "type": "module",
   "scripts": {
@@ -14,11 +14,13 @@
     "https-proxy-agent": "^9.1.0",
     "js-tiktoken": "^1.0.21",
     "node-pty": "^1.1.0",
+    "sql.js": "^1.14.1",
     "undici": "^8.5.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
+    "@types/sql.js": "^1.4.11",
     "@types/ws": "^8.18.1",
     "electron": "^42.5.0",
     "typescript": "^5.9.3"
