@@ -1,14 +1,14 @@
 <h1 align="center">OpenCodex</h1>
 
 <p align="center">
-  <a href="#windows-beta--windows-测试版"><img alt="Windows Beta" src="https://img.shields.io/badge/Windows-测试版-orange"></a>
+  <a href="#windows-support-verified--windows-支持已验证"><img alt="Windows Support" src="https://img.shields.io/badge/Windows-已验证-green"></a>
 </p>
 
-> ## Windows Beta / Windows 测试版
+> ## Windows Support (Verified & Stable)
 >
-> Windows support is now included in this unified repository and passes the automated Windows build. Real-device verification is still in progress.
+> Windows support is fully verified on real Windows devices. It supports native Win32 computer-use redirection, bypassing UWP sandboxing (AppContainer UIA URL block) for seamless browser and desktop automation, and historical screenshot memory optimization (automatic payload compression) for custom model stability.
 >
-> Windows 支持现已整合进统一仓库，并已通过 Windows 自动构建测试，目前为测试版本，仍在进行真实设备验证。
+> Windows 支持已在真实设备上完成验证并稳定运行。支持原生 Win32 电脑控制重定向，完美绕过 Windows UWP 沙箱（AppContainer）的浏览器 UIA 隔离限制，实现顺畅的浏览器和桌面自动化。同时引入了历史截图 Payload 自动裁剪，保证第三方模型（如 DeepSeek 等）长对话连接稳定。
 
 <p align="center">
   <strong>Use GPT, DeepSeek, MiniMax, OpenRouter, SiliconFlow, and other models inside Codex Desktop through one local gateway.</strong>
@@ -258,7 +258,8 @@ The companion app provides global voice hotkeys, VAD, STT/TTS integration, and a
 
 ### Install And Run
 
-> Windows support is currently in beta. The commands below pass the automated Windows build, but real-device testing is still in progress.
+> Windows support is fully verified and stable on real Windows 10/11 devices.
+
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
@@ -553,7 +554,8 @@ Dashboard 也可以把 Codex 会话导出为 OpenCodex Memory Package、OpenAI-c
 
 ### 安装与启动
 
-> Windows 支持目前为测试版。以下命令已通过 Windows 自动构建测试，但仍在进行真实设备验证。
+> Windows 支持已在真实 Windows 10/11 设备上通过完整功能验证并稳定运行。
+
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
