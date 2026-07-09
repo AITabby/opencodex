@@ -18,6 +18,7 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch } from "undici";
 import zlib from "node:zlib";
 import { getEncoding, type Tiktoken } from "js-tiktoken";
+import { decompress as zstdDecompress } from "fzstd";
 
 // Auto-detect and configure outbound proxy support
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
@@ -58,10 +59,15 @@ if (proxyUrl) {
 
 import {
   responsesToChat,
+  responsesToChatWin,
   chatCompletionToResponse,
   extractNamespaceMap,
   ResponsesStreamState,
-  processVisionBridge
+  processVisionBridge,
+  runToolLocally,
+  pendingToolCallsMap,
+  pendingToolArgumentsAccumulator,
+  itemIdToCallIdMap
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
@@ -1483,7 +1489,7 @@ except Exception as e:
       let patchedToml = stripManagedBlocks(tomlContent);
 
       const managedTop = `# >>> opencodex managed >>>
-model_catalog_json = "${catalogPath}"
+model_catalog_json = "${catalogPath.replace(/\\/g, '\\\\')}"
 openai_base_url = "http://127.0.0.1:8765/v1"
 # <<< opencodex managed <<<
 `;
@@ -1519,7 +1525,7 @@ stream_idle_timeout_ms = 600000
       const content = readFileSync(tomlPath, "utf-8");
       let patched = stripManagedBlocks(content);
       const managedTop = `# >>> opencodex managed >>>
-model_catalog_json = "${catalogPath}"
+model_catalog_json = "${catalogPath.replace(/\\/g, '\\\\')}"
 openai_base_url = "http://127.0.0.1:8765/v1"
 # <<< opencodex managed <<<
 `;
@@ -1603,21 +1609,32 @@ stream_idle_timeout_ms = 600000
           break;
         }
       }
-      if (executablePath) {
-        const killCmd = 'taskkill /F /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
-        exec(killCmd, () => {
-          setTimeout(() => {
+      const isMsix = !executablePath;
+
+      const killCmd = 'taskkill /F /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
+      exec(killCmd, () => {
+        setTimeout(() => {
+          if (isMsix) {
+            try {
+              const child = spawn("explorer.exe", ["shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"], {
+                detached: true,
+                stdio: "ignore"
+              });
+              child.unref();
+              console.log("[OpenCodex] Codex MSIX App successfully restarted on Windows.");
+            } catch (err: any) {
+              console.error("[OpenCodex] Failed to start Codex MSIX App via explorer:", err.message);
+            }
+          } else {
             const child = spawn(executablePath, ["--remote-debugging-port=8315"], {
               detached: true,
               stdio: "ignore"
             });
             child.unref();
             console.log("[OpenCodex] Codex Desktop successfully restarted on Windows.");
-          }, 1500);
-        });
-      } else {
-        console.error("[OpenCodex] Could not locate Codex.exe on Windows.");
-      }
+          }
+        }, 1500);
+      });
     } else {
       const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex --args --remote-debugging-port=8315';
       exec(cmd, (err, stdout, stderr) => {
@@ -2062,6 +2079,47 @@ stream_idle_timeout_ms = 600000
             if (!tIsBinary) {
               try {
                 const payload = JSON.parse(msgStr);
+                if (payload) {
+                  if (payload.type === "response.output_item.added" && payload.item && payload.item.type === "function_call") {
+                    const itemId = payload.item.id;
+                    const callId = payload.item.call_id;
+                    const name = payload.item.name || "";
+                    if (callId) {
+                      itemIdToCallIdMap.set(itemId, callId);
+                      pendingToolCallsMap.set(callId, { name, arguments: payload.item.arguments || "" });
+                    }
+                    if (itemId) {
+                      pendingToolArgumentsAccumulator.set(itemId, payload.item.arguments || "");
+                    }
+                    console.log(`[OpenCodex WS Proxy] Recorded official model tool call: ${name} (item_id: ${itemId}, call_id: ${callId})`);
+                  }
+                  if (payload.type === "response.function_call_arguments.delta") {
+                    const itemId = payload.item_id;
+                    const delta = payload.delta || "";
+                    if (itemId) {
+                      const current = pendingToolArgumentsAccumulator.get(itemId) || "";
+                      const updated = current + delta;
+                      pendingToolArgumentsAccumulator.set(itemId, updated);
+                      const callId = itemIdToCallIdMap.get(itemId);
+                      if (callId) {
+                        const existing = pendingToolCallsMap.get(callId);
+                        if (existing) {
+                          existing.arguments = updated;
+                        }
+                      }
+                    }
+                  }
+                  if (payload.type === "response.output_item.done" && payload.item && payload.item.type === "function_call") {
+                    const itemId = payload.item.id;
+                    const callId = payload.item.call_id;
+                    const name = payload.item.name || "";
+                    const finalArgs = pendingToolArgumentsAccumulator.get(itemId) || payload.item.arguments || "";
+                    if (callId) {
+                      pendingToolCallsMap.set(callId, { name, arguments: finalArgs });
+                      console.log(`[OpenCodex WS Proxy] Finalized official model tool call: ${name} (call_id: ${callId}) with arguments: ${finalArgs}`);
+                    }
+                  }
+                }
                 if (payload && payload.sequence_number !== undefined) {
                   const currentSeq = this.sessionSequenceNumberMap.get(sessionIdStr) || 1;
                   const newSeq = Math.max(currentSeq, Number(payload.sequence_number) + 1);
@@ -2244,6 +2302,29 @@ stream_idle_timeout_ms = 600000
                   }
                 }
 
+                if (process.platform === "win32" && msg && msg.type === "conversation.item.create" && msg.item && msg.item.type === "function_call_output") {
+                  const callId = msg.item.call_id;
+                  const saved = pendingToolCallsMap.get(callId);
+                  const isComputerUse = saved && (
+                    saved.name.startsWith("mcp__computer_use") ||
+                    saved.name.includes("computer") ||
+                    ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "set_value", "list_apps", "wait_for_ui", "screenshot"].includes(saved.name)
+                  );
+                  if (isComputerUse) {
+                    console.log(`[OpenCodex WS Proxy] Intercepting official model tool call output for ${saved.name} (call_id: ${callId}). Current output: ${msg.item.output}. Overriding with native Win32 execution...`);
+                    try {
+                      const result = await runToolLocally(saved.name, saved.arguments);
+                      msg.item.output = JSON.stringify(result);
+                      processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                      console.log(`[OpenCodex WS Proxy] Overrode official tool output successfully: ${msg.item.output}`);
+                    } catch (execErr: any) {
+                      console.error(`[OpenCodex WS Proxy] Local execution for official tool failed: ${execErr.message}`);
+                      msg.item.output = JSON.stringify({ status: "error", error: execErr.message });
+                      processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                    }
+                  }
+                }
+
                 // If forwarding to official server, sanitize encrypted_content from client inputs
                 if (msg && Array.isArray(msg.input)) {
                   let mutated = false;
@@ -2285,7 +2366,9 @@ stream_idle_timeout_ms = 600000
               }
             }
 
-            if (isLocal) {
+            const activeSidForLocalCheck = connInfo.activeSessionId || sessionIdStr;
+            const isSessionLocal = isLocal || this.customModelSessions.has(activeSidForLocalCheck) || connInfo.isCustomMode;
+            if (isSessionLocal) {
               return;
             }
 
@@ -2406,9 +2489,9 @@ stream_idle_timeout_ms = 600000
       }
     } else if (contentEncoding === "zstd") {
       try {
-        decompressedBody = execSync("zstd -d", { input: rawBody, maxBuffer: 100 * 1024 * 1024 });
+        decompressedBody = Buffer.from(zstdDecompress(rawBody));
       } catch (err: any) {
-        console.error("[OpenCodex] Failed to zstd decompress body:", err.message);
+        console.error("[OpenCodex] Failed to zstd decompress body using fzstd:", err.message);
       }
     }
 
@@ -4357,7 +4440,9 @@ stream_idle_timeout_ms = 600000
 
     console.log(`[Responses] Routing ${requestedModel} → ${provider.name}/${upstreamModel} (stream=${isStream}, visionBridge=${callVisionBridge})`);
 
-    const chatBody = responsesToChat(processedReqBody, upstreamModel, finalSessionId);
+    const chatBody = process.platform === "win32"
+      ? await responsesToChatWin(processedReqBody, upstreamModel, finalSessionId)
+      : responsesToChat(processedReqBody, upstreamModel, finalSessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = finalSessionId ? String(finalSessionId) : "default";
@@ -6059,7 +6144,9 @@ stream_idle_timeout_ms = 600000
 
 
 
-    const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
+    const chatBody = process.platform === "win32"
+      ? await responsesToChatWin(processedReqBody, mappedModelName, sessionId)
+      : responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     this.customModelSessions.add(sessionIdStr);

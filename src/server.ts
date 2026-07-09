@@ -419,11 +419,23 @@ class OpenCodex {
           path.join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
           path.join(localAppData, "Programs", "Codex", "Codex.exe"),
         ];
-        codexMcpBinary = possiblePaths[0];
-        for (const p of possiblePaths) {
-          if (fs.existsSync(p)) {
-            codexMcpBinary = p;
-            break;
+        let found = possiblePaths.find(p => fs.existsSync(p));
+        if (found) {
+          codexMcpBinary = found;
+        } else {
+          // Search OpenAI Codex App Store / MSIX sub-path
+          const openAiCodexBinDir = path.join(localAppData, "OpenAI", "Codex", "bin");
+          if (fs.existsSync(openAiCodexBinDir)) {
+            try {
+              const subdirs = fs.readdirSync(openAiCodexBinDir);
+              for (const subdir of subdirs) {
+                const p = path.join(openAiCodexBinDir, subdir, "codex.exe");
+                if (fs.existsSync(p)) {
+                  codexMcpBinary = p;
+                  break;
+                }
+              }
+            } catch {}
           }
         }
       }

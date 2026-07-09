@@ -12,6 +12,57 @@ import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import { ProxyAgent, fetch } from "undici";
+import { sendWindowsAction } from "../cu/windows-agent.js";
+import { ScreenshotTaker } from "../cu/screenshot.js";
+
+export const pendingToolCallsMap = new Map<string, { name: string, arguments: string }>();
+export const pendingToolArgumentsAccumulator = new Map<string, string>();
+export const itemIdToCallIdMap = new Map<string, string>();
+
+export async function runToolLocally(name: string, argumentsStr: string): Promise<any> {
+  const cleanName = name.replace(/^mcp__computer_use__/, "");
+  const args = argumentsStr ? JSON.parse(argumentsStr) : {};
+  
+  if (cleanName === "screenshot") {
+    const taker = new ScreenshotTaker();
+    const buf = await taker.capture();
+    return { status: "ok", data: buf.toString("base64") };
+  }
+
+  if (cleanName === "get_window_state" || cleanName === "get_app_state") {
+    const taker = new ScreenshotTaker();
+    const buf = await taker.capture();
+    const base64 = buf.toString("base64");
+    return {
+      window: {
+        app: "chrome",
+        id: 1,
+        title: "Google Chrome"
+      },
+      screenshots: [
+        {
+          id: "screenshot-0",
+          zIndex: 0,
+          url: `data:image/png;base64,${base64}`
+        }
+      ],
+      accessibility: {
+        tree: "<window title=\"Google Chrome\" />"
+      }
+    };
+  }
+  
+  const params: Record<string, any> = { ...args };
+  let action = cleanName;
+  if (cleanName === "type_text") {
+    action = "type";
+  } else if (cleanName === "press_key") {
+    action = "press_key";
+  }
+  
+  const result = await sendWindowsAction(action, params);
+  return result;
+}
 
 // Auto-detect and configure outbound proxy support for translator requests
 const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
@@ -274,6 +325,247 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   return chat;
 }
 
+export async function responsesToChatWin(body: any, upstreamModel: string, sessionId?: string): Promise<any> {
+  const messages: any[] = [];
+  const instructions = body.instructions;
+  
+  // Try to load voice settings and inject voice system prompt if it's the active voice session
+  let voiceSystemPrompt = "";
+  try {
+    const configPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+    if (fs.existsSync(configPath)) {
+      const settings = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+      if (settings.voice_system_prompt && (!sessionId || sessionId === settings.active_session_id)) {
+        voiceSystemPrompt = settings.voice_system_prompt;
+      }
+    }
+  } catch (err) {
+    // ignore
+  }
+
+  let systemContent = _contentToText(instructions || "");
+  if (voiceSystemPrompt) {
+    systemContent = voiceSystemPrompt + "\n\n" + systemContent;
+  }
+  
+  if (systemContent) {
+    messages.push({ role: "system", content: systemContent });
+  }
+
+  let pendingReasoning: string | null = null;
+  const inputMessages = await _responsesInputToMessagesWin(body.input);
+
+  for (const m of inputMessages) {
+    if (m._reasoning_only) {
+      const summary = m.summary || [];
+      const text = summary.map((item: any) => (typeof item === "object" ? item.text || "" : "")).join(" ");
+      if (text) {
+        pendingReasoning = text;
+      }
+      continue;
+    }
+    if (pendingReasoning && m.role === "assistant") {
+      m.reasoning_content = pendingReasoning;
+      pendingReasoning = null;
+    }
+    
+    // Clean up any prepended voice prompt in user messages
+    if (m.role === "user" && typeof m.content === "string" && voiceSystemPrompt) {
+      m.content = cleanUserPrompt(m.content, voiceSystemPrompt);
+    }
+    
+    messages.push(m);
+  }
+
+  const mergedMessages = _mergeConsecutiveMessages(_normalizeChatRoles(messages));
+  const sanitizedMessages = _sanitizeChatMessages(mergedMessages);
+
+  // Clean older screenshots to prevent network timeouts/payload resets
+  cleanOlderScreenshots(sanitizedMessages);
+
+  if (voiceSystemPrompt && sanitizedMessages.length > 0) {
+    sanitizedMessages.push({
+      role: "system",
+      content: `[System Instruction reminder: Follow this personality style for the final response: ${voiceSystemPrompt}]`
+    });
+  }
+
+  // Sanitize empty/null content fields for MiniMax model
+  if (upstreamModel.toLowerCase().includes("minimax")) {
+    for (const m of sanitizedMessages) {
+      if (m.content === null || m.content === undefined || m.content === "") {
+        m.content = " ";
+      }
+    }
+  }
+
+  const chat: any = {
+    model: upstreamModel,
+    messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
+    stream: body.stream !== false,
+  };
+  if (chat.stream) {
+    chat.stream_options = { include_usage: true };
+  }
+
+  _copyIfPresent(body, chat, "temperature");
+  _copyIfPresent(body, chat, "top_p");
+  if (body.max_output_tokens !== undefined) {
+    chat.max_tokens = body.max_output_tokens;
+  } else {
+    _copyIfPresent(body, chat, "max_tokens");
+  }
+  _copyIfPresent(body, chat, "parallel_tool_calls");
+  if (body.reasoning_effort !== undefined) {
+    if (body.reasoning_effort === "xhigh") {
+      chat.reasoning_effort = "high";
+    } else {
+      chat.reasoning_effort = body.reasoning_effort;
+    }
+  }
+
+  const tools = _responsesToolsToChatTools(body.tools);
+  if (tools && tools.length > 0) {
+    chat.tools = tools;
+    _copyIfPresent(body, chat, "tool_choice");
+  }
+  return chat;
+}
+
+async function _responsesInputToMessagesWin(value: any): Promise<any[]> {
+  if (value === undefined || value === null) return [];
+  if (typeof value === "string") return [{ role: "user", content: value }];
+  if (!Array.isArray(value)) return [{ role: "user", content: _contentToText(value) }];
+
+  const messages: any[] = [];
+  const pendingToolCalls: any[] = [];
+  const deferredMessages: any[] = [];
+
+  function flushPendingAssistantToolCalls() {
+    if (pendingToolCalls.length > 0) {
+      messages.push({ role: "assistant", content: null, tool_calls: [...pendingToolCalls] });
+      pendingToolCalls.length = 0;
+    }
+  }
+
+  function flushDeferred() {
+    if (deferredMessages.length > 0) {
+      messages.push(...deferredMessages);
+      deferredMessages.length = 0;
+    }
+  }
+
+  for (const item of value) {
+    if (typeof item === "string") {
+      flushPendingAssistantToolCalls();
+      flushDeferred();
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+    if (typeof item !== "object" || item === null) continue;
+
+    const itemType = item.type;
+    if ((itemType === "message" || !itemType) && "role" in item) {
+      if (pendingToolCalls.length > 0) {
+        // Defer system/developer messages when tool calls are pending
+        let role = item.role || "user";
+        if (role === "developer") role = "system";
+        deferredMessages.push({ role, content: _contentToText(item.content || "") });
+      } else {
+        flushPendingAssistantToolCalls();
+        flushDeferred();
+        let role = item.role || "user";
+        if (role === "developer") role = "system";
+        messages.push({ role, content: _contentToText(item.content || "") });
+      }
+    } else if (itemType === "input_text" || itemType === "text") {
+      flushPendingAssistantToolCalls();
+      flushDeferred();
+      messages.push({ role: "user", content: _contentToText(item) });
+    } else if (itemType === "function_call") {
+      const callId = item.call_id || item.id || "call_0";
+      const argsRaw = item.arguments || "";
+      if (argsRaw) {
+        try {
+          const argsObj = JSON.parse(argsRaw);
+          if (typeof argsObj === "object" && argsObj !== null && argsObj.app) {
+            CURRENT_ACTIVE_APP = argsObj.app;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      pendingToolCalls.push({
+        id: callId,
+        type: "function",
+        function: {
+          name: item.name || "",
+          arguments: item.arguments || "",
+        },
+      });
+      pendingToolCallsMap.set(callId, { name: item.name || "", arguments: item.arguments || "" });
+    } else if (itemType === "function_call_output") {
+      flushPendingAssistantToolCalls();
+      let outputText = _contentToText(item.output || "");
+
+      // Intercept computer_use tool call output on Windows. If it is a computer_use tool call, 
+      // ALWAYS override the client execution result (which might fail due to UWP/AppContainer sandbox URL blocks)
+      // and execute it via our native Win32 agent.
+      let isIntercepted = false;
+      if (item.call_id) {
+        const saved = pendingToolCallsMap.get(item.call_id);
+        const isComputerUse = saved && (
+          saved.name.startsWith("mcp__computer_use") ||
+          saved.name.includes("computer") ||
+          ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "set_value", "list_apps", "wait_for_ui", "screenshot"].includes(saved.name)
+        );
+        if (process.platform === "win32" && isComputerUse) {
+          isIntercepted = true;
+        }
+      }
+
+      if (isIntercepted && item.call_id) {
+        const saved = pendingToolCallsMap.get(item.call_id)!;
+        console.log(`[OpenCodex Translator] Intercepting tool call output for ${saved.name}. Running locally via Win32 agent...`);
+        try {
+          const result = await runToolLocally(saved.name, saved.arguments);
+          outputText = JSON.stringify(result);
+          console.log(`[OpenCodex Translator] Local execution success: ${outputText}`);
+        } catch (execErr: any) {
+          console.error(`[OpenCodex Translator] Local execution failed: ${execErr.message}`);
+          outputText = JSON.stringify({ status: "error", error: execErr.message });
+        }
+      }
+
+      // Parse get_app_state result to update CURRENT_ACTIVE_APP from actual app state,
+      // not from what the model guessed in the function call arguments.
+      const appMatch = outputText.match(/App=.*?\/([^\/]+\.app)\//);
+      if (appMatch) {
+        CURRENT_ACTIVE_APP = appMatch[1].replace(/\.app$/, "");
+      }
+
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: outputText,
+      });
+      flushDeferred();
+    } else if (itemType === "reasoning") {
+      flushPendingAssistantToolCalls();
+      messages.push({
+        role: "assistant",
+        _reasoning_only: true,
+        encrypted_content: item.encrypted_content,
+        summary: item.summary || [],
+        content: null,
+      });
+    }
+  }
+  flushPendingAssistantToolCalls();
+  flushDeferred();
+  return messages;
+}
+
 export function chatCompletionToResponse(payload: any, requestedModel: string, namespaceMap?: Record<string, string>): any {
   const choice = (payload.choices || [{}])[0];
   const message = choice.message || {};
@@ -531,6 +823,117 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
       });
     }
   }
+  
+  // Inject computer_use tools if not already present (Windows only to keep Mac logic untouched)
+  if (process.platform === "win32") {
+    const hasComputerUse = converted.some(t => t.type === "function" && t.function?.name?.startsWith("mcp__computer_use"));
+    if (!hasComputerUse) {
+      converted.push(
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__click",
+            description: "Click a mouse button at coordinates (x, y).",
+            parameters: {
+              type: "object",
+              properties: {
+                x: { type: "number" },
+                y: { type: "number" },
+                button: { type: "string", enum: ["left", "right", "middle"], default: "left" },
+                clicks: { type: "number", default: 1 }
+              },
+              required: ["x", "y"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__scroll",
+            description: "Scroll the wheel or trackpad.",
+            parameters: {
+              type: "object",
+              properties: {
+                x: { type: "number" },
+                y: { type: "number" },
+                delta_x: { type: "number", default: 0 },
+                delta_y: { type: "number", default: 0 }
+              },
+              required: ["x", "y"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__press_key",
+            description: "Press a key or key combination (e.g., 'Control+C', 'Return').",
+            parameters: {
+              type: "object",
+              properties: {
+                key: { type: "string" }
+              },
+              required: ["key"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__type_text",
+            description: "Type a string of text.",
+            parameters: {
+              type: "object",
+              properties: {
+                text: { type: "string" }
+              },
+              required: ["text"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__drag",
+            description: "Drag from coordinates (from_x, from_y) to (to_x, to_y).",
+            parameters: {
+              type: "object",
+              properties: {
+                from_x: { type: "number" },
+                from_y: { type: "number" },
+                to_x: { type: "number" },
+                to_y: { type: "number" }
+              },
+              required: ["from_x", "from_y", "to_x", "to_y"]
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__get_app_state",
+            description: "Get the current active application and basic UI details.",
+            parameters: {
+              type: "object",
+              properties: {}
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
+            name: "mcp__computer_use__list_apps",
+            description: "List running applications.",
+            parameters: {
+              type: "object",
+              properties: {}
+            }
+          }
+        }
+      );
+    }
+  }
+
   return converted;
 }
 
@@ -1643,4 +2046,34 @@ export async function processVisionBridge(body: any, config?: any): Promise<any>
   }
 
   return body;
+}
+
+function cleanOlderScreenshots(messages: any[]) {
+  const toolMessagesWithScreenshots: any[] = [];
+  for (const m of messages) {
+    if (m.role === "tool" && typeof m.content === "string" && m.content.includes("data:image/png;base64,")) {
+      toolMessagesWithScreenshots.push(m);
+    }
+  }
+
+  if (toolMessagesWithScreenshots.length > 1) {
+    const tinyPng = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    for (let i = 0; i < toolMessagesWithScreenshots.length - 1; i++) {
+      const msg = toolMessagesWithScreenshots[i];
+      try {
+        const obj = JSON.parse(msg.content);
+        if (obj && Array.isArray(obj.screenshots)) {
+          for (const s of obj.screenshots) {
+            if (s && s.url && s.url.startsWith("data:image/")) {
+              s.url = tinyPng;
+            }
+          }
+          msg.content = JSON.stringify(obj);
+        }
+      } catch {
+        msg.content = msg.content.replace(/"url"\s*:\s*"data:image\/png;base64,[^"]*"/g, `"url":"${tinyPng}"`);
+      }
+    }
+    console.log(`[OpenCodex] Cleaned ${toolMessagesWithScreenshots.length - 1} older historical screenshots from request payload.`);
+  }
 }

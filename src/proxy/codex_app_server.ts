@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -22,7 +22,21 @@ export function resolveCodexBinary(): string {
       join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
       join(localAppData, "Programs", "Codex", "Codex.exe")
     ];
-    return candidates.find(existsSync) || "codex.exe";
+    const found = candidates.find(existsSync);
+    if (found) return found;
+
+    // Search OpenAI Codex App Store / MSIX sub-path
+    const openAiCodexBinDir = join(localAppData, "OpenAI", "Codex", "bin");
+    if (existsSync(openAiCodexBinDir)) {
+      try {
+        const subdirs = readdirSync(openAiCodexBinDir);
+        for (const subdir of subdirs) {
+          const p = join(openAiCodexBinDir, subdir, "codex.exe");
+          if (existsSync(p)) return p;
+        }
+      } catch {}
+    }
+    return "codex.exe";
   }
 
   return "codex";
