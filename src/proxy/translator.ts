@@ -343,6 +343,8 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
       chat.reasoning_effort = body.reasoning_effort;
     }
   }
+  _copyIfPresent(body, chat, "speed_tier");
+
 
   const tools = _responsesToolsToChatTools(body.tools);
   if (tools && tools.length > 0) {

@@ -411,7 +411,12 @@ class OpenCodex {
     try {
       console.error("[OpenCodex] Starting resident codex mcp-server background daemon...");
       const { spawn } = await import("node:child_process");
-      let codexMcpBinary = "/Applications/Codex.app/Contents/Resources/codex";
+      let codexMcpBinary = "/Applications/ChatGPT.app/Contents/Resources/codex";
+      if (os.platform() === "darwin") {
+        if (!fs.existsSync(codexMcpBinary)) {
+          codexMcpBinary = "/Applications/Codex.app/Contents/Resources/codex";
+        }
+      }
       if (os.platform() === "win32") {
         const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
         const possiblePaths = [

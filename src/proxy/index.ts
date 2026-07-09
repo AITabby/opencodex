@@ -53,6 +53,44 @@ function keepExistingSecret(incoming: unknown, existing: unknown): string {
   return next;
 }
 
+type VoiceEndpointProfile = {
+  kind: "complete" | "neutral" | "incomplete";
+  silenceSeconds: number;
+  hardSilenceSeconds: number;
+};
+
+function getVoiceEndpointProfile(text: string, configuredSilence: number): VoiceEndpointProfile {
+  const trimmed = text.trim();
+  const base = Number.isFinite(configuredSilence)
+    ? Math.min(4, Math.max(0.8, configuredSilence))
+    : 1.5;
+
+  const incompleteEnding = /(?:，|、|：|:|的|和|与|或|但|但是|不过|然后|因为|所以|如果|虽然|而且|还有|就是|那个|这个|比如|例如|我觉得|我认为|我的意思|开始|源于|包括|关于|至于|以及)$/;
+  const explicitEnding = /(?:[。？！?!]|谢谢|就这样|就可以了|怎么做|怎么办|什么意思|可以吗|行不行)$/;
+
+  if (incompleteEnding.test(trimmed) && !/(?:好的|可以的|没问题的)$/.test(trimmed)) {
+    return {
+      kind: "incomplete",
+      silenceSeconds: Math.max(2.5, base + 0.9),
+      hardSilenceSeconds: Math.max(3.4, base + 1.8)
+    };
+  }
+
+  if (explicitEnding.test(trimmed)) {
+    return {
+      kind: "complete",
+      silenceSeconds: Math.min(base, 1.0),
+      hardSilenceSeconds: Math.max(1.8, base + 0.4)
+    };
+  }
+
+  return {
+    kind: "neutral",
+    silenceSeconds: Math.max(1.6, base),
+    hardSilenceSeconds: Math.max(2.6, base + 1.0)
+  };
+}
+
 if (proxyUrl) {
   console.log(`[OpenCodex Proxy] Configured outbound proxy agent with: ${proxyUrl}`);
 }
@@ -1250,6 +1288,7 @@ except Exception as e:
     for (const model of catalog.models) {
       const isCustomModel = model.provider === "opencodex" || !!model.backend_provider || model.slug.startsWith("mimo") || model.slug.includes("deepseek") || model.slug.includes("qwen");
       if (isCustomModel) {
+        let modelChanged = false;
         if (!model.supported_reasoning_levels || !model.supported_reasoning_levels.some((l: any) => l.effort === "xhigh")) {
           model.supported_reasoning_levels = [
             { effort: "low", description: "Lighter reasoning" },
@@ -1258,6 +1297,13 @@ except Exception as e:
             { effort: "xhigh", description: "Extra high reasoning depth" }
           ];
           model.default_reasoning_level = "medium";
+          modelChanged = true;
+        }
+        if (!model.additional_speed_tiers || !model.additional_speed_tiers.includes("fast")) {
+          model.additional_speed_tiers = ["fast"];
+          modelChanged = true;
+        }
+        if (modelChanged) {
           updated = true;
         }
       }
@@ -1636,7 +1682,7 @@ stream_idle_timeout_ms = 600000
         }, 1500);
       });
     } else {
-      const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex --args --remote-debugging-port=8315';
+      const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315 || open -a Codex --args --remote-debugging-port=8315';
       exec(cmd, (err, stdout, stderr) => {
         if (err) {
           console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
@@ -5491,14 +5537,12 @@ stream_idle_timeout_ms = 600000
     let isListening = false;
     let lastProcessedLength = 0;
     let lastVADCheckedLength = 0;
+    let isVADProcessing = false;
     let chunkInterval: NodeJS.Timeout | null = null;
     let isProcessingChunk = false;
-    let lastSpeechActivityTime = Date.now();
     let hasSentFinal = false;
     let lastTranscribedText = "";
-    let consecutiveSilenceCount = 0;
     let speechDetected = false;
-    let silenceStartTime = 0;
 
     // Helper to clear timer
     const clearChunkInterval = () => {
@@ -5508,7 +5552,22 @@ stream_idle_timeout_ms = 600000
       }
     };
 
-    // Semantic VAD: Decides if we can cut off early based on transcribed text and time since last sound
+    const finishSpeech = async (previewText: string, reason: string) => {
+      if (hasSentFinal) return;
+      hasSentFinal = true;
+      isListening = false;
+      clearChunkInterval();
+
+      console.error(`[Voice Endpoint] ${reason}. Preview: "${previewText}"`);
+      ws.send(JSON.stringify({
+        type: "stop_recording",
+        text: previewText
+      }));
+      await this.processWebSocketSTT(ws, audioBuffer, previewText);
+    };
+
+    // Semantic checks supplement physical VAD; they never treat repeated partial
+    // transcripts as silence because API response timing is not speech timing.
     const checkSemanticVAD = async (text: string) => {
       if (hasSentFinal) return;
       const trimmed = text.trim();
@@ -5536,49 +5595,12 @@ stream_idle_timeout_ms = 600000
         }
         
         console.error(`[Semantic AEC] Interruption detected! User said: "${trimmed}" while system was saying: "${this.currentSystemUtterance}"`);
-        this.currentSystemUtterance = ""; // Clear it so we don't block subsequent speech
-        triggerSpeechEnd(trimmed);
+        this.currentSystemUtterance = "";
+        await finishSpeech(trimmed, "user interrupted TTS");
         return;
       }
 
-      // Common final Chinese particles and signs
-      const endParticles = ["吗", "呢", "了", "吧", "哈", "呀", "啊", "啦", "吗？", "呢？", "吧？", "呀？", "谢谢", "就可以了", "怎么做", "怎么办", "什么意思", "。", "？", "！"];
-      const matchesEnd = endParticles.some(p => trimmed.endsWith(p));
-
-      // Calculate if the transcription has stopped growing (indicating the user paused/stopped speaking)
-      if (trimmed === lastTranscribedText) {
-        consecutiveSilenceCount++;
-      } else {
-        consecutiveSilenceCount = 0;
-        lastTranscribedText = trimmed;
-      }
-
-      // We only cut off if we detected a sentence-end particle AND a brief silence pause (at least 2 chunk durations, ~800ms)
-      if (matchesEnd && consecutiveSilenceCount >= 2) {
-        console.error(`[Semantic VAD] Finished sentence pattern detected with active pause: "${trimmed}"`);
-        triggerSpeechEnd(trimmed);
-      }
-    };
-
-    const triggerSpeechEnd = async (finalText: string) => {
-      if (hasSentFinal) return;
-      hasSentFinal = true;
-      isListening = false;
-      clearChunkInterval();
-
-      console.error(`[Semantic VAD] Triggering early speech end. Final Text: "${finalText}"`);
-
-      // 1. Tell client to stop immediately and transition to loading state
-      ws.send(JSON.stringify({
-        type: "stop_recording",
-        text: finalText
-      }));
-
-      // 2. Deliver transcription directly as final
-      ws.send(JSON.stringify({
-        type: "transcription_final",
-        text: finalText
-      }));
+      lastTranscribedText = trimmed;
     };
 
     ws.on("message", async (data, isBinary) => {
@@ -5587,12 +5609,14 @@ stream_idle_timeout_ms = 600000
           const buf = data as Buffer;
           audioBuffer = Buffer.concat([audioBuffer, buf]);
 
-          // Run Silero VAD check if we have enough accumulated audio buffer (check every 320ms / 5120 samples)
-          const checkSize = 10240; // 5120 samples
-          if (audioBuffer.length >= checkSize && (audioBuffer.length - lastVADCheckedLength) >= 5120) {
-            lastVADCheckedLength = audioBuffer.length;
-            const startIdx = audioBuffer.length - 10240;
-            const newChunk = audioBuffer.slice(startIdx, audioBuffer.length);
+          // Submit only new PCM bytes. The previous implementation resent an
+          // overlapping window, which inflated silence timings inside the daemon.
+          const checkSize = 10240;
+          if (!isVADProcessing && audioBuffer.length >= checkSize && (audioBuffer.length - lastVADCheckedLength) >= 5120) {
+            const endIdx = audioBuffer.length;
+            const newChunk = audioBuffer.slice(lastVADCheckedLength, endIdx);
+            lastVADCheckedLength = endIdx;
+            isVADProcessing = true;
             const b64Data = newChunk.toString("base64");
             
             this.sendVADRequest({ action: "chunk", data: b64Data }).then(async (vadResult) => {
@@ -5600,41 +5624,36 @@ stream_idle_timeout_ms = 600000
                 console.error(`[Silero VAD Daemon Error] ${vadResult.error}`);
                 return;
               }
-              if (vadResult.has_speech) {
+              if (vadResult.has_speech && vadResult.speech_duration >= 0.30) {
                 speechDetected = true;
                 
-                // Read dynamic vad_duration from settings
-                let silenceThreshold = 0.8;
+                let configuredSilence = 1.5;
                 const p = join(this.configDir, "voice_settings.json");
                 if (existsSync(p)) {
                   try {
                     const settings = JSON.parse(readFileSync(p, "utf-8"));
                     if (settings.vad_duration !== undefined) {
-                      silenceThreshold = parseFloat(settings.vad_duration);
+                      configuredSilence = parseFloat(settings.vad_duration);
                     }
                   } catch {}
                 }
-                
-                // If silence at end exceeds threshold, trigger finalization
-                if (vadResult.silence_at_end >= silenceThreshold) {
-                  console.error(`[Silero VAD] Speech ended with silence duration: ${vadResult.silence_at_end.toFixed(2)}s (threshold: ${silenceThreshold}s)`);
-                  
-                  isListening = false;
-                  clearChunkInterval();
-                  if (!hasSentFinal) {
-                    console.error(`[Silero VAD] Triggering early stop stt`);
-                    hasSentFinal = true;
-                    // Instantly notify client to stop recording and show thinking animation
-                    ws.send(JSON.stringify({
-                      type: "stop_recording",
-                      text: lastTranscribedText
-                    }));
-                    await this.processWebSocketSTT(ws, audioBuffer, lastTranscribedText);
-                  }
+
+                const profile = getVoiceEndpointProfile(lastTranscribedText, configuredSilence);
+                const hasUsableTranscript = lastTranscribedText.replace(/[^\p{L}\p{N}]/gu, "").length >= 2;
+                const reachedSemanticSilence = hasUsableTranscript && vadResult.silence_at_end >= profile.silenceSeconds;
+                const reachedHardSilence = hasUsableTranscript && vadResult.silence_at_end >= profile.hardSilenceSeconds;
+
+                if (reachedSemanticSilence || reachedHardSilence) {
+                  await finishSpeech(
+                    lastTranscribedText,
+                    `${profile.kind} utterance, ${vadResult.silence_at_end.toFixed(2)}s silence`
+                  );
                 }
               }
             }).catch(err => {
               console.error(`[Silero VAD Daemon Promise Err] ${err.message}`);
+            }).finally(() => {
+              isVADProcessing = false;
             });
           }
         }
@@ -5647,16 +5666,14 @@ stream_idle_timeout_ms = 600000
           this.sendVADRequest({ action: "reset" });
           audioBuffer = Buffer.alloc(0);
           lastVADCheckedLength = 0;
+          isVADProcessing = false;
           this.currentSystemUtterance = "";
           lastProcessedLength = 0;
           lastTranscribedText = "";
-          consecutiveSilenceCount = 0;
           isListening = true;
           isProcessingChunk = false;
           hasSentFinal = false;
           speechDetected = false;
-          silenceStartTime = 0;
-          lastSpeechActivityTime = Date.now();
           console.error("[WebSocket STT] Listening started...");
 
           // Periodically check/transcribe current buffer
