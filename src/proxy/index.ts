@@ -781,6 +781,7 @@ export class ProxyServer {
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
   private sessionModelMap = new Map<string, string>();
+  private sessionThreadMap = new Map<string, string>();
   private sessionPrevResponseIdFailed = new Map<string, boolean>();
   private sessionSequenceNumberMap = new Map<string, number>();
   private lastCompletedSequenceNumberMap = new Map<string, number>();
@@ -1645,7 +1646,9 @@ stream_idle_timeout_ms = 600000
     if (process.platform === "win32") {
       const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
       const possiblePaths = [
+        join(localAppData, "Programs", "ChatGPT", "ChatGPT.exe"),
         join(localAppData, "Programs", "Codex", "Codex.exe"),
+        join(process.env.PROGRAMFILES || "C:\\Program Files", "ChatGPT", "ChatGPT.exe"),
         join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "Codex.exe"),
       ];
       let executablePath = "";
@@ -1657,27 +1660,36 @@ stream_idle_timeout_ms = 600000
       }
       const isMsix = !executablePath;
 
-      const killCmd = 'taskkill /F /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
+      const killCmd = 'taskkill /F /IM ChatGPT.exe /IM "ChatGPT Helper.exe" /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
       exec(killCmd, () => {
         setTimeout(() => {
           if (isMsix) {
             try {
-              const child = spawn("explorer.exe", ["shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"], {
-                detached: true,
-                stdio: "ignore"
+              const launchCmd = 'powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).ShellExecute(\'shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App\')"';
+              exec(launchCmd, (err) => {
+                if (err) {
+                  console.error("[OpenCodex] Failed to start ChatGPT MSIX App via COM:", err.message);
+                } else {
+                  console.log("[OpenCodex] ChatGPT MSIX App successfully restarted on Windows via COM ShellExecute.");
+                }
               });
-              child.unref();
-              console.log("[OpenCodex] Codex MSIX App successfully restarted on Windows.");
             } catch (err: any) {
-              console.error("[OpenCodex] Failed to start Codex MSIX App via explorer:", err.message);
+              console.error("[OpenCodex] Exception launching ChatGPT MSIX App:", err.message);
             }
           } else {
-            const child = spawn(executablePath, ["--remote-debugging-port=8315"], {
-              detached: true,
-              stdio: "ignore"
-            });
-            child.unref();
-            console.log("[OpenCodex] Codex Desktop successfully restarted on Windows.");
+            try {
+              const escapedPath = executablePath.replace(/'/g, "''");
+              const launchCmd = `powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).ShellExecute('${escapedPath}', '--remote-debugging-port=8315')"`;
+              exec(launchCmd, (err) => {
+                if (err) {
+                  console.error("[OpenCodex] Failed to start ChatGPT Desktop via COM:", err.message);
+                } else {
+                  console.log("[OpenCodex] ChatGPT Desktop successfully restarted on Windows via COM ShellExecute.");
+                }
+              });
+            } catch (err: any) {
+              console.error("[OpenCodex] Exception launching ChatGPT Desktop:", err.message);
+            }
           }
         }, 1500);
       });
@@ -2319,6 +2331,16 @@ stream_idle_timeout_ms = 600000
                   }
                   this.sessionModelMap.set(activeSid, model);
 
+                  const threadId = msg.client_metadata?.thread_id || "";
+                  const lastThreadId = this.sessionThreadMap.get(activeSid);
+                  if (threadId && lastThreadId && lastThreadId !== threadId) {
+                    console.log(`[OpenCodex WS Proxy] Thread changed from ${lastThreadId} to ${threadId}. Clearing stale history for session ${activeSid}.`);
+                    this.customConversationHistory.delete(activeSid);
+                  }
+                  if (threadId) {
+                    this.sessionThreadMap.set(activeSid, threadId);
+                  }
+
                   if (isCustomModel) {
                     isLocal = true;
                     connInfo.isCustomMode = true;
@@ -2348,28 +2370,7 @@ stream_idle_timeout_ms = 600000
                   }
                 }
 
-                if (process.platform === "win32" && msg && msg.type === "conversation.item.create" && msg.item && msg.item.type === "function_call_output") {
-                  const callId = msg.item.call_id;
-                  const saved = pendingToolCallsMap.get(callId);
-                  const isComputerUse = saved && (
-                    saved.name.startsWith("mcp__computer_use") ||
-                    saved.name.includes("computer") ||
-                    ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "set_value", "list_apps", "wait_for_ui", "screenshot"].includes(saved.name)
-                  );
-                  if (isComputerUse) {
-                    console.log(`[OpenCodex WS Proxy] Intercepting official model tool call output for ${saved.name} (call_id: ${callId}). Current output: ${msg.item.output}. Overriding with native Win32 execution...`);
-                    try {
-                      const result = await runToolLocally(saved.name, saved.arguments);
-                      msg.item.output = JSON.stringify(result);
-                      processedData = Buffer.from(JSON.stringify(msg), "utf-8");
-                      console.log(`[OpenCodex WS Proxy] Overrode official tool output successfully: ${msg.item.output}`);
-                    } catch (execErr: any) {
-                      console.error(`[OpenCodex WS Proxy] Local execution for official tool failed: ${execErr.message}`);
-                      msg.item.output = JSON.stringify({ status: "error", error: execErr.message });
-                      processedData = Buffer.from(JSON.stringify(msg), "utf-8");
-                    }
-                  }
-                }
+
 
                 // If forwarding to official server, sanitize encrypted_content from client inputs
                 if (msg && Array.isArray(msg.input)) {
@@ -3656,11 +3657,31 @@ stream_idle_timeout_ms = 600000
     if (path === "/api/reset" && req.method === "POST") {
       try {
         const tomlPath = join(homedir(), ".codex", "config.toml");
-        if (existsSync(tomlPath)) {
+        const configDir = join(homedir(), ".codex");
+        let restoredFromBackup = false;
+
+        if (existsSync(configDir)) {
+          const files = readdirSync(configDir);
+          const backups = files
+            .filter(f => f.startsWith("config.toml.bak_"))
+            .map(f => ({ name: f, time: parseInt(f.split("_")[1]) || 0 }))
+            .sort((a, b) => a.time - b.time);
+
+          if (backups.length > 0) {
+            const earliestBackup = join(configDir, backups[0].name);
+            console.log(`[OpenCodex] Restoring config.toml from original backup: ${earliestBackup}`);
+            writeFileSync(tomlPath, readFileSync(earliestBackup));
+            restoredFromBackup = true;
+          }
+        }
+
+        if (!restoredFromBackup && existsSync(tomlPath)) {
+          console.log("[OpenCodex] No backup found. Falling back to regex stripping of managed blocks.");
           let content = readFileSync(tomlPath, "utf-8");
           content = content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
           writeFileSync(tomlPath, content + "\n", "utf-8");
         }
+
         const catalogPath = join(this.configDir, "custom_model_catalog.json");
         if (existsSync(catalogPath)) {
           writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");

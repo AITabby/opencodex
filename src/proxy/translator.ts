@@ -181,18 +181,18 @@ function _unflattenVariants(name: string): string[] {
 }
 
 export function unflattenToolCall(name: string, namespaceMap?: Record<string, string>): [string, string | null] {
-  // First, prioritize standard computer use actions so they always map to mcp__computer_use
-  const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "set_value", "list_apps", "wait_for_ui"];
+  // First, prioritize standard computer use actions so they always map to mcp__computer-use__
+  const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "screenshot", "set_value", "list_apps", "wait_for_ui"];
   for (const action of actions) {
-    if (name === action || name === `mcp__computer_use_${action}` || name === `mcp__computer_use__${action}` || (name.endsWith(`_${action}`) && name.includes("computer"))) {
-      return [action, "mcp__computer_use"];
+    if (name === action || name === `mcp__computer_use_${action}` || name === `mcp__computer_use__${action}` || name === `mcp__computer-use_${action}` || name === `mcp__computer-use__${action}` || (name.endsWith(`_${action}`) && name.includes("computer"))) {
+      return [action, "mcp__computer-use__"];
     }
   }
 
   // Fallback check of variants for computer use actions to avoid incorrect mapping by other namespace mappings
   for (const variant of _unflattenVariants(name)) {
     if (actions.includes(variant)) {
-      return [variant, "mcp__computer_use"];
+      return [variant, "mcp__computer-use__"];
     }
   }
 
@@ -219,7 +219,7 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
   if (name.includes("computer_use") || name.includes("computer-use")) {
     for (const action of actions) {
       if (name.includes(action)) {
-        return [action, "mcp__computer_use"];
+        return [action, "mcp__computer-use__"];
       }
     }
   }
@@ -346,6 +346,21 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   _copyIfPresent(body, chat, "speed_tier");
 
 
+  if (body.text?.format?.type === "json_schema") {
+    chat.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: body.text.format.name || "codex_output_schema",
+        strict: body.text.format.strict !== false,
+        schema: body.text.format.schema
+      }
+    };
+  } else if (body.text?.format?.type === "json_object") {
+    chat.response_format = {
+      type: "json_object"
+    };
+  }
+
   const tools = _responsesToolsToChatTools(body.tools);
   if (tools && tools.length > 0) {
     chat.tools = tools;
@@ -453,6 +468,21 @@ export async function responsesToChatWin(body: any, upstreamModel: string, sessi
     }
   }
 
+  if (body.text?.format?.type === "json_schema") {
+    chat.response_format = {
+      type: "json_schema",
+      json_schema: {
+        name: body.text.format.name || "codex_output_schema",
+        strict: body.text.format.strict !== false,
+        schema: body.text.format.schema
+      }
+    };
+  } else if (body.text?.format?.type === "json_object") {
+    chat.response_format = {
+      type: "json_object"
+    };
+  }
+
   const tools = _responsesToolsToChatTools(body.tools);
   if (tools && tools.length > 0) {
     chat.tools = tools;
@@ -537,34 +567,7 @@ async function _responsesInputToMessagesWin(value: any): Promise<any[]> {
       flushPendingAssistantToolCalls();
       let outputText = _contentToText(item.output || "");
 
-      // Intercept computer_use tool call output on Windows. If it is a computer_use tool call, 
-      // ALWAYS override the client execution result (which might fail due to UWP/AppContainer sandbox URL blocks)
-      // and execute it via our native Win32 agent.
-      let isIntercepted = false;
-      if (item.call_id) {
-        const saved = pendingToolCallsMap.get(item.call_id);
-        const isComputerUse = saved && (
-          saved.name.startsWith("mcp__computer_use") ||
-          saved.name.includes("computer") ||
-          ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "set_value", "list_apps", "wait_for_ui", "screenshot"].includes(saved.name)
-        );
-        if (process.platform === "win32" && isComputerUse) {
-          isIntercepted = true;
-        }
-      }
 
-      if (isIntercepted && item.call_id) {
-        const saved = pendingToolCallsMap.get(item.call_id)!;
-        console.log(`[OpenCodex Translator] Intercepting tool call output for ${saved.name}. Running locally via Win32 agent...`);
-        try {
-          const result = await runToolLocally(saved.name, saved.arguments);
-          outputText = JSON.stringify(result);
-          console.log(`[OpenCodex Translator] Local execution success: ${outputText}`);
-        } catch (execErr: any) {
-          console.error(`[OpenCodex Translator] Local execution failed: ${execErr.message}`);
-          outputText = JSON.stringify({ status: "error", error: execErr.message });
-        }
-      }
 
       // Parse get_app_state result to update CURRENT_ACTIVE_APP from actual app state,
       // not from what the model guessed in the function call arguments.
@@ -828,7 +831,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
       for (const f of funcs) {
         if (typeof f !== "object" || f === null) continue;
         const fName = f.name || "";
-        const fullName = namespaceName.endsWith("__") ? namespaceName + fName : `${namespaceName}_${fName}`;
+        const fullName = namespaceName.endsWith("__") ? namespaceName + fName : `${namespaceName}__${fName}`;
         const fFunc = f.function || f;
         const params = fFunc.parameters || fFunc.input_schema || { type: "object", properties: {}, additionalProperties: true };
         const desc = fFunc.description || "";
@@ -855,13 +858,16 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
   
   // Inject computer_use tools if not already present (Windows only to keep Mac logic untouched)
   if (process.platform === "win32") {
-    const hasComputerUse = converted.some(t => t.type === "function" && t.function?.name?.startsWith("mcp__computer_use"));
+    const hasComputerUse = converted.some(t => {
+      const name = t.function?.name || "";
+      return name.startsWith("mcp__computer-use") || name.startsWith("mcp__computer_use");
+    });
     if (!hasComputerUse) {
       converted.push(
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__click",
+            name: "mcp__computer-use__click",
             description: "Click a mouse button at coordinates (x, y).",
             parameters: {
               type: "object",
@@ -878,7 +884,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__scroll",
+            name: "mcp__computer-use__scroll",
             description: "Scroll the wheel or trackpad.",
             parameters: {
               type: "object",
@@ -895,7 +901,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__press_key",
+            name: "mcp__computer-use__press_key",
             description: "Press a key or key combination (e.g., 'Control+C', 'Return').",
             parameters: {
               type: "object",
@@ -909,7 +915,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__type_text",
+            name: "mcp__computer-use__type_text",
             description: "Type a string of text.",
             parameters: {
               type: "object",
@@ -923,7 +929,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__drag",
+            name: "mcp__computer-use__drag",
             description: "Drag from coordinates (from_x, from_y) to (to_x, to_y).",
             parameters: {
               type: "object",
@@ -940,7 +946,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__get_app_state",
+            name: "mcp__computer-use__get_app_state",
             description: "Get the current active application and basic UI details.",
             parameters: {
               type: "object",
@@ -951,7 +957,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__get_window_state",
+            name: "mcp__computer-use__get_window_state",
             description: "Get the current window layout, titles, and screenshot.",
             parameters: {
               type: "object",
@@ -965,7 +971,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer_use__list_apps",
+            name: "mcp__computer-use__list_apps",
             description: "List running applications.",
             parameters: {
               type: "object",
@@ -1371,12 +1377,12 @@ export class ResponsesStreamState {
       }
     }
 
-    if (state.name && !state.added) {
-      await this._ensureToolOpened(writeSse, state);
-    }
-
+    // Defer ensureToolOpened until we have the complete name (which is when arguments start streaming or the tool closes)
     const argDelta = fn.arguments || "";
     if (argDelta) {
+      if (!state.added) {
+        await this._ensureToolOpened(writeSse, state);
+      }
       state.arguments += argDelta;
       await writeSse({
         type: "response.function_call_arguments.delta",
@@ -1394,7 +1400,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: this.messageIndex,
       item: {
         id: this.messageItemId,
         type: "message",
@@ -1436,7 +1441,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: this.messageIndex,
       item: this._messageItem("completed"),
     });
   }
@@ -1487,7 +1491,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: outputIndex,
       item: itemData,
     });
   }
@@ -1508,7 +1511,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: state.output_index,
       item: this._toolItem(state, "completed"),
     });
   }
@@ -1529,7 +1531,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: outputIndex,
       item: {
         id: itemId,
         type: "reasoning",
@@ -1572,7 +1573,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: state.output_index,
       item: this._reasoningItem(state, "completed"),
     });
   }
