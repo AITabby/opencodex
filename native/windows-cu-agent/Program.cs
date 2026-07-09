@@ -78,6 +78,36 @@ static string SendKeyName(string key) {
   return names.GetValueOrDefault(key, key);
 }
 
+  static void ActivateChromeIfAvailable() {
+    try {
+      Process[] processes = Process.GetProcessesByName("chrome");
+      foreach (var proc in processes) {
+        if (proc.MainWindowHandle != IntPtr.Zero) {
+          WinApi.ShowWindowAsync(proc.MainWindowHandle, WinApi.Restore);
+          WinApi.SetForegroundWindow(proc.MainWindowHandle);
+          Thread.Sleep(150);
+          return;
+        }
+      }
+      IntPtr window = WinApi.GetWindow(WinApi.GetDesktopWindow(), 5);
+      while (window != IntPtr.Zero) {
+        int length = WinApi.GetWindowTextLength(window);
+        if (WinApi.IsWindowVisible(window) && length > 0) {
+          var title = new StringBuilder(length + 1);
+          WinApi.GetWindowText(window, title, title.Capacity);
+          string t = title.ToString().ToLowerInvariant();
+          if (t.Contains("google chrome") || t.Contains("chrome") || t.Contains("zhihu") || t.Contains("知乎")) {
+            WinApi.ShowWindowAsync(window, WinApi.Restore);
+            WinApi.SetForegroundWindow(window);
+            Thread.Sleep(150);
+            return;
+          }
+        }
+        window = WinApi.GetWindow(window, 2);
+      }
+    } catch {}
+  }
+
 public static void Main() {
 string? line;
 while ((line = Console.ReadLine()) != null) {
@@ -125,9 +155,11 @@ while ((line = Console.ReadLine()) != null) {
         WinApi.mouse_event(WinApi.Wheel, 0, 0, unchecked((uint)(Int(command, "delta_y", -3) * 120)), 0);
         break;
       case "type":
+        ActivateChromeIfAvailable();
         SendKeys.SendWait(Text(command, "text"));
         break;
       case "press_key": {
+        ActivateChromeIfAvailable();
         string[] parts = Text(command, "key").ToLowerInvariant().Split('+');
         string sendKey = SendKeyName(parts[^1]);
         for (int i = 0; i < parts.Length - 1; i++) {
