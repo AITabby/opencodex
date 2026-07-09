@@ -51,6 +51,33 @@ export async function runToolLocally(name: string, argumentsStr: string): Promis
       }
     };
   }
+
+  if (cleanName === "list_apps") {
+    try {
+      const windowsRes = await sendWindowsAction("get_windows", {});
+      const windows = windowsRes.windows || [];
+      const appsMap = new Map<string, any>();
+      for (const w of windows) {
+        const appName = w.app || "unknown";
+        if (!appsMap.has(appName)) {
+          appsMap.set(appName, {
+            id: appName,
+            displayName: appName,
+            isRunning: true,
+            windows: []
+          });
+        }
+        appsMap.get(appName).windows.push({
+          id: w.id,
+          app: appName,
+          title: w.title
+        });
+      }
+      return Array.from(appsMap.values());
+    } catch {
+      return [];
+    }
+  }
   
   const params: Record<string, any> = { ...args };
   let action = cleanName;
@@ -346,9 +373,6 @@ export async function responsesToChatWin(body: any, upstreamModel: string, sessi
   let systemContent = _contentToText(instructions || "");
   if (voiceSystemPrompt) {
     systemContent = voiceSystemPrompt + "\n\n" + systemContent;
-  }
-  if (process.platform === "win32") {
-    systemContent += "\n\n[System Instruction: For GUI, browser, and desktop automation tasks, you MUST use the mcp__computer_use tools (e.g. get_window_state to capture screenshots, click to click, type_text to type, scroll to scroll). Do NOT use shell commands, command-line scripts, or node processes to perform GUI actions or navigate the browser.]";
   }
   
   if (systemContent) {
