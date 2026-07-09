@@ -922,6 +922,20 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
+            name: "mcp__computer_use__get_window_state",
+            description: "Get the current window layout, titles, and screenshot.",
+            parameters: {
+              type: "object",
+              properties: {
+                include_screenshot: { type: "boolean", default: true },
+                include_text: { type: "boolean", default: false }
+              }
+            }
+          }
+        },
+        {
+          type: "function",
+          function: {
             name: "mcp__computer_use__list_apps",
             description: "List running applications.",
             parameters: {
