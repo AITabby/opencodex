@@ -1910,10 +1910,19 @@ stream_idle_timeout_ms = 600000
         wss.handleUpgrade(request, socket, head, (clientWs) => {
           this.desktopWsClients.add(clientWs);
           (clientWs as any).sequenceNumber = 1;
-          const sidHeader = request.headers["x-session-id"] || request.headers["session-id"] || request.headers["x-thread-id"] || request.headers["thread-id"] || "";
+          const sidHeader = request.headers["x-session-id"] || request.headers["session-id"] || "";
           const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || "default");
           const sessionIdStr = sessionId ? String(sessionId) : "default";
           (clientWs as any).sessionId = sessionIdStr;
+
+          const threadIdHeader = request.headers["x-thread-id"] || request.headers["thread-id"] || "";
+          const threadIdStr = Array.isArray(threadIdHeader) ? threadIdHeader[0] : (threadIdHeader || "");
+          (clientWs as any).threadId = threadIdStr;
+
+          const subagentHeader = request.headers["x-openai-subagent"] || "";
+          const subagentStr = Array.isArray(subagentHeader) ? subagentHeader[0] : (subagentHeader || "");
+          (clientWs as any).subagent = subagentStr;
+
           this.sessionActiveWs.set(sessionIdStr, clientWs);
           const connInfo = { 
             clientWs, 
@@ -2251,7 +2260,13 @@ stream_idle_timeout_ms = 600000
             }
             if (!isTitleOrBackground) {
               for (const otherWs of this.desktopWsClients) {
-                if (otherWs !== clientWs && (otherWs as any).sessionId === activeSid && otherWs.readyState === WebSocket.OPEN) {
+                if (
+                  otherWs !== clientWs && 
+                  (otherWs as any).sessionId === activeSid && 
+                  (otherWs as any).threadId === (clientWs as any).threadId &&
+                  (otherWs as any).subagent === (clientWs as any).subagent &&
+                  otherWs.readyState === WebSocket.OPEN
+                ) {
                   otherWs.send(processedTData, { binary: tIsBinary });
                 }
               }
