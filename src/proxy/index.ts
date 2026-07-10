@@ -2258,9 +2258,29 @@ stream_idle_timeout_ms = 600000
             }
           });
 
+          // Heartbeat keepalive for the connection to the official server
+          const heartbeatInterval = setInterval(() => {
+            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+              try { targetWs.ping(); } catch {}
+            }
+          }, 15000); // 15 seconds
+
+          targetWs.on("ping", () => {
+            if (clientWs && clientWs.readyState === WebSocket.OPEN) {
+              try { clientWs.ping(); } catch {}
+            }
+          });
+
+          clientWs.on("ping", () => {
+            if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+              try { targetWs.ping(); } catch {}
+            }
+          });
+
           targetWs.on("close", (code, reason) => {
             console.log(`[OpenCodex WS Proxy] Official target connection closed: ${code} - ${reason.toString()}`);
             targetClosed = true;
+            clearInterval(heartbeatInterval);
             if (!clientClosed && routedToOfficial && !isLocal && !connInfo.isCustomMode) {
               clientWs.close();
             }
@@ -2268,6 +2288,7 @@ stream_idle_timeout_ms = 600000
 
           targetWs.on("error", (err) => {
             console.error("[OpenCodex WS Proxy Target Error]", err);
+            clearInterval(heartbeatInterval);
             if (!clientClosed && routedToOfficial && !isLocal && !connInfo.isCustomMode) {
               clientWs.close();
             }
@@ -2434,6 +2455,7 @@ stream_idle_timeout_ms = 600000
 
           clientWs.on("close", () => {
             clientClosed = true;
+            clearInterval(heartbeatInterval);
             this.desktopWsClients.delete(clientWs);
             if (sessionId && sessionId !== "default") {
               this.activeConnectionsBySession.delete(sessionId);
@@ -2448,6 +2470,7 @@ stream_idle_timeout_ms = 600000
 
           clientWs.on("error", (err) => {
             console.error("[OpenCodex WS Proxy Client Error]", err);
+            clearInterval(heartbeatInterval);
             this.desktopWsClients.delete(clientWs);
             if (sessionId && sessionId !== "default") {
               this.activeConnectionsBySession.delete(sessionId);
