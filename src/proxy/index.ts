@@ -6380,7 +6380,23 @@ stream_idle_timeout_ms = 600000
       if (!response.ok) {
         const errorText = await response.text();
         console.error(`[OpenCodex WS Proxy] Upstream error response: ${errorText}`);
-        broadcastToClients({ error: { message: errorText } });
+        if (streamState) {
+          const fakeChunk = {
+            choices: [{
+              delta: {
+                content: `\n[OpenCodex Proxy Error] Failed to fetch from upstream: ${response.status} - ${errorText}\n`
+              }
+            }]
+          };
+          await streamState.writeChatDelta(async (payload) => {
+            broadcastToClients(payload);
+          }, fakeChunk);
+          await streamState.finish(async (payload) => {
+            broadcastToClients(payload);
+          });
+        } else {
+          broadcastToClients({ error: { message: errorText } });
+        }
         return;
       }
 
