@@ -993,11 +993,13 @@ export class ProxyServer {
     try {
       if (options.body) {
         const reqBody = JSON.parse(options.body);
-        if (reqBody.model === "gpt-5.5" || reqBody.model === "gpt-5.4-mini") {
+        const catalog = this.getModelCatalog();
+        const catalogEntry = catalog?.models?.find((m: any) => m.backend_model === reqBody.model && m.backend_provider === "antigravity");
+        if (catalogEntry) {
           const token = this.resolveKey("antigravity-cli-auto");
           let originalModel = options.requestedModel || reqBody.model;
           if (originalModel.includes("flash")) originalModel = "gemini-3.5-flash-low";
-          else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel === "gpt-5.5") originalModel = "gemini-3.1-pro-low";
+          else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel === "gpt-5.5" || originalModel === "gpt-5.6-terra") originalModel = "gemini-3.1-pro-low";
           else if (originalModel === "gpt-5.4-mini") originalModel = "gemini-3.5-flash-low";
           else originalModel = "gemini-3.5-flash-low";
           console.log(`[OpenCodex Antigravity Bridge] Intercepted native model ${reqBody.model}. Mapped to original model ${originalModel}. Routing to daily-cloudcode-pa.googleapis.com`);
