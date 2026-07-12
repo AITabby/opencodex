@@ -249,22 +249,32 @@ The companion app provides global voice hotkeys, VAD, STT/TTS integration, and a
 
 ## Quick Start
 
-### Prerequisites
+### For Windows Users (Recommended - Standalone Desktop App)
+
+If you are on Windows, you don't need Node.js or git! You can use the pre-packaged standalone green application:
+1. Go to the **[Releases](https://github.com/AITabby/opencodex/releases)** page of this repository.
+2. Download **`OpenCodex.zip`** from the latest release assets.
+3. Extract the downloaded Zip archive to any location on your PC.
+4. Double-click **`OpenCodex.exe`** inside the extracted folder to run. A beautiful desktop control panel window will instantly open and the local gateway proxy will start in the background.
+
+---
+
+### For Developers (macOS & Windows - From Source)
+
+#### Prerequisites
 
 - macOS or Windows 10+
 - Node.js v18 or newer
 - Codex Desktop installed
 - Windows only: .NET 8 SDK (`winget install Microsoft.DotNet.SDK.8`)
 
-### Install And Run
-
-> Windows support is fully verified and stable on real Windows 10/11 devices.
-
+#### Install And Run
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
 cd opencodex
 npm install
+npm run build
 npm start
 ```
 
@@ -545,22 +555,32 @@ Dashboard 也可以把 Codex 会话导出为 OpenCodex Memory Package、OpenAI-c
 
 ## 快速上手
 
-### 准备工作
+### Windows 普通用户（推荐 - 绿色免安装桌面端）
+
+如果你使用的是 Windows 系统，不需要安装 Node.js、Git，也不需要运行任何终端命令行！
+1. 直接访问本仓库的 **[Releases](https://github.com/AITabby/opencodex/releases)** 发布页面。
+2. 下载最新版本发布资源中的 **`OpenCodex.zip`** 压缩包。
+3. 将下载好的压缩包解压到您电脑的任意位置（例如桌面）。
+4. 双击解压文件夹内的 **`OpenCodex.exe`** 启动，即可瞬间弹出原生客户端控制面板，代理服务会自动在后台拉起！
+
+---
+
+### 开发者（macOS & Windows - 源码运行）
+
+#### 准备工作
 
 - macOS 或 Windows 10+
 - Node.js v18 或更新版本
 - 已安装 Codex Desktop
 - 仅 Windows：.NET 8 SDK（`winget install Microsoft.DotNet.SDK.8`）
 
-### 安装与启动
-
-> Windows 支持已在真实 Windows 10/11 设备上通过完整功能验证并稳定运行。
-
+#### 安装与启动
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
 cd opencodex
 npm install
+npm run build
 npm start
 ```
 

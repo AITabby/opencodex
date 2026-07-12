@@ -11,3 +11,6 @@ debug_*.json
 test_cdp.js
 native/windows-cu-agent/bin/
 native/windows-cu-agent/obj/
+dist-app/
+out.log
+out_desktop*.log

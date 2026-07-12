@@ -3,9 +3,12 @@
   "version": "0.4.1",
   "description": "OpenCodex - The Unified Codex Desktop Unlocker, Custom Model Gateway & Computer Use Router",
   "type": "module",
+  "main": "dist/app.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
+    "app:start": "electron dist/app.js",
+    "app:dist": "electron-builder --win portable",
     "dev": "tsc --watch",
     "postinstall": "npm run build && node scripts/build-native.mjs"
   },
@@ -14,7 +17,6 @@
     "fzstd": "^0.1.1",
     "https-proxy-agent": "^9.1.0",
     "js-tiktoken": "^1.0.21",
-    "node-pty": "^1.1.0",
     "sql.js": "^1.14.1",
     "undici": "^8.5.0",
     "ws": "^8.21.0"
@@ -24,6 +26,27 @@
     "@types/sql.js": "^1.4.11",
     "@types/ws": "^8.18.1",
     "electron": "^42.5.0",
+    "electron-builder": "^26.15.3",
     "typescript": "^5.9.3"
+  },
+  "build": {
+    "appId": "com.aitabby.opencodex",
+    "productName": "OpenCodex",
+    "directories": {
+      "output": "dist-app"
+    },
+    "win": {
+      "icon": "assets/icon.png",
+      "target": [
+        "portable"
+      ],
+      "signExecutable": false
+    },
+    "files": [
+      "dist/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "asar": false
   }
 }

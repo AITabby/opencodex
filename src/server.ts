@@ -485,7 +485,19 @@ class OpenCodex {
   }
 }
 
-new OpenCodex().start().catch((err) => {
-  console.error("[OpenCodex] Failed to start:", err);
-  process.exit(1);
-});
+export { OpenCodex };
+
+import { fileURLToPath } from "node:url";
+
+const isMain = process.argv[1] && (
+  fileURLToPath(import.meta.url) === fs.realpathSync(process.argv[1]) ||
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url)) ||
+  process.argv[1].endsWith("server.js")
+);
+
+if (isMain) {
+  new OpenCodex().start().catch((err) => {
+    console.error("[OpenCodex] Failed to start:", err);
+    process.exit(1);
+  });
+}
