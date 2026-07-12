@@ -442,23 +442,24 @@ async function parseAntigravityDatabase(
   path: string,
   selectedSessionId?: string
 ): Promise<MemoryFileImportResult> {
-  // @ts-ignore
-  const { DatabaseSync } = await import("node:sqlite");
-  const database = new DatabaseSync(path, { readOnly: true });
+  const bytes = readFileSync(path);
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(bytes);
   const threadId = basename(path, ".db");
   try {
-    const countRow = database.prepare(`
+    const countRows = queryRows(database, `
       SELECT COUNT(*) AS user_message_count
       FROM steps
       WHERE step_type = 14 AND status = 3 AND length(step_payload) > 0
-    `).get() as Record<string, any>;
-    const firstUserRow = database.prepare(`
+    `);
+    const countRow = countRows[0];
+    const firstUserRow = queryRows(database, `
       SELECT step_payload
       FROM steps
       WHERE step_type = 14 AND status = 3 AND length(step_payload) > 0
       ORDER BY idx
       LIMIT 12
-    `).all() as Record<string, any>[];
+    `);
     const firstUserText = firstUserRow
       .map((row) => antigravityMessageText(Buffer.from(row.step_payload || [])))
       .find(Boolean);
@@ -479,12 +480,12 @@ async function parseAntigravityDatabase(
       };
     }
 
-    const rows = database.prepare(`
+    const rows = queryRows(database, `
       SELECT idx, step_type, step_payload
       FROM steps
       WHERE step_type IN (14, 15) AND status = 3 AND length(step_payload) > 0
       ORDER BY idx
-    `).all() as Record<string, any>[];
+    `);
     const messages: MemoryMessage[] = [];
     for (const row of rows) {
       const content = antigravityMessageText(Buffer.from(row.step_payload || []));
@@ -696,11 +697,11 @@ async function parseOpenCodeDatabase(
   path: string,
   selectedSessionId?: string
 ): Promise<MemoryFileImportResult> {
-  // @ts-ignore
-  const { DatabaseSync } = await import("node:sqlite");
-  const database = new DatabaseSync(path, { readOnly: true });
+  const bytes = readFileSync(path);
+  const SQL = await initSqlJs();
+  const database = new SQL.Database(bytes);
   try {
-    const sessionRows = database.prepare(`
+    const sessionRows = queryRows(database, `
       SELECT id, title, directory, time_updated, model,
              (SELECT COUNT(*) FROM message WHERE message.session_id = session.id) AS message_count
       FROM session
@@ -708,7 +709,7 @@ async function parseOpenCodeDatabase(
         AND parent_id IS NULL
         AND title NOT LIKE '%-branch'
       ORDER BY time_updated DESC
-    `).all() as Record<string, any>[];
+    `);
     const sessions: ImportSessionCandidate[] = sessionRows.map((row) => {
       const modelData = parseMaybeJson(row.model) as any;
       return {
@@ -728,14 +729,14 @@ async function parseOpenCodeDatabase(
 
     const selected = sessions.find((session) => session.id === selectedSessionId);
     if (!selected) throw new Error("The selected OpenCode session was not found");
-    const rows = database.prepare(`
+    const rows = queryRows(database, `
       SELECT m.id AS message_id, m.data AS message_data,
              p.id AS part_id, p.data AS part_data
       FROM message m
       LEFT JOIN part p ON p.message_id = m.id
       WHERE m.session_id = ?
       ORDER BY m.time_created, p.time_created
-    `).all(selectedSessionId) as Record<string, any>[];
+    `, [selectedSessionId]);
 
     const grouped = new Map<string, { role: string; parts: string[]; model?: string }>();
     for (const row of rows) {
