@@ -21,7 +21,33 @@ import { getEncoding, type Tiktoken } from "js-tiktoken";
 import { decompress as zstdDecompress } from "fzstd";
 
 // Auto-detect and configure outbound proxy support
-const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+let proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
+
+if (!proxyUrl && process.platform === "win32") {
+  try {
+    const registryProxyEnable = execSync('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable', { encoding: "utf8" });
+    if (registryProxyEnable.includes("0x1")) {
+      const registryProxyServer = execSync('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer', { encoding: "utf8" });
+      const match = registryProxyServer.match(/ProxyServer\s+REG_SZ\s+(.+)/);
+      if (match && match[1]) {
+        const proxyServerStr = match[1].trim();
+        if (proxyServerStr.includes(";")) {
+          const parts = proxyServerStr.split(";");
+          const httpsPart = parts.find(p => p.startsWith("https="));
+          const httpPart = parts.find(p => p.startsWith("http="));
+          const actualProxy = httpsPart ? httpsPart.split("=")[1] : (httpPart ? httpPart.split("=")[1] : parts[0]);
+          proxyUrl = actualProxy.startsWith("http") ? actualProxy : `http://${actualProxy}`;
+        } else {
+          proxyUrl = proxyServerStr.startsWith("http") ? proxyServerStr : `http://${proxyServerStr}`;
+        }
+        console.log(`[OpenCodex Proxy] Auto-detected Windows System Proxy from registry: ${proxyUrl}`);
+      }
+    }
+  } catch (err: any) {
+    // Ignore registry read errors
+  }
+}
+
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 const MAX_REQUEST_BODY_BYTES = 80 * 1024 * 1024;
@@ -814,6 +840,8 @@ export class ProxyServer {
   private vadStdoutBuffer = "";
   private vadCallbackQueue: ((res: any) => void)[] = [];
   private orbProcess: any = null;
+  private antigravityTokenCache = "";
+  private antigravityTokenCacheTime = 0;
   private memorySourceFiles = new Map<string, ScannedMemorySource>();
   private providerRotationIndices = new Map<string, number>();
 
@@ -997,9 +1025,9 @@ export class ProxyServer {
         const catalogEntry = catalog?.models?.find((m: any) => m.backend_model === reqBody.model && m.backend_provider === "antigravity");
         if (catalogEntry) {
           const token = this.resolveKey("antigravity-cli-auto");
-          let originalModel = options.requestedModel || reqBody.model;
+          let originalModel = catalogEntry.slug || options.requestedModel || reqBody.model;
           if (originalModel.includes("flash")) originalModel = "gemini-3.5-flash-low";
-          else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel === "gpt-5.5" || originalModel === "gpt-5.6-terra") originalModel = "gemini-3.1-pro-low";
+          else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel.includes("sonnet") || originalModel.includes("opus") || originalModel === "gpt-5.5" || originalModel === "gpt-5.6-terra") originalModel = "gemini-3.1-pro-low";
           else if (originalModel === "gpt-5.4-mini") originalModel = "gemini-3.5-flash-low";
           else originalModel = "gemini-3.5-flash-low";
           console.log(`[OpenCodex Antigravity Bridge] Intercepted native model ${reqBody.model}. Mapped to original model ${originalModel}. Routing to daily-cloudcode-pa.googleapis.com`);
@@ -1036,13 +1064,26 @@ export class ProxyServer {
   private async handleAntigravityBridge(requestBodyStr: string, token: string, model: string): Promise<any> {
     console.log(`[OpenCodex Antigravity Bridge] Initializing conversation...`);
     const reqBody = JSON.parse(requestBodyStr);
-    const contents = reqBody.messages.map((m: any) => {
-      let role = m.role === "assistant" ? "model" : "user";
-      return {
-        role: role,
-        parts: [{ text: m.content || "" }]
-      };
-    });
+    const contents: any[] = [];
+    for (const m of reqBody.messages) {
+      if (m.role === "system") continue;
+      const role = m.role === "assistant" ? "model" : "user";
+      const text = m.content || "";
+      if (contents.length > 0 && contents[contents.length - 1].role === role) {
+        contents[contents.length - 1].parts[0].text += "\n" + text;
+      } else {
+        contents.push({
+          role,
+          parts: [{ text }]
+        });
+      }
+    }
+    if (contents.length > 0 && contents[0].role === "model") {
+      contents.unshift({
+        role: "user",
+        parts: [{ text: "Hello" }]
+      });
+    }
 
     const antigravityPayload = {
       project: "default-cli-project",
@@ -1067,7 +1108,11 @@ export class ProxyServer {
 
     if (!response.ok) {
       const errorText = await response.text();
-      return new Response(JSON.stringify({ error: `Antigravity API Error: ${response.status} - ${errorText}` }), { status: response.status });
+      let userFriendlyMsg = `Antigravity API Error: ${response.status} - ${errorText}`;
+      if (response.status === 401) {
+        userFriendlyMsg = `[OpenCodex Proxy Error] Antigravity 登录凭证已过期/无效，请在终端（PowerShell 或 CMD）运行 "agy login" 重新登录激活权限！`;
+      }
+      return new Response(JSON.stringify({ error: userFriendlyMsg }), { status: response.status });
     }
 
     const reader = response.body!.getReader();
@@ -1811,6 +1856,45 @@ except Exception as e:
   private saveModelCatalog(catalog: any) {
     const p = join(this.configDir, "custom_model_catalog.json");
     try {
+      if (catalog && Array.isArray(catalog.models)) {
+        for (const model of catalog.models) {
+          const isCustomModel = model.provider === "opencodex" || !!model.backend_provider || model.slug.startsWith("mimo") || model.slug.includes("deepseek") || model.slug.includes("qwen");
+          if (isCustomModel) {
+            if (model.default_reasoning_level === undefined) model.default_reasoning_level = "medium";
+            if (!model.supported_reasoning_levels || model.supported_reasoning_levels.length === 0) {
+              model.supported_reasoning_levels = [
+                { effort: "low", description: "Lighter reasoning" },
+                { effort: "medium", description: "Balanced reasoning" },
+                { effort: "high", description: "Greater reasoning depth" },
+                { effort: "xhigh", description: "Extra high reasoning depth" }
+              ];
+            }
+            if (model.default_reasoning_summary === undefined) model.default_reasoning_summary = "none";
+            if (model.reasoning_summary_format === undefined) model.reasoning_summary_format = "none";
+            if (model.supports_reasoning_summaries === undefined) model.supports_reasoning_summaries = false;
+            if (model.default_verbosity === undefined) model.default_verbosity = "low";
+            if (model.support_verbosity === undefined) model.support_verbosity = false;
+            if (model.apply_patch_tool_type === undefined) model.apply_patch_tool_type = "freeform";
+            if (model.web_search_tool_type === undefined) model.web_search_tool_type = "text_and_image";
+            if (model.supports_search_tool === undefined) model.supports_search_tool = false;
+            if (model.supports_parallel_tool_calls === undefined) model.supports_parallel_tool_calls = true;
+            if (!model.experimental_supported_tools) model.experimental_supported_tools = ["computer_use", "mcp"];
+            if (!model.input_modalities) model.input_modalities = ["text", "image"];
+            if (model.supports_image_detail_original === undefined) model.supports_image_detail_original = true;
+            if (model.shell_type === undefined) model.shell_type = "shell_command";
+            if (model.visibility === undefined) model.visibility = "list";
+            if (model.minimal_client_version === undefined) model.minimal_client_version = "0.0.1";
+            if (model.supported_in_api === undefined) model.supported_in_api = true;
+            if (model.availability_nux === undefined) model.availability_nux = null;
+            if (model.upgrade === undefined) model.upgrade = null;
+            if (model.priority === undefined) model.priority = 100;
+            if (model.prefer_websockets === undefined) model.prefer_websockets = false;
+            if (!model.available_in_plans) model.available_in_plans = ["free", "plus", "pro", "team", "business", "enterprise"];
+            if (model.base_instructions === undefined) model.base_instructions = "You are a coding agent running in Codex through a local BYOK shim.";
+            if (!model.additional_speed_tiers) model.additional_speed_tiers = ["fast"];
+          }
+        }
+      }
       const jsonStr = JSON.stringify(catalog, null, 2);
       writeFileSync(p, jsonStr, "utf-8");
       console.error(`[OpenCodex] Saved custom model catalog to ${p}`);
@@ -1822,33 +1906,7 @@ except Exception as e:
   private upgradeReasoningLevelsInCatalog() {
     const catalog = this.getModelCatalog();
     if (!catalog || !Array.isArray(catalog.models)) return;
-    let updated = false;
-    for (const model of catalog.models) {
-      const isCustomModel = model.provider === "opencodex" || !!model.backend_provider || model.slug.startsWith("mimo") || model.slug.includes("deepseek") || model.slug.includes("qwen");
-      if (isCustomModel) {
-        let modelChanged = false;
-        if (!model.supported_reasoning_levels || !model.supported_reasoning_levels.some((l: any) => l.effort === "xhigh")) {
-          model.supported_reasoning_levels = [
-            { effort: "low", description: "Lighter reasoning" },
-            { effort: "medium", description: "Balanced reasoning" },
-            { effort: "high", description: "Greater reasoning depth" },
-            { effort: "xhigh", description: "Extra high reasoning depth" }
-          ];
-          model.default_reasoning_level = "medium";
-          modelChanged = true;
-        }
-        if (!model.additional_speed_tiers || !model.additional_speed_tiers.includes("fast")) {
-          model.additional_speed_tiers = ["fast"];
-          modelChanged = true;
-        }
-        if (modelChanged) {
-          updated = true;
-        }
-      }
-    }
-    if (updated) {
-      this.saveModelCatalog(catalog);
-    }
+    this.saveModelCatalog(catalog);
   }
 
   private mergeNativeModelsIntoCatalog() {
@@ -2072,18 +2130,37 @@ except Exception as e:
       }
     }
     if (raw === "antigravity-cli-auto") {
+      const now = Date.now();
+      if (this.antigravityTokenCache && (now - this.antigravityTokenCacheTime) < 300000) {
+        return this.antigravityTokenCache;
+      }
       try {
-        const stdout = execSync('security find-generic-password -a "antigravity" -s "gemini" -w', { encoding: "utf-8" }).trim();
-        if (stdout.startsWith("go-keyring-base64:")) {
-          const base64Data = stdout.substring("go-keyring-base64:".length);
-          const jsonStr = Buffer.from(base64Data, "base64").toString("utf-8");
-          const data = JSON.parse(jsonStr);
-          if (data?.token?.access_token) {
-            return data.token.access_token;
+        if (process.platform === "darwin") {
+          const stdout = execSync('security find-generic-password -a "antigravity" -s "gemini" -w', { encoding: "utf-8" }).trim();
+          if (stdout.startsWith("go-keyring-base64:")) {
+            const base64Data = stdout.substring("go-keyring-base64:".length);
+            const jsonStr = Buffer.from(base64Data, "base64").toString("utf-8");
+            const data = JSON.parse(jsonStr);
+            if (data?.token?.access_token) {
+              this.antigravityTokenCache = data.token.access_token;
+              this.antigravityTokenCacheTime = now;
+              return data.token.access_token;
+            }
+          }
+        } else if (process.platform === "win32") {
+          const psCommand = `powershell -ExecutionPolicy Bypass -Command "$Definition = 'using System; using System.Runtime.InteropServices; public class CredManager { [DllImport(\\"advapi32.dll\\", EntryPoint = \\"CredReadW\\", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr); [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct CREDENTIAL { public int Flags; public int Type; public string TargetName; public string Comment; public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten; public int CredentialBlobSize; public IntPtr CredentialBlob; public int Persist; public int AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName; } public static string GetPassword(string target) { IntPtr credPtr; if (CredRead(target, 1, 0, out credPtr)) { CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL)); byte[] bytes = new byte[cred.CredentialBlobSize]; Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize); return System.Text.Encoding.UTF8.GetString(bytes); } return null; } }'; Add-Type -TypeDefinition $Definition; [CredManager]::GetPassword('gemini:antigravity')"`;
+          const stdout = execSync(psCommand, { encoding: "utf-8" }).trim();
+          if (stdout) {
+            const data = JSON.parse(stdout);
+            if (data?.token?.access_token) {
+              this.antigravityTokenCache = data.token.access_token;
+              this.antigravityTokenCacheTime = now;
+              return data.token.access_token;
+            }
           }
         }
       } catch (e: any) {
-        console.error("[OpenCodex] Failed to auto-resolve Antigravity token from Keychain:", e);
+        console.error("[OpenCodex] Failed to auto-resolve Antigravity token:", e);
       }
       const op = this.config.providers.find((p: any) => p.name === "opencode");
       return op ? op.api_key : "dummy";
@@ -3565,6 +3642,7 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/models" && req.method === "GET") {
       // Returns complete model catalog & enabled models
+      this.mergeNativeModelsIntoCatalog();
       const catalog = this.getModelCatalog();
       const active = catalog.models?.filter((m: any) => m.visibility === "list").map((m: any) => m.slug) || [];
       
@@ -3589,6 +3667,7 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/models" && req.method === "POST") {
       try {
+        this.mergeNativeModelsIntoCatalog();
         const data = JSON.parse(body);
         console.log("[OpenCodex] Received POST /api/models data:", data);
         const activeIds = data.active || [];
@@ -5174,6 +5253,38 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/v1/chat/completions" && req.method === "POST") {
       this.handleChat(body, res);
+      return;
+    }
+
+    if (path.startsWith("/v1/")) {
+      console.log(`[OpenCodex Proxy] Transparently proxying unhandled API route ${path} to api.openai.com`);
+      try {
+        const headers: Record<string, string> = {};
+        for (const [key, val] of Object.entries(req.headers)) {
+          if (key.toLowerCase() === "host") continue;
+          headers[key] = Array.isArray(val) ? val[0] : (val || "");
+        }
+        
+        const response = await fetch(`https://api.openai.com${req.url}`, {
+          method: req.method,
+          headers,
+          body: req.method !== "GET" && req.method !== "HEAD" ? rawBody : undefined,
+          dispatcher: fetchDispatcher
+        });
+
+        const resHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(response.headers)) {
+          resHeaders[k] = Array.isArray(v) ? v.join(", ") : v || "";
+        }
+
+        res.writeHead(response.status, resHeaders);
+        const resBody = await response.arrayBuffer();
+        res.end(Buffer.from(resBody));
+      } catch (err: any) {
+        console.error(`[OpenCodex Proxy] Failed to proxy unhandled route ${path}: ${err.message}`);
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: `Proxy failed: ${err.message}` }));
+      }
       return;
     }
 
