@@ -862,6 +862,80 @@ export function getDashboardHtml(): string {
 
               <button type="submit" class="action-btn" id="i18n-btn-save-vision-fallback" style="margin-top: 0.5rem;">Save Vision Fallback Settings</button>
             </form>
+           </div>
+
+          <!-- Local CLI Auto-Detector -->
+          <div class="panel-card">
+            <div class="panel-title" id="i18n-cli-detector-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+              Local CLI Session Auto-Detector (本地 CLI 会话检测)
+            </div>
+            
+            <div style="display: flex; flex-direction: column; gap: 1.25rem;">
+              <p id="i18n-cli-detector-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
+                自动检测本地已登录的 CLI 终端会话。点击“一键配置”即可自动在 Codex 中注入代理和模型，无需手动复制 Key。
+              </p>
+              
+              <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                <!-- Grok CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Grok CLI</span>
+                      <span id="cli-status-grok-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-grok-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-grok" class="action-btn" onclick="activateCli('grok')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-grok" class="action-btn" onclick="deactivateCli('grok')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Claude CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Claude CLI (Claude Code)</span>
+                      <span id="cli-status-claude-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-claude-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-claude" class="action-btn" onclick="activateCli('claude')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-claude" class="action-btn" onclick="deactivateCli('claude')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Antigravity CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Antigravity</span>
+                      <span id="cli-status-antigravity-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-antigravity-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-antigravity" class="action-btn" onclick="activateCli('antigravity')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-antigravity" class="action-btn" onclick="deactivateCli('antigravity')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1617,13 +1691,22 @@ export function getDashboardHtml(): string {
       const providers = (configData.providers || []).map(p => ({
         name: p.name,
         base_url: p.base_url,
-        api_key: p.api_key
+        api_key: p.api_key,
+        api_keys: p.api_keys
       })).filter(p => p.name !== providerName);
       
+      let apiKeys = undefined;
+      let finalApiKey = apiKey;
+      if (apiKey.includes(',')) {
+        apiKeys = apiKey.split(',').map(s => s.trim()).filter(Boolean);
+        finalApiKey = apiKeys[0] || '';
+      }
+
       providers.push({
         name: providerName,
         base_url: baseUrl,
-        api_key: apiKey
+        api_key: finalApiKey,
+        api_keys: apiKeys
       });
 
       // Get existing catalog models from UI or catalog
@@ -1756,6 +1839,128 @@ export function getDashboardHtml(): string {
         }
       } catch (err) {
         showToast(i18nDict[currentLang].toastConnFailed, true);
+      }
+    }
+
+    async function checkCliStatus() {
+      try {
+        const res = await fetch('/api/cli-bridge/status');
+        const data = await res.json();
+
+        // Update Grok
+        const grokBadge = document.getElementById('cli-status-grok-badge');
+        const grokDetails = document.getElementById('cli-status-grok-details');
+        const grokBtn = document.getElementById('btn-activate-grok');
+        const grokDeactBtn = document.getElementById('btn-deactivate-grok');
+
+        if (data.grok.detected) {
+          grokBadge.innerText = data.grok.active ? (currentLang === 'zh' ? '已启用' : 'Active') : (currentLang === 'zh' ? '检测到会话' : 'Detected');
+          grokBadge.style.background = data.grok.active ? 'rgba(46,204,113,0.2)' : 'rgba(230,126,34,0.2)';
+          grokBadge.style.color = data.grok.active ? '#2ecc71' : '#e67e22';
+          
+          grokDetails.innerText = (currentLang === 'zh' ? '检测到会话：' : 'Session detected: ') + data.grok.email;
+          grokBtn.style.display = data.grok.active ? 'none' : 'block';
+          grokDeactBtn.style.display = data.grok.active ? 'block' : 'none';
+        } else {
+          grokBadge.innerText = currentLang === 'zh' ? '未检测到' : 'Not Detected';
+          grokBadge.style.background = 'rgba(231,76,60,0.15)';
+          grokBadge.style.color = '#e74c3c';
+          grokDetails.innerText = currentLang === 'zh' ? '请在终端运行 grok-cli 登录账号' : 'Please run grok-cli login in terminal';
+          grokBtn.style.display = 'none';
+          grokDeactBtn.style.display = 'none';
+        }
+
+        // Update Claude
+        const claudeBadge = document.getElementById('cli-status-claude-badge');
+        const claudeDetails = document.getElementById('cli-status-claude-details');
+        const claudeBtn = document.getElementById('btn-activate-claude');
+        const claudeDeactBtn = document.getElementById('btn-deactivate-claude');
+
+        if (data.claude.detected) {
+          claudeBadge.innerText = data.claude.active ? (currentLang === 'zh' ? '已启用' : 'Active') : (currentLang === 'zh' ? '检测到会话' : 'Detected');
+          claudeBadge.style.background = data.claude.active ? 'rgba(46,204,113,0.2)' : 'rgba(230,126,34,0.2)';
+          claudeBadge.style.color = data.claude.active ? '#2ecc71' : '#e67e22';
+
+          claudeDetails.innerText = (currentLang === 'zh' ? '代理地址：' : 'Adapter URL: ') + data.claude.baseUrl;
+          claudeBtn.style.display = data.claude.active ? 'none' : 'block';
+          claudeDeactBtn.style.display = data.claude.active ? 'block' : 'none';
+        } else {
+          claudeBadge.innerText = currentLang === 'zh' ? '未检测到' : 'Not Detected';
+          claudeBadge.style.background = 'rgba(231,76,60,0.15)';
+          claudeBadge.style.color = '#e74c3c';
+          claudeDetails.innerText = currentLang === 'zh' ? '未检测到 Claude CLI 登录态' : 'No Claude CLI login state detected';
+          claudeBtn.style.display = 'none';
+          claudeDeactBtn.style.display = 'none';
+        }
+
+        // Update Antigravity
+        const antiBadge = document.getElementById('cli-status-antigravity-badge');
+        const antiDetails = document.getElementById('cli-status-antigravity-details');
+        const antiBtn = document.getElementById('btn-activate-antigravity');
+        const antiDeactBtn = document.getElementById('btn-deactivate-antigravity');
+
+        if (data.antigravity.active) {
+          antiBadge.innerText = currentLang === 'zh' ? '已启用' : 'Active';
+          antiBadge.style.background = 'rgba(46,204,113,0.2)';
+          antiBadge.style.color = '#2ecc71';
+          antiDetails.innerText = currentLang === 'zh' ? '本地 AI 编码助手服务已就绪' : 'Local AI Agent service is ready';
+          antiBtn.style.display = 'none';
+          antiDeactBtn.style.display = 'block';
+        } else {
+          antiBadge.innerText = currentLang === 'zh' ? '未启用' : 'Inactive';
+          antiBadge.style.background = 'rgba(230,126,34,0.2)';
+          antiBadge.style.color = '#e67e22';
+          antiDetails.innerText = currentLang === 'zh' ? '模型未加入 Codex 列表' : 'Model not added to Codex';
+          antiBtn.style.display = 'block';
+          antiDeactBtn.style.display = 'none';
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function activateCli(cliName) {
+      try {
+        const res = await fetch('/api/cli-bridge/activate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cli: cliName })
+        });
+        if (res.ok) {
+          showToast(currentLang === 'zh' ? '🎉 模型配置成功！' : '🎉 Models configured successfully!', false);
+          await checkCliStatus();
+          await loadConfig();
+          await loadModels();
+        } else {
+          const err = await res.json();
+          showToast(err.error || 'Failed to activate', true);
+        }
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    async function deactivateCli(cliName) {
+      if (!confirm(currentLang === 'zh' ? '确认要清理所有属于 ' + cliName + ' 的模型和配置吗？' : 'Confirm to clean up all models and config for ' + cliName + '?')) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/cli-bridge/deactivate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cli: cliName })
+        });
+        if (res.ok) {
+          showToast(currentLang === 'zh' ? '🎉 模型清理成功！' : '🎉 Models cleaned up successfully!', false);
+          await checkCliStatus();
+          await loadConfig();
+          await loadModels();
+        } else {
+          const err = await res.json();
+          showToast(err.error || 'Failed to deactivate', true);
+        }
+      } catch (e) {
+        showToast(e.message, true);
       }
     }
 
@@ -2642,11 +2847,14 @@ export function getDashboardHtml(): string {
     window.deleteSession = deleteSession;
     window.toggleArchiveSession = toggleArchiveSession;
     window.launchVoiceBar = launchVoiceBar;
-    window.toggleDesktopOrb = toggleDesktopOrb;
+    window.checkCliStatus = checkCliStatus;
+    window.activateCli = activateCli;
+    window.deactivateCli = deactivateCli;
 
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
       await loadConfig();
+      try { await checkCliStatus(); } catch {}
       await loadModels();
       await loadVoiceSettings();
       

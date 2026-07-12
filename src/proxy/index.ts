@@ -25,6 +25,13 @@ const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.en
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 const MAX_REQUEST_BODY_BYTES = 80 * 1024 * 1024;
+
+class UpstreamError extends Error {
+  constructor(public status: number, public text: string) {
+    super(`Upstream error: ${status} - ${text}`);
+    this.name = "UpstreamError";
+  }
+}
 const REQUEST_DEBUG_ENABLED = process.env.OPENCODEX_DEBUG_REQUESTS === "1";
 
 function isTrustedBrowserOrigin(origin: string | undefined): boolean {
@@ -133,6 +140,7 @@ interface ProviderConfig {
   name: string;
   base_url: string;
   api_key: string;
+  api_keys?: string[];
   vision_model?: string;
 }
 
@@ -807,6 +815,515 @@ export class ProxyServer {
   private vadCallbackQueue: ((res: any) => void)[] = [];
   private orbProcess: any = null;
   private memorySourceFiles = new Map<string, ScannedMemorySource>();
+  private providerRotationIndices = new Map<string, number>();
+
+  private getNextKeyForProvider(provider: ProviderConfig): string {
+    const keys = provider.api_keys && provider.api_keys.length > 0 ? provider.api_keys : [provider.api_key];
+    if (keys.length <= 1) {
+      return this.resolveKey(keys[0] || "");
+    }
+    let idx = this.providerRotationIndices.get(provider.name) || 0;
+    const key = keys[idx];
+    idx = (idx + 1) % keys.length;
+    this.providerRotationIndices.set(provider.name, idx);
+    console.log(`[OpenCodex Key Rotation] Rotating key for provider ${provider.name} (index: ${idx}, total keys: ${keys.length})`);
+    return this.resolveKey(key);
+  }
+
+  private loginStatus = { status: "idle", error: "" };
+  private loginBrowserProcess: any = null;
+
+  private getLoginStatus() {
+    return this.loginStatus;
+  }
+
+  private async launchLoginBrowser(platform: string, providerName: string) {
+    if (this.loginBrowserProcess) {
+      try { this.loginBrowserProcess.kill(); } catch {}
+      this.loginBrowserProcess = null;
+    }
+
+    this.loginStatus = { status: "logging_in", error: "" };
+    console.log(`[OpenCodex Web Login] Launching login window for ${platform}...`);
+
+    const loginUrl = platform === "grok-web" ? "https://x.com/login" : "https://chatgpt.com/auth/login";
+    const port = 9222;
+    const profileDir = join(this.configDir, `login-profile-${platform}`);
+
+    const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+    if (!existsSync(chromePath)) {
+      this.loginStatus = { status: "failed", error: "Google Chrome not found in /Applications" };
+      return;
+    }
+
+    const args = [
+      `--remote-debugging-port=${port}`,
+      `--user-data-dir=${profileDir}`,
+      "--no-first-run",
+      "--no-default-browser-check",
+      loginUrl
+    ];
+
+    try {
+      this.loginBrowserProcess = spawn(chromePath, args);
+      this.loginBrowserProcess.on("exit", () => {
+        console.log(`[OpenCodex Web Login] Browser window closed.`);
+        if (this.loginStatus.status === "logging_in") {
+          this.loginStatus = { status: "failed", error: "User closed the browser window before completing login" };
+        }
+        this.loginBrowserProcess = null;
+      });
+
+      setTimeout(async () => {
+        try {
+          await this.monitorLoginCookies(platform, providerName, port, profileDir);
+        } catch (err: any) {
+          console.error(`[OpenCodex Web Login Error]`, err);
+          this.loginStatus = { status: "failed", error: err.message };
+        }
+      }, 2500);
+
+    } catch (err: any) {
+      this.loginStatus = { status: "failed", error: err.message };
+    }
+  }
+
+  private async monitorLoginCookies(platform: string, providerName: string, port: number, profileDir: string) {
+    let wsUrl = "";
+    try {
+      const listRes = await fetch(`http://127.0.0.1:${port}/json/list`, { dispatcher: fetchDispatcher });
+      const pages = (await listRes.json()) as any[];
+      const targetPage = pages.find((p: any) => p.type === "page");
+      if (targetPage && targetPage.webSocketDebuggerUrl) {
+        wsUrl = targetPage.webSocketDebuggerUrl;
+      }
+    } catch (e: any) {
+      console.log(`[OpenCodex Web Login] Retrying CDP connection...`);
+      await new Promise(r => setTimeout(r, 2000));
+      const listRes = await fetch(`http://127.0.0.1:${port}/json/list`, { dispatcher: fetchDispatcher });
+      const pages = (await listRes.json()) as any[];
+      const targetPage = pages.find((p: any) => p.type === "page");
+      if (targetPage && targetPage.webSocketDebuggerUrl) {
+        wsUrl = targetPage.webSocketDebuggerUrl;
+      }
+    }
+
+    if (!wsUrl) {
+      throw new Error("Could not find Chrome debugger WebSocket URL");
+    }
+
+    console.log(`[OpenCodex Web Login] Connected to CDP: ${wsUrl}`);
+    const ws = new WebSocket(wsUrl);
+
+    ws.on("open", () => {
+      ws.send(JSON.stringify({ id: 1, method: "Network.enable" }));
+    });
+
+    const interval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ id: 2, method: "Network.getCookies" }));
+      }
+    }, 1500);
+
+    ws.on("message", (dataStr) => {
+      try {
+        const msg = JSON.parse(dataStr.toString());
+        if (msg.id === 2 && msg.result && Array.isArray(msg.result.cookies)) {
+          const cookies = msg.result.cookies;
+          
+          if (platform === "grok-web") {
+            const authToken = cookies.find((c: any) => c.name === "auth_token");
+            const ct0 = cookies.find((c: any) => c.name === "ct0");
+            if (authToken && ct0) {
+              clearInterval(interval);
+              ws.close();
+              const cookieStr = `auth_token=${authToken.value}; ct0=${ct0.value}`;
+              console.log(`[OpenCodex Web Login] Successfully captured Grok cookies!`);
+              this.saveCapturedCookieToProvider(providerName, cookieStr, "grok-web");
+              this.cleanupLoginCapture(profileDir);
+            }
+          } else if (platform === "chatgpt-web") {
+            const sessionToken = cookies.find((c: any) => c.name === "__Secure-next-auth.session-token");
+            if (sessionToken) {
+              clearInterval(interval);
+              ws.close();
+              const cookieStr = `__Secure-next-auth.session-token=${sessionToken.value}`;
+              console.log(`[OpenCodex Web Login] Successfully captured ChatGPT session token!`);
+              this.saveCapturedCookieToProvider(providerName, cookieStr, "chatgpt-web");
+              this.cleanupLoginCapture(profileDir);
+            }
+          }
+        }
+      } catch (err) {
+        console.error("[OpenCodex Web Login CDP Msg Error]", err);
+      }
+    });
+
+    ws.on("close", () => {
+      clearInterval(interval);
+    });
+  }
+
+  private saveCapturedCookieToProvider(providerName: string, cookieStr: string, platformType: string) {
+    let provider = this.config.providers.find(p => p.name === providerName);
+    if (!provider) {
+      provider = {
+        name: providerName,
+        base_url: platformType,
+        api_key: cookieStr
+      };
+      this.config.providers.push(provider);
+    } else {
+      provider.base_url = platformType;
+      provider.api_key = cookieStr;
+    }
+    this.saveConfig();
+    this.loginStatus = { status: "success", error: "" };
+    console.log(`[OpenCodex Config] Auto-updated provider config for ${providerName}`);
+  }
+
+  private cleanupLoginCapture(profileDir: string) {
+    if (this.loginBrowserProcess) {
+      try { this.loginBrowserProcess.kill(); } catch {}
+      this.loginBrowserProcess = null;
+    }
+  }
+
+  private async fetchWithWebBridge(url: string, options: any): Promise<any> {
+    try {
+      if (options.body) {
+        const reqBody = JSON.parse(options.body);
+        if (reqBody.model === "gpt-5.5" || reqBody.model === "gpt-5.4-mini") {
+          const token = this.resolveKey("antigravity-cli-auto");
+          let originalModel = options.requestedModel || reqBody.model;
+          if (originalModel.includes("flash")) originalModel = "gemini-3.5-flash-low";
+          else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel === "gpt-5.5") originalModel = "gemini-3.1-pro-low";
+          else if (originalModel === "gpt-5.4-mini") originalModel = "gemini-3.5-flash-low";
+          else originalModel = "gemini-3.5-flash-low";
+          console.log(`[OpenCodex Antigravity Bridge] Intercepted native model ${reqBody.model}. Mapped to original model ${originalModel}. Routing to daily-cloudcode-pa.googleapis.com`);
+          return this.handleAntigravityBridge(options.body, token, originalModel);
+        }
+      }
+    } catch {}
+
+    const isGrokWeb = url.includes("grok-web");
+    const isChatGPTWeb = url.includes("chatgpt-web");
+
+    if (!isGrokWeb && !isChatGPTWeb) {
+      return fetch(url, options);
+    }
+
+    const cookieStr = (options.headers["Authorization"] || "").replace("Bearer ", "");
+    let finalCookie = cookieStr;
+    if (!finalCookie || finalCookie === "...") {
+      const targetProviderName = isChatGPTWeb ? "chatgpt" : "grok";
+      const p = this.config.providers.find((prov: any) => prov.name === targetProviderName);
+      if (p && p.api_key) {
+        finalCookie = this.resolveKey(p.api_key);
+        console.log(`[OpenCodex Web Bridge] Fallback to auto-captured cookies for ${targetProviderName}`);
+      }
+    }
+    
+    if (isChatGPTWeb) {
+      return this.handleChatGPTWebBridge(options.body, finalCookie);
+    } else {
+      return this.handleGrokWebBridge(options.body, finalCookie);
+    }
+  }
+
+  private async handleAntigravityBridge(requestBodyStr: string, token: string, model: string): Promise<any> {
+    console.log(`[OpenCodex Antigravity Bridge] Initializing conversation...`);
+    const reqBody = JSON.parse(requestBodyStr);
+    const contents = reqBody.messages.map((m: any) => {
+      let role = m.role === "assistant" ? "model" : "user";
+      return {
+        role: role,
+        parts: [{ text: m.content || "" }]
+      };
+    });
+
+    const antigravityPayload = {
+      project: "default-cli-project",
+      model: model,
+      request: {
+        contents: contents,
+        generationConfig: {}
+      }
+    };
+
+    const response = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity/hub/2.2.1 darwin/arm64",
+        "Accept-Encoding": "gzip"
+      },
+      body: JSON.stringify(antigravityPayload),
+      dispatcher: fetchDispatcher
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return new Response(JSON.stringify({ error: `Antigravity API Error: ${response.status} - ${errorText}` }), { status: response.status });
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const simulatedStream = new ReadableStream({
+      async pull(controller) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            controller.close();
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              const part = data.response?.candidates?.[0]?.content?.parts?.[0]?.text || data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              if (part) {
+                const choices = [{
+                  delta: { content: part }
+                }];
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices })}\n\n`));
+              }
+            } catch {}
+          }
+        }
+      }
+    });
+
+    return new Response(simulatedStream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+
+  private async handleChatGPTWebBridge(requestBodyStr: string, sessionToken: string): Promise<any> {
+    console.log(`[OpenCodex ChatGPT Web Bridge] Initializing conversation...`);
+    const reqBody = JSON.parse(requestBodyStr);
+    const prompt = reqBody.messages?.[reqBody.messages.length - 1]?.content || "Hello";
+
+    let accessToken = "";
+    try {
+      const sessionRes = await fetch("https://chatgpt.com/api/auth/session", {
+        headers: {
+          "Cookie": `__Secure-next-auth.session-token=${sessionToken}`,
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        dispatcher: fetchDispatcher
+      });
+      if (!sessionRes.ok) {
+        throw new Error(`Failed to fetch session: ${sessionRes.status}`);
+      }
+      const sessionData = await sessionRes.json() as any;
+      accessToken = sessionData.accessToken;
+    } catch (err: any) {
+      console.error(`[OpenCodex ChatGPT Web Bridge Auth Error]`, err);
+      return new Response(JSON.stringify({ error: `Authentication failed: ${err.message}` }), { status: 401 });
+    }
+
+    const chatGptWebPayload = {
+      action: "next",
+      messages: [
+        {
+          id: randomUUID(),
+          author: { role: "user" },
+          content: { content_type: "text", parts: [prompt] },
+          metadata: {}
+        }
+      ],
+      parent_message_id: randomUUID(),
+      model: "auto",
+      timezone_offset_min: -480,
+      history_and_training_disabled: false,
+      conversation_mode: { kind: "primary_assistant" }
+    };
+
+    const response = await fetch("https://chatgpt.com/backend-api/conversation", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      body: JSON.stringify(chatGptWebPayload),
+      dispatcher: fetchDispatcher
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return new Response(JSON.stringify({ error: `ChatGPT Web API Error: ${response.status} - ${errorText}` }), { status: response.status });
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const simulatedStream = new ReadableStream({
+      async pull(controller) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            controller.close();
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              const part = data.message?.content?.parts?.[0] || "";
+              const choices = [{
+                delta: { content: part }
+              }];
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices })}\n\n`));
+            } catch {}
+          }
+        }
+      }
+    });
+
+    return new Response(simulatedStream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
+
+  private async handleGrokWebBridge(requestBodyStr: string, cookieStr: string): Promise<any> {
+    console.log(`[OpenCodex Grok Web Bridge] Initializing conversation...`);
+    const reqBody = JSON.parse(requestBodyStr);
+    const prompt = reqBody.messages?.[reqBody.messages.length - 1]?.content || "Hello";
+
+    const ct0Match = cookieStr.match(/ct0=([^;]+)/);
+    const ct0 = ct0Match ? ct0Match[1] : "";
+
+    let conversationId = "";
+    try {
+      const convoRes = await fetch("https://x.com/i/api/graphql/vvC5uy7pWWHXS2aDi1FZeA/CreateGrokConversation", {
+        method: "POST",
+        headers: {
+          "Cookie": cookieStr,
+          "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+          "x-csrf-token": ct0,
+          "x-twitter-active-user": "yes",
+          "x-twitter-auth-type": "OAuth2Session",
+          "Content-Type": "application/json",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        body: JSON.stringify({ variables: {}, queryId: "vvC5uy7pWWHXS2aDi1FZeA" }),
+        dispatcher: fetchDispatcher
+      });
+      if (convoRes.ok) {
+        const convoData = (await convoRes.json()) as any;
+        conversationId = convoData?.data?.create_grok_conversation?.conversation_id || "";
+      } else {
+        const errText = await convoRes.text();
+        return new Response(JSON.stringify({ error: `CreateGrokConversation failed: ${convoRes.status} - ${errText}` }), { status: convoRes.status });
+      }
+    } catch (e: any) {
+      console.error("[OpenCodex Grok Web Bridge] Failed to initialize conversation:", e);
+      return new Response(JSON.stringify({ error: `CreateGrokConversation exception: ${e.message}` }), { status: 500 });
+    }
+
+    if (!conversationId) {
+      return new Response(JSON.stringify({ error: `Could not obtain conversationId from CreateGrokConversation` }), { status: 500 });
+    }
+
+    const grokWebPayload = {
+      responses: [{ message: prompt, sender: 1, promptSource: "", fileAttachments: [] }],
+      systemPromptName: "",
+      grokModelOptionId: "grok-3",
+      conversationId: conversationId,
+      returnSearchResults: true,
+      returnCitations: true,
+      promptMetadata: { promptSource: "NATURAL", action: "INPUT" },
+      imageGenerationCount: 4,
+      requestFeatures: { eagerTweets: true, serverHistory: true },
+      enableCustomization: true,
+      enableSideBySide: true,
+      toolOverrides: {},
+      isDeepsearch: false,
+      isReasoning: false
+    };
+
+    const response = await fetch("https://x.com/i/api/2/grok/add_response.json", {
+      method: "POST",
+      headers: {
+        "Cookie": cookieStr,
+        "authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+        "x-csrf-token": ct0,
+        "x-twitter-active-user": "yes",
+        "x-twitter-auth-type": "OAuth2Session",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      },
+      body: JSON.stringify(grokWebPayload),
+      dispatcher: fetchDispatcher
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      return new Response(JSON.stringify({ error: `Grok Web API Error: ${response.status} - ${errorText}` }), { status: response.status });
+    }
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const simulatedStream = new ReadableStream({
+      async pull(controller) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) {
+            controller.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+            controller.close();
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === "data: [DONE]") continue;
+            try {
+              const cleanLine = trimmed.startsWith("data: ") ? trimmed.slice(6) : trimmed;
+              const data = JSON.parse(cleanLine);
+              const text = data.result?.message || data.grokResponseToken || "";
+              if (text) {
+                const choices = [{
+                  delta: { content: text }
+                }];
+                controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices })}\n\n`));
+              }
+            } catch {}
+          }
+        }
+      }
+    });
+
+    return new Response(simulatedStream, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" }
+    });
+  }
 
   constructor() {
     this.ensureConfigDir();
@@ -1211,6 +1728,24 @@ except Exception as e:
         this.config = JSON.parse(readFileSync(p, "utf-8"));
         console.error(`[OpenCodex] Loaded providers configuration: ${p}`);
 
+        if (this.config.providers && Array.isArray(this.config.providers)) {
+          for (const prov of this.config.providers) {
+            if (prov.base_url === "claude-cli-auto-url") {
+              try {
+                const claudeSettingsPath = join(homedir(), ".claude", "settings.json");
+                if (existsSync(claudeSettingsPath)) {
+                  const settings = JSON.parse(readFileSync(claudeSettingsPath, "utf-8"));
+                  prov.base_url = settings?.env?.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
+                } else {
+                  prov.base_url = "https://api.anthropic.com/v1";
+                }
+              } catch {
+                prov.base_url = "https://api.anthropic.com/v1";
+              }
+            }
+          }
+        }
+
         // Clean up unused blank providers on startup
         const catalog = this.getModelCatalog();
         const activeProviders = new Set<string>();
@@ -1488,6 +2023,16 @@ except Exception as e:
 
   private findProvider(model: string, catalogEntry?: any): ProviderConfig | null {
     const providerName = catalogEntry?.backend_provider || catalogEntry?.provider;
+    if (providerName === "antigravity") {
+      if (model.includes("claude")) {
+        const found = this.config.providers.find(p => p.name === "claude");
+        if (found) return found;
+      }
+      if (model.includes("gpt-oss")) {
+        const found = this.config.providers.find(p => p.name === "opencode");
+        if (found) return found;
+      }
+    }
     if (providerName && providerName !== "opencodex") {
       const found = this.config.providers.find(p => p.name === providerName);
       if (found) return found;
@@ -1499,6 +2044,48 @@ except Exception as e:
   }
 
   private resolveKey(raw: string): string {
+    if (raw === "grok-cli-auto") {
+      try {
+        const authPath = join(homedir(), ".grok", "auth.json");
+        if (existsSync(authPath)) {
+          const authData = JSON.parse(readFileSync(authPath, "utf-8"));
+          const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
+          if (sessionKey && authData[sessionKey]?.key) {
+            return authData[sessionKey].key;
+          }
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Grok CLI token:", e);
+      }
+    }
+    if (raw === "claude-cli-auto") {
+      try {
+        const claudeSettingsPath = join(homedir(), ".claude", "settings.json");
+        if (existsSync(claudeSettingsPath)) {
+          const settings = JSON.parse(readFileSync(claudeSettingsPath, "utf-8"));
+          return settings?.env?.ANTHROPIC_API_KEY || "";
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Claude CLI token:", e);
+      }
+    }
+    if (raw === "antigravity-cli-auto") {
+      try {
+        const stdout = execSync('security find-generic-password -a "antigravity" -s "gemini" -w', { encoding: "utf-8" }).trim();
+        if (stdout.startsWith("go-keyring-base64:")) {
+          const base64Data = stdout.substring("go-keyring-base64:".length);
+          const jsonStr = Buffer.from(base64Data, "base64").toString("utf-8");
+          const data = JSON.parse(jsonStr);
+          if (data?.token?.access_token) {
+            return data.token.access_token;
+          }
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Antigravity token from Keychain:", e);
+      }
+      const op = this.config.providers.find((p: any) => p.name === "opencode");
+      return op ? op.api_key : "dummy";
+    }
     if (raw.startsWith("$")) {
       return process.env[raw.slice(1)] || "";
     }
@@ -2664,7 +3251,7 @@ stream_idle_timeout_ms = 600000
             if (newP.api_key && (newP.api_key.includes("...") || newP.api_key.endsWith("..."))) {
               const oldP = this.config.providers.find((p: any) => p.name === newP.name);
               if (oldP && oldP.api_key) {
-                return { ...newP, api_key: oldP.api_key };
+                return { ...newP, api_key: oldP.api_key, api_keys: oldP.api_keys };
               }
             }
             return newP;
@@ -2715,6 +3302,260 @@ stream_idle_timeout_ms = 600000
       } catch (err: any) {
         const isInputError = String(err.message || "").includes("No supported conversation messages");
         res.writeHead(isInputError ? 400 : 500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/cli-bridge/status" && req.method === "GET") {
+      let grokDetected = false;
+      let grokEmail = "";
+      let grokExpiresAt = "";
+      let grokActive = false;
+
+      try {
+        const grokAuthPath = join(homedir(), ".grok", "auth.json");
+        if (existsSync(grokAuthPath)) {
+          const authData = JSON.parse(readFileSync(grokAuthPath, "utf-8"));
+          const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
+          if (sessionKey && authData[sessionKey]?.key) {
+            grokDetected = true;
+            grokEmail = authData[sessionKey].email || "";
+            grokExpiresAt = authData[sessionKey].expires_at || "";
+          }
+        }
+      } catch {}
+
+      let claudeDetected = false;
+      let claudeBaseUrl = "";
+      let claudeActive = false;
+
+      try {
+        const claudeSettingsPath = join(homedir(), ".claude", "settings.json");
+        if (existsSync(claudeSettingsPath)) {
+          const settings = JSON.parse(readFileSync(claudeSettingsPath, "utf-8"));
+          if (settings?.env?.ANTHROPIC_API_KEY) {
+            claudeDetected = true;
+            claudeBaseUrl = settings?.env?.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
+          }
+        }
+      } catch {}
+
+      const catalog = this.getModelCatalog();
+      const hasGrokModel = catalog?.models?.some((m: any) => m.backend_provider === "grok");
+      const hasClaudeModel = catalog?.models?.some((m: any) => m.backend_provider === "claude");
+      const hasAntigravityModel = catalog?.models?.some((m: any) => m.backend_provider === "antigravity");
+
+      let antigravityActive = false;
+
+      if (this.config && Array.isArray(this.config.providers)) {
+        const gp = this.config.providers.find((p: any) => p.name === "grok");
+        if (gp && gp.api_key === "grok-cli-auto" && hasGrokModel) {
+          grokActive = true;
+        }
+        const cp = this.config.providers.find((p: any) => p.name === "claude");
+        if (cp && cp.api_key === "claude-cli-auto" && hasClaudeModel) {
+          claudeActive = true;
+        }
+        const ap = this.config.providers.find((p: any) => p.name === "antigravity");
+        if (ap && ap.api_key === "antigravity-cli-auto" && hasAntigravityModel) {
+          antigravityActive = true;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        grok: { detected: grokDetected, email: grokEmail, expiresAt: grokExpiresAt, active: grokActive },
+        claude: { detected: claudeDetected, baseUrl: claudeBaseUrl, active: claudeActive },
+        antigravity: { detected: true, active: antigravityActive }
+      }));
+      return;
+    }
+
+    if (path === "/api/cli-bridge/activate" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const cliName = data.cli;
+
+        if (cliName === "grok") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "grok");
+          providers.push({
+            name: "grok",
+            base_url: "https://api.x.ai/v1",
+            api_key: "grok-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "grok");
+            
+            const modelsToAdd = [
+              { slug: "grok-4.5", model: "grok-4.5", display_name: "grok-4.5", backend_model: "grok-4.5", context_window: 500000, max_context_window: 500000 },
+              { slug: "grok-4.3", model: "grok-4.3", display_name: "grok-4.3", backend_model: "grok-4.3", context_window: 1000000, max_context_window: 1000000 },
+              { slug: "grok-4.20-reasoning", model: "grok-4.20-0309-reasoning", display_name: "grok-4.20-reasoning", backend_model: "grok-4.20-0309-reasoning", context_window: 1000000, max_context_window: 1000000 }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "grok",
+                description: `Custom model: ${item.display_name} (grok)`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else if (cliName === "claude") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "claude");
+          providers.push({
+            name: "claude",
+            base_url: "claude-cli-auto-url",
+            api_key: "claude-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "claude");
+            
+            const modelsToAdd = [
+              { slug: "claude-3-5-sonnet", model: "claude-3-5-sonnet", display_name: "claude-3-5-sonnet", backend_model: "claude-3-5-sonnet-20241022", context_window: 200000, max_context_window: 200000 },
+              { slug: "claude-3-5-haiku", model: "claude-3-5-haiku", display_name: "claude-3-5-haiku", backend_model: "claude-3-5-haiku-20241022", context_window: 200000, max_context_window: 200000 }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "claude",
+                description: `Custom model: ${item.display_name} (claude)`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else if (cliName === "antigravity") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "antigravity");
+          providers.push({
+            name: "antigravity",
+            base_url: "https://opencode.ai/zen/go/v1",
+            api_key: "antigravity-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "antigravity");
+            
+            const modelsToAdd = [
+              { slug: "gemini-3.5-flash-medium", model: "gemini-3.5-flash-medium", display_name: "Gemini 3.5 Flash (Medium)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.5-flash-high", model: "gemini-3.5-flash-high", display_name: "Gemini 3.5 Flash (High)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.1-pro-low", model: "gemini-3.1-pro-low", display_name: "Gemini 3.1 Pro (Low)", backend_model: "gpt-5.5" },
+              { slug: "gemini-3.1-pro-high", model: "gemini-3.1-pro-high", display_name: "Gemini 3.1 Pro (High)", backend_model: "gpt-5.5" },
+              { slug: "claude-sonnet-4.6-thinking", model: "claude-sonnet-4.6-thinking", display_name: "Claude Sonnet 4.6 (Thinking)", backend_model: "gpt-5.5" },
+              { slug: "claude-opus-4.6-thinking", model: "claude-opus-4.6-thinking", display_name: "Claude Opus 4.6 (Thinking)", backend_model: "gpt-5.6-terra" },
+              { slug: "gpt-oss-120b-medium", model: "gpt-oss-120b-medium", display_name: "GPT-OSS 120B (Medium)", backend_model: "deepseek-v4-pro" }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "antigravity",
+                description: `Antigravity model: ${item.display_name}`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid CLI name" }));
+          return;
+        }
+
+        this.loadConfig();
+        this.patchCodexConfig();
+        this.autoPatchPlugins();
+        
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/cli-bridge/deactivate" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const cliName = data.cli;
+
+        let providers = this.config.providers || [];
+        providers = providers.filter((p: any) => p.name !== cliName);
+        this.config.providers = providers;
+        this.saveConfig();
+
+        const catalog = this.getModelCatalog();
+        if (catalog && Array.isArray(catalog.models)) {
+          catalog.models = catalog.models.filter((m: any) => m.backend_provider !== cliName);
+          this.saveModelCatalog(catalog);
+        }
+
+        this.loadConfig();
+        this.patchCodexConfig();
+        this.autoPatchPlugins();
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
       return;
@@ -4529,8 +5370,8 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
-    const apiKey = this.resolveKey(provider.api_key);
-    if (!apiKey) {
+    const hasKeys = (provider.api_keys && provider.api_keys.length > 0) || provider.api_key;
+    if (!hasKeys) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `API Key is missing. Configure keys via http://localhost:8765/dashboard` }));
       return;
@@ -4567,13 +5408,18 @@ stream_idle_timeout_ms = 600000
       const prevIncoming = incomingMessages[incomingMessages.length - 2];
       const found = existingHistory.some((m: any) => isSameMessage(m, prevIncoming));
       if (!found) {
-        console.log(`[OpenCodex] Cache desync detected for session ${sessionIdStr}. Reloading from rollout...`);
+        console.log(`[Responses] Cache desync detected for session ${sessionIdStr}. Reloading from rollout...`);
         existingHistory = loadHistoryFromRollout(sessionIdStr);
         this.sessionContextMap.delete(sessionIdStr);
       }
     } else if (existingHistory.length === 0) {
       existingHistory = loadHistoryFromRollout(sessionIdStr);
       this.sessionContextMap.delete(sessionIdStr);
+      if (existingHistory.length === 0) {
+        console.log(`[Responses] Stale history empty. Waiting 350ms for client to write rollout file...`);
+        await new Promise(resolve => setTimeout(resolve, 350));
+        existingHistory = loadHistoryFromRollout(sessionIdStr);
+      }
     }
 
     if (existingHistory.length === 0) {
@@ -4603,17 +5449,84 @@ stream_idle_timeout_ms = 600000
     this.updateContextUsage(sessionIdStr, requestedModel, chatBody, contextWindow);
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
 
-    try {
-      if (isStream) {
-        await this.streamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId, !!processedReqBody.background);
-      } else {
-        await this.nonStreamResponses(chatBody, provider, requestedModel, apiKey, namespaceMap, res, finalSessionId);
+    let maxRetries = provider.api_keys && provider.api_keys.length > 0 ? provider.api_keys.length : 1;
+    let attempt = 0;
+    let success = false;
+    let lastError: any = null;
+
+    while (attempt < maxRetries) {
+      attempt++;
+      const currentApiKey = this.getNextKeyForProvider(provider);
+      try {
+        if (isStream) {
+          await this.streamResponses(chatBody, provider, requestedModel, currentApiKey, namespaceMap, res, finalSessionId, !!processedReqBody.background);
+        } else {
+          await this.nonStreamResponses(chatBody, provider, requestedModel, currentApiKey, namespaceMap, res, finalSessionId);
+        }
+        success = true;
+        break;
+      } catch (err: any) {
+        lastError = err;
+        console.error(`[Responses] Attempt ${attempt} failed with error: ${err.message}`);
+        if (res.headersSent) {
+          break;
+        }
+        if (err instanceof UpstreamError && ![429, 401, 403, 502, 503, 504].includes(err.status)) {
+          break;
+        }
       }
-    } catch (err: any) {
-      console.error(`[Responses] Error: ${err.message}`);
+    }
+
+    if (!success && lastError) {
+      console.error(`[Responses] All ${attempt} attempts failed. Final error: ${lastError.message}`);
       if (!res.headersSent) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        if (isStream) {
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.setHeader("X-Accel-Buffering", "no");
+          res.writeHead(200);
+
+          const streamState = new ResponsesStreamState(
+            requestedModel,
+            namespaceMap,
+            finalSessionId,
+            (textChunk) => {
+              const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
+              for (const wsClient of this.activeWsClients) {
+                try { wsClient.send(msg); } catch {}
+              }
+            },
+            (fullText) => {
+              const msg = JSON.stringify({ type: "model_done", text: fullText });
+              for (const wsClient of this.activeWsClients) {
+                try { wsClient.send(msg); } catch {}
+              }
+            },
+            undefined,
+            !!processedReqBody.background || requestedModel.includes("mini") || requestedModel.includes("title")
+          );
+          await streamState.start(async (payload) => {
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          });
+          const fakeChunk = {
+            choices: [{
+              delta: {
+                content: `\n[OpenCodex Proxy Error] Failed to fetch from upstream after ${attempt} attempts. Last error: ${lastError.message}\n`
+              }
+            }]
+          };
+          await streamState.writeChatDelta(async (payload) => {
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          }, fakeChunk);
+          await streamState.finish(async (payload) => {
+            res.write(`data: ${JSON.stringify(payload)}\n\n`);
+          });
+          res.end();
+        } else {
+          res.writeHead(502, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: lastError.message }));
+        }
       }
     }
   }
@@ -4628,6 +5541,19 @@ stream_idle_timeout_ms = 600000
     sessionId?: string,
     isBackground?: boolean
   ) {
+    const response = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body),
+      dispatcher: fetchDispatcher,
+      requestedModel: requestedModel
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new UpstreamError(response.status, errorText);
+    }
+
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -4660,31 +5586,6 @@ stream_idle_timeout_ms = 600000
     });
 
     try {
-      const response = await fetch(`${provider.base_url}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(body),
-        dispatcher: fetchDispatcher
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        const fakeChunk = {
-          choices: [{
-            delta: {
-              content: `\n[OpenCodex Proxy Error] Failed to fetch from upstream: ${response.status} - ${errorText}\n`
-            }
-          }]
-        };
-        await streamState.writeChatDelta(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        }, fakeChunk);
-        await streamState.finish(async (payload) => {
-          res.write(`data: ${JSON.stringify(payload)}\n\n`);
-        });
-        res.end();
-        return;
-      }
 
       const reader = response.body!.getReader();
       const decoder = new TextDecoder();
@@ -4773,11 +5674,12 @@ stream_idle_timeout_ms = 600000
     res: http.ServerResponse,
     sessionId?: string
   ) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const r = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: fetchDispatcher,
+      requestedModel: requestedModel
     });
 
     const rawText = await r.text();
@@ -4789,9 +5691,7 @@ stream_idle_timeout_ms = 600000
     }
 
     if (!r.ok) {
-      res.writeHead(r.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(data));
-      return;
+      throw new UpstreamError(r.status, rawText);
     }
 
     const responseBody = chatCompletionToResponse(data, requestedModel, namespaceMap);
@@ -4847,8 +5747,8 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
-    const apiKey = this.resolveKey(provider.api_key);
-    if (!apiKey) {
+    const hasKeys = (provider.api_keys && provider.api_keys.length > 0) || provider.api_key;
+    if (!hasKeys) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: `API Key missing.` }));
       return;
@@ -4867,17 +5767,39 @@ stream_idle_timeout_ms = 600000
       stream: isStream
     };
 
-    try {
-      if (isStream) {
-        await this.streamChat(upstreamBody, provider, model, apiKey, res);
-      } else {
-        await this.nonStreamChat(upstreamBody, provider, model, apiKey, res);
+    let maxRetries = provider.api_keys && provider.api_keys.length > 0 ? provider.api_keys.length : 1;
+    let attempt = 0;
+    let success = false;
+    let lastError: any = null;
+
+    while (attempt < maxRetries) {
+      attempt++;
+      const currentApiKey = this.getNextKeyForProvider(provider);
+      try {
+        if (isStream) {
+          await this.streamChat(upstreamBody, provider, model, currentApiKey, res);
+        } else {
+          await this.nonStreamChat(upstreamBody, provider, model, currentApiKey, res);
+        }
+        success = true;
+        break;
+      } catch (err: any) {
+        lastError = err;
+        console.error(`[Chat] Attempt ${attempt} failed with error: ${err.message}`);
+        if (res.headersSent) {
+          break;
+        }
+        if (err instanceof UpstreamError && ![429, 401, 403, 502, 503, 504].includes(err.status)) {
+          break;
+        }
       }
-    } catch (err: any) {
-      console.error(`[Chat] Error: ${err.message}`);
+    }
+
+    if (!success && lastError) {
+      console.error(`[Chat] All ${attempt} attempts failed. Final error: ${lastError.message}`);
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: lastError.message }));
       }
     }
   }
@@ -4930,11 +5852,12 @@ stream_idle_timeout_ms = 600000
   }
 
   private async nonStreamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const r = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: fetchDispatcher,
+      requestedModel: model
     });
     
     const text = await r.text();
@@ -4945,23 +5868,26 @@ stream_idle_timeout_ms = 600000
       data = { error: text.slice(0, 200) };
     }
     
+    if (!r.ok) {
+      throw new UpstreamError(r.status, text);
+    }
+
     res.writeHead(r.status, { "Content-Type": "application/json" });
     res.end(JSON.stringify(data));
   }
 
   private async streamChat(body: any, provider: ProviderConfig, model: string, apiKey: string, res: http.ServerResponse) {
-    const r = await fetch(`${provider.base_url}/chat/completions`, {
+    const r = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify(body),
-      dispatcher: fetchDispatcher
+      dispatcher: fetchDispatcher,
+      requestedModel: model
     });
 
     if (!r.ok) {
       const errorText = await r.text();
-      res.writeHead(r.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: errorText }));
-      return;
+      throw new UpstreamError(r.status, errorText);
     }
 
     res.setHeader("Content-Type", "text/event-stream");
@@ -6368,12 +7294,13 @@ stream_idle_timeout_ms = 600000
 
     try {
       console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
-      const response = await fetch(`${provider.base_url}/chat/completions`, {
+      const response = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(chatBody),
         dispatcher: fetchDispatcher,
-        signal
+        signal,
+        requestedModel: requestedModel
       });
 
       console.log(`[OpenCodex WS Proxy] Upstream response status: ${response.status}`);
