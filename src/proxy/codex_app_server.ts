@@ -11,6 +11,8 @@ type PendingRequest = {
 
 export function resolveCodexBinary(): string {
   if (process.platform === "darwin") {
+    const chatGptBundled = "/Applications/ChatGPT.app/Contents/Resources/codex";
+    if (existsSync(chatGptBundled)) return chatGptBundled;
     const bundled = "/Applications/Codex.app/Contents/Resources/codex";
     return existsSync(bundled) ? bundled : "codex";
   }
