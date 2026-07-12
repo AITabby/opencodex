@@ -2110,8 +2110,42 @@ except Exception as e:
         if (existsSync(authPath)) {
           const authData = JSON.parse(readFileSync(authPath, "utf-8"));
           const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
-          if (sessionKey && authData[sessionKey]?.key) {
-            return authData[sessionKey].key;
+          if (sessionKey) {
+            const session = authData[sessionKey];
+            const expiresAt = session.expires_at ? new Date(session.expires_at).getTime() : 0;
+            const now = Date.now();
+            if (session.key && expiresAt && (expiresAt - now > 300000)) {
+              return session.key;
+            }
+            console.log("[OpenCodex] Grok CLI OAuth token is expired or expiring soon. Refreshing...");
+            const issuer = session.oidc_issuer || "https://auth.x.ai";
+            const clientId = session.oidc_client_id;
+            const refreshToken = session.refresh_token;
+            if (refreshToken && clientId) {
+              try {
+                const curlCmd = `curl -s -X POST ${issuer}/oauth2/token -d "grant_type=refresh_token&refresh_token=${refreshToken}&client_id=${clientId}"`;
+                const resStr = execSync(curlCmd, { encoding: "utf-8" });
+                const tokenData = JSON.parse(resStr);
+                if (tokenData && tokenData.access_token) {
+                  session.key = tokenData.access_token;
+                  if (tokenData.refresh_token) {
+                    session.refresh_token = tokenData.refresh_token;
+                  }
+                  if (tokenData.expires_in) {
+                    session.expires_at = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
+                  }
+                  authData[sessionKey] = session;
+                  writeFileSync(authPath, JSON.stringify(authData, null, 2), "utf-8");
+                  console.log("[OpenCodex] Grok CLI OAuth token successfully refreshed and saved.");
+                  return tokenData.access_token;
+                } else {
+                  console.error("[OpenCodex] Grok token refresh response invalid:", resStr);
+                }
+              } catch (refreshErr: any) {
+                console.error("[OpenCodex] Failed to refresh Grok token synchronously:", refreshErr.message);
+              }
+            }
+            if (session.key) return session.key;
           }
         }
       } catch (e: any) {
