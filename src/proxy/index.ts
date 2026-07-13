@@ -1933,6 +1933,15 @@ except Exception as e:
       for (const native of nativeModels) {
         if (!native.slug) continue;
         
+        const isCustomSlug = native.slug.startsWith("gpt-5.") || 
+                             native.slug.startsWith("grok-") || 
+                             native.slug.startsWith("deepseek-") || 
+                             native.slug.startsWith("gemini-") || 
+                             native.slug.startsWith("claude-") ||
+                             native.slug.startsWith("mimo-") ||
+                             native.slug === "MiniMax-M3";
+        if (isCustomSlug) continue;
+
         const idx = catalog.models.findIndex((m: any) => m.slug === native.slug);
         
         if (idx === -1) {
@@ -2106,47 +2115,62 @@ except Exception as e:
   private resolveKey(raw: string): string {
     if (raw === "grok-cli-auto") {
       try {
-        const authPath = join(homedir(), ".grok", "auth.json");
-        if (existsSync(authPath)) {
-          const authData = JSON.parse(readFileSync(authPath, "utf-8"));
-          const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
-          if (sessionKey) {
-            const session = authData[sessionKey];
-            const expiresAt = session.expires_at ? new Date(session.expires_at).getTime() : 0;
-            const now = Date.now();
-            if (session.key && expiresAt && (expiresAt - now > 300000)) {
-              return session.key;
-            }
-            console.log("[OpenCodex] Grok CLI OAuth token is expired or expiring soon. Refreshing...");
-            const issuer = session.oidc_issuer || "https://auth.x.ai";
-            const clientId = session.oidc_client_id;
-            const refreshToken = session.refresh_token;
-            if (refreshToken && clientId) {
-              try {
-                const curlCmd = `curl -s -X POST ${issuer}/oauth2/token -d "grant_type=refresh_token&refresh_token=${refreshToken}&client_id=${clientId}"`;
-                const resStr = execSync(curlCmd, { encoding: "utf-8" });
-                const tokenData = JSON.parse(resStr);
-                if (tokenData && tokenData.access_token) {
-                  session.key = tokenData.access_token;
-                  if (tokenData.refresh_token) {
-                    session.refresh_token = tokenData.refresh_token;
-                  }
-                  if (tokenData.expires_in) {
-                    session.expires_at = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
-                  }
-                  authData[sessionKey] = session;
-                  writeFileSync(authPath, JSON.stringify(authData, null, 2), "utf-8");
-                  console.log("[OpenCodex] Grok CLI OAuth token successfully refreshed and saved.");
-                  return tokenData.access_token;
-                } else {
-                  console.error("[OpenCodex] Grok token refresh response invalid:", resStr);
-                }
-              } catch (refreshErr: any) {
-                console.error("[OpenCodex] Failed to refresh Grok token synchronously:", refreshErr.message);
-              }
-            }
-            if (session.key) return session.key;
+        const cachePath = join(this.configDir, "grok_auth_cache.json");
+        let session: any = null;
+        if (existsSync(cachePath)) {
+          try {
+            session = JSON.parse(readFileSync(cachePath, "utf-8"));
+          } catch (e) {
+            console.error("[OpenCodex] Failed to parse grok_auth_cache.json:", e);
           }
+        }
+        if (!session) {
+          const authPath = join(homedir(), ".grok", "auth.json");
+          if (existsSync(authPath)) {
+            const authData = JSON.parse(readFileSync(authPath, "utf-8"));
+            const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
+            if (sessionKey) {
+              session = authData[sessionKey];
+              console.log("[OpenCodex] Bootstrapped Grok CLI session into independent cache.");
+            }
+          }
+        }
+        if (session) {
+          const expiresAt = session.expires_at ? new Date(session.expires_at).getTime() : 0;
+          const now = Date.now();
+          if (session.key && expiresAt && (expiresAt - now > 300000)) {
+            return session.key;
+          }
+          console.log("[OpenCodex] Grok independent session is expired or expiring soon. Refreshing...");
+          const issuer = session.oidc_issuer || "https://auth.x.ai";
+          const clientId = session.oidc_client_id;
+          const refreshToken = session.refresh_token;
+          if (refreshToken && clientId) {
+            try {
+              const curlCmd = `curl -s -X POST ${issuer}/oauth2/token -d "grant_type=refresh_token&refresh_token=${refreshToken}&client_id=${clientId}"`;
+              const resStr = execSync(curlCmd, { encoding: "utf-8" });
+              const tokenData = JSON.parse(resStr);
+              if (tokenData && tokenData.access_token) {
+                session.key = tokenData.access_token;
+                if (tokenData.refresh_token) {
+                  session.refresh_token = tokenData.refresh_token;
+                }
+                if (tokenData.expires_in) {
+                  session.expires_at = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
+                }
+                writeFileSync(cachePath, JSON.stringify(session, null, 2), "utf-8");
+                console.log("[OpenCodex] Grok independent session successfully refreshed and saved.");
+                return tokenData.access_token;
+              } else {
+                console.error("[OpenCodex] Grok token refresh response invalid, clearing cache:", resStr);
+                try { unlinkSync(cachePath); } catch {}
+              }
+            } catch (refreshErr: any) {
+              console.error("[OpenCodex] Failed to refresh Grok token synchronously, clearing cache:", refreshErr.message);
+              try { unlinkSync(cachePath); } catch {}
+            }
+          }
+          if (session.key) return session.key;
         }
       } catch (e: any) {
         console.error("[OpenCodex] Failed to auto-resolve Grok CLI token:", e);
