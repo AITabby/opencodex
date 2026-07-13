@@ -7,6 +7,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, Tool } from "@modelcontextprotocol/sdk/types.js";
+import dns from "node:dns";
+
+dns.setDefaultResultOrder("ipv4first");
 
 import { ProxyServer } from "./proxy/index.js";
 import { ScreenshotTaker } from "./cu/screenshot.js";
