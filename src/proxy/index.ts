@@ -3040,6 +3040,34 @@ stream_idle_timeout_ms = 600000
                 if (msg && msg.client_metadata?.session_id) {
                   connInfo.activeSessionId = String(msg.client_metadata.session_id);
                 }
+                if (msg && msg.type === "response.create") {
+                  console.log("[OpenCodex WS Proxy] Client response.create:", JSON.stringify(msg));
+                  const activeSid = connInfo.activeSessionId || sessionIdStr;
+                  const history = loadHistoryFromRollout(activeSid);
+                  if (history.length > 0 && msg.input && Array.isArray(msg.input)) {
+                    const incomingSimple = msg.input.map((item: any) => {
+                      let text = "";
+                      if (typeof item.content === "string") {
+                        text = item.content;
+                      } else if (Array.isArray(item.content)) {
+                        text = item.content.map((c: any) => c.text || c.content || "").join("");
+                      }
+                      return { role: item.role, content: text.trim() };
+                    }).filter((m: any) => m.role === "user" || m.role === "assistant");
+
+                    const merged = mergeHistory(history, incomingSimple);
+                    msg.input = merged.map((m: any) => ({
+                      type: "message",
+                      role: m.role,
+                      content: [{
+                        type: m.role === "assistant" ? "output_text" : "input_text",
+                        text: m.content
+                      }]
+                    }));
+                    processedData = Buffer.from(JSON.stringify(msg), "utf-8");
+                    console.log(`[OpenCodex WS Proxy] Reconstructed response.create input array with full merged history (${merged.length} messages) for session ${activeSid}`);
+                  }
+                }
                 if (msg && msg.type === "response.cancel") {
                   const activeSid = connInfo.activeSessionId || sessionIdStr;
                   const controller = this.activeAbortControllers.get(activeSid);
@@ -3121,7 +3149,7 @@ stream_idle_timeout_ms = 600000
                   msg.item.content = msg.item.content.filter((part: any) => {
                     if (!part) return false;
                     const type = String(part.type || "").toLowerCase();
-                    return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+                    return type === "text" || type === "input_text" || type === "output_text" || type === "text_text" || type === "text_delta";
                   });
                   if (msg.item.content.length !== originalLength) {
                     console.log(`[OpenCodex WS Proxy] Intercepted conversation.item.create. Stripped non-text parts from client payload to prevent official server crash.`);
@@ -3140,7 +3168,7 @@ stream_idle_timeout_ms = 600000
                       item.content = item.content.filter((part: any) => {
                         if (!part) return false;
                         const type = String(part.type || "").toLowerCase();
-                        return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+                        return type === "text" || type === "input_text" || type === "output_text" || type === "text_text" || type === "text_delta";
                       });
                       if (item.content.length !== originalLength) {
                         mutated = true;
@@ -5472,7 +5500,7 @@ stream_idle_timeout_ms = 600000
             item.content = item.content.filter((part: any) => {
               if (!part) return false;
               const type = String(part.type || "").toLowerCase();
-              return type === "text" || type === "input_text" || type === "text_text" || type === "text_delta";
+              return type === "text" || type === "input_text" || type === "output_text" || type === "text_text" || type === "text_delta";
             });
             if (item.content.length !== originalLength) {
               mutated = true;
@@ -7470,7 +7498,7 @@ stream_idle_timeout_ms = 600000
     this.updateContextUsage(sessionIdStr, requestedModel, chatBody, contextWindow);
 
     try {
-      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
+      console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`, JSON.stringify(chatBody.messages));
       const response = await this.fetchWithWebBridge(`${provider.base_url}/chat/completions`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
