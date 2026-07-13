@@ -172,7 +172,7 @@ function parseGrokJsonlItems(
         cwd = userInfoMatch[1].trim();
       }
 
-      if (content.includes("<user_info>")) {
+      if (content.includes("<user_info>") || content.includes("<system-reminder>")) {
         continue;
       }
       
