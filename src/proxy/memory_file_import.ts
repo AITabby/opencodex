@@ -167,14 +167,18 @@ function parseGrokJsonlItems(
     }
     
     if (role === "user") {
-      const match = content.match(/<user_query>([\s\S]*?)<\/user_query>/);
-      if (match) {
-        content = match[1].trim();
-      }
-      
       const userInfoMatch = content.match(/Workspace Path:\s*([^\n]+)/);
       if (userInfoMatch) {
         cwd = userInfoMatch[1].trim();
+      }
+
+      if (content.includes("<user_info>")) {
+        continue;
+      }
+      
+      const match = content.match(/<user_query>([\s\S]*?)<\/user_query>/);
+      if (match) {
+        content = match[1].trim();
       }
     }
     
