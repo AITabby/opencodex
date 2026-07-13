@@ -1939,6 +1939,7 @@ except Exception as e:
                              native.slug.startsWith("gemini-") || 
                              native.slug.startsWith("claude-") ||
                              native.slug.startsWith("mimo-") ||
+                             native.slug.startsWith("codex-") ||
                              native.slug === "MiniMax-M3";
         if (isCustomSlug) continue;
 
@@ -4704,6 +4705,13 @@ stream_idle_timeout_ms = 600000
         if (existsSync(catalogPath)) {
           writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
         }
+
+        const cachePath = join(homedir(), ".codex", "models_cache.json");
+        if (existsSync(cachePath)) {
+          try { unlinkSync(cachePath); } catch {}
+          console.log("[OpenCodex] Cleared client models_cache.json during native restore.");
+        }
+
         console.log("[OpenCodex] Reset to native state. Restarting Codex...");
         this.restartCodexDesktop();
         res.writeHead(200, { "Content-Type": "application/json" });
