@@ -40,6 +40,7 @@ function agentName(path: string): string {
   const lower = path.toLowerCase();
   if (lower.includes(`${sep}.hermes${sep}`)) return "Hermes";
   if (lower.includes(`${sep}.claude${sep}`)) return "Claude Code";
+  if (lower.includes(`${sep}.grok${sep}`)) return "Grok Build";
   if (lower.includes("opencode")) return "OpenCode";
   if (lower.includes("antigravity")) return "Antigravity";
   if (lower.includes("openclaw")) return "OpenClaw";
@@ -113,6 +114,7 @@ function candidateRoots(): Array<{ path: string; depth: number }> {
   const home = homedir();
   const roots: Array<{ path: string; depth: number }> = [
     { path: join(home, ".hermes"), depth: 3 },
+    { path: join(home, ".grok", "sessions"), depth: 4 },
     { path: join(home, ".opencode"), depth: 5 },
     { path: join(home, ".openclaw"), depth: 6 },
     { path: join(home, ".continue"), depth: 5 },
@@ -129,7 +131,7 @@ function candidateRoots(): Array<{ path: string; depth: number }> {
     join(home, ".local", "share"),
     join(home, "Library", "Application Support")
   ];
-  const agentDirectoryPattern = /(agent|assistant|chat|claude|code|claw|hermes|cursor|continue|aider|open.?webui)/i;
+  const agentDirectoryPattern = /(agent|assistant|chat|claude|code|claw|hermes|cursor|continue|aider|grok|open.?webui)/i;
   for (const parent of genericParents) {
     if (!existsSync(parent)) continue;
     try {

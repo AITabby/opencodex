@@ -145,6 +145,60 @@ function parseClaudeJsonlItems(
   return { detected_format: "jsonl", memory };
 }
 
+function parseGrokJsonlItems(
+  parsedItems: any[],
+  fallbackTitle: string
+): MemoryFileImportResult {
+  const rawMessages: any[] = [];
+  let cwd: string | undefined;
+  let model: string | undefined;
+
+  for (const item of parsedItems) {
+    if (item?.type !== "user" && item?.type !== "assistant" && item?.type !== "system") continue;
+    
+    const role = item.type === "system" ? "system" : item.type;
+    let content = "";
+    if (typeof item.content === "string") {
+      content = item.content;
+    } else if (Array.isArray(item.content)) {
+      content = item.content
+        .map((c: any) => c.text || c.content || "")
+        .join("\n");
+    }
+    
+    if (role === "user") {
+      const match = content.match(/<user_query>([\s\S]*?)<\/user_query>/);
+      if (match) {
+        content = match[1].trim();
+      }
+      
+      const userInfoMatch = content.match(/Workspace Path:\s*([^\n]+)/);
+      if (userInfoMatch) {
+        cwd = userInfoMatch[1].trim();
+      }
+    }
+    
+    if (!content) continue;
+    rawMessages.push({ role, content });
+  }
+
+  if (rawMessages.length === 0) {
+    throw new Error("No supported Grok conversation messages were found");
+  }
+
+  const firstUser = rawMessages.find((message) => message.role === "user")?.content;
+  const title = firstUser
+    ? String(firstUser).replace(/\s+/g, " ").slice(0, 100)
+    : fallbackTitle;
+  const memory = normalizeImportedMemory(rawMessages, title);
+  memory.source = {
+    application: "Grok Build",
+    model_provider: "grok-4.5",
+    cwd
+  };
+  return { detected_format: "jsonl", memory };
+}
+
 function parseJsonl(
   text: string,
   fallbackTitle: string,
@@ -157,6 +211,13 @@ function parseJsonl(
     ) && item?.message?.role
   )) {
     return parseClaudeJsonlItems(parsedItems, fallbackTitle);
+  }
+  if (parsedItems.some(
+    (item) => (
+      item?.type === "user" || item?.type === "assistant" || item?.type === "system"
+    ) && (typeof item?.content === "string" || Array.isArray(item?.content))
+  )) {
+    return parseGrokJsonlItems(parsedItems, fallbackTitle);
   }
 
   const responseItems = parsedItems.filter(
