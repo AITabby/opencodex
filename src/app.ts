@@ -3,8 +3,21 @@ import { OpenCodex } from "./server.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dns from "node:dns";
+import fs from "node:fs";
 
 dns.setDefaultResultOrder("ipv4first");
+
+const logPath = "C:/Users/young/projects/opencodex/out_desktop.log";
+const originalWrite = process.stdout.write.bind(process.stdout);
+const originalErrWrite = process.stderr.write.bind(process.stderr);
+process.stdout.write = (chunk: any, encoding?: any, callback?: any) => {
+  try { fs.appendFileSync(logPath, chunk); } catch {}
+  return originalWrite(chunk, encoding, callback);
+};
+process.stderr.write = (chunk: any, encoding?: any, callback?: any) => {
+  try { fs.appendFileSync(logPath, chunk); } catch {}
+  return originalErrWrite(chunk, encoding, callback);
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

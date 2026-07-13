@@ -417,11 +417,15 @@ function loadImportedMemoryFromRollout(sessionId: string): any[] {
       if (!["system", "developer", "user", "assistant"].includes(payload.role)) continue;
 
       let text = "";
-      for (const part of Array.isArray(payload.content) ? payload.content : []) {
-        if (typeof part === "string") {
-          text += part;
-        } else if (part && typeof part.text === "string") {
-          text += part.text;
+      if (typeof payload.content === "string") {
+        text = payload.content;
+      } else if (Array.isArray(payload.content)) {
+        for (const part of payload.content) {
+          if (typeof part === "string") {
+            text += part;
+          } else if (part && typeof part.text === "string") {
+            text += part.text;
+          }
         }
       }
       const normalizedText = text.trim();
@@ -5640,14 +5644,19 @@ stream_idle_timeout_ms = 600000
       const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
       this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
-    chatBody.messages = alignToolMessages(
-      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
-        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
-          return { ...m, content: " " };
+    const cleanMessages: any[] = [];
+    for (const m of (this.customConversationHistory.get(sessionIdStr) || [])) {
+      if (m.role === "user" || m.role === "assistant") {
+        const content = typeof m.content === "string" ? m.content.trim() : "";
+        if (!content && m.tool_calls && m.tool_calls.length > 0) {
+          continue; // Strip assistant messages that only called tools
         }
-        return m;
-      })
-    );
+        if (content) {
+          cleanMessages.push({ role: m.role, content });
+        }
+      }
+    }
+    chatBody.messages = cleanMessages;
 
     const contextWindow = catalogEntry?.context_window || 200000;
     this.currentActiveSessionId = sessionIdStr;
@@ -7466,14 +7475,19 @@ stream_idle_timeout_ms = 600000
       const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
       this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
-    chatBody.messages = alignToolMessages(
-      (this.customConversationHistory.get(sessionIdStr) || []).map((m: any) => {
-        if (m.role === "assistant" && !m.content && (!m.tool_calls || m.tool_calls.length === 0)) {
-          return { ...m, content: " " };
+    const cleanMessages: any[] = [];
+    for (const m of (this.customConversationHistory.get(sessionIdStr) || [])) {
+      if (m.role === "user" || m.role === "assistant") {
+        const content = typeof m.content === "string" ? m.content.trim() : "";
+        if (!content && m.tool_calls && m.tool_calls.length > 0) {
+          continue; // Strip assistant messages that only called tools
         }
-        return m;
-      })
-    );
+        if (content) {
+          cleanMessages.push({ role: m.role, content });
+        }
+      }
+    }
+    chatBody.messages = cleanMessages;
 
 
     // Sanitize empty/null content fields for MiniMax model
