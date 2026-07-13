@@ -1933,13 +1933,11 @@ except Exception as e:
       for (const native of nativeModels) {
         if (!native.slug) continue;
         
-        const isCustomSlug = native.slug.startsWith("gpt-5.") || 
-                             native.slug.startsWith("grok-") || 
+        const isCustomSlug = native.slug.startsWith("grok-") || 
                              native.slug.startsWith("deepseek-") || 
                              native.slug.startsWith("gemini-") || 
                              native.slug.startsWith("claude-") ||
                              native.slug.startsWith("mimo-") ||
-                             native.slug.startsWith("codex-") ||
                              native.slug === "MiniMax-M3";
         if (isCustomSlug) continue;
 
