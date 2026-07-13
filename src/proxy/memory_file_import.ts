@@ -154,9 +154,9 @@ function parseGrokJsonlItems(
   let model: string | undefined;
 
   for (const item of parsedItems) {
-    if (item?.type !== "user" && item?.type !== "assistant" && item?.type !== "system") continue;
+    if (item?.type !== "user" && item?.type !== "assistant") continue;
     
-    const role = item.type === "system" ? "system" : item.type;
+    const role = item.type;
     let content = "";
     if (typeof item.content === "string") {
       content = item.content;
