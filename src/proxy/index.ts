@@ -808,6 +808,7 @@ export class ProxyServer {
   private sessionModelContextMap = new Map<string, SessionContextSnapshot>();
   private sessionCumulativeUsage = new Map<string, SessionCumulativeUsage>();
   private currentActiveSessionId: string = "";
+  private titleSessionHashes = new Set<string>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -2780,6 +2781,8 @@ stream_idle_timeout_ms = 600000
               console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
             }
             
+            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
+
             if (!tIsBinary) {
               try {
                 const payload = JSON.parse(msgStr);
@@ -2830,6 +2833,32 @@ stream_idle_timeout_ms = 600000
                   this.sessionSequenceNumberMap.set(sessionIdStr, newSeq);
                   if (payload.type === "response.done" || payload.type === "response.completed" || payload.type === "response.output_text.done") {
                     this.lastCompletedSequenceNumberMap.set(sessionIdStr, Number(payload.sequence_number));
+                  }
+                }
+                
+                const getSessionHash = (id: string): string | null => {
+                  if (!id) return null;
+                  const match = id.match(/^(resp|rs|msg|ctc)_([a-f0-9]{24})/);
+                  return match ? match[2] : null;
+                };
+
+                // Detect title responses and register their session hashes
+                if (payload.type === "response.created" && payload.response) {
+                  const model = payload.response.model || "";
+                  if (model.includes("mini") || model.includes("title")) {
+                    const hash = getSessionHash(payload.response.id);
+                    if (hash) {
+                      this.titleSessionHashes.add(hash);
+                    }
+                  }
+                }
+                
+                // Precise check if this payload belongs to a title session hash
+                const checkId = payload.item_id || payload.response_id || payload.response?.id || payload.item?.id;
+                if (checkId) {
+                  const hash = getSessionHash(checkId);
+                  if (hash && this.titleSessionHashes.has(hash)) {
+                    isTitleOrBackground = true;
                   }
                 }
                 
@@ -2889,8 +2918,6 @@ stream_idle_timeout_ms = 600000
                 }
               } catch {}
             }
-
-            const isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
 
             if (clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(processedTData, { binary: tIsBinary });
