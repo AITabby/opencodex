@@ -131,6 +131,7 @@ export class ProxyServer {
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
+  private titleSessionHashes = new Set<string>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -777,7 +778,7 @@ stream_idle_timeout_ms = 600000
 
   public restartCodexDesktop() {
     console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
-    const cmd = 'killall Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a Codex --args --remote-debugging-port=8315';
+    const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315';
     exec(cmd, (err, stdout, stderr) => {
       if (err) {
         console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
@@ -998,9 +999,37 @@ stream_idle_timeout_ms = 600000
             const msgStr = processedTData.toString();
             console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
             
+            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
+
             if (!tIsBinary) {
               try {
                 const payload = JSON.parse(msgStr);
+                
+                const getSessionHash = (id: string): string | null => {
+                  if (!id) return null;
+                  const match = id.match(/^(resp|rs|msg|ctc)_([a-f0-9]{24})/);
+                  return match ? match[2] : null;
+                };
+
+                // Detect title responses and register their session hashes
+                if (payload.type === "response.created" && payload.response) {
+                  const model = payload.response.model || "";
+                  if (model.includes("mini") || model.includes("title")) {
+                    const hash = getSessionHash(payload.response.id);
+                    if (hash) {
+                      this.titleSessionHashes.add(hash);
+                    }
+                  }
+                }
+                
+                // Precise check if this payload belongs to a title session hash
+                const checkId = payload.item_id || payload.response_id || payload.response?.id || payload.item?.id;
+                if (checkId) {
+                  const hash = getSessionHash(checkId);
+                  if (hash && this.titleSessionHashes.has(hash)) {
+                    isTitleOrBackground = true;
+                  }
+                }
                 
                 // Broadcast streaming text delta to active voice clients
                 if (payload.type === "response.output_text.delta" && payload.delta) {
@@ -1032,8 +1061,6 @@ stream_idle_timeout_ms = 600000
                 }
               } catch {}
             }
-
-            const isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
 
             if (clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(processedTData, { binary: tIsBinary });
@@ -2238,7 +2265,7 @@ stream_idle_timeout_ms = 600000
         }
 
         console.error(`[OpenCodex Command Console] Executing: ${command}`);
-        const cmdPath = "/Applications/Codex.app/Contents/Resources/codex";
+        const cmdPath = "/Applications/ChatGPT.app/Contents/Resources/codex";
         const child = spawn(cmdPath, ["--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check", "-"]);
         
         let output = "";
@@ -4052,7 +4079,7 @@ stream_idle_timeout_ms = 600000
     if (this.mcpProcess) return;
     console.error("[OpenCodex MCP Manager] Starting persistent codex mcp-server...");
     
-    this.mcpProcess = spawn("/Applications/Codex.app/Contents/Resources/codex", ["mcp-server"]);
+    this.mcpProcess = spawn("/Applications/ChatGPT.app/Contents/Resources/codex", ["mcp-server"]);
     this.mcpStdoutBuffer = "";
 
     this.mcpProcess.stdout.on("data", (chunk: Buffer) => {

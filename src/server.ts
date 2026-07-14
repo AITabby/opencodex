@@ -411,7 +411,7 @@ class OpenCodex {
     try {
       console.error("[OpenCodex] Starting resident codex mcp-server background daemon...");
       const { spawn } = await import("node:child_process");
-      const execServer = spawn("/Applications/Codex.app/Contents/Resources/codex", [
+      const execServer = spawn("/Applications/ChatGPT.app/Contents/Resources/codex", [
         "--dangerously-bypass-approvals-and-sandbox",
         "mcp-server"
       ], {

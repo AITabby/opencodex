@@ -765,7 +765,7 @@ export function getDashboardHtml(): string {
       </div>
       
       <div class="header-actions">
-        <button class="console-btn" id="restart-codex-btn" onclick="restartCodexDesktop()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.3); color: var(--color-primary); font-weight: 600;">🚀 重启 Codex / Restart</button>
+        <button class="console-btn" id="restart-codex-btn" onclick="restartCodexDesktop()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.3); color: var(--color-primary); font-weight: 600;">🚀 重启 ChatGPT / Restart</button>
         <button class="console-btn" id="reset-btn" onclick="resetCodex()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #ef4444; font-weight: 600;">↺ 还原原生 / Reset</button>
         <button class="console-btn" id="lang-btn" onclick="toggleLanguage()" style="padding: 0.5rem 1rem; border-radius: 99px;">🌐 EN / 中</button>
         
@@ -823,7 +823,7 @@ export function getDashboardHtml(): string {
 
               <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
                 <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 Codex Desktop</label>
+                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 ChatGPT Desktop</label>
               </div>
               
               <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save & Add Model</button>
@@ -884,7 +884,7 @@ export function getDashboardHtml(): string {
 
             <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
               <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-              <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
+              <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 ChatGPT Desktop</label>
             </div>
             
             <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
@@ -1156,7 +1156,7 @@ export function getDashboardHtml(): string {
         modelAliasHint: "Support alias mapping to avoid official name conflicts, e.g., gpt-5.5-custom=gpt-5.5 or gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "Save & Add Model",
         panelModelsTitle: "Model Dropdown Customizer",
-        modelsDesc: "Select which models appear in the Codex model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
+        modelsDesc: "Select which models appear in the ChatGPT model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
         btnUpdateDropdown: "Update Dropdown List",
         panelConsoleTitle: "Live Stream Console Logger",
         btnClear: "Clear",
@@ -1164,17 +1164,17 @@ export function getDashboardHtml(): string {
         toastConfigSaved: "API key and model saved successfully!",
         toastConfigFailed: "Failed to save configs",
         toastConnFailed: "Failed to connect to backend",
-        toastModelsSaved: "Codex dropdown selector list updated!",
+        toastModelsSaved: "ChatGPT dropdown selector list updated!",
         toastModelsFailed: "Failed to update models list",
         toastConsoleCleared: "Console cleared",
-        btnRestartCodex: "🚀 Restart Codex",
-        labelConfigRestart: "Auto-restart Codex Desktop on save",
-        labelModelsRestart: "Auto-restart Codex Desktop on update",
-        toastRestarting: "Restarting Codex Desktop...",
-        toastRestarted: "Codex Desktop restarted!",
+        btnRestartCodex: "🚀 Restart ChatGPT",
+        labelConfigRestart: "Auto-restart ChatGPT Desktop on save",
+        labelModelsRestart: "Auto-restart ChatGPT Desktop on update",
+        toastRestarting: "Restarting ChatGPT Desktop...",
+        toastRestarted: "ChatGPT Desktop restarted!",
         btnReset: "↺ Reset to Native",
-        toastResetting: "Resetting to native Codex...",
-        toastResetDone: "Reset complete. Codex restarting.",
+        toastResetting: "Resetting to native ChatGPT...",
+        toastResetDone: "Reset complete. ChatGPT restarting.",
         panelVoiceTitle: "Voice & Speech Settings",
         labelSttEngine: "Speech-to-Text (STT) Engine",
         labelSttApiKey: "STT API Key",
@@ -1223,7 +1223,7 @@ export function getDashboardHtml(): string {
         modelAliasHint: "支持使用别名映射规避官方同名冲突，如：gpt-5.5-custom=gpt-5.5 或 gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "保存并添加该模型",
         panelModelsTitle: "自定义下拉框模型",
-        modelsDesc: "勾选想要显示在 Codex 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
+        modelsDesc: "勾选想要显示在 ChatGPT 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
         btnUpdateDropdown: "更新下拉框菜单",
         panelConsoleTitle: "实时日志控制台",
         btnClear: "清空日志",
@@ -1231,17 +1231,17 @@ export function getDashboardHtml(): string {
         toastConfigSaved: "API 密钥和模型配置已保存！",
         toastConfigFailed: "保存配置失败",
         toastConnFailed: "连接后端失败",
-        toastModelsSaved: "Codex 下拉框模型列表更新成功！",
+        toastModelsSaved: "ChatGPT 下拉框模型列表更新成功！",
         toastModelsFailed: "更新模型列表失败",
         toastConsoleCleared: "控制台已清空",
-        btnRestartCodex: "🚀 重启 Codex",
-        labelConfigRestart: "保存后自动重启 Codex Desktop",
-        labelModelsRestart: "更新后自动重启 Codex Desktop",
-        toastRestarting: "正在重启 Codex Desktop...",
-        toastRestarted: "Codex Desktop 重启成功！",
+        btnRestartCodex: "🚀 重启 ChatGPT",
+        labelConfigRestart: "保存后自动重启 ChatGPT Desktop",
+        labelModelsRestart: "更新后自动重启 ChatGPT Desktop",
+        toastRestarting: "正在重启 ChatGPT Desktop...",
+        toastRestarted: "ChatGPT Desktop 重启成功！",
         btnReset: "↺ 还原原生",
-        toastResetting: "正在还原原生 Codex...",
-        toastResetDone: "还原完成，Codex 重启中.",
+        toastResetting: "正在还原原生 ChatGPT...",
+        toastResetDone: "还原完成，ChatGPT 重启中.",
         panelVoiceTitle: "语音与分贝设置",
         labelSttEngine: "语音识别 (STT) 引擎",
         labelSttApiKey: "语音识别 API 密钥 (Key)",
@@ -1659,7 +1659,7 @@ export function getDashboardHtml(): string {
     }
 
     async function resetCodex() {
-      const msg = currentLang === 'zh' ? '还原后 Codex 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native Codex.';
+      const msg = currentLang === 'zh' ? '还原后 ChatGPT 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native ChatGPT.';
       showConfirm(msg, async () => {
         try {
           const response = await fetch('/api/reset', { method: 'POST' });
