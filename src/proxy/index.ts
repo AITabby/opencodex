@@ -23,31 +23,6 @@ import { decompress as zstdDecompress } from "fzstd";
 // Auto-detect and configure outbound proxy support
 let proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.all_proxy || process.env.ALL_PROXY;
 
-if (!proxyUrl && process.platform === "win32") {
-  try {
-    const registryProxyEnable = execSync('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable', { encoding: "utf8" });
-    if (registryProxyEnable.includes("0x1")) {
-      const registryProxyServer = execSync('reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer', { encoding: "utf8" });
-      const match = registryProxyServer.match(/ProxyServer\s+REG_SZ\s+(.+)/);
-      if (match && match[1]) {
-        const proxyServerStr = match[1].trim();
-        if (proxyServerStr.includes(";")) {
-          const parts = proxyServerStr.split(";");
-          const httpsPart = parts.find(p => p.startsWith("https="));
-          const httpPart = parts.find(p => p.startsWith("http="));
-          const actualProxy = httpsPart ? httpsPart.split("=")[1] : (httpPart ? httpPart.split("=")[1] : parts[0]);
-          proxyUrl = actualProxy.startsWith("http") ? actualProxy : `http://${actualProxy}`;
-        } else {
-          proxyUrl = proxyServerStr.startsWith("http") ? proxyServerStr : `http://${proxyServerStr}`;
-        }
-        console.log(`[OpenCodex Proxy] Auto-detected Windows System Proxy from registry: ${proxyUrl}`);
-      }
-    }
-  } catch (err: any) {
-    // Ignore registry read errors
-  }
-}
-
 const wsAgent = proxyUrl ? new HttpsProxyAgent(proxyUrl) : undefined;
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 const MAX_REQUEST_BODY_BYTES = 80 * 1024 * 1024;
@@ -144,7 +119,7 @@ import {
 import { getDashboardHtml } from "./dashboard.js";
 import { getVisualizerHtml } from "./visualizer.js";
 import { getOrbHtml } from "./orb_view.js";
-import { resolveCodexBinary, withCodexAppServer } from "./codex_app_server.js";
+import { withCodexAppServer } from "./codex_app_server.js";
 import {
   memoryPackageFromMessages,
   memoryPackageFromThread,
@@ -1541,7 +1516,7 @@ export class ProxyServer {
     }
     console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
 
-    const python = process.platform === "win32" ? "python" : "python3";
+    const python = "python3";
     this.vadProcess = spawn(python, [scriptPath]);
     this.vadStdoutBuffer = "";
     this.vadCallbackQueue = [];
@@ -2208,17 +2183,6 @@ except Exception as e:
               return data.token.access_token;
             }
           }
-        } else if (process.platform === "win32") {
-          const psCommand = `powershell -ExecutionPolicy Bypass -Command "$Definition = 'using System; using System.Runtime.InteropServices; public class CredManager { [DllImport(\\"advapi32.dll\\", EntryPoint = \\"CredReadW\\", CharSet = CharSet.Unicode, SetLastError = true)] public static extern bool CredRead(string target, int type, int reservedFlag, out IntPtr credentialPtr); [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct CREDENTIAL { public int Flags; public int Type; public string TargetName; public string Comment; public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten; public int CredentialBlobSize; public IntPtr CredentialBlob; public int Persist; public int AttributeCount; public IntPtr Attributes; public string TargetAlias; public string UserName; } public static string GetPassword(string target) { IntPtr credPtr; if (CredRead(target, 1, 0, out credPtr)) { CREDENTIAL cred = (CREDENTIAL)Marshal.PtrToStructure(credPtr, typeof(CREDENTIAL)); byte[] bytes = new byte[cred.CredentialBlobSize]; Marshal.Copy(cred.CredentialBlob, bytes, 0, cred.CredentialBlobSize); return System.Text.Encoding.UTF8.GetString(bytes); } return null; } }'; Add-Type -TypeDefinition $Definition; [CredManager]::GetPassword('gemini:antigravity')"`;
-          const stdout = execSync(psCommand, { encoding: "utf-8" }).trim();
-          if (stdout) {
-            const data = JSON.parse(stdout);
-            if (data?.token?.access_token) {
-              this.antigravityTokenCache = data.token.access_token;
-              this.antigravityTokenCacheTime = now;
-              return data.token.access_token;
-            }
-          }
         }
       } catch (e: any) {
         console.error("[OpenCodex] Failed to auto-resolve Antigravity token:", e);
@@ -2346,9 +2310,7 @@ stream_idle_timeout_ms = 600000
       if (!existsSync(cacheDir)) {
         console.log("[OpenCodex] computer-use plugin assets not found. Installing via codex plugin add...");
         const codexPath = join(homedir(), ".local", "bin", "codex");
-        const execPath = process.platform === "win32"
-          ? resolveCodexBinary()
-          : (existsSync(codexPath) ? codexPath : "codex");
+        const execPath = existsSync(codexPath) ? codexPath : "codex";
 
         exec(`"${execPath}" plugin add computer-use@openai-bundled`, {
           env: {
@@ -2370,66 +2332,14 @@ stream_idle_timeout_ms = 600000
 
   public restartCodexDesktop() {
     console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
-    if (process.platform === "win32") {
-      const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-      const possiblePaths = [
-        join(localAppData, "Programs", "ChatGPT", "ChatGPT.exe"),
-        join(localAppData, "Programs", "Codex", "Codex.exe"),
-        join(process.env.PROGRAMFILES || "C:\\Program Files", "ChatGPT", "ChatGPT.exe"),
-        join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "Codex.exe"),
-      ];
-      let executablePath = "";
-      for (const p of possiblePaths) {
-        if (existsSync(p)) {
-          executablePath = p;
-          break;
-        }
+    const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315 || open -a Codex --args --remote-debugging-port=8315';
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
+      } else {
+        console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
       }
-      const isMsix = !executablePath;
-
-      const killCmd = 'taskkill /F /IM ChatGPT.exe /IM "ChatGPT Helper.exe" /IM Codex.exe /IM "Codex Helper.exe" /IM SkyComputerUseClient.exe /IM SkyComputerUseService.exe 2>NUL';
-      exec(killCmd, () => {
-        setTimeout(() => {
-          if (isMsix) {
-            try {
-              const launchCmd = 'powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).ShellExecute(\'shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App\')"';
-              exec(launchCmd, (err) => {
-                if (err) {
-                  console.error("[OpenCodex] Failed to start ChatGPT MSIX App via COM:", err.message);
-                } else {
-                  console.log("[OpenCodex] ChatGPT MSIX App successfully restarted on Windows via COM ShellExecute.");
-                }
-              });
-            } catch (err: any) {
-              console.error("[OpenCodex] Exception launching ChatGPT MSIX App:", err.message);
-            }
-          } else {
-            try {
-              const escapedPath = executablePath.replace(/'/g, "''");
-              const launchCmd = `powershell.exe -NoProfile -Command "(New-Object -ComObject Shell.Application).ShellExecute('${escapedPath}', '--remote-debugging-port=8315')"`;
-              exec(launchCmd, (err) => {
-                if (err) {
-                  console.error("[OpenCodex] Failed to start ChatGPT Desktop via COM:", err.message);
-                } else {
-                  console.log("[OpenCodex] ChatGPT Desktop successfully restarted on Windows via COM ShellExecute.");
-                }
-              });
-            } catch (err: any) {
-              console.error("[OpenCodex] Exception launching ChatGPT Desktop:", err.message);
-            }
-          }
-        }, 1500);
-      });
-    } else {
-      const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315 || open -a Codex --args --remote-debugging-port=8315';
-      exec(cmd, (err, stdout, stderr) => {
-        if (err) {
-          console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
-        } else {
-          console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
-        }
-      });
-    }
+    });
   }
 
   public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
@@ -5122,7 +5032,7 @@ stream_idle_timeout_ms = 600000
         }
 
         console.error(`[OpenCodex Command Console] Executing: ${command}`);
-        const cmdPath = resolveCodexBinary();
+        const cmdPath = "/Applications/ChatGPT.app/Contents/Resources/codex";
         const child = spawn(cmdPath, ["--dangerously-bypass-approvals-and-sandbox", "exec", "--skip-git-repo-check", "-"]);
         
         let output = "";
@@ -5260,9 +5170,7 @@ stream_idle_timeout_ms = 600000
           const moduleDir = dirname(fileURLToPath(import.meta.url));
           const orbScript = join(moduleDir, "orb.js");
           
-          const electronPath = process.platform === "win32" 
-            ? join(moduleDir, "..", "..", "node_modules", ".bin", "electron.cmd")
-            : join(moduleDir, "..", "..", "node_modules", ".bin", "electron");
+          const electronPath = join(moduleDir, "..", "..", "node_modules", ".bin", "electron");
           
           this.orbProcess = spawn(electronPath, [orbScript], {
             detached: true,
@@ -5595,9 +5503,7 @@ stream_idle_timeout_ms = 600000
 
     console.log(`[Responses] Routing ${requestedModel} → ${provider.name}/${upstreamModel} (stream=${isStream}, visionBridge=${callVisionBridge})`);
 
-    const chatBody = process.platform === "win32"
-      ? await responsesToChatWin(processedReqBody, upstreamModel, finalSessionId)
-      : responsesToChat(processedReqBody, upstreamModel, finalSessionId);
+    const chatBody = await responsesToChatWin(processedReqBody, upstreamModel, finalSessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = finalSessionId ? String(finalSessionId) : "default";
@@ -6160,7 +6066,7 @@ stream_idle_timeout_ms = 600000
   }
 
   private transcribeAudioLocal(filePath: string, cb: (text: string | null) => void) {
-    const pythonCmd = process.platform === "win32" ? "python" : "python3";
+    const pythonCmd = "python3";
     const transcribeHelper = join(tmpdir(), "ocb_transcribe.py");
     const args = [transcribeHelper, filePath];
     const uvxPath = join(homedir(), ".local", "bin", "uvx");
@@ -7360,9 +7266,7 @@ stream_idle_timeout_ms = 600000
 
 
 
-    const chatBody = process.platform === "win32"
-      ? await responsesToChatWin(processedReqBody, mappedModelName, sessionId)
-      : responsesToChat(processedReqBody, mappedModelName, sessionId);
+    const chatBody = await responsesToChatWin(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     this.customModelSessions.add(sessionIdStr);
@@ -7677,7 +7581,7 @@ stream_idle_timeout_ms = 600000
     if (this.mcpProcess) return;
     console.error("[OpenCodex MCP Manager] Starting persistent codex mcp-server...");
     
-    this.mcpProcess = spawn(resolveCodexBinary(), ["mcp-server"]);
+    this.mcpProcess = spawn("/Applications/ChatGPT.app/Contents/Resources/codex", ["mcp-server"]);
     this.mcpStdoutBuffer = "";
 
     this.mcpProcess.stdout.on("data", (chunk: Buffer) => {

@@ -8,7 +8,6 @@ import { spawnSync } from "node:child_process";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { sendWindowsAction } from "./windows-agent.js";
 
 export interface WindowInfo {
   id: number;
@@ -24,70 +23,38 @@ export class ActionPerformer {
   // ─── Mouse Actions ───
 
   async click(x: number, y: number, button = "left", clicks = 1) {
-    if (process.platform === "win32") {
-      for (let i = 0; i < clicks; i++) await sendWindowsAction("click", { x, y, button });
-      return;
-    }
     for (let i = 0; i < clicks; i++) {
       this.run("click", [String(x), String(y), button === "right" ? "right" : "left"]);
     }
   }
 
   async drag(fromX: number, fromY: number, toX: number, toY: number) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("drag", { from_x: fromX, from_y: fromY, to_x: toX, to_y: toY });
-      return;
-    }
     this.run("drag", [String(fromX), String(fromY), String(toX), String(toY)]);
   }
 
   async scroll(x: number, y: number, deltaX: number, deltaY: number) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("scroll", { x, y, delta_x: deltaX, delta_y: deltaY });
-      return;
-    }
     this.run("scroll", [String(x), String(y), String(deltaX), String(deltaY)]);
   }
 
   async mouseDown(x: number, y: number, button = "left") {
-    if (process.platform === "win32") {
-      await sendWindowsAction("mouse_down", { x, y, button });
-      return;
-    }
     this.run("mouse_down", [String(x), String(y), button === "right" ? "right" : "left"]);
   }
 
   async mouseUp(x: number, y: number, button = "left") {
-    if (process.platform === "win32") {
-      await sendWindowsAction("mouse_up", { x, y, button });
-      return;
-    }
     this.run("mouse_up", [String(x), String(y), button === "right" ? "right" : "left"]);
   }
 
   async mouseMove(x: number, y: number, drag = false) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("mouse_move", { x, y, drag });
-      return;
-    }
     this.run("mouse_move", [String(x), String(y), String(drag)]);
   }
 
   // ─── Keyboard Actions ───
 
   async typeText(text: string) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("type", { text });
-      return;
-    }
     this.run("type", [text]);
   }
 
   async pressKey(key: string) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("press_key", { key });
-      return;
-    }
     this.run("key", [key]);
   }
 
@@ -101,19 +68,11 @@ export class ActionPerformer {
   // ─── Window Management ───
 
   async getWindows(): Promise<WindowInfo[]> {
-    if (process.platform === "win32") {
-      const result = await sendWindowsAction("get_windows");
-      return result.windows || [];
-    }
     const out = this.run("windows", []);
     return JSON.parse(out);
   }
 
   async focusWindow(windowId: number) {
-    if (process.platform === "win32") {
-      await sendWindowsAction("focus_window", { window_id: String(windowId) });
-      return;
-    }
     this.run("focus", [String(windowId)]);
   }
 

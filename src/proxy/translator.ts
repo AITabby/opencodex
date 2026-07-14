@@ -12,7 +12,7 @@ import { execSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import { ProxyAgent, fetch } from "undici";
-import { sendWindowsAction } from "../cu/windows-agent.js";
+import { ActionPerformer } from "../cu/actions.js";
 import { ScreenshotTaker } from "../cu/screenshot.js";
 
 export const pendingToolCallsMap = new Map<string, { name: string, arguments: string }>();
@@ -54,8 +54,8 @@ export async function runToolLocally(name: string, argumentsStr: string): Promis
 
   if (cleanName === "list_apps") {
     try {
-      const windowsRes = await sendWindowsAction("get_windows", {});
-      const windows = windowsRes.windows || [];
+      const perf = new ActionPerformer();
+      const windows = await perf.getWindows();
       const appsMap = new Map<string, any>();
       for (const w of windows) {
         const appName = w.app || "unknown";
@@ -79,16 +79,59 @@ export async function runToolLocally(name: string, argumentsStr: string): Promis
     }
   }
   
-  const params: Record<string, any> = { ...args };
-  let action = cleanName;
-  if (cleanName === "type_text") {
-    action = "type";
-  } else if (cleanName === "press_key") {
-    action = "press_key";
+  const perf = new ActionPerformer();
+  
+  if (cleanName === "click") {
+    const clicks = args.clicks !== undefined ? args.clicks : 1;
+    const button = args.button || "left";
+    await perf.click(args.x, args.y, button, clicks);
+    return { status: "ok" };
   }
   
-  const result = await sendWindowsAction(action, params);
-  return result;
+  if (cleanName === "drag") {
+    await perf.drag(args.from_x, args.from_y, args.to_x, args.to_y);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "scroll") {
+    await perf.scroll(args.x, args.y, args.delta_x || 0, args.delta_y || 0);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "mouse_down") {
+    const button = args.button || "left";
+    await perf.mouseDown(args.x, args.y, button);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "mouse_up") {
+    const button = args.button || "left";
+    await perf.mouseUp(args.x, args.y, button);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "mouse_move") {
+    const drag = args.drag || false;
+    await perf.mouseMove(args.x, args.y, drag);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "type_text" || cleanName === "type") {
+    await perf.typeText(args.text);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "press_key" || cleanName === "key") {
+    await perf.pressKey(args.key);
+    return { status: "ok" };
+  }
+  
+  if (cleanName === "focus_window") {
+    await perf.focusWindow(args.window_id);
+    return { status: "ok" };
+  }
+
+  throw new Error(`Unsupported tool: ${cleanName}`);
 }
 
 // Auto-detect and configure outbound proxy support for translator requests
@@ -856,8 +899,8 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
     }
   }
   
-  // Inject computer_use tools if not already present (Windows only to keep Mac logic untouched)
-  if (process.platform === "win32") {
+  // Inject computer_use tools if not already present
+  if (true) {
     const hasComputerUse = converted.some(t => {
       const name = t.function?.name || "";
       return name.startsWith("mcp__computer-use") || name.startsWith("mcp__computer_use");

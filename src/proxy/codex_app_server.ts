@@ -17,30 +17,6 @@ export function resolveCodexBinary(): string {
     return existsSync(bundled) ? bundled : "codex";
   }
 
-  if (process.platform === "win32") {
-    const localAppData = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-    const candidates = [
-      join(localAppData, "Programs", "Codex", "resources", "codex.exe"),
-      join(process.env.PROGRAMFILES || "C:\\Program Files", "Codex", "resources", "codex.exe"),
-      join(localAppData, "Programs", "Codex", "Codex.exe")
-    ];
-    const found = candidates.find(existsSync);
-    if (found) return found;
-
-    // Search OpenAI Codex App Store / MSIX sub-path
-    const openAiCodexBinDir = join(localAppData, "OpenAI", "Codex", "bin");
-    if (existsSync(openAiCodexBinDir)) {
-      try {
-        const subdirs = readdirSync(openAiCodexBinDir);
-        for (const subdir of subdirs) {
-          const p = join(openAiCodexBinDir, subdir, "codex.exe");
-          if (existsSync(p)) return p;
-        }
-      } catch {}
-    }
-    return "codex.exe";
-  }
-
   return "codex";
 }
 
