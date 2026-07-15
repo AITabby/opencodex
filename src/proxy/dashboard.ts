@@ -2686,6 +2686,7 @@ export function getDashboardHtml(): string {
       const button = document.getElementById('memory-scan-import-btn');
       button.disabled = true;
       let importedCount = 0;
+      const importWarnings = [];
       try {
         for (let index = 0; index < selected.length; index++) {
           button.textContent = (index + 1) + ' / ' + selected.length;
@@ -2696,23 +2697,20 @@ export function getDashboardHtml(): string {
             body: JSON.stringify({
               source_id: checkbox.dataset.sourceId,
               session_id: checkbox.dataset.sessionId,
-              restart: false
+              restart: index === selected.length - 1
             })
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || 'Import failed');
           importedCount++;
+          if (Array.isArray(data.warnings)) importWarnings.push(...data.warnings);
         }
         closeMemoryScanModal();
-        showToast((i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...') + ' (' + importedCount + ')');
-        await fetch('/api/restart-codex', { method: 'POST' });
+        const warningSuffix = importWarnings.length ? ' ⚠️ ' + Array.from(new Set(importWarnings)).join('；') : '';
+        showToast((i18nDict[currentLang].toastImportSuccess || 'Import complete.') + ' (' + importedCount + ')' + warningSuffix);
+        loadSessionsList();
       } catch (error) {
         showToast((i18nDict[currentLang].toastImportFailed || 'Import failed') + ': ' + error.message);
-        if (importedCount > 0) {
-          try {
-            await fetch('/api/restart-codex', { method: 'POST' });
-          } catch {}
-        }
       } finally {
         button.disabled = false;
         button.textContent = i18nDict[currentLang].importSelected || 'Import Selected';
@@ -2792,7 +2790,10 @@ export function getDashboardHtml(): string {
       const baseMessage = responseData.restarted
         ? (i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...')
         : (i18nDict[currentLang].toastImportSuccess || 'Imported successfully!');
-      showToast(baseMessage + ' (' + (responseData.message_count || 0) + ')');
+      const warningSuffix = Array.isArray(responseData.warnings) && responseData.warnings.length
+        ? ' ⚠️ ' + Array.from(new Set(responseData.warnings)).join('；')
+        : '';
+      showToast(baseMessage + ' (' + (responseData.message_count || 0) + ')' + warningSuffix);
       if (!responseData.restarted) {
         loadSessionsList();
         if (responseData.id) selectSession(responseData.id);

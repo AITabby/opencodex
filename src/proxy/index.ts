@@ -135,6 +135,8 @@ import {
   toMarkdown,
   toOpenAiMessages,
   toResponsesItems,
+  type MemoryGitSnapshot,
+  type MemoryMessage,
   type OpenCodexMemoryPackage
 } from "./memory_bridge.js";
 import { parseMemoryFile, parseMemoryFilePath } from "./memory_file_import.js";
@@ -439,6 +441,7 @@ function loadImportedMemoryFromRollout(sessionId: string): any[] {
 
   const messages: any[] = [];
   let importedMemoryStarted = false;
+  let importedMetadata: any;
   try {
     const lines = readFileSync(rolloutFile, "utf-8").split("\n");
     for (const line of lines) {
@@ -447,9 +450,13 @@ function loadImportedMemoryFromRollout(sessionId: string): any[] {
       const item = JSON.parse(trimmed);
       const payload = item.type === "response_item" ? item.payload : null;
       if (payload?.type !== "message") continue;
-      const isImportedMessage =
-        payload.internal_chat_message_metadata_passthrough?.turn_id === OPENCODEX_MEMORY_TURN_ID;
+      const passthrough = payload.internal_chat_message_metadata_passthrough || {};
+      const isImportedMessage = passthrough.turn_id === OPENCODEX_MEMORY_TURN_ID;
       if (isImportedMessage) importedMemoryStarted = true;
+      if (passthrough.import_metadata && typeof passthrough.import_metadata === "object") {
+        importedMetadata = passthrough.import_metadata;
+      }
+      if (passthrough.import_boundary || passthrough.import_events) continue;
       if (!isImportedMessage && (!importedMemoryStarted || !["user", "assistant"].includes(payload.role))) {
         continue;
       }
@@ -471,11 +478,17 @@ function loadImportedMemoryFromRollout(sessionId: string): any[] {
       if (normalizedText && !(normalizedText.startsWith("{") && normalizedText.includes('"title"'))) {
         messages.push({
           role: payload.role,
-          content: normalizedText
+          content: normalizedText,
+          source_id: passthrough.historical_source_id,
+          timestamp: passthrough.historical_timestamp,
+          tool_call_id: passthrough.historical_tool_call_id,
+          tool_name: passthrough.historical_tool_name,
+          tool_calls: passthrough.historical_tool_calls
         });
       }
     }
   } catch {}
+  if (importedMetadata) (messages as any).import_metadata = importedMetadata;
   return messages;
 }
 
@@ -517,10 +530,70 @@ function getPreferredCodexCwd(): string {
   return homedir();
 }
 
+function captureGitSnapshot(cwd: string): MemoryGitSnapshot | undefined {
+  const runGit = (args: string[]): string => execSync(`git ${args.join(" ")}`, {
+    cwd,
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "ignore"]
+  }).trim();
+
+  try {
+    const root = runGit(["rev-parse", "--show-toplevel"]);
+    if (!root) return undefined;
+    const branch = runGit(["branch", "--show-current"]);
+    const commit = runGit(["rev-parse", "HEAD"]);
+    const status = runGit(["status", "--porcelain", "--untracked-files=all"]);
+    return {
+      root,
+      branch: branch || undefined,
+      commit: commit || undefined,
+      dirty: Boolean(status),
+      changed_files: status ? status.split("\n").slice(0, 500) : [],
+      captured_at: new Date().toISOString()
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function enrichMemoryForExport(
+  memory: OpenCodexMemoryPackage,
+  gatewayActive = !isNativeModeEnabled()
+): OpenCodexMemoryPackage {
+  const cwd = memory.source?.cwd;
+  return {
+    ...memory,
+    source: {
+      ...memory.source,
+      runtime_mode: gatewayActive ? "gateway" : "native",
+      git: memory.source?.git || (cwd && existsSync(cwd) ? captureGitSnapshot(cwd) : undefined)
+    }
+  };
+}
+
+function restoreImportedMemoryMetadata(
+  memory: OpenCodexMemoryPackage,
+  importedMessages: any[]
+): OpenCodexMemoryPackage {
+  const metadata = (importedMessages as any).import_metadata;
+  if (!metadata || typeof metadata !== "object") return memory;
+  return {
+    ...memory,
+    exported_at: typeof metadata.exported_at === "string" ? metadata.exported_at : memory.exported_at,
+    imported_at: typeof metadata.imported_at === "string" ? metadata.imported_at : undefined,
+    title: typeof metadata.title === "string" ? metadata.title : memory.title,
+    source: metadata.source && typeof metadata.source === "object"
+      ? { ...metadata.source, thread_id: memory.source?.thread_id || metadata.source.thread_id }
+      : memory.source,
+    continuity: metadata.continuity && typeof metadata.continuity === "object" ? metadata.continuity : memory.continuity,
+    events: Array.isArray(metadata.events) ? metadata.events : memory.events,
+    messages: memory.messages
+  };
+}
+
 function appendImportedSessionProjection(
   rolloutPath: string,
-  title: string,
-  messageCount: number,
+  memory: OpenCodexMemoryPackage,
   cwd: string,
   model: string
 ): void {
@@ -528,41 +601,48 @@ function appendImportedSessionProjection(
     throw new Error("Codex did not create a readable rollout file");
   }
 
+  // The app-server stores injected items for model context, but the desktop
+  // transcript currently renders event_msg entries. Avoid adding the old
+  // synthetic two-message projection more than once.
+  try {
+    if (readFileSync(rolloutPath, "utf-8").includes('"opencodex_import_projection":true')) return;
+  } catch {}
+
   const timestamp = new Date().toISOString();
-  const turnId = randomUUID();
-  const userMessage = `Imported memory: ${title} (${messageCount} messages)`;
-  const assistantMessage = "The imported conversation is available as model-visible history. Continue normally from this thread.";
+  const importedMessages = memory.messages.filter((message: MemoryMessage) =>
+    message.role === "user" || message.role === "assistant"
+  );
   const projection = [
     {
       timestamp,
       type: "turn_context",
       payload: {
-        turn_id: turnId,
+        turn_id: randomUUID(),
         cwd,
         workspace_roots: [cwd],
-        model
+        model,
+        opencodex_import_projection: true
       }
     },
-    {
-      timestamp,
+    ...importedMessages.map((message) => ({
+      timestamp: message.timestamp || timestamp,
       type: "event_msg",
-      payload: {
-        type: "user_message",
-        message: userMessage,
-        images: [],
-        local_images: [],
-        text_elements: []
-      }
-    },
-    {
-      timestamp,
-      type: "event_msg",
-      payload: {
-        type: "agent_message",
-        message: assistantMessage,
-        phase: "final_answer"
-      }
-    }
+      payload: message.role === "user"
+        ? {
+            type: "user_message",
+            message: message.content,
+            images: [],
+            local_images: [],
+            text_elements: [],
+            opencodex_import_projection: true
+          }
+        : {
+            type: "agent_message",
+            message: message.content,
+            phase: "final_answer",
+            opencodex_import_projection: true
+          }
+    }))
   ];
   appendFileSync(rolloutPath, "\n" + projection.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf-8");
 }
@@ -601,22 +681,48 @@ async function updateImportedThreadState(threadId: string, preview: string): Pro
   }
 }
 
-async function importMemoryIntoCodex(memory: OpenCodexMemoryPackage): Promise<{
+async function importMemoryIntoCodex(
+  memory: OpenCodexMemoryPackage,
+  gatewayActive = !isNativeModeEnabled()
+): Promise<{
   id: string;
   name: string;
   message_count: number;
   event_count: number;
+  warnings: string[];
 }> {
   const fallbackTitle = `Imported conversation ${new Date().toLocaleDateString()}`;
   const threadName = String(memory.title || fallbackTitle).slice(0, 200);
   const sourceCwd = memory.source?.cwd;
+  const warnings: string[] = [];
   let importCwd = getPreferredCodexCwd();
   if (sourceCwd && existsSync(sourceCwd)) {
     try {
       if (statSync(sourceCwd).isDirectory()) importCwd = sourceCwd;
     } catch {}
+  } else if (sourceCwd) {
+    warnings.push(`来源工作目录不存在，已使用当前默认目录：${importCwd}`);
+  } else {
+    warnings.push(`来源未提供工作目录，已使用当前默认目录：${importCwd}`);
   }
-  const responseItems = toResponsesItems(memory);
+  const currentGit = captureGitSnapshot(importCwd);
+  if (memory.source?.git?.commit && currentGit?.commit && memory.source.git.commit !== currentGit.commit) {
+    warnings.push(`当前 HEAD 与来源基线不同：${currentGit.commit.slice(0, 12)} ≠ ${memory.source.git.commit.slice(0, 12)}`);
+  }
+  if (memory.source?.git?.dirty) {
+    warnings.push("来源会话记录了未提交变更；这些变更不会随会话自动恢复。");
+  }
+  const importMemory: OpenCodexMemoryPackage = {
+    ...memory,
+    imported_at: new Date().toISOString(),
+    environment: {
+      cwd: importCwd,
+      runtime_mode: gatewayActive ? "gateway" : "native",
+      git: currentGit,
+      captured_at: new Date().toISOString()
+    }
+  };
+  const responseItems = toResponsesItems(importMemory);
 
   const newSid = await withCodexAppServer(async (client) => {
     let createdThreadId = "";
@@ -645,8 +751,7 @@ async function importMemoryIntoCodex(memory: OpenCodexMemoryPackage): Promise<{
       });
       appendImportedSessionProjection(
         String(readResult.thread?.path || ""),
-        threadName,
-        memory.messages.length,
+        importMemory,
         importCwd,
         String(startResult.model || "gpt-5.5")
       );
@@ -670,7 +775,8 @@ async function importMemoryIntoCodex(memory: OpenCodexMemoryPackage): Promise<{
     id: newSid,
     name: threadName,
     message_count: memory.messages.length,
-    event_count: memory.events?.length || 0
+    event_count: memory.events?.length || 0,
+    warnings
   };
 }
 
@@ -4611,6 +4717,7 @@ stream_idle_timeout_ms = 600000
             getSessionTitle(sid),
             sid
           );
+          memory = restoreImportedMemoryMetadata(memory, importedHistory);
         } else {
           try {
             memory = await withCodexAppServer(async (client) => {
@@ -4637,6 +4744,7 @@ stream_idle_timeout_ms = 600000
           }
         }
 
+        memory = enrichMemoryForExport(memory, this.gatewayIsActive());
         let outputContent = "";
         let filename = `session_${sid}`;
 
@@ -4721,8 +4829,8 @@ stream_idle_timeout_ms = 600000
           : String(data.session_id || "");
         const parsed = await parseMemoryFilePath(source.path, selectedSessionId);
         if (!parsed.memory) throw new Error("The selected session could not be read");
-        const imported = await importMemoryIntoCodex(parsed.memory);
-        const shouldRestart = data.restart !== false;
+        const imported = await importMemoryIntoCodex(parsed.memory, this.gatewayIsActive());
+        const shouldRestart = data.restart === true;
         console.log(`[OpenCodex Memory Bridge] Imported scanned source ${source.display_path} into ${imported.id}`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
@@ -4733,7 +4841,7 @@ stream_idle_timeout_ms = 600000
           restarted: shouldRestart
         }));
         if (shouldRestart) {
-          setTimeout(() => this.restartCodexDesktop(), 350);
+          setTimeout(() => this.restartCodexDesktop(true), 350);
         }
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -4775,8 +4883,8 @@ stream_idle_timeout_ms = 600000
           const rawImport = data.payload ?? (Array.isArray(data.messages) ? data.messages : data);
           memory = normalizeImportedMemory(rawImport, fallbackTitle);
         }
-        const imported = await importMemoryIntoCodex(memory);
-        const shouldRestart = data.restart !== false;
+        const imported = await importMemoryIntoCodex(memory, this.gatewayIsActive());
+        const shouldRestart = data.restart === true;
         console.log(`[OpenCodex Memory Bridge] Imported ${memory.messages.length} messages into Codex thread ${imported.id}`);
 
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -4788,7 +4896,7 @@ stream_idle_timeout_ms = 600000
           restarted: shouldRestart
         }));
         if (shouldRestart) {
-          setTimeout(() => this.restartCodexDesktop(), 350);
+          setTimeout(() => this.restartCodexDesktop(true), 350);
         }
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
