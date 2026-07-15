@@ -19,8 +19,13 @@ export const pendingToolCallsMap = new Map<string, { name: string, arguments: st
 export const pendingToolArgumentsAccumulator = new Map<string, string>();
 export const itemIdToCallIdMap = new Map<string, string>();
 
+const COMPUTER_USE_NAMESPACE = "mcp__computer_use";
+
 export async function runToolLocally(name: string, argumentsStr: string): Promise<any> {
-  const cleanName = name.replace(/^mcp__computer_use__/, "");
+  // Accept all names emitted by the 0.2.x and 0.4.x clients, but execute a
+  // single canonical action name locally. The Codex client uses the 0.2.x
+  // namespace `mcp__computer_use`; the flattened Chat name adds `__`.
+  const cleanName = name.replace(/^mcp__computer[-_]use(?:__|_)/, "");
   const args = argumentsStr ? JSON.parse(argumentsStr) : {};
   
   if (cleanName === "screenshot") {
@@ -29,7 +34,7 @@ export async function runToolLocally(name: string, argumentsStr: string): Promis
     return { status: "ok", data: buf.toString("base64") };
   }
 
-  if (cleanName === "get_window_state" || cleanName === "get_app_state") {
+  if (cleanName === "get_app_state") {
     const taker = new ScreenshotTaker();
     const buf = await taker.capture();
     const base64 = buf.toString("base64");
@@ -148,7 +153,7 @@ export function stripThink(text: string): string {
 
 export function patchToolCallArguments(fnName: string, argumentsStr: string): string {
   if (
-    fnName.startsWith("mcp__computer_use__") ||
+    /^mcp__computer[-_]use(?:__|_)/.test(fnName) ||
     ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "set_value"].includes(fnName)
   ) {
     try {
@@ -204,6 +209,75 @@ export function extractNamespaceMap(tools: any[] | undefined): Record<string, st
   return nsMap;
 }
 
+const COMPUTER_USE_FUNCTIONS = [
+  {
+    name: "click",
+    description: "Click an accessibility element or screen coordinate in an application.",
+    parameters: { type: "object", properties: { app: { type: "string" }, element_index: { type: "integer" }, x: { type: "number" }, y: { type: "number" }, mouse_button: { type: "string", enum: ["left", "right", "middle"] }, click_count: { type: "integer" } }, required: ["app"] }
+  },
+  {
+    name: "drag",
+    description: "Drag between two screen coordinates in an application.",
+    parameters: { type: "object", properties: { app: { type: "string" }, from_x: { type: "number" }, from_y: { type: "number" }, to_x: { type: "number" }, to_y: { type: "number" } }, required: ["app", "from_x", "from_y", "to_x", "to_y"] }
+  },
+  {
+    name: "get_app_state",
+    description: "Get the active application's accessibility tree and screenshot.",
+    parameters: { type: "object", properties: { app: { type: "string" }, disableDiff: { type: "boolean" } }, required: ["app"] }
+  },
+  {
+    name: "list_apps",
+    description: "List running applications.",
+    parameters: { type: "object", properties: {} }
+  },
+  {
+    name: "perform_secondary_action",
+    description: "Invoke an accessibility action exposed by an element.",
+    parameters: { type: "object", properties: { app: { type: "string" }, element_index: { type: "integer" }, action: { type: "string" } }, required: ["app", "element_index", "action"] }
+  },
+  {
+    name: "press_key",
+    description: "Press a key or key combination in an application.",
+    parameters: { type: "object", properties: { app: { type: "string" }, key: { type: "string" } }, required: ["app", "key"] }
+  },
+  {
+    name: "scroll",
+    description: "Scroll an accessibility element in an application.",
+    parameters: { type: "object", properties: { app: { type: "string" }, element_index: { type: "integer" }, direction: { type: "string", enum: ["up", "down", "left", "right", "u", "d", "l", "r"] }, pages: { type: "number" } }, required: ["app", "direction"] }
+  },
+  {
+    name: "select_text",
+    description: "Select matching text in an editable element.",
+    parameters: { type: "object", properties: { app: { type: "string" }, element_index: { type: "integer" }, text: { type: "string" }, prefix: { type: "string" }, suffix: { type: "string" }, selection_type: { type: "string", enum: ["text", "cursor_before", "cursor_after"] } }, required: ["app", "element_index", "text"] }
+  },
+  {
+    name: "set_value",
+    description: "Set the value of an accessibility element.",
+    parameters: { type: "object", properties: { app: { type: "string" }, element_index: { type: "integer" }, value: { type: "string" } }, required: ["app", "element_index", "value"] }
+  },
+  {
+    name: "type_text",
+    description: "Type text into the focused application.",
+    parameters: { type: "object", properties: { app: { type: "string" }, text: { type: "string" } }, required: ["app", "text"] }
+  }
+];
+
+/** Ensure custom providers receive a real MCP namespace in direct Responses requests. */
+export function ensureComputerUseResponsesTools(tools: any[] | undefined): any[] {
+  const current = Array.isArray(tools) ? [...tools] : [];
+  const hasComputerUse = current.some(tool => {
+    if (!tool || typeof tool !== "object") return false;
+    return /mcp__computer[-_]use|computer-use@openai-bundled/i.test(JSON.stringify(tool));
+  });
+  if (hasComputerUse) return current;
+  return [...current, {
+    type: "namespace",
+    name: COMPUTER_USE_NAMESPACE,
+    description: "Control the local desktop through Computer Use.",
+    functions: COMPUTER_USE_FUNCTIONS
+  }];
+}
+
 function _unflattenVariants(name: string): string[] {
   const variants: string[] = [];
   if (name.includes("__")) {
@@ -224,18 +298,19 @@ function _unflattenVariants(name: string): string[] {
 }
 
 export function unflattenToolCall(name: string, namespaceMap?: Record<string, string>): [string, string | null] {
-  // First, prioritize standard computer use actions so they always map to mcp__computer-use__
+  // First, prioritize standard computer use actions so all legacy and 0.4.x
+  // spellings map back to the canonical 0.2.x namespace.
   const actions = ["click", "scroll", "press_key", "type_text", "perform_secondary_action", "select_text", "drag", "get_app_state", "get_window_state", "screenshot", "set_value", "list_apps", "wait_for_ui"];
   for (const action of actions) {
     if (name === action || name === `mcp__computer_use_${action}` || name === `mcp__computer_use__${action}` || name === `mcp__computer-use_${action}` || name === `mcp__computer-use__${action}` || (name.endsWith(`_${action}`) && name.includes("computer"))) {
-      return [action, "mcp__computer-use__"];
+      return [action, COMPUTER_USE_NAMESPACE];
     }
   }
 
   // Fallback check of variants for computer use actions to avoid incorrect mapping by other namespace mappings
   for (const variant of _unflattenVariants(name)) {
     if (actions.includes(variant)) {
-      return [variant, "mcp__computer-use__"];
+      return [variant, COMPUTER_USE_NAMESPACE];
     }
   }
 
@@ -262,7 +337,7 @@ export function unflattenToolCall(name: string, namespaceMap?: Record<string, st
   if (name.includes("computer_use") || name.includes("computer-use")) {
     for (const action of actions) {
       if (name.includes(action)) {
-        return [action, "mcp__computer-use__"];
+        return [action, COMPUTER_USE_NAMESPACE];
       }
     }
   }
@@ -365,11 +440,8 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   const chat: any = {
     model: upstreamModel,
     messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
-    stream: body.stream !== false,
+    stream: !!body.stream,
   };
-  if (chat.stream) {
-    chat.stream_options = { include_usage: true };
-  }
 
   _copyIfPresent(body, chat, "temperature");
   _copyIfPresent(body, chat, "top_p");
@@ -489,11 +561,8 @@ export async function responsesToChatWin(body: any, upstreamModel: string, sessi
   const chat: any = {
     model: upstreamModel,
     messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
-    stream: body.stream !== false,
+    stream: !!body.stream,
   };
-  if (chat.stream) {
-    chat.stream_options = { include_usage: true };
-  }
 
   _copyIfPresent(body, chat, "temperature");
   _copyIfPresent(body, chat, "top_p");
@@ -874,7 +943,12 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
       for (const f of funcs) {
         if (typeof f !== "object" || f === null) continue;
         const fName = f.name || "";
-        const fullName = namespaceName.endsWith("__") ? namespaceName + fName : `${namespaceName}__${fName}`;
+        const canonicalNamespace = /mcp__computer[-_]use/.test(namespaceName)
+          ? COMPUTER_USE_NAMESPACE
+          : namespaceName;
+        const fullName = canonicalNamespace.endsWith("__")
+          ? canonicalNamespace + fName
+          : `${canonicalNamespace}__${fName}`;
         const fFunc = f.function || f;
         const params = fFunc.parameters || fFunc.input_schema || { type: "object", properties: {}, additionalProperties: true };
         const desc = fFunc.description || "";
@@ -899,8 +973,9 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
     }
   }
   
-  // Inject computer_use tools if not already present
-  if (true) {
+  // Inject the local coordinate-based compatibility tools only on Windows.
+  // macOS uses the official native Computer Use MCP exposed by Codex.
+  if (process.platform === "win32") {
     const hasComputerUse = converted.some(t => {
       const name = t.function?.name || "";
       return name.startsWith("mcp__computer-use") || name.startsWith("mcp__computer_use");
@@ -910,7 +985,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__click",
+            name: "mcp__computer_use__click",
             description: "Click a mouse button at coordinates (x, y).",
             parameters: {
               type: "object",
@@ -927,7 +1002,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__scroll",
+            name: "mcp__computer_use__scroll",
             description: "Scroll the wheel or trackpad.",
             parameters: {
               type: "object",
@@ -944,7 +1019,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__press_key",
+            name: "mcp__computer_use__press_key",
             description: "Press a key or key combination (e.g., 'Control+C', 'Return').",
             parameters: {
               type: "object",
@@ -958,7 +1033,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__type_text",
+            name: "mcp__computer_use__type_text",
             description: "Type a string of text.",
             parameters: {
               type: "object",
@@ -972,7 +1047,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__drag",
+            name: "mcp__computer_use__drag",
             description: "Drag from coordinates (from_x, from_y) to (to_x, to_y).",
             parameters: {
               type: "object",
@@ -989,7 +1064,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__get_app_state",
+            name: "mcp__computer_use__get_app_state",
             description: "Get the current active application and basic UI details.",
             parameters: {
               type: "object",
@@ -1000,21 +1075,7 @@ function _responsesToolsToChatTools(tools: any[] | undefined): any[] {
         {
           type: "function",
           function: {
-            name: "mcp__computer-use__get_window_state",
-            description: "Get the current window layout, titles, and screenshot.",
-            parameters: {
-              type: "object",
-              properties: {
-                include_screenshot: { type: "boolean", default: true },
-                include_text: { type: "boolean", default: false }
-              }
-            }
-          }
-        },
-        {
-          type: "function",
-          function: {
-            name: "mcp__computer-use__list_apps",
+            name: "mcp__computer_use__list_apps",
             description: "List running applications.",
             parameters: {
               type: "object",

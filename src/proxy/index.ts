@@ -34,6 +34,11 @@ class UpstreamError extends Error {
   }
 }
 const REQUEST_DEBUG_ENABLED = process.env.OPENCODEX_DEBUG_REQUESTS === "1";
+const NATIVE_MODE_PATH = join(homedir(), ".opencodex", "native_mode");
+
+export function isNativeModeEnabled(): boolean {
+  return existsSync(NATIVE_MODE_PATH);
+}
 
 function isTrustedBrowserOrigin(origin: string | undefined): boolean {
   if (!origin) return true;
@@ -108,6 +113,7 @@ import {
   responsesToChatWin,
   chatCompletionToResponse,
   extractNamespaceMap,
+  ensureComputerUseResponsesTools,
   ResponsesStreamState,
   processVisionBridge,
   runToolLocally,
@@ -242,6 +248,64 @@ function mergeHistory(history: any[], incoming: any[]): any[] {
     }
   }
   return history.concat(incoming.slice(overlapLength));
+}
+
+function isCustomCatalogModel(model: any): boolean {
+  const slug = String(model?.slug || model?.model || "").toLowerCase();
+  return model?.provider === "opencodex"
+    || !!model?.backend_provider
+    || slug.includes("deepseek")
+    || slug.includes("minimax")
+    || slug.includes("qwen")
+    || slug.startsWith("mimo");
+}
+
+function hasThirdPartyModels(catalog: any): boolean {
+  return !!catalog
+    && Array.isArray(catalog.models)
+    && catalog.models.some((model: any) => isCustomCatalogModel(model));
+}
+
+/**
+ * Codex decides whether to expose MCP/Computer Use from the catalog entry,
+ * before the request reaches this proxy.  Keep every BYOK/custom entry
+ * usable with the local computer-use bridge, including older entries that
+ * were saved without these fields.
+ */
+function normalizeCustomModelCapabilities(catalog: any): boolean {
+  if (!catalog || !Array.isArray(catalog.models)) return false;
+
+  let changed = false;
+  for (const model of catalog.models) {
+    if (!isCustomCatalogModel(model)) continue;
+
+    const supportedTools = Array.isArray(model.experimental_supported_tools)
+      ? [...model.experimental_supported_tools]
+      : [];
+    for (const tool of ["computer_use", "mcp"]) {
+      if (!supportedTools.includes(tool)) {
+        supportedTools.push(tool);
+        changed = true;
+      }
+    }
+    if (JSON.stringify(model.experimental_supported_tools) !== JSON.stringify(supportedTools)) {
+      model.experimental_supported_tools = supportedTools;
+      changed = true;
+    }
+    if (model.supports_computer_use !== true) {
+      model.supports_computer_use = true;
+      changed = true;
+    }
+    if (model.supports_mcp !== true) {
+      model.supports_mcp = true;
+      changed = true;
+    }
+    if (model.supported_in_api !== true) {
+      model.supported_in_api = true;
+      changed = true;
+    }
+  }
+  return changed;
 }
 
 function loadHistoryFromRollout(sessionId: string): any[] {
@@ -653,6 +717,38 @@ function alignToolMessages(msgs: any[]): any[] {
   }
   
   return result;
+}
+
+/**
+ * DeepSeek is stricter than MiniMax about Chat Completions tool history. Keep
+ * system messages at the front, give assistant tool-call messages non-empty
+ * content, and ensure tool outputs are never sent as null/empty values.
+ */
+function normalizeDeepSeekToolHistory(messages: any[], model: string): any[] {
+  if (!/deepseek/i.test(model)) return messages;
+
+  const systemMessages: any[] = [];
+  const conversationMessages: any[] = [];
+  for (const message of messages) {
+    if (message.role === "system") {
+      systemMessages.push(message);
+    } else {
+      conversationMessages.push(message);
+    }
+  }
+
+  for (const message of conversationMessages) {
+    if (message.role === "assistant" && message.tool_calls?.length > 0
+      && (message.content === null || message.content === undefined || message.content === "")) {
+      message.content = " ";
+    }
+    if (message.role === "tool"
+      && (message.content === null || message.content === undefined || message.content === "")) {
+      message.content = " ";
+    }
+  }
+
+  return [...systemMessages, ...conversationMessages];
 }
 
 
@@ -1356,10 +1452,14 @@ export class ProxyServer {
     this.ensureConfigDir();
     this.ensureCheckPermsHelper();
     this.loadConfig();
-    this.autoPatchCodexConfig();
+    if (!isNativeModeEnabled()) {
+      this.autoPatchCodexConfig();
+    }
     this.mergeNativeModelsIntoCatalog();
     this.upgradeReasoningLevelsInCatalog();
-    this.autoPatchPlugins();
+    if (!isNativeModeEnabled()) {
+      this.autoPatchPlugins();
+    }
     this.ensurePythonScripts();
     this.startVADDaemon();
   }
@@ -1825,7 +1925,19 @@ except Exception as e:
     const p = join(this.configDir, "custom_model_catalog.json");
     if (existsSync(p)) {
       try {
-        return JSON.parse(readFileSync(p, "utf-8"));
+        const catalog = JSON.parse(readFileSync(p, "utf-8"));
+        // Older catalog entries (especially manually added DeepSeek entries)
+        // often lack the capability flags that make Codex send MCP tools.
+        // Normalize them at read time so the running proxy and Codex see the
+        // same capabilities, even before the dashboard is opened.
+        if (normalizeCustomModelCapabilities(catalog)) {
+          try {
+            writeFileSync(p, JSON.stringify(catalog, null, 2), "utf-8");
+          } catch (writeErr: any) {
+            console.warn(`[OpenCodex] Failed to persist model capabilities: ${writeErr.message}`);
+          }
+        }
+        return catalog;
       } catch (err: any) {
         console.error(`[OpenCodex] Failed to read model catalog: ${err.message}`);
       }
@@ -1836,6 +1948,7 @@ except Exception as e:
   private saveModelCatalog(catalog: any) {
     const p = join(this.configDir, "custom_model_catalog.json");
     try {
+      normalizeCustomModelCapabilities(catalog);
       if (catalog && Array.isArray(catalog.models)) {
         for (const model of catalog.models) {
           const isCustomModel = model.provider === "opencodex" || !!model.backend_provider || model.slug.startsWith("mimo") || model.slug.includes("deepseek") || model.slug.includes("qwen");
@@ -2198,6 +2311,8 @@ except Exception as e:
   }
 
   private autoPatchCodexConfig() {
+    if (isNativeModeEnabled()) return;
+    if (!hasThirdPartyModels(this.getModelCatalog())) return;
     const tomlPath = join(homedir(), ".codex", "config.toml");
 
     const catalogPath = join(this.configDir, "custom_model_catalog.json");
@@ -2257,6 +2372,7 @@ stream_idle_timeout_ms = 600000
   }
 
   public patchCodexConfig() {
+    if (isNativeModeEnabled() || !hasThirdPartyModels(this.getModelCatalog())) return;
     const tomlPath = join(homedir(), ".codex", "config.toml");
     const catalogPath = join(this.configDir, "custom_model_catalog.json");
     if (!existsSync(tomlPath)) return;
@@ -2289,22 +2405,91 @@ stream_idle_timeout_ms = 600000
   }
 
   private autoPatchPlugins() {
+    if (isNativeModeEnabled() || !hasThirdPartyModels(this.getModelCatalog())) return;
     const tomlPath = join(homedir(), ".codex", "config.toml");
     if (!existsSync(tomlPath)) return;
     try {
       let content = readFileSync(tomlPath, "utf-8");
+      let changed = false;
       if (!content.includes('computer-use@openai-bundled')) {
         console.log("[OpenCodex] Enabling computer-use@openai-bundled plugin...");
         let lines = content.split(/\r?\n/);
         let idx = lines.findIndex(l => l.includes("[plugins.") || l.includes("[features]"));
         if (idx !== -1) {
           lines.splice(idx, 0, '[plugins."computer-use@openai-bundled"]', "enabled = true", "");
-          writeFileSync(tomlPath, lines.join("\n"), "utf-8");
-          console.log("[OpenCodex] Successfully enabled computer-use@openai-bundled in config.toml.");
+          content = lines.join("\n");
+          changed = true;
         } else {
-          writeFileSync(tomlPath, content + '\n\n[plugins."computer-use@openai-bundled"]\nenabled = true\n', "utf-8");
-          console.log("[OpenCodex] Successfully appended computer-use@openai-bundled in config.toml.");
+          content += '\n\n[plugins."computer-use@openai-bundled"]\nenabled = true\n';
+          changed = true;
         }
+      }
+
+      const pluginHeader = '[plugins."computer-use@openai-bundled"]';
+      const pluginStart = content.indexOf(pluginHeader);
+      if (pluginStart >= 0) {
+        const nextSection = content.indexOf("\n[", pluginStart + pluginHeader.length);
+        const sectionEnd = nextSection >= 0 ? nextSection : content.length;
+        const section = content.slice(pluginStart, sectionEnd);
+        if (/^\s*enabled\s*=\s*false\s*$/m.test(section)) {
+          const enabledSection = section.replace(/(^\s*enabled\s*=\s*)false(\s*$)/m, "$1true$2");
+          content = content.slice(0, pluginStart) + enabledSection + content.slice(sectionEnd);
+          changed = true;
+        } else if (!/^\s*enabled\s*=/m.test(section)) {
+          content = content.slice(0, sectionEnd) + "\nenabled = true\n" + content.slice(sectionEnd);
+          changed = true;
+        }
+      }
+
+      // The plugin and its MCP server are separate switches. The native
+      // config may keep the server disabled, so explicitly enable it only
+      // after a third-party model activates gateway mode.
+      const computerUseClientCandidates = [
+        join(homedir(), ".codex", "computer-use", "Codex Computer Use.app", "Contents", "SharedSupport", "SkyComputerUseClient.app", "Contents", "MacOS", "SkyComputerUseClient")
+      ];
+      const pluginCacheRoot = join(homedir(), ".codex", "plugins", "cache", "openai-bundled", "computer-use");
+      if (existsSync(pluginCacheRoot)) {
+        for (const version of readdirSync(pluginCacheRoot).sort().reverse()) {
+          computerUseClientCandidates.push(join(pluginCacheRoot, version, "Codex Computer Use.app", "Contents", "SharedSupport", "SkyComputerUseClient.app", "Contents", "MacOS", "SkyComputerUseClient"));
+        }
+      }
+      const computerUseClient = computerUseClientCandidates.find(candidate => existsSync(candidate));
+      const tomlCommand = computerUseClient
+        ? computerUseClient.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+        : "./Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient";
+      const mcpHeader = "[mcp_servers.computer-use]";
+      const mcpStart = content.indexOf(mcpHeader);
+      if (mcpStart >= 0) {
+        const nextSection = content.indexOf("\n[", mcpStart + mcpHeader.length);
+        const sectionEnd = nextSection >= 0 ? nextSection : content.length;
+        let section = content.slice(mcpStart, sectionEnd);
+        if (/^\s*command\s*=/m.test(section)) {
+          const normalizedSection = section.replace(/^\s*command\s*=.*$/m, `command = "${tomlCommand}"`);
+          if (normalizedSection !== section) {
+            section = normalizedSection;
+            changed = true;
+          }
+        } else {
+          section = `${section.trimEnd()}\ncommand = "${tomlCommand}"\n`;
+          changed = true;
+        }
+        if (/^\s*enabled\s*=\s*false\s*$/m.test(section)) {
+          const enabledSection = section.replace(/(^\s*enabled\s*=\s*)false(\s*$)/m, "$1true$2");
+          section = enabledSection;
+          changed = true;
+        } else if (!/^\s*enabled\s*=/m.test(section)) {
+          section = `${section.trimEnd()}\nenabled = true\n`;
+          changed = true;
+        }
+        content = content.slice(0, mcpStart) + section + content.slice(sectionEnd);
+      } else {
+        content += `\n\n[mcp_servers.computer-use]\ncommand = "${tomlCommand}"\nargs = ["mcp"]\ncwd = "."\nenabled = true\n`;
+        changed = true;
+      }
+
+      if (changed) {
+        writeFileSync(tomlPath, content, "utf-8");
+        console.log("[OpenCodex] Enabled computer-use plugin and MCP server in config.toml.");
       }
 
       const cacheDir = join(homedir(), ".codex", "plugins", "cache", "openai-bundled", "computer-use");
@@ -2331,15 +2516,114 @@ stream_idle_timeout_ms = 600000
     }
   }
 
-  public restartCodexDesktop() {
-    console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
-    const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315 || open -a Codex --args --remote-debugging-port=8315';
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
-      } else {
-        console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
+  private restoreNativeConfigFiles(): void {
+    const tomlPath = join(homedir(), ".codex", "config.toml");
+    const codexConfigDir = join(homedir(), ".codex");
+    let restoredFromBackup = false;
+    const currentToml = existsSync(tomlPath) ? readFileSync(tomlPath, "utf-8") : "";
+    const hasGatewayConfig = /opencodex managed|model_catalog_json\s*=|openai_base_url\s*=\s*["']http:\/\/127\.0\.0\.1:8765\/v1/i.test(currentToml);
+
+    if (hasGatewayConfig && existsSync(codexConfigDir)) {
+      const backups = readdirSync(codexConfigDir)
+        .filter(f => f.startsWith("config.toml.bak_"))
+        .map(f => ({ name: f, time: parseInt(f.split("_")[1]) || 0 }))
+        .sort((a, b) => a.time - b.time);
+
+      if (backups.length > 0) {
+        const originalBackup = join(codexConfigDir, backups[0].name);
+        writeFileSync(tomlPath, readFileSync(originalBackup));
+        restoredFromBackup = true;
+        console.log(`[OpenCodex] Restored native config from ${originalBackup}`);
       }
+    }
+
+    if (!restoredFromBackup && hasGatewayConfig && existsSync(tomlPath)) {
+      let content = currentToml;
+      content = content
+        .replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "")
+        .replace(/^\s*model_catalog_json\s*=.*\r?\n?/gim, "")
+        .replace(/^\s*openai_base_url\s*=\s*["']http:\/\/127\.0\.0\.1:8765\/v1["']\s*\r?\n?/gim, "")
+        .trim();
+      writeFileSync(tomlPath, content + "\n", "utf-8");
+    }
+
+    const catalogPath = join(this.configDir, "custom_model_catalog.json");
+    if (existsSync(catalogPath)) {
+      writeFileSync(catalogPath, JSON.stringify({ models: [] }, null, 2), "utf-8");
+    }
+
+    const cachePath = join(homedir(), ".codex", "models_cache.json");
+    if (existsSync(cachePath)) {
+      try { unlinkSync(cachePath); } catch {}
+    }
+  }
+
+  private gatewayIsActive(catalog = this.getModelCatalog()): boolean {
+    return !isNativeModeEnabled() && hasThirdPartyModels(catalog);
+  }
+
+  private activateGatewayMode(): void {
+    if (existsSync(NATIVE_MODE_PATH)) {
+      unlinkSync(NATIVE_MODE_PATH);
+    }
+  }
+
+  private deactivateGatewayMode(): void {
+    writeFileSync(NATIVE_MODE_PATH, "native\n", { encoding: "utf-8", mode: 0o600 });
+    this.restoreNativeConfigFiles();
+  }
+
+  public getGatewayStatus(): { native_mode: boolean; third_party_models: boolean; gateway_active: boolean } {
+    const catalog = this.getModelCatalog();
+    return {
+      native_mode: isNativeModeEnabled(),
+      third_party_models: hasThirdPartyModels(catalog),
+      gateway_active: this.gatewayIsActive(catalog)
+    };
+  }
+
+  public restoreOriginalConfig(): void {
+    this.deactivateGatewayMode();
+    console.log("[OpenCodex] Native mode enabled. Gateway ownership released.");
+    this.restartCodexDesktop(true);
+  }
+
+  public restartCodexDesktop(allowNative = false) {
+    if (!allowNative && !this.gatewayIsActive()) {
+      console.warn("[OpenCodex] Ignoring Codex restart while no third-party gateway model is active.");
+      return;
+    }
+    this.restartCodexForCdp();
+  }
+
+  /**
+   * Restart Codex with its local CDP endpoint. This is a voice-control
+   * operation and does not modify routing or enable the third-party gateway.
+   */
+  public restartCodexForCdp() {
+    console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
+    const killCmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null';
+    exec(killCmd, () => {
+      setTimeout(() => {
+        const candidates = process.platform === "darwin"
+          ? ["/Applications/ChatGPT.app/Contents/MacOS/ChatGPT", "/Applications/Codex.app/Contents/MacOS/Codex"]
+          : ["codex"];
+        const executable = candidates.find(candidate => candidate === "codex" || existsSync(candidate));
+        if (!executable) {
+          console.error("[OpenCodex] Cannot find a Codex desktop executable for CDP launch.");
+          return;
+        }
+        try {
+          const child = spawn(executable, ["--remote-debugging-port=8315"], {
+            detached: true,
+            stdio: "ignore"
+          });
+          child.unref();
+          console.log(`[OpenCodex] Codex Desktop launched with CDP on 8315: ${executable}`);
+        } catch (err: any) {
+          console.error(`[OpenCodex] Failed to launch Codex with CDP: ${err.message}`);
+        }
+      }, 1500);
     });
   }
 
@@ -2508,7 +2792,9 @@ stream_idle_timeout_ms = 600000
   }
 
   start(port: number) {
-    this.initCodexMcp();
+    if (!isNativeModeEnabled()) {
+      this.initCodexMcp();
+    }
     this.server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       let receivedBytes = 0;
@@ -2985,7 +3271,19 @@ stream_idle_timeout_ms = 600000
                   console.log("[OpenCodex WS Proxy] Client response.create:", JSON.stringify(msg));
                   const activeSid = connInfo.activeSessionId || sessionIdStr;
                   const history = loadHistoryFromRollout(activeSid);
-                  if (history.length > 0 && msg.input && Array.isArray(msg.input)) {
+                  const requestCatalog = this.getModelCatalog();
+                  const requestCatalogEntry = requestCatalog.models?.find((m: any) => m.slug === msg.model);
+                  const isCustomRequest = !!requestCatalogEntry?.backend_provider;
+                  const hasToolItems = Array.isArray(msg.input) && msg.input.some((item: any) => {
+                    return item && ["function_call", "function_call_output", "reasoning"].includes(item.type);
+                  });
+
+                  // Never rewrite a custom-model request into plain message
+                  // items. That conversion drops function_call/tool output
+                  // records and makes DeepSeek repeat the same text forever.
+                  // Official requests can still use the rollout-history
+                  // reconstruction, but only when the turn has no tool items.
+                  if (!isCustomRequest && !hasToolItems && history.length > 0 && msg.input && Array.isArray(msg.input)) {
                     const incomingSimple = msg.input.map((item: any) => {
                       let text = "";
                       if (typeof item.content === "string") {
@@ -3397,13 +3695,24 @@ stream_idle_timeout_ms = 600000
         }
         this.saveConfig();
 
-        this.patchCodexConfig();
-        this.autoPatchPlugins();
-        if (data.restart) {
+        const hasThirdParty = hasThirdPartyModels(catalog);
+        if (hasThirdParty) {
+          this.activateGatewayMode();
+          this.patchCodexConfig();
+          this.autoPatchPlugins();
+        } else if (!isNativeModeEnabled()) {
+          this.deactivateGatewayMode();
+        }
+        const shouldRestart = data.restart === true && hasThirdParty;
+        if (shouldRestart) {
           this.restartCodexDesktop();
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", restarted: !!data.restart }));
+        res.end(JSON.stringify({
+          status: "success",
+          restarted: shouldRestart,
+          gateway_active: this.gatewayIsActive(catalog)
+        }));
       } catch (err: any) {
         const isInputError = String(err.message || "").includes("No supported conversation messages");
         res.writeHead(isInputError ? 400 : 500, { "Content-Type": "application/json" });
@@ -3670,14 +3979,17 @@ stream_idle_timeout_ms = 600000
       // Returns complete model catalog & enabled models
       this.mergeNativeModelsIntoCatalog();
       const catalog = this.getModelCatalog();
-      const active = catalog.models?.filter((m: any) => m.visibility === "list").map((m: any) => m.slug) || [];
+      // The dashboard is the custom-model manager. Native Codex models are
+      // owned by Codex itself and must never appear in this dropdown.
+      const customModels = (catalog.models || []).filter((m: any) => isCustomCatalogModel(m));
+      const active = customModels.filter((m: any) => m.visibility === "list").map((m: any) => m.slug);
       
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache, no-store, must-revalidate"
       });
       res.end(JSON.stringify({
-        catalog: catalog.models?.map((m: any) => ({
+        catalog: customModels.map((m: any) => ({
           id: m.slug,
           model: m.model,
           provider: m.provider || "",
@@ -3686,7 +3998,8 @@ stream_idle_timeout_ms = 600000
           vision_bridge_enabled: !!m.vision_bridge_enabled,
           context_window: m.context_window
         })) || [],
-        active
+        active,
+        ...this.getGatewayStatus()
       }));
       return;
     }
@@ -3700,9 +4013,10 @@ stream_idle_timeout_ms = 600000
         const visionBridgeIds = data.vision_bridge || [];
         const context1mIds = data.context_1m || [];
         const catalog = this.getModelCatalog();
+        const wasGatewayActive = this.gatewayIsActive(catalog);
         
         if (catalog.models) {
-          catalog.models.forEach((m: any) => {
+          catalog.models.filter((m: any) => isCustomCatalogModel(m)).forEach((m: any) => {
             m.visibility = activeIds.includes(m.slug) ? "list" : "hide";
             m.vision_bridge_enabled = visionBridgeIds.includes(m.slug);
             
@@ -3720,11 +4034,20 @@ stream_idle_timeout_ms = 600000
           this.saveModelCatalog(catalog);
         }
         
-        if (data.restart) {
-          this.restartCodexDesktop();
+        const hasThirdParty = hasThirdPartyModels(catalog);
+        if (hasThirdParty) {
+          this.activateGatewayMode();
+          this.patchCodexConfig();
+          this.autoPatchPlugins();
+        } else if (wasGatewayActive) {
+          this.deactivateGatewayMode();
+        }
+        const shouldRestart = (data.restart === true && hasThirdParty) || (wasGatewayActive && !hasThirdParty);
+        if (shouldRestart) {
+          this.restartCodexDesktop(!hasThirdParty && wasGatewayActive);
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", restarted: !!data.restart }));
+        res.end(JSON.stringify({ status: "success", restarted: shouldRestart, gateway_active: hasThirdParty && !isNativeModeEnabled() }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -3737,13 +4060,19 @@ stream_idle_timeout_ms = 600000
         const data = JSON.parse(body);
         const slug = data.id;
         const catalog = this.getModelCatalog();
+        const wasGatewayActive = this.gatewayIsActive(catalog);
         if (catalog.models) {
-          catalog.models = catalog.models.filter((m: any) => m.slug !== slug && m.model !== slug);
+          catalog.models = catalog.models.filter((m: any) => !isCustomCatalogModel(m) || (m.slug !== slug && m.model !== slug));
           this.saveModelCatalog(catalog);
           console.log(`[OpenCodex] Deleted model: ${slug}`);
         }
+        const hasThirdParty = hasThirdPartyModels(catalog);
+        if (!hasThirdParty && wasGatewayActive) {
+          this.deactivateGatewayMode();
+          this.restartCodexDesktop(true);
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success" }));
+        res.end(JSON.stringify({ status: "success", gateway_active: hasThirdParty && !isNativeModeEnabled() }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -4630,6 +4959,11 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/restart-codex" && req.method === "POST") {
       try {
+        if (!this.gatewayIsActive()) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Codex is in native mode; no third-party gateway model is active." }));
+          return;
+        }
         this.restartCodexDesktop();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
@@ -4642,47 +4976,14 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/reset" && req.method === "POST") {
       try {
-        const tomlPath = join(homedir(), ".codex", "config.toml");
-        const configDir = join(homedir(), ".codex");
-        let restoredFromBackup = false;
-
-        if (existsSync(configDir)) {
-          const files = readdirSync(configDir);
-          const backups = files
-            .filter(f => f.startsWith("config.toml.bak_"))
-            .map(f => ({ name: f, time: parseInt(f.split("_")[1]) || 0 }))
-            .sort((a, b) => a.time - b.time);
-
-          if (backups.length > 0) {
-            const earliestBackup = join(configDir, backups[0].name);
-            console.log(`[OpenCodex] Restoring config.toml from original backup: ${earliestBackup}`);
-            writeFileSync(tomlPath, readFileSync(earliestBackup));
-            restoredFromBackup = true;
-          }
+        if (!this.gatewayIsActive()) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Native mode is already active." }));
+          return;
         }
-
-        if (!restoredFromBackup && existsSync(tomlPath)) {
-          console.log("[OpenCodex] No backup found. Falling back to regex stripping of managed blocks.");
-          let content = readFileSync(tomlPath, "utf-8");
-          content = content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
-          writeFileSync(tomlPath, content + "\n", "utf-8");
-        }
-
-        const catalogPath = join(this.configDir, "custom_model_catalog.json");
-        if (existsSync(catalogPath)) {
-          writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
-        }
-
-        const cachePath = join(homedir(), ".codex", "models_cache.json");
-        if (existsSync(cachePath)) {
-          try { unlinkSync(cachePath); } catch {}
-          console.log("[OpenCodex] Cleared client models_cache.json during native restore.");
-        }
-
-        console.log("[OpenCodex] Reset to native state. Restarting Codex...");
-        this.restartCodexDesktop();
+        this.restoreOriginalConfig();
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success" }));
+        res.end(JSON.stringify({ status: "success", native_mode: true, gateway_active: false }));
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -5023,12 +5324,24 @@ stream_idle_timeout_ms = 600000
             } catch {}
           }
 
+          // Native Codex does not send its response stream through the gateway
+          // WebSocket. Observe the rendered assistant message through CDP so
+          // the voice bar still receives model_chunk/model_done events.
+          let nativeMonitorStop: (() => void) | null = null;
+          if (isNativeModeEnabled()) {
+            nativeMonitorStop = await this.startNativeCdpResponseMonitor();
+          }
+
           let result = await this.injectPromptViaCDP(prompt);
           if (result === "connection_failed") {
             console.warn("[OpenCodex Voice API] CDP connection failed. Attempting to relaunch Codex with debugging enabled...");
-            this.restartCodexDesktop();
+            nativeMonitorStop?.();
+            this.restartCodexForCdp();
             // Wait 5 seconds for Codex to restart and open
             await new Promise((resolve) => setTimeout(resolve, 5000));
+            if (isNativeModeEnabled()) {
+              nativeMonitorStop = await this.startNativeCdpResponseMonitor();
+            }
             // Retry injection
             result = await this.injectPromptViaCDP(prompt);
           }
@@ -5037,6 +5350,7 @@ stream_idle_timeout_ms = 600000
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "injected", reply: "" }));
           } else {
+            nativeMonitorStop?.();
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: `Failed to inject prompt via CDP: ${result}` }));
           }
@@ -5125,7 +5439,7 @@ stream_idle_timeout_ms = 600000
 
           if (!isCDPOpen) {
             console.log("[OpenCodex] Proactively relaunching Codex with debugging enabled since port 8315 is closed...");
-            this.restartCodexDesktop();
+            this.restartCodexForCdp();
             // Wait 3.5 seconds for Codex to restart cleanly
             await new Promise((resolve) => setTimeout(resolve, 3500));
           }
@@ -5523,14 +5837,19 @@ stream_idle_timeout_ms = 600000
 
     // Always compress images; describe with MiMo if vision bridge enabled
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
-    const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
+    const providerReqBody = isCustomModel
+      ? { ...reqBody, tools: ensureComputerUseResponsesTools(reqBody.tools) }
+      : reqBody;
+    const processedReqBody = await processVisionBridge(providerReqBody, callVisionBridge ? this.config : undefined);
 
     const upstreamModel = mappedModelName;
     const isStream = processedReqBody.stream ?? false;
 
     console.log(`[Responses] Routing ${requestedModel} → ${provider.name}/${upstreamModel} (stream=${isStream}, visionBridge=${callVisionBridge})`);
 
-    const chatBody = await responsesToChatWin(processedReqBody, upstreamModel, finalSessionId);
+    const chatBody = process.platform === "win32"
+      ? await responsesToChatWin(processedReqBody, upstreamModel, finalSessionId)
+      : await responsesToChat(processedReqBody, upstreamModel, finalSessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     const sessionIdStr = finalSessionId ? String(finalSessionId) : "default";
@@ -5577,19 +5896,13 @@ stream_idle_timeout_ms = 600000
       const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
       this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
-    const cleanMessages: any[] = [];
-    for (const m of (this.customConversationHistory.get(sessionIdStr) || [])) {
-      if (m.role === "user" || m.role === "assistant") {
-        const content = typeof m.content === "string" ? m.content.trim() : "";
-        if (!content && m.tool_calls && m.tool_calls.length > 0) {
-          continue; // Strip assistant messages that only called tools
-        }
-        if (content) {
-          cleanMessages.push({ role: m.role, content });
-        }
-      }
-    }
-    chatBody.messages = cleanMessages;
+    // Preserve assistant tool_calls and their role=tool results.  Removing
+    // these messages makes the next turn look like a fresh conversation to
+    // third-party models and breaks Computer Use continuation.
+    chatBody.messages = normalizeDeepSeekToolHistory(
+      alignToolMessages(this.customConversationHistory.get(sessionIdStr) || []),
+      mappedModelName
+    );
 
     const contextWindow = catalogEntry?.context_window || 200000;
     this.currentActiveSessionId = sessionIdStr;
@@ -7079,7 +7392,8 @@ stream_idle_timeout_ms = 600000
     const isStream = reqBody.stream ?? true;
 
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
-    const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
+    const providerReqBody = { ...reqBody, tools: ensureComputerUseResponsesTools(reqBody.tools) };
+    const processedReqBody = await processVisionBridge(providerReqBody, callVisionBridge ? this.config : undefined);
 
     // isPrewarm is already computed at the top of the function
 
@@ -7293,7 +7607,9 @@ stream_idle_timeout_ms = 600000
 
 
 
-    const chatBody = await responsesToChatWin(processedReqBody, mappedModelName, sessionId);
+    const chatBody = process.platform === "win32"
+      ? await responsesToChatWin(processedReqBody, mappedModelName, sessionId)
+      : await responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
     this.customModelSessions.add(sessionIdStr);
@@ -7406,19 +7722,12 @@ stream_idle_timeout_ms = 600000
       const updatedHistory = mergeHistory(alignedHistory, incomingMessages);
       this.customConversationHistory.set(sessionIdStr, updatedHistory);
     }
-    const cleanMessages: any[] = [];
-    for (const m of (this.customConversationHistory.get(sessionIdStr) || [])) {
-      if (m.role === "user" || m.role === "assistant") {
-        const content = typeof m.content === "string" ? m.content.trim() : "";
-        if (!content && m.tool_calls && m.tool_calls.length > 0) {
-          continue; // Strip assistant messages that only called tools
-        }
-        if (content) {
-          cleanMessages.push({ role: m.role, content });
-        }
-      }
-    }
-    chatBody.messages = cleanMessages;
+    // Keep the complete tool-call exchange in the upstream history so a
+    // custom model can continue after Computer Use instead of losing state.
+    chatBody.messages = normalizeDeepSeekToolHistory(
+      alignToolMessages(this.customConversationHistory.get(sessionIdStr) || []),
+      mappedModelName
+    );
 
 
     // Sanitize empty/null content fields for MiniMax model
@@ -7676,7 +7985,9 @@ stream_idle_timeout_ms = 600000
       this.mcpRequests.clear();
       
       // Auto-restart after a brief delay
-      setTimeout(() => this.initCodexMcp(), 2000);
+      setTimeout(() => {
+        if (!isNativeModeEnabled()) this.initCodexMcp();
+      }, 2000);
     });
 
     // Send initialization
@@ -7707,6 +8018,10 @@ stream_idle_timeout_ms = 600000
 
   public askMcp(prompt: string, threadId?: string, onDelta?: (text: string) => void): Promise<{ threadId: string; reply: string }> {
     return new Promise((resolve, reject) => {
+      if (isNativeModeEnabled()) {
+        reject(new Error("Codex MCP control is disabled while native mode is active."));
+        return;
+      }
       if (!this.mcpProcess) {
         this.initCodexMcp();
       }
@@ -7845,6 +8160,156 @@ stream_idle_timeout_ms = 600000
         resolve("connection_failed");
       }
     });
+  }
+
+  private async startNativeCdpResponseMonitor(): Promise<() => void> {
+    const noop = () => {};
+    try {
+      const targetsResponse = await fetch("http://127.0.0.1:8315/json");
+      const targets = await targetsResponse.json() as any[];
+      const pageTarget = targets.find((target: any) =>
+        target.type === "page" &&
+        target.url.includes("index.html") &&
+        !target.url.includes("avatar-overlay") &&
+        !target.url.includes("initialRoute")
+      );
+      if (!pageTarget?.webSocketDebuggerUrl) return noop;
+
+      const cdpWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
+      let nextCommandId = 1;
+      let stopped = false;
+      let polling = false;
+      let interval: NodeJS.Timeout | null = null;
+      let timeout: NodeJS.Timeout | null = null;
+      let previousText = "";
+      let responseId = "";
+      let stableSince = 0;
+      const pending = new Map<number, (value: any) => void>();
+
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        if (interval) clearInterval(interval);
+        if (timeout) clearTimeout(timeout);
+        for (const resolve of pending.values()) resolve(null);
+        pending.clear();
+        try { cdpWs.close(); } catch {}
+      };
+
+      cdpWs.on("message", (raw) => {
+        try {
+          const message = JSON.parse(raw.toString());
+          if (typeof message.id === "number") {
+            pending.get(message.id)?.(message.result?.result?.value ?? null);
+            pending.delete(message.id);
+          }
+        } catch {}
+      });
+      cdpWs.on("error", () => stop());
+      cdpWs.on("close", () => stop());
+
+      await new Promise<void>((resolve, reject) => {
+        const onOpen = () => {
+          cdpWs.off("error", onError);
+          resolve();
+        };
+        const onError = (error: Error) => {
+          cdpWs.off("open", onOpen);
+          reject(error);
+        };
+        cdpWs.once("open", onOpen);
+        cdpWs.once("error", onError);
+      });
+
+      const evaluate = (expression: string): Promise<any> => new Promise((resolve) => {
+        if (stopped || cdpWs.readyState !== WebSocket.OPEN) {
+          resolve(null);
+          return;
+        }
+        const id = nextCommandId++;
+        pending.set(id, resolve);
+        cdpWs.send(JSON.stringify({
+          id,
+          method: "Runtime.evaluate",
+          params: { expression, returnByValue: true }
+        }));
+      });
+
+      const snapshotExpression = `
+        (() => {
+          const groups = Array.from(document.querySelectorAll('[data-response-annotation-target]'));
+          const last = groups[groups.length - 1];
+          if (!last) return { count: 0, id: '', text: '' };
+          const content = last.querySelector('[data-selected-text-overlay-target]');
+          return {
+            count: groups.length,
+            id: last.getAttribute('data-response-annotation-target') || '',
+            text: (content ? content.innerText : last.innerText || '').trim()
+          };
+        })()
+      `;
+      const baseline = await evaluate(snapshotExpression);
+      if (!baseline) {
+        stop();
+        return noop;
+      }
+      const baselineId = String(baseline.id || "");
+      const baselineCount = Number(baseline.count || 0);
+
+      const broadcast = (payload: Record<string, unknown>) => {
+        const message = JSON.stringify(payload);
+        for (const voiceClient of this.activeWsClients) {
+          if (voiceClient.readyState === WebSocket.OPEN) {
+            try { voiceClient.send(message); } catch {}
+          }
+        }
+      };
+
+      const poll = async () => {
+        if (stopped || polling) return;
+        polling = true;
+        try {
+          const snapshot = await evaluate(snapshotExpression);
+          if (!snapshot) return;
+          const currentId = String(snapshot.id || "");
+          const text = String(snapshot.text || "").trim();
+          const isNewAssistantMessage = currentId && (currentId !== baselineId || Number(snapshot.count || 0) > baselineCount);
+          if (!isNewAssistantMessage || !text) return;
+
+          if (currentId !== responseId) {
+            responseId = currentId;
+            previousText = "";
+            stableSince = Date.now();
+          }
+
+          if (text !== previousText) {
+            const delta = previousText && text.startsWith(previousText)
+              ? text.slice(previousText.length)
+              : text;
+            if (delta) broadcast({ type: "model_chunk", text: delta });
+            previousText = text;
+            stableSince = Date.now();
+          } else if (previousText && Date.now() - stableSince >= 1800) {
+            broadcast({ type: "model_done", text: previousText });
+            stop();
+          }
+        } finally {
+          polling = false;
+        }
+      };
+
+      interval = setInterval(() => { void poll(); }, 300);
+      timeout = setTimeout(() => {
+        if (previousText) broadcast({ type: "model_done", text: previousText });
+        stop();
+      }, 120000);
+      void poll();
+      console.log("[OpenCodex Voice API] Native CDP response monitor started.");
+      return stop;
+    } catch (error: any) {
+      console.warn(`[OpenCodex Voice API] Native CDP response monitor unavailable: ${error.message}`);
+      return noop;
+    }
   }
 }
 

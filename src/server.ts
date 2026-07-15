@@ -11,7 +11,7 @@ import dns from "node:dns";
 
 dns.setDefaultResultOrder("ipv4first");
 
-import { ProxyServer } from "./proxy/index.js";
+import { ProxyServer, isNativeModeEnabled } from "./proxy/index.js";
 import { ScreenshotTaker } from "./cu/screenshot.js";
 import { ActionPerformer } from "./cu/actions.js";
 import { execSync } from "node:child_process";
@@ -410,8 +410,10 @@ class OpenCodex {
       console.error(`[OpenCodex] Proxy server port conflict (could be running as a background daemon): ${err.message}`);
     }
 
-    // Launch codex mcp-server in background via stdio transport
-    try {
+    // Launch codex mcp-server in background via stdio transport only after
+    // the first third-party model activates gateway mode. In native mode the
+    // dashboard may run on 8765, but it must not control Codex.
+    if (!isNativeModeEnabled()) try {
       console.error("[OpenCodex] Starting resident codex mcp-server background daemon...");
       const { spawn } = await import("node:child_process");
       let codexMcpBinary = "/Applications/ChatGPT.app/Contents/Resources/codex";

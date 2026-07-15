@@ -747,6 +747,11 @@ export function getDashboardHtml(): string {
       background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
       color: #fff;
     }
+    button:disabled, input:disabled {
+      opacity: 0.42;
+      cursor: not-allowed !important;
+      filter: grayscale(0.8);
+    }
   </style>
 </head>
 <body>
@@ -822,11 +827,6 @@ export function getDashboardHtml(): string {
                 </div>
               </div>
 
-              <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-                <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 ChatGPT Desktop</label>
-              </div>
-              
               <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save & Add Model</button>
             </form>
           </div>
@@ -1483,6 +1483,16 @@ export function getDashboardHtml(): string {
     let currentTab = 'gateway';
     let activeSessionId = '';
     let configData = { providers: [] };
+    let gatewayActive = false;
+
+    function updateGatewayControls(active) {
+      gatewayActive = !!active;
+      ['restart-codex-btn', 'reset-btn', 'i18n-btn-update-dropdown', 'models-restart-checkbox']
+        .forEach(id => {
+          const element = document.getElementById(id);
+          if (element) element.disabled = !gatewayActive;
+        });
+    }
 
     function switchTab(tabName) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -1610,6 +1620,7 @@ export function getDashboardHtml(): string {
       try {
         const response = await fetch('/api/models');
         const data = await response.json();
+        updateGatewayControls(!!data.gateway_active);
         
         const activeIds = new Set(data.active || []);
         const container = document.getElementById('models-list-container');
@@ -1664,7 +1675,6 @@ export function getDashboardHtml(): string {
     document.getElementById('config-form').onsubmit = async (e) => {
       e.preventDefault();
       
-      const restartChecked = document.getElementById('config-restart-checkbox').checked;
       const modelInput = document.getElementById('new-model-name').value.trim();
       const baseUrl = document.getElementById('new-base-url').value.trim();
       const apiKey = document.getElementById('new-api-key').value.trim();
@@ -1721,17 +1731,15 @@ export function getDashboardHtml(): string {
       }
 
       try {
-        if (restartChecked) {
-          showToast(i18nDict[currentLang].toastRestarting);
-        }
-        
         const response = await fetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             providers,
             models: modelsTextarea,
-            restart: restartChecked
+            // Saving a model only activates/configures the gateway. Restarting
+            // is explicitly controlled by the model dropdown below.
+            restart: false
           })
         });
         
@@ -1755,6 +1763,7 @@ export function getDashboardHtml(): string {
 
     // Save active models
     async function saveActiveModels() {
+      if (!gatewayActive) return;
       const checkedBoxes = document.querySelectorAll('.model-checkbox:checked');
       const activeIds = Array.from(checkedBoxes).map(cb => cb.getAttribute('data-id'));
       const visionBridgeBoxes = document.querySelectorAll('.vision-bridge-checkbox:checked');
@@ -1796,7 +1805,6 @@ export function getDashboardHtml(): string {
       const apiKey = document.getElementById('vision-fallback-key').value.trim();
       const baseUrl = document.getElementById('vision-fallback-url').value.trim();
       const model = document.getElementById('vision-fallback-model').value.trim();
-      const restartChecked = document.getElementById('config-restart-checkbox').checked;
       
       const providers = (configData.providers || []).map(p => {
         if (p.name === 'opencode') {
@@ -1820,15 +1828,12 @@ export function getDashboardHtml(): string {
       }
       
       try {
-        if (restartChecked) {
-          showToast(i18nDict[currentLang].toastRestarting);
-        }
         const response = await fetch('/api/config', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             providers,
-            restart: restartChecked
+            restart: false
           })
         });
         if (response.ok) {
@@ -1983,6 +1988,7 @@ export function getDashboardHtml(): string {
     }
 
     async function restartCodexDesktop() {
+      if (!gatewayActive) return;
       showToast(i18nDict[currentLang].toastRestarting);
       try {
         const response = await fetch('/api/restart-codex', { method: 'POST' });
@@ -2004,6 +2010,7 @@ export function getDashboardHtml(): string {
     }
 
     async function resetCodex() {
+      if (!gatewayActive) return;
       const msg = currentLang === 'zh' ? '还原后 ChatGPT 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native ChatGPT.';
       showConfirm(msg, async () => {
         try {
