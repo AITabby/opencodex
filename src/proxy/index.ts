@@ -5384,15 +5384,15 @@ function appendImportedSessionProjection(
   } catch {}
 
   const projection: any[] = [];
-  const baseTime = Date.now() - memory.messages.length * 1000;
+  const baseTime = Date.now() + 1000;
 
   for (let i = 0; i < memory.messages.length; i++) {
     const msg = memory.messages[i];
     if (msg.role !== "user" && msg.role !== "assistant") continue;
 
     const timestamp = new Date(baseTime + i * 1000).toISOString();
-    const turnId = `turn_import_${randomUUID().replace(/-/g, "")}`;
-    const msgId = msg.source_id || `msg_import_${randomUUID().replace(/-/g, "")}`;
+    const turnId = randomUUID();
+    const msgId = msg.source_id && msg.source_id.includes("-") ? msg.source_id : randomUUID();
 
     projection.push({
       timestamp,
