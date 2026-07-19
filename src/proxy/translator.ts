@@ -244,7 +244,7 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
   const chat: any = {
     model: upstreamModel,
     messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
-    stream: !!body.stream,
+    stream: body.stream ?? true,
   };
 
   _copyIfPresent(body, chat, "temperature");
@@ -687,9 +687,21 @@ class ThinkTagFilter {
   }
 }
 
+
+
+
+function generateRandomHex(length: number): string {
+  const chars = "0123456789abcdef";
+  let result = "";
+  for (let i = 0; i < length; i++) {
+    result += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return result;
+}
+
 export class ResponsesStreamState {
   private static sessionResponseIds = new Map<string, string>();
-  private responseId: string;
+  public responseId: string;
   private thinkFilter = new ThinkTagFilter();
   private messageItemId: string;
   private model: string;
@@ -701,16 +713,39 @@ export class ResponsesStreamState {
   private toolCalls: Record<number, any> = {};
   private reasoningBlocks: Record<string, any> = {};
   private nextOutputIndex = 0;
+  private hasStartedReasoningText = false;
+  private hasEndedReasoningText = false;
   private onTextChunk?: (text: string) => void;
   private onTextDone?: (text: string) => void;
+  private metadata?: any;
+  private sequenceNumber = 1;
+  private isBackground = false;
+  private sequenceNumberCallbacks?: { get: () => number, set: (seq: number) => void };
 
-  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void) {
-    this.responseId = `resp_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
-    this.messageItemId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 10)}`;
+  constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void, metadata?: any, isBackground?: boolean, sequenceNumberCallbacks?: { get: () => number, set: (seq: number) => void }) {
+    this.responseId = `resp_${generateRandomHex(48)}`;
+    this.messageItemId = `msg_${generateRandomHex(48)}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};
     this.onTextChunk = onTextChunk;
     this.onTextDone = onTextDone;
+    this.metadata = metadata;
+    this.isBackground = !!isBackground;
+    this.sequenceNumberCallbacks = sequenceNumberCallbacks;
+    if (sequenceNumberCallbacks) {
+      this.sequenceNumber = sequenceNumberCallbacks.get();
+    }
+  }
+
+  private _wrap(writeSse: (payload: any) => Promise<void>): (payload: any) => Promise<void> {
+    return async (payload: any) => {
+      payload.sequence_number = this.sequenceNumber;
+      this.sequenceNumber += 1;
+      if (this.sequenceNumberCallbacks) {
+        this.sequenceNumberCallbacks.set(this.sequenceNumber);
+      }
+      await writeSse(payload);
+    };
   }
 
   getAssistantMessage(): any {
@@ -739,45 +774,80 @@ export class ResponsesStreamState {
   }
 
   async start(writeSse: (payload: any) => Promise<void>): Promise<void> {
-    await writeSse({ type: "response.created", response: this._response("in_progress") });
+    const wrapped = this._wrap(writeSse);
+    await wrapped({ type: "response.created", response: this._response("in_progress") });
+    await wrapped({ type: "response.in_progress", response: this._response("in_progress") });
   }
 
-  async finish(writeSse: (payload: any) => Promise<void>): Promise<void> {
+  async finish(writeSse: (payload: any) => Promise<void>, usage?: { input_tokens: number, output_tokens: number, total_tokens: number }): Promise<void> {
+    const wrapped = this._wrap(writeSse);
     for (const key of Object.keys(this.reasoningBlocks)) {
       const rState = this.reasoningBlocks[key];
       if (!rState.closed) {
-        await this._closeReasoning(writeSse, rState);
+        await this._closeReasoning(wrapped, rState);
       }
     }
+    if (!this.messageOpened) {
+      await this._openMessage(wrapped);
+    }
     if (this.messageOpened && !this.messageClosed) {
-      await this._closeMessage(writeSse);
+      await this._closeMessage(wrapped);
     }
     for (const key of Object.keys(this.toolCalls)) {
       const tState = this.toolCalls[Number(key)];
       if (!tState.added) {
-        await this._ensureToolOpened(writeSse, tState);
+        await this._ensureToolOpened(wrapped, tState);
       }
     }
     for (const key of Object.keys(this.toolCalls).map(Number).sort((a, b) => this.toolCalls[a].output_index - this.toolCalls[b].output_index)) {
       const tState = this.toolCalls[key];
       if (!tState.closed) {
-        await this._closeTool(writeSse, tState);
+        await this._closeTool(wrapped, tState);
       }
     }
     if (this.onTextDone) {
       try { this.onTextDone(this.messageText); } catch {}
     }
-    await writeSse({ type: "response.completed", response: this._response("completed", true) });
+    const finalResp = this._response("completed", true, usage);
+    await wrapped({ type: "response.completed", response: finalResp });
+    await wrapped({ type: "response.done", response: finalResp });
+
+    if (usage) {
+      await wrapped({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            last_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            model_context_window: finalResp.usage?.model_context_window || 200000
+          }
+        }
+      });
+    }
   }
 
   async writeChatDelta(writeSse: (payload: any) => Promise<void>, chunk: any): Promise<void> {
+    const wrapped = this._wrap(writeSse);
     const choice = (chunk.choices && chunk.choices.length > 0) ? chunk.choices[0] : null;
     if (!choice) return;
     const delta = choice.delta || {};
 
     const reasoning = delta.reasoning_content || delta.reasoning;
     if (reasoning) {
-      await this._chatReasoningDelta(writeSse, reasoning);
+      await this._chatReasoningDelta(wrapped, reasoning);
     }
 
     const content = delta.content;
@@ -785,18 +855,22 @@ export class ResponsesStreamState {
       for (const key of Object.keys(this.reasoningBlocks)) {
         const rState = this.reasoningBlocks[key];
         if (!rState.closed) {
-          await this._closeReasoning(writeSse, rState);
+          await this._closeReasoning(wrapped, rState);
         }
       }
+
       const filtered = this.thinkFilter.filter(content);
       if (filtered) {
-        await this._textDelta(writeSse, filtered);
+        if (!this.messageOpened) {
+          await this._openMessage(wrapped);
+        }
+        await this._textDelta(wrapped, filtered);
       }
     }
 
     const toolCalls = delta.tool_calls || [];
     for (const call of toolCalls) {
-      await this._chatToolDelta(writeSse, call);
+      await this._chatToolDelta(wrapped, call);
     }
   }
 
@@ -845,12 +919,12 @@ export class ResponsesStreamState {
       }
     }
 
-    if (state.name && !state.added) {
-      await this._ensureToolOpened(writeSse, state);
-    }
-
+    // Defer ensureToolOpened until we have the complete name (which is when arguments start streaming or the tool closes)
     const argDelta = fn.arguments || "";
     if (argDelta) {
+      if (!state.added) {
+        await this._ensureToolOpened(writeSse, state);
+      }
       state.arguments += argDelta;
       await writeSse({
         type: "response.function_call_arguments.delta",
@@ -868,12 +942,12 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: this.messageIndex,
       item: {
         id: this.messageItemId,
         type: "message",
         status: "in_progress",
         role: "assistant",
+        phase: "final_answer",
         content: [],
       },
     });
@@ -909,7 +983,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: this.messageIndex,
       item: this._messageItem("completed"),
     });
   }
@@ -960,7 +1033,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: outputIndex,
       item: itemData,
     });
   }
@@ -981,7 +1053,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: state.output_index,
       item: this._toolItem(state, "completed"),
     });
   }
@@ -1002,7 +1073,6 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.added",
-      output_index: outputIndex,
       item: {
         id: itemId,
         type: "reasoning",
@@ -1045,24 +1115,17 @@ export class ResponsesStreamState {
 
     await writeSse({
       type: "response.output_item.done",
-      output_index: state.output_index,
       item: this._reasoningItem(state, "completed"),
     });
   }
 
   private _reasoningItem(state: any, status: string): any {
-    const payload = {
-      type: "thinking",
-      thinking: state.text || "",
-      signature: state.signature || "",
-    };
-    const encrypted = _encodeThinkingPayload(payload);
     return {
       id: state.id,
       type: "reasoning",
       summary: state.text ? [{ type: "summary_text", text: state.text }] : [],
       content: [],
-      encrypted_content: encrypted,
+      encrypted_content: null,
     };
   }
 
@@ -1072,6 +1135,7 @@ export class ResponsesStreamState {
       type: "message",
       status,
       role: "assistant",
+      phase: "final_answer",
       content: this.messageText ? [{ type: "output_text", text: this.messageText, annotations: [] }] : [],
     };
   }
@@ -1092,14 +1156,15 @@ export class ResponsesStreamState {
     return item;
   }
 
-  private _response(status: string, final = false): any {
+  private _response(status: string, final = false, usage?: { input_tokens: number, output_tokens: number, total_tokens: number }): any {
     let output: any[] = [];
+    const now = Math.floor(Date.now() / 1000);
     if (final) {
       const collected: [number, any][] = [];
       for (const state of Object.values(this.reasoningBlocks)) {
         collected.push([state.output_index, this._reasoningItem(state, "completed")]);
       }
-      if (this.messageOpened && this.messageText && this.messageIndex !== null) {
+      if (this.messageOpened && this.messageIndex !== null) {
         collected.push([this.messageIndex, this._messageItem("completed")]);
       }
       for (const state of Object.values(this.toolCalls)) {
@@ -1114,6 +1179,7 @@ export class ResponsesStreamState {
           type: "message",
           status: "completed",
           role: "assistant",
+          phase: "final_answer",
           content: [{ type: "output_text", text: " ", annotations: [] }],
         });
       }
@@ -1121,10 +1187,21 @@ export class ResponsesStreamState {
     return {
       id: this.responseId,
       object: "response",
-      created_at: Math.floor(Date.now() / 1000),
+      created_at: now,
+      completed_at: final ? now : null,
       status,
       model: this.model,
       output,
+      metadata: this.metadata,
+      usage: usage ? {
+        total_tokens: usage.total_tokens,
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens
+      } : {
+        total_tokens: 100,
+        input_tokens: 50,
+        output_tokens: 50
+      }
     };
   }
 }

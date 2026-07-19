@@ -6,7 +6,7 @@
  */
 
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -131,6 +131,8 @@ export class ProxyServer {
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
+  private sessionSequenceNumberMap = new Map<string, number>();
+  private customSessionQueues = new Map<any, Promise<void>>();
   private titleSessionHashes = new Set<string>();
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
@@ -880,6 +882,7 @@ stream_idle_timeout_ms = 600000
           const sessionId = Array.isArray(sidHeader) ? sidHeader[0] : (sidHeader || "default");
           
           const sessionIdStr = sessionId ? String(sessionId) : "default";
+          (clientWs as any).sessionId = sessionIdStr;
           const connInfo = { 
             clientWs, 
             targetWs: null as WebSocket | null, 
@@ -1092,8 +1095,11 @@ stream_idle_timeout_ms = 600000
             if (!isBinary) {
               try {
                 const msg = JSON.parse(data.toString());
+                let activeSid = msg.client_metadata?.session_id || connInfo.activeSessionId || sessionIdStr;
+                this.logWSPacket("IN", msg, String(activeSid));
                 if (msg && msg.client_metadata?.session_id) {
-                  connInfo.activeSessionId = String(msg.client_metadata.session_id);
+                   connInfo.activeSessionId = String(msg.client_metadata.session_id);
+                   (clientWs as any).sessionId = String(msg.client_metadata.session_id);
                 }
                 if (msg && msg.type === "response.create") {
                   connInfo.lastMsg = msg;
@@ -1106,21 +1112,75 @@ stream_idle_timeout_ms = 600000
                   }
                 }
                 const model = msg.model || "";
+                activeSid = connInfo.activeSessionId || sessionIdStr;
+
+                let isTitlePrompt = false;
+                const instructions = msg.instructions || msg.response?.instructions || "";
+                if (instructions.includes("provide a short title") || instructions.includes("task title based solely on the prompt")) {
+                  isTitlePrompt = true;
+                }
+                if (Array.isArray(msg.input)) {
+                  for (const item of msg.input) {
+                    if (item.content && Array.isArray(item.content)) {
+                      for (const part of item.content) {
+                        if (part.text && (part.text.includes("provide a short title") || part.text.includes("task title based solely on the prompt"))) {
+                          isTitlePrompt = true;
+                        }
+                      }
+                    }
+                    if (typeof item.content === "string" && (item.content.includes("provide a short title") || item.content.includes("task title based solely on the prompt"))) {
+                      isTitlePrompt = true;
+                    }
+                  }
+                }
+
                 if (model) {
                   const catalog = this.getModelCatalog();
                   const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                   const isCustomModel = !!catalogEntry?.backend_provider;
-                  const activeSid = connInfo.activeSessionId || sessionIdStr;
 
-                  if (isCustomModel) {
+                  if (isCustomModel || isTitlePrompt) {
                     isLocal = true;
-                    this.customModelSessions.add(activeSid);
-                    console.log(`[OpenCodex WS Proxy] Intercepted custom model ${model} over WebSocket, handling locally.`);
-                    await this.handleLocalResponsesWebSocketInline(clientWs, msg, request.headers);
+                    if (isCustomModel) {
+                      connInfo.isCustomMode = true;
+                      this.customModelSessions.add(activeSid);
+                    }
+                    console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Intercepted Custom Model/Title [${model}] locally for activeSid=${activeSid}.`);
+                    await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
                     return;
                   } else {
+                    const hasUserChatMessage = msg.input && Array.isArray(msg.input) && msg.input.some((item: any) => {
+                      if (item.role === "user" && item.content && Array.isArray(item.content)) {
+                        return item.content.some((part: any) => part.text && !part.text.includes("provide a short title") && !part.text.includes("task title based solely on the prompt"));
+                      }
+                      return false;
+                    });
+                    const isBackgroundRequest = isTitlePrompt || !hasUserChatMessage;
+
+                    if (isBackgroundRequest && this.customModelSessions.has(activeSid)) {
+                      isLocal = false;
+                      console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Native Model [${model}] requested for background task. Preserving isCustomMode=true.`);
+                    } else {
+                      isLocal = false;
+                      connInfo.isCustomMode = false;
+                      this.customModelSessions.delete(activeSid);
+                      console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Native Model [${model}] requested. Forwarding to official server.`);
+                    }
+                  }
+                } else {
+                  // If the message does not specify a model, preserve the session's local state
+                  if (this.customModelSessions.has(activeSid)) {
+                    isLocal = true;
+                    connInfo.isCustomMode = true;
+                    console.log(`[DEBUG-CUSTOM-MODEL-FLOW] No model field in frame, but activeSid=${activeSid} is marked custom. Preserving isLocal=true.`);
+                    if (msg.type === "response.create") {
+                      console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Intercepted local response.create without model field on custom session.`);
+                      await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
+                      return;
+                    }
+                  } else {
                     isLocal = false;
-                    this.customModelSessions.delete(activeSid);
+                    connInfo.isCustomMode = false;
                   }
                 }
 
@@ -3386,6 +3446,13 @@ stream_idle_timeout_ms = 600000
 
   private activeWsClients = new Set<WebSocket>();
   private desktopWsClients = new Set<WebSocket>();
+
+  private logWSPacket(direction: "IN" | "OUT", payload: any, sessionId?: string) {
+    const line = `[${new Date().toISOString()}] [${direction}] [Session: ${sessionId || "unknown"}] ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n`;
+    try {
+      appendFileSync("/Users/aitabby/projects/opencodex/ws_packets.log", line, "utf-8");
+    } catch (e) {}
+  }
   private activeConnectionsBySession = new Map<string, {
     clientWs: WebSocket;
     targetWs: WebSocket | null;
@@ -3885,8 +3952,166 @@ stream_idle_timeout_ms = 600000
     }
   }
 
-  private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, clientHeaders: http.IncomingHttpHeaders) {
+  private async handleLocalResponsesWebSocketInline(ws: WebSocket, reqBody: any, connInfo: { headers: any; activeSessionId?: string }) {
+    const clientHeaders = connInfo.headers;
+    const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
+    const sessionId = reqBody.client_metadata?.session_id || connInfo.activeSessionId || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
+    const sessionIdStr = sessionId ? String(sessionId) : "default";
+
+    const previous = this.customSessionQueues.get(ws) || Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(() => this.handleLocalResponsesWebSocketInlineQueued(ws, reqBody, connInfo, sessionId, sessionIdStr));
+    this.customSessionQueues.set(ws, current);
+    try {
+      await current;
+    } finally {
+      if (this.customSessionQueues.get(ws) === current) {
+        this.customSessionQueues.delete(ws);
+      }
+    }
+  }
+
+  private async handleLocalResponsesWebSocketInlineQueued(ws: WebSocket, reqBody: any, connInfo: { headers: any; activeSessionId?: string }, sessionId: any, sessionIdStr: string) {
+    (ws as any).sessionId = sessionIdStr;
+    const clientHeaders = connInfo.headers;
     const requestedModel = reqBody.model || "";
+    const isStream = reqBody.stream ?? true;
+
+    const broadcastToClients = (payload: any) => {
+      const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+      this.logWSPacket("OUT", payload, sessionIdStr);
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(payloadStr); } catch {}
+      }
+      for (const otherWs of this.desktopWsClients) {
+        if (otherWs !== ws && (otherWs as any).sessionId === sessionIdStr && otherWs.readyState === WebSocket.OPEN) {
+          try { otherWs.send(payloadStr); } catch {}
+        }
+      }
+    };
+
+    const sendDirect = (payload: any) => {
+      const payloadStr = typeof payload === "string" ? payload : JSON.stringify(payload);
+      this.logWSPacket("OUT", payload, sessionIdStr);
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send(payloadStr); } catch {}
+      }
+    };
+
+    // Intercept title prompt locally and simulate a quick structured JSON response
+    let isTitlePrompt = false;
+    const instructionsStr = reqBody.instructions || "";
+    if (instructionsStr.includes("provide a short title") || instructionsStr.includes("task title based solely on the prompt")) {
+      isTitlePrompt = true;
+    }
+    if (Array.isArray(reqBody.input)) {
+      for (const item of reqBody.input) {
+        if (item.content && Array.isArray(item.content)) {
+          for (const part of item.content) {
+            if (part.text && (part.text.includes("provide a short title") || part.text.includes("task title based solely on the prompt"))) {
+              isTitlePrompt = true;
+            }
+          }
+        }
+        if (typeof item.content === "string" && (item.content.includes("provide a short title") || item.content.includes("task title based solely on the prompt"))) {
+          isTitlePrompt = true;
+        }
+      }
+    }
+
+    if (isTitlePrompt) {
+      console.log(`[DEBUG-TITLE-GENERATION] Simulating title response locally.`);
+      let userPrompt = "Coding Task";
+      if (Array.isArray(reqBody.input)) {
+        for (const item of reqBody.input) {
+          if (item.role === "user" && item.content && Array.isArray(item.content)) {
+            for (const part of item.content) {
+              if (part.text) {
+                if (part.text.includes("User prompt:\n")) {
+                  const idx = part.text.indexOf("User prompt:\n");
+                  userPrompt = part.text.slice(idx + 12).trim().substring(0, 20);
+                } else if (!part.text.includes("provide a short title") && !part.text.includes("task title based solely on the prompt")) {
+                  userPrompt = part.text.trim().substring(0, 20);
+                }
+              }
+            }
+          }
+        }
+      }
+      const titleJson = JSON.stringify({
+        title: userPrompt || "Coding Task",
+        description: "Conversation with Codex"
+      });
+
+      const responseMetadata = {
+        session_id: reqBody.client_metadata?.session_id || sessionIdStr,
+        thread_id: reqBody.client_metadata?.thread_id,
+        turn_id: reqBody.client_metadata?.turn_id,
+        "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
+      };
+
+      const namespaceMap = extractNamespaceMap(reqBody.tools);
+      const streamState = new ResponsesStreamState(
+        requestedModel,
+        namespaceMap,
+        sessionId,
+        (textChunk) => {
+          const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
+          for (const wsClient of this.activeWsClients) {
+            try { wsClient.send(msg); } catch {}
+          }
+        },
+        (fullText) => {
+          const msg = JSON.stringify({ type: "model_done", text: fullText });
+          for (const wsClient of this.activeWsClients) {
+            try { wsClient.send(msg); } catch {}
+          }
+        },
+        responseMetadata,
+        false,
+        {
+          get: () => this.sessionSequenceNumberMap.get(sessionIdStr) || 1,
+          set: (seq: number) => this.sessionSequenceNumberMap.set(sessionIdStr, seq)
+        }
+      );
+      await streamState.start(async (payload: any) => {
+        sendDirect(payload);
+      });
+      await streamState.writeChatDelta(async (payload: any) => {
+        sendDirect(payload);
+      }, {
+        choices: [{
+          delta: {
+            content: titleJson
+          }
+        }]
+      });
+      await streamState.finish(async (payload: any) => {
+        sendDirect(payload);
+      });
+      return;
+    }
+
+    const turnMetadataStr = reqBody.client_metadata?.["x-codex-turn-metadata"];
+    let isPrewarm = false;
+    if (turnMetadataStr) {
+      try {
+        const parsed = JSON.parse(turnMetadataStr);
+        if (parsed.request_kind === "prewarm") {
+          isPrewarm = true;
+        }
+      } catch {}
+    }
+    if (!isPrewarm && (!reqBody.input || reqBody.input.length === 0)) {
+      isPrewarm = true;
+    }
+
+    if (isPrewarm) {
+      console.log(`[OpenCodex WS Proxy] Ignoring prewarm request locally.`);
+      return;
+    }
+
     try {
       writeFileSync("/Users/aitabby/projects/opencodex/debug_req.json", JSON.stringify(reqBody, null, 2), "utf-8");
     } catch (e) {}
@@ -3916,19 +4141,14 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
-    const isStream = reqBody.stream ?? true;
-    const sidHeader = clientHeaders["x-session-id"] || clientHeaders["session-id"] || "";
-    const sessionId = reqBody.client_metadata?.session_id || (Array.isArray(sidHeader) ? sidHeader[0] : sidHeader);
-
     const callVisionBridge = catalogEntry ? !!catalogEntry.vision_bridge_enabled : false;
     const processedReqBody = await processVisionBridge(reqBody, callVisionBridge ? this.config : undefined);
 
     const chatBody = responsesToChat(processedReqBody, mappedModelName, sessionId);
     
     // Maintain conversation history locally in the proxy as the client does not send full history in input.
-    const sessionIdStr = sessionId ? String(sessionId) : "default";
     this.customModelSessions.add(sessionIdStr);
-        const isFirstTurn = !processedReqBody.previous_response_id;
+    const isFirstTurn = !processedReqBody.previous_response_id;
     
     if (isFirstTurn) {
       this.customConversationHistory.set(sessionIdStr, chatBody.messages);
@@ -3963,6 +4183,51 @@ stream_idle_timeout_ms = 600000
     }
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
+    let streamState: ResponsesStreamState | null = null;
+
+    if (isStream) {
+      console.log(`[OpenCodex WS Proxy] Instantiating streamState before fetch...`);
+      const responseMetadata = {
+        session_id: reqBody.client_metadata?.session_id || sessionIdStr,
+        thread_id: reqBody.client_metadata?.thread_id,
+        turn_id: reqBody.client_metadata?.turn_id,
+        "x-codex-turn-metadata": reqBody.client_metadata?.["x-codex-turn-metadata"],
+      };
+
+      streamState = new ResponsesStreamState(
+        requestedModel,
+        namespaceMap,
+        sessionId,
+        (textChunk) => {
+          const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
+          for (const wsClient of this.activeWsClients) {
+            try { wsClient.send(msg); } catch {}
+          }
+        },
+        (fullText) => {
+          const msg = JSON.stringify({ type: "model_done", text: fullText });
+          for (const wsClient of this.activeWsClients) {
+            try { wsClient.send(msg); } catch {}
+          }
+        },
+        responseMetadata,
+        false,
+        {
+          get: () => this.sessionSequenceNumberMap.get(sessionIdStr) || 1,
+          set: (seq: number) => this.sessionSequenceNumberMap.set(sessionIdStr, seq)
+        }
+      );
+      const hasActiveDesktop = Array.from(this.desktopWsClients).some(
+        (c: any) => c.sessionId === sessionIdStr
+      );
+      if (!hasActiveDesktop) {
+        console.log(`[OpenCodex WS Proxy] No active desktop connection for session ${sessionIdStr} yet. Delaying stream start by 500ms...`);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+      }
+      await streamState.start(async (payload) => {
+        broadcastToClients(payload);
+      });
+    }
 
     try {
       console.log(`[OpenCodex WS Proxy] Sending request to upstream: ${provider.base_url}/chat/completions`);
@@ -3981,29 +4246,7 @@ stream_idle_timeout_ms = 600000
         return;
       }
 
-      if (isStream) {
-        console.log(`[OpenCodex WS Proxy] Starting stream response...`);
-        const streamState = new ResponsesStreamState(
-          requestedModel,
-          namespaceMap,
-          sessionId,
-          (textChunk) => {
-            const msg = JSON.stringify({ type: "model_chunk", text: textChunk });
-            for (const wsClient of this.activeWsClients) {
-              try { wsClient.send(msg); } catch {}
-            }
-          },
-          (fullText) => {
-            const msg = JSON.stringify({ type: "model_done", text: fullText });
-            for (const wsClient of this.activeWsClients) {
-              try { wsClient.send(msg); } catch {}
-            }
-          }
-        );
-        await streamState.start(async (payload) => {
-          ws.send(JSON.stringify(payload));
-        });
-
+      if (isStream && streamState) {
         const reader = response.body!.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -4028,7 +4271,7 @@ stream_idle_timeout_ms = 600000
               try {
                 const chunk = JSON.parse(trimmed.slice(6));
                 await streamState.writeChatDelta(async (payload) => {
-                  ws.send(JSON.stringify(payload));
+                  broadcastToClients(payload);
                 }, chunk);
               } catch (parseErr: any) {
                 console.error(`[OpenCodex WS Proxy] Error parsing or writing delta: ${parseErr.message}`);
@@ -4041,7 +4284,7 @@ stream_idle_timeout_ms = 600000
 
         console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
         await streamState.finish(async (payload) => {
-          ws.send(JSON.stringify(payload));
+          broadcastToClients(payload);
         });
 
         const assistantMsg = streamState.getAssistantMessage();

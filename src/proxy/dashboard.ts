@@ -362,6 +362,10 @@ export function getDashboardHtml(): string {
       border-color: rgba(255,255,255,0.08);
       transform: translateX(3px);
     }
+    button:disabled, input:disabled {
+      opacity: 0.42;
+      cursor: not-allowed !important;
+    }
 
     .model-checkbox-container {
       display: flex;
@@ -862,6 +866,25 @@ export function getDashboardHtml(): string {
               <button type="submit" class="action-btn" id="i18n-btn-save-vision-fallback" style="margin-top: 0.5rem;">Save Vision Fallback Settings</button>
             </form>
           </div>
+
+          <div class="panel-card" id="subscription-import-panel">
+            <div class="panel-title">订阅模型导入 / Subscription Import</div>
+            <p style="font-size:0.85rem;color:var(--color-text-muted);line-height:1.4;">读取本机已登录订阅，无需填写 Key。导入或清理不会重启 ChatGPT；完成后在右侧更新下拉菜单，并按需重启。</p>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem;margin-top:1rem;">
+              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
+                <strong>Grok Build</strong><div id="subscription-grok-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
+                <button id="subscription-grok-button" class="action-btn" type="button" onclick="toggleSubscription('grok')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Grok Build</button>
+              </div>
+              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
+                <strong>Claude Code</strong><div id="subscription-claude-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
+                <button id="subscription-claude-button" class="action-btn" type="button" onclick="toggleSubscription('claude')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Claude Code</button>
+              </div>
+              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
+                <strong>Antigravity</strong><div id="subscription-antigravity-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
+                <button id="subscription-antigravity-button" class="action-btn" type="button" onclick="toggleSubscription('antigravity')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Antigravity</button>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- Model Catalog Customized -->
@@ -1286,6 +1309,38 @@ export function getDashboardHtml(): string {
     let currentTab = 'gateway';
     let activeSessionId = '';
     let configData = { providers: [] };
+    let gatewayModeActive = false;
+
+    function setGatewayUiState(active) {
+      gatewayModeActive = !!active;
+      const disabledIds = ['restart-codex-btn', 'reset-btn', 'i18n-btn-update-dropdown', 'models-restart-checkbox'];
+      disabledIds.forEach(id => {
+        const node = document.getElementById(id);
+        if (node) node.disabled = !gatewayModeActive;
+      });
+
+      const status = document.getElementById('i18n-status');
+      const dot = document.querySelector('.status-dot');
+      if (!gatewayModeActive) {
+        if (status) status.innerText = currentLang === 'zh' ? '原生直连（网关空闲）' : 'Native Direct (Gateway Idle)';
+        if (dot) dot.style.background = 'var(--color-text-muted)';
+      } else {
+        if (status) status.innerText = currentLang === 'zh' ? '网关已接管' : 'Gateway Active';
+        if (dot) dot.style.background = '';
+      }
+    }
+
+    async function loadGatewayStatus() {
+      try {
+        const response = await fetch('/api/gateway/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error('gateway status unavailable');
+        const data = await response.json();
+        setGatewayUiState(data.active === true);
+      } catch (_) {
+        // Fail closed: without a confirmed active gateway, protect native mode.
+        setGatewayUiState(false);
+      }
+    }
 
     function switchTab(tabName) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -1363,6 +1418,7 @@ export function getDashboardHtml(): string {
         voiceLlmSelect.options[0].text = lang === 'zh' ? '-- 未设置 (使用默认) --' : '-- Not Set (Default) --';
       }
       
+      setGatewayUiState(gatewayModeActive);
       checkPermissionsStatus();
     }
 
@@ -1408,6 +1464,11 @@ export function getDashboardHtml(): string {
         const activeIds = new Set(data.active || []);
         const container = document.getElementById('models-list-container');
         container.innerHTML = '';
+
+        if (data.mode === 'native' || !gatewayModeActive) {
+          container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);padding:2rem;">原生模式：模型由 ChatGPT / Codex 管理。未接入第三方模型，因此不会显示自定义模型。</div>';
+          return;
+        }
         
         (data.catalog || []).forEach(m => {
           const isActive = activeIds.has(m.id);
@@ -1616,6 +1677,70 @@ export function getDashboardHtml(): string {
         }
       } catch (err) {
         showToast(i18nDict[currentLang].toastConnFailed, true);
+      }
+    }
+
+    let subscriptionState = {};
+    async function loadSubscriptionStatus() {
+      try {
+        const response = await fetch('/api/cli-bridge/status', { cache: 'no-store' });
+        if (!response.ok) throw new Error('status unavailable');
+        subscriptionState = await response.json();
+        const labels = { grok: 'Grok Build', claude: 'Claude Code', antigravity: 'Antigravity' };
+        for (const source of Object.keys(labels)) {
+          const state = subscriptionState[source] || {};
+          const status = document.getElementById('subscription-' + source + '-status');
+          const button = document.getElementById('subscription-' + source + '-button');
+          if (!status || !button) continue;
+          if (state.active) {
+            status.innerText = currentLang === 'zh' ? '已导入（待更新下拉菜单应用）' : 'Imported (apply via dropdown update)';
+            status.style.color = 'var(--color-success)';
+            button.disabled = false;
+            button.innerText = currentLang === 'zh' ? '清理 ' + labels[source] + ' 模型' : 'Clear ' + labels[source];
+            button.style.background = 'linear-gradient(135deg,#ff4d4f,#d9363e)';
+          } else if (state.detected) {
+            const detail = source === 'grok' && state.email ? '：' + state.email : '';
+            status.innerText = (currentLang === 'zh' ? '已检测到' : 'Detected') + detail;
+            status.style.color = 'var(--color-secondary)';
+            button.disabled = false;
+            button.innerText = currentLang === 'zh' ? '导入 ' + labels[source] : 'Import ' + labels[source];
+            button.style.background = '';
+          } else {
+            status.innerText = currentLang === 'zh' ? '未检测到本机登录' : 'No local login detected';
+            status.style.color = 'var(--color-text-muted)';
+            button.disabled = true;
+            button.innerText = currentLang === 'zh' ? '导入 ' + labels[source] : 'Import ' + labels[source];
+            button.style.background = '';
+          }
+        }
+      } catch (_) {
+        for (const source of ['grok', 'claude', 'antigravity']) {
+          const status = document.getElementById('subscription-' + source + '-status');
+          if (status) status.innerText = currentLang === 'zh' ? '检测失败' : 'Detection unavailable';
+        }
+      }
+    }
+
+    async function toggleSubscription(source) {
+      const current = subscriptionState[source] || {};
+      const endpoint = current.active ? '/api/cli-bridge/deactivate' : '/api/cli-bridge/activate';
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cli: source })
+        });
+        if (!response.ok) {
+          const error = await response.json().catch(() => ({}));
+          throw new Error(error.error || 'Request failed');
+        }
+        showToast(current.active
+          ? (currentLang === 'zh' ? '模型已清理；未重启。' : 'Models cleared without restart.')
+          : (currentLang === 'zh' ? '模型已导入；请在右侧更新下拉菜单。' : 'Models imported; apply from the dropdown panel.'));
+        await loadGatewayStatus();
+        await loadConfig();
+        await loadModels();
+        await loadSubscriptionStatus();
+      } catch (error) {
+        showToast(error.message || 'Subscription operation failed', true);
       }
     }
 
@@ -2139,8 +2264,10 @@ export function getDashboardHtml(): string {
 
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
+      await loadGatewayStatus();
       await loadConfig();
       await loadModels();
+      await loadSubscriptionStatus();
       await loadVoiceSettings();
       
       setupLogsPolling();
