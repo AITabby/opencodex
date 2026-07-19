@@ -12,6 +12,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { exec, spawn, spawnSync, execSync } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
+import { randomUUID } from "node:crypto";
 // @ts-ignore
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { ProxyAgent, fetch } from "undici";
@@ -37,6 +38,18 @@ import {
 
 import { getDashboardHtml } from "./dashboard.js";
 import { getVisualizerHtml } from "./visualizer.js";
+
+import {
+  toResponsesItems,
+  toOpenAiMessages,
+  toAnthropicPayload,
+  normalizeImportedMemory,
+  OPENCODEX_MEMORY_TURN_ID,
+  type OpenCodexMemoryPackage
+} from "./memory_bridge.js";
+import { parseMemoryFile, parseMemoryFilePath } from "./memory_file_import.js";
+import { scanLocalMemorySources, type ScannedMemorySource } from "./memory_source_scanner.js";
+import { withCodexAppServer } from "./codex_app_server.js";
 
 export function isNativeModeEnabled(): boolean {
   const tomlPath = join(homedir(), ".codex", "config.toml");
@@ -150,6 +163,7 @@ export class ProxyServer {
   private antigravityTokenCacheTime = 0;
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
+  private memorySourceFiles = new Map<string, ScannedMemorySource>();
   public codexMcpClient: any = null;
   private mcpProcess: any = null;
   private mcpRequestId = 0;
@@ -2124,6 +2138,126 @@ stream_idle_timeout_ms = 600000
         res.end(JSON.stringify({ status: "success" }));
       } catch (err: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/memory-sources/scan" && req.method === "GET") {
+      try {
+        const groups = await scanLocalMemorySources();
+        this.memorySourceFiles.clear();
+        for (const group of groups) {
+          for (const source of group.sources) {
+            this.memorySourceFiles.set(source.source_id, source);
+          }
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          agents: groups.map((group) => ({
+            name: group.name,
+            session_count: group.session_count,
+            sources: group.sources.map((source) => ({
+              source_id: source.source_id,
+              display_path: source.display_path,
+              format: source.format,
+              modified_at: source.modified_at,
+              sessions: source.sessions
+            }))
+          }))
+        }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/memory-sources/import" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const source = this.memorySourceFiles.get(String(data.source_id || ""));
+        if (!source) {
+          res.writeHead(410, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Scan result expired. Scan local agents again." }));
+          return;
+        }
+        const selectedSessionId = data.session_id === "__default__"
+          ? undefined
+          : String(data.session_id || "");
+        const parsed = await parseMemoryFilePath(source.path, selectedSessionId);
+        if (!parsed.memory) throw new Error("The selected session could not be read");
+        const imported = await importMemoryIntoCodex(parsed.memory);
+        const shouldRestart = data.restart !== false;
+        console.log(`[OpenCodex Memory Bridge] Imported scanned source ${source.display_path} into ${imported.id}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "success",
+          ...imported,
+          detected_format: parsed.detected_format,
+          model_visible: true,
+          restarted: shouldRestart
+        }));
+        if (shouldRestart) {
+          setTimeout(() => this.restartCodexDesktop(), 350);
+        }
+      } catch (err: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/sessions/import" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const fallbackTitle = String(data.name || `Imported conversation ${new Date().toLocaleDateString()}`);
+        let memory;
+        let detectedFormat = "json";
+        if (typeof data.file_name === "string" && typeof data.file_base64 === "string") {
+          const fileBytes = Buffer.from(data.file_base64, "base64");
+          if (fileBytes.length === 0) throw new Error("The selected file is empty");
+          if (fileBytes.length > 48 * 1024 * 1024) {
+            throw new Error("Import file is too large. Maximum size is 48 MB");
+          }
+          const parsedFile = await parseMemoryFile(
+            data.file_name,
+            new Uint8Array(fileBytes),
+            typeof data.session_id === "string" ? data.session_id : undefined
+          );
+          detectedFormat = parsedFile.detected_format;
+          if (parsedFile.sessions?.length && !parsedFile.memory) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              requires_session_selection: true,
+              detected_format: parsedFile.detected_format,
+              sessions: parsedFile.sessions
+            }));
+            return;
+          }
+          if (!parsedFile.memory) throw new Error("No conversation was selected");
+          memory = parsedFile.memory;
+        } else {
+          const rawImport = data.payload ?? (Array.isArray(data.messages) ? data.messages : data);
+          memory = normalizeImportedMemory(rawImport, fallbackTitle);
+        }
+        const imported = await importMemoryIntoCodex(memory);
+        const shouldRestart = data.restart !== false;
+        console.log(`[OpenCodex Memory Bridge] Imported ${memory.messages.length} messages into Codex thread ${imported.id}`);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          status: "success",
+          ...imported,
+          detected_format: detectedFormat,
+          model_visible: true,
+          restarted: shouldRestart
+        }));
+        if (shouldRestart) {
+          setTimeout(() => this.restartCodexDesktop(), 350);
+        }
+      } catch (err: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
       return;
@@ -5210,4 +5344,182 @@ function stripManagedBlocks(content: string): string {
 
 function getDefaultCatalog() {
   return { models: [] };
+}
+
+function getPreferredCodexCwd(): string {
+  try {
+    const sessionsDir = join(homedir(), ".codex", "sessions");
+    const recentFiles = findRolloutFiles(sessionsDir)
+      .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)
+      .slice(0, 20);
+    for (const file of recentFiles) {
+      const content = readFileSync(file, "utf-8");
+      if (content.includes(OPENCODEX_MEMORY_TURN_ID)) continue;
+      const firstLine = content.split("\n", 1)[0];
+      const metadata = JSON.parse(firstLine);
+      const cwd = metadata.type === "session_meta" ? metadata.payload?.cwd : "";
+      if (typeof cwd === "string" && cwd && existsSync(cwd) && statSync(cwd).isDirectory()) {
+        return cwd;
+      }
+    }
+  } catch {}
+  return homedir();
+}
+
+function appendImportedSessionProjection(
+  rolloutPath: string,
+  title: string,
+  messageCount: number,
+  cwd: string,
+  model: string
+): void {
+  if (!rolloutPath || !existsSync(rolloutPath)) {
+    throw new Error("Codex did not create a readable rollout file");
+  }
+
+  const timestamp = new Date().toISOString();
+  const turnId = randomUUID();
+  const userMessage = `Imported memory: ${title} (${messageCount} messages)`;
+  const assistantMessage = "The imported conversation is available as model-visible history. Continue normally from this thread.";
+  const projection = [
+    {
+      timestamp,
+      type: "turn_context",
+      payload: {
+        turn_id: turnId,
+        cwd,
+        workspace_roots: [cwd],
+        model
+      }
+    },
+    {
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "user_message",
+        text: userMessage,
+        turn_id: turnId,
+        message_id: `msg_user_${randomUUID()}`
+      }
+    },
+    {
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: "assistant_message",
+        text: assistantMessage,
+        turn_id: turnId,
+        message_id: `msg_assistant_${randomUUID()}`
+      }
+    }
+  ];
+
+  const lines = projection.map((item) => JSON.stringify(item)).join("\n") + "\n";
+  appendFileSync(rolloutPath, lines, "utf-8");
+}
+
+async function updateImportedThreadState(threadId: string, preview: string): Promise<void> {
+  const databasePath = join(homedir(), ".codex", "state_5.sqlite");
+  if (!existsSync(databasePath)) return;
+
+  try {
+    // @ts-ignore
+    const { DatabaseSync } = await import("node:sqlite");
+    const database = new DatabaseSync(databasePath);
+    try {
+      database.exec("PRAGMA busy_timeout = 5000");
+      database.prepare(`
+        UPDATE threads
+        SET thread_source = 'user',
+            preview = ?,
+            first_user_message = ?
+        WHERE id = ?
+      `).run(preview, preview, threadId);
+    } finally {
+      database.close();
+    }
+    return;
+  } catch {}
+
+  const escapeSql = (value: string) => value.replace(/'/g, "''");
+  const result = spawnSync("sqlite3", [
+    databasePath,
+    `PRAGMA busy_timeout=5000; UPDATE threads SET thread_source='user', preview='${escapeSql(preview)}', first_user_message='${escapeSql(preview)}' WHERE id='${escapeSql(threadId)}';`
+  ], { encoding: "utf-8" });
+  if (result.status !== 0) {
+    console.error(`[OpenCodex Memory Bridge] Unable to update Codex thread index: ${result.stderr || result.error?.message || "unknown error"}`);
+  }
+}
+
+async function importMemoryIntoCodex(memory: OpenCodexMemoryPackage): Promise<{
+  id: string;
+  name: string;
+  message_count: number;
+  event_count: number;
+}> {
+  const fallbackTitle = `Imported conversation ${new Date().toLocaleDateString()}`;
+  const threadName = String(memory.title || fallbackTitle).slice(0, 200);
+  const sourceCwd = memory.source?.cwd;
+  let importCwd = getPreferredCodexCwd();
+  if (sourceCwd && existsSync(sourceCwd)) {
+    try {
+      if (statSync(sourceCwd).isDirectory()) importCwd = sourceCwd;
+    } catch {}
+  }
+  const responseItems = toResponsesItems(memory);
+
+  const newSid = await withCodexAppServer(async (client) => {
+    let createdThreadId = "";
+    try {
+      const startResult = await client.call("thread/start", {
+        cwd: importCwd,
+        threadSource: "user"
+      }, 60000);
+      createdThreadId = String(startResult.thread?.id || "");
+      if (!createdThreadId) throw new Error("Codex did not return a thread id");
+
+      for (let index = 0; index < responseItems.length; index += 200) {
+        await client.call("thread/inject_items", {
+          threadId: createdThreadId,
+          items: responseItems.slice(index, index + 200)
+        }, 60000);
+      }
+
+      await client.call("thread/name/set", {
+        threadId: createdThreadId,
+        name: threadName
+      });
+      const readResult = await client.call("thread/read", {
+        threadId: createdThreadId,
+        includeTurns: false
+      });
+      appendImportedSessionProjection(
+        String(readResult.thread?.path || ""),
+        threadName,
+        memory.messages.length,
+        importCwd,
+        String(startResult.model || "gpt-5.5")
+      );
+      await client.call("thread/list", { limit: 20, sourceKinds: [] });
+      return createdThreadId;
+    } catch (error) {
+      if (createdThreadId) {
+        try {
+          await client.call("thread/archive", { threadId: createdThreadId });
+        } catch {}
+      }
+      throw error;
+    }
+  });
+
+  await updateImportedThreadState(
+    newSid,
+    `Imported memory: ${threadName} (${memory.messages.length} messages)`
+  );
+  return {
+    id: newSid,
+    name: threadName,
+    message_count: memory.messages.length,
+    event_count: memory.events?.length || 0
+  };
 }

@@ -362,10 +362,6 @@ export function getDashboardHtml(): string {
       border-color: rgba(255,255,255,0.08);
       transform: translateX(3px);
     }
-    button:disabled, input:disabled {
-      opacity: 0.42;
-      cursor: not-allowed !important;
-    }
 
     .model-checkbox-container {
       display: flex;
@@ -594,13 +590,14 @@ export function getDashboardHtml(): string {
     }
     
     .session-btn {
-      padding: 0.25rem 0.5rem;
-      font-size: 0.75rem;
+      padding: 0.25rem 0.45rem;
+      font-size: 0.7rem;
       border-radius: 5px;
       border: none;
       cursor: pointer;
       font-weight: 600;
       transition: var(--transition-standard);
+      white-space: nowrap;
     }
     
     .session-btn-del {
@@ -769,7 +766,7 @@ export function getDashboardHtml(): string {
       </div>
       
       <div class="header-actions">
-        <button class="console-btn" id="restart-codex-btn" onclick="restartCodexDesktop()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.3); color: var(--color-primary); font-weight: 600;">🚀 重启 ChatGPT / Restart</button>
+        <button class="console-btn" id="restart-codex-btn" onclick="restartCodexDesktop()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(168, 85, 247, 0.15); border-color: rgba(168, 85, 247, 0.3); color: var(--color-primary); font-weight: 600;">🚀 重启 Codex / Restart</button>
         <button class="console-btn" id="reset-btn" onclick="resetCodex()" style="padding: 0.5rem 1rem; border-radius: 99px; background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.3); color: #ef4444; font-weight: 600;">↺ 还原原生 / Reset</button>
         <button class="console-btn" id="lang-btn" onclick="toggleLanguage()" style="padding: 0.5rem 1rem; border-radius: 99px;">🌐 EN / 中</button>
         
@@ -825,9 +822,9 @@ export function getDashboardHtml(): string {
                 </div>
               </div>
 
-              <div style="display: none;">
-                <input type="checkbox" id="config-restart-checkbox" style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 ChatGPT Desktop</label>
+              <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
+                <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
+                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 Codex Desktop</label>
               </div>
               
               <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save & Add Model</button>
@@ -865,23 +862,78 @@ export function getDashboardHtml(): string {
 
               <button type="submit" class="action-btn" id="i18n-btn-save-vision-fallback" style="margin-top: 0.5rem;">Save Vision Fallback Settings</button>
             </form>
-          </div>
+           </div>
 
-          <div class="panel-card" id="subscription-import-panel">
-            <div class="panel-title">订阅模型导入 / Subscription Import</div>
-            <p style="font-size:0.85rem;color:var(--color-text-muted);line-height:1.4;">读取本机已登录订阅，无需填写 Key。导入或清理不会重启 ChatGPT；完成后在右侧更新下拉菜单，并按需重启。</p>
-            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0.75rem;margin-top:1rem;">
-              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
-                <strong>Grok Build</strong><div id="subscription-grok-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
-                <button id="subscription-grok-button" class="action-btn" type="button" onclick="toggleSubscription('grok')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Grok Build</button>
-              </div>
-              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
-                <strong>Claude Code</strong><div id="subscription-claude-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
-                <button id="subscription-claude-button" class="action-btn" type="button" onclick="toggleSubscription('claude')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Claude Code</button>
-              </div>
-              <div style="padding:0.9rem;border:1px solid var(--glass-border);border-radius:10px;background:rgba(255,255,255,0.02);">
-                <strong>Antigravity</strong><div id="subscription-antigravity-status" style="font-size:0.78rem;color:var(--color-text-muted);margin:0.35rem 0 0.7rem;">检测中…</div>
-                <button id="subscription-antigravity-button" class="action-btn" type="button" onclick="toggleSubscription('antigravity')" style="margin:0;width:100%;padding:0.55rem;" disabled>导入 Antigravity</button>
+          <!-- Local CLI Auto-Detector -->
+          <div class="panel-card">
+            <div class="panel-title" id="i18n-cli-detector-title">
+              <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg>
+              Local CLI Session Auto-Detector (本地 CLI 会话检测)
+            </div>
+            
+            <div style="display: flex; flex-direction: column; gap: 1.25rem;">
+              <p id="i18n-cli-detector-desc" style="font-size: 0.85rem; color: var(--color-text-muted); line-height: 1.4;">
+                自动检测本地已登录的 CLI 终端会话。点击“一键配置”即可自动在 Codex 中注入代理和模型，无需手动复制 Key。
+              </p>
+              
+              <div style="display: flex; flex-direction: column; gap: 0.75rem;">
+                <!-- Grok CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Grok CLI</span>
+                      <span id="cli-status-grok-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-grok-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-grok" class="action-btn" onclick="activateCli('grok')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-grok" class="action-btn" onclick="deactivateCli('grok')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Claude CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Claude CLI (Claude Code)</span>
+                      <span id="cli-status-claude-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-claude-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-claude" class="action-btn" onclick="activateCli('claude')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-claude" class="action-btn" onclick="deactivateCli('claude')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Antigravity CLI -->
+                <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-radius: 6px; background: rgba(255,255,255,0.03); border: 1px solid var(--glass-border);">
+                  <div>
+                    <div style="font-weight: bold; font-size: 0.9rem; display: flex; align-items: center; gap: 0.5rem;">
+                      <span>Antigravity</span>
+                      <span id="cli-status-antigravity-badge" class="badge" style="background: rgba(255,255,255,0.1); color: var(--color-text-muted);">Checking...</span>
+                    </div>
+                    <div id="cli-status-antigravity-details" style="font-size: 0.75rem; color: var(--color-text-muted); margin-top: 0.25rem;">-</div>
+                  </div>
+                  <div style="display: flex; gap: 0.5rem;">
+                    <button type="button" id="btn-activate-antigravity" class="action-btn" onclick="activateCli('antigravity')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0;">
+                      一键配置模型
+                    </button>
+                    <button type="button" id="btn-deactivate-antigravity" class="action-btn" onclick="deactivateCli('antigravity')" style="width: auto; padding: 0.4rem 0.8rem; font-size: 0.8rem; display: none; margin: 0; background: linear-gradient(135deg, #ff4d4f 0%, #d9363e 100%);">
+                      一键清理模型
+                    </button>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -907,7 +959,7 @@ export function getDashboardHtml(): string {
 
             <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
               <input type="checkbox" id="models-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-              <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 ChatGPT Desktop</label>
+              <label for="models-restart-checkbox" id="i18n-label-models-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">更新后自动重启 Codex Desktop</label>
             </div>
             
             <button type="button" class="action-btn" id="i18n-btn-update-dropdown" onclick="saveActiveModels()">Update Dropdown List</button>
@@ -1108,6 +1160,30 @@ export function getDashboardHtml(): string {
                 🗑️ 清空 / Clear
               </button>
             </div>
+            
+            <button class="action-btn" id="scan-memory-btn" onclick="scanLocalAgents()" style="width: 100%; margin: 0 0 0.65rem 0; padding: 0.6rem; font-size: 0.8rem; background: rgba(168, 85, 247, 0.16); border: 1px solid rgba(168, 85, 247, 0.3); color: var(--color-primary); border-radius: 8px;">
+              扫描本机 Agent / Scan Local Agents
+            </button>
+
+            <div style="background: rgba(255,255,255,0.02); border: 1px dashed rgba(255,255,255,0.12); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem; text-align: center; cursor: pointer; transition: var(--transition-standard);" 
+                 id="import-dropzone" 
+                 onclick="triggerImportFileInput()"
+                 ondragover="handleDragOver(event)" 
+                 ondragleave="handleDragLeave(event)"
+                 ondrop="handleFileDrop(event)">
+              <span style="font-size: 0.8rem; color: var(--color-secondary); font-weight: 600; display: flex; align-items: center; justify-content: center; gap: 0.25rem;" id="i18n-import-title">📥 导入对话 / Import Memory</span>
+              <div style="font-size: 0.65rem; color: var(--color-text-muted); margin-top: 4px;" id="i18n-import-desc">JSON · JSONL · SQLite · Markdown</div>
+              <input type="file" id="import-file-input" style="display: none;" accept=".json,.jsonl,.db,.sqlite,.sqlite3,.md,.markdown" onchange="handleImportFileSelect(event)">
+            </div>
+
+            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem;">
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
+                <span style="font-size: 0.85rem; font-weight: 600; color: var(--color-text);">桌面置顶悬浮球 / Desktop Orb</span>
+                <span id="orb-status-badge" style="font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 99px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">关闭 / Offline</span>
+              </div>
+              <button class="action-btn" id="orb-toggle-btn" onclick="toggleDesktopOrb()" style="width: 100%; margin-top: 0; padding: 0.5rem; font-size: 0.8rem; background: var(--color-primary); color: white; border-radius: 8px;">开启置顶悬浮球 / Launch Orb</button>
+            </div>
+
             <div id="session-list-container" style="display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; flex: 1;">
               <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;" id="i18n-loading-sessions">Loading sessions...</div>
             </div>
@@ -1166,6 +1242,54 @@ export function getDashboardHtml(): string {
     </div>
   </div>
 
+  <div class="modal-overlay" id="export-modal">
+    <div class="modal-box" style="width: 320px; max-width: 90%;">
+      <h3 style="margin-bottom: 1rem; font-weight: 600; font-size: 1.1rem; color: var(--color-text);">📤 导出对话历史 / Export Chat History</h3>
+      <p style="margin-bottom: 1.5rem; font-size: 0.85rem; color: var(--color-text-muted);">选择您希望导出的格式： / Select your export format:</p>
+      <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-bottom: 1.5rem;">
+        <button onclick="executeExport('memory')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--color-success); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          🧠 OpenCodex Memory Package
+        </button>
+        <button onclick="executeExport('openai')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(147, 51, 234, 0.15); border: 1px solid rgba(147, 51, 234, 0.3); color: var(--color-primary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          🌐 Standard JSON (OpenAI / LangChain)
+        </button>
+        <button onclick="executeExport('anthropic')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(6, 182, 212, 0.15); border: 1px solid rgba(6, 182, 212, 0.3); color: var(--color-secondary); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          💬 Claude API Format (Anthropic)
+        </button>
+        <button onclick="executeExport('markdown')" class="action-btn" style="margin-top:0; padding: 0.75rem; background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--color-success); font-size: 0.85rem; border-radius: 8px; cursor: pointer; text-align: left; font-weight: 600; outline: none; display: block; width: 100%;">
+          📝 Markdown (Notion / Notes)
+        </button>
+      </div>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" onclick="document.getElementById('export-modal').classList.remove('show')" style="width: 100%; border-radius: 8px; padding: 0.6rem;">关闭 / Close</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="import-session-modal">
+    <div class="modal-box" style="width: 420px; max-width: 92%;">
+      <h3 id="import-session-modal-title" style="margin-bottom: 0.75rem; font-weight: 600; font-size: 1.05rem; color: var(--color-text);">选择要导入的会话</h3>
+      <p id="import-session-modal-desc" style="margin-bottom: 1rem; font-size: 0.8rem; color: var(--color-text-muted);">该文件包含多个会话，请选择一条。</p>
+      <select id="import-session-select" style="width: 100%; padding: 0.7rem; margin-bottom: 1rem; border-radius: 6px; border: 1px solid rgba(255,255,255,0.16); background: var(--color-bg-secondary); color: var(--color-text); font-size: 0.8rem;"></select>
+      <div class="modal-actions">
+        <button class="modal-btn-cancel" onclick="cancelImportSessionSelection()">取消 / Cancel</button>
+        <button class="modal-btn-confirm" onclick="confirmImportSessionSelection()">导入 / Import</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="memory-scan-modal">
+    <div class="modal-box" style="width: 680px; max-width: 94%; max-height: 82vh; display: flex; flex-direction: column;">
+      <h3 id="memory-scan-modal-title" style="margin-bottom: 0.35rem; font-weight: 600; font-size: 1.05rem; color: var(--color-text);">本机 Agent 记忆</h3>
+      <p id="memory-scan-modal-desc" style="margin-bottom: 0.85rem; font-size: 0.78rem; color: var(--color-text-muted);">选择需要导入到 Codex 的会话。</p>
+      <div id="memory-scan-results" style="overflow-y: auto; min-height: 180px; max-height: 56vh; padding-right: 0.25rem;"></div>
+      <div class="modal-actions" style="margin-top: 1rem;">
+        <button class="modal-btn-cancel" onclick="closeMemoryScanModal()">关闭 / Close</button>
+        <button class="modal-btn-confirm" id="memory-scan-import-btn" onclick="importSelectedMemorySources()">导入选中 / Import Selected</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     // i18n
     const i18nDict = {
@@ -1179,7 +1303,7 @@ export function getDashboardHtml(): string {
         modelAliasHint: "Support alias mapping to avoid official name conflicts, e.g., gpt-5.5-custom=gpt-5.5 or gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "Save & Add Model",
         panelModelsTitle: "Model Dropdown Customizer",
-        modelsDesc: "Select which models appear in the ChatGPT model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
+        modelsDesc: "Select which models appear in the Codex model dropdown selector. Check **Vision Bridge** to auto-describe screenshots for text-only models (requires Vision Fallback API key).",
         btnUpdateDropdown: "Update Dropdown List",
         panelConsoleTitle: "Live Stream Console Logger",
         btnClear: "Clear",
@@ -1187,17 +1311,17 @@ export function getDashboardHtml(): string {
         toastConfigSaved: "API key and model saved successfully!",
         toastConfigFailed: "Failed to save configs",
         toastConnFailed: "Failed to connect to backend",
-        toastModelsSaved: "ChatGPT dropdown selector list updated!",
+        toastModelsSaved: "Codex dropdown selector list updated!",
         toastModelsFailed: "Failed to update models list",
         toastConsoleCleared: "Console cleared",
-        btnRestartCodex: "🚀 Restart ChatGPT",
-        labelConfigRestart: "Auto-restart ChatGPT Desktop on save",
-        labelModelsRestart: "Auto-restart ChatGPT Desktop on update",
-        toastRestarting: "Restarting ChatGPT Desktop...",
-        toastRestarted: "ChatGPT Desktop restarted!",
+        btnRestartCodex: "🚀 Restart Codex",
+        labelConfigRestart: "Auto-restart Codex Desktop on save",
+        labelModelsRestart: "Auto-restart Codex Desktop on update",
+        toastRestarting: "Restarting Codex Desktop...",
+        toastRestarted: "Codex Desktop restarted!",
         btnReset: "↺ Reset to Native",
-        toastResetting: "Resetting to native ChatGPT...",
-        toastResetDone: "Reset complete. ChatGPT restarting.",
+        toastResetting: "Resetting to native Codex...",
+        toastResetDone: "Reset complete. Codex restarting.",
         panelVoiceTitle: "Voice & Speech Settings",
         labelSttEngine: "Speech-to-Text (STT) Engine",
         labelSttApiKey: "STT API Key",
@@ -1234,7 +1358,32 @@ export function getDashboardHtml(): string {
         sessionManagerTitle: "Session Manager & Context Synchronizer",
         selectSessionHint: "Select a session from the left",
         chooseSessionDetail: "Please choose a session to view conversation details.",
-        loadingSessions: "Loading sessions..."
+        loadingSessions: "Loading sessions...",
+        importDropzoneTitle: "📥 Import Memory",
+        importDropzoneDesc: "JSON · JSONL · SQLite · Markdown",
+        btnExport: "Export",
+        btnArchive: "Archive",
+        btnUnarchive: "Activate",
+        btnDelete: "Delete",
+        toastExportSuccess: "Exported successfully",
+        toastExportFailed: "Export failed",
+        toastExportError: "Export error",
+        toastImportSuccess: "Imported successfully!",
+        toastImportRestarting: "Import complete. Restarting Codex Desktop...",
+        toastImportFailed: "Import failed",
+        toastInvalidFormat: "Use JSON, JSONL, SQLite, or Markdown",
+        toastUnsupportedStructure: "Unsupported file structure",
+        toastJsonError: "Error reading import file",
+        importSessionTitle: "Select a session",
+        importSessionDesc: "This file contains multiple sessions. Choose one to import.",
+        btnScanMemory: "Scan Local Agents",
+        scanningMemory: "Scanning local agent data...",
+        memoryScanTitle: "Local Agent Memory",
+        memoryScanDesc: "Choose sessions to import into Codex.",
+        noMemorySources: "No supported local agent sessions were found. Use manual file import below.",
+        importSelected: "Import Selected",
+        selectAtLeastOne: "Select at least one session",
+        scanFailed: "Local agent scan failed"
       },
       zh: {
         title: "OpenCodex 统一网关",
@@ -1246,7 +1395,7 @@ export function getDashboardHtml(): string {
         modelAliasHint: "支持使用别名映射规避官方同名冲突，如：gpt-5.5-custom=gpt-5.5 或 gpt-5.5-custom->gpt-5.5",
         btnSaveConfig: "保存并添加该模型",
         panelModelsTitle: "自定义下拉框模型",
-        modelsDesc: "勾选想要显示在 ChatGPT 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
+        modelsDesc: "勾选想要显示在 Codex 左上角下拉菜单中的模型。勾选 **Vision Bridge** 的模型会拦截截图并生成文字描述（需填写视觉降级 API Key）。",
         btnUpdateDropdown: "更新下拉框菜单",
         panelConsoleTitle: "实时日志控制台",
         btnClear: "清空日志",
@@ -1254,17 +1403,17 @@ export function getDashboardHtml(): string {
         toastConfigSaved: "API 密钥和模型配置已保存！",
         toastConfigFailed: "保存配置失败",
         toastConnFailed: "连接后端失败",
-        toastModelsSaved: "ChatGPT 下拉框模型列表更新成功！",
+        toastModelsSaved: "Codex 下拉框模型列表更新成功！",
         toastModelsFailed: "更新模型列表失败",
         toastConsoleCleared: "控制台已清空",
-        btnRestartCodex: "🚀 重启 ChatGPT",
-        labelConfigRestart: "保存后自动重启 ChatGPT Desktop",
-        labelModelsRestart: "更新后自动重启 ChatGPT Desktop",
-        toastRestarting: "正在重启 ChatGPT Desktop...",
-        toastRestarted: "ChatGPT Desktop 重启成功！",
+        btnRestartCodex: "🚀 重启 Codex",
+        labelConfigRestart: "保存后自动重启 Codex Desktop",
+        labelModelsRestart: "更新后自动重启 Codex Desktop",
+        toastRestarting: "正在重启 Codex Desktop...",
+        toastRestarted: "Codex Desktop 重启成功！",
         btnReset: "↺ 还原原生",
-        toastResetting: "正在还原原生 ChatGPT...",
-        toastResetDone: "还原完成，ChatGPT 重启中.",
+        toastResetting: "正在还原原生 Codex...",
+        toastResetDone: "还原完成，Codex 重启中.",
         panelVoiceTitle: "语音与分贝设置",
         labelSttEngine: "语音识别 (STT) 引擎",
         labelSttApiKey: "语音识别 API 密钥 (Key)",
@@ -1301,7 +1450,32 @@ export function getDashboardHtml(): string {
         sessionManagerTitle: "会话历史管理与上下文同步",
         selectSessionHint: "请从左侧选择一个历史会话",
         chooseSessionDetail: "请选择一个会话以查看详细聊天对话内容。",
-        loadingSessions: "正在加载会话列表..."
+        loadingSessions: "正在加载会话列表...",
+        importDropzoneTitle: "📥 导入对话 / Import Memory",
+        importDropzoneDesc: "JSON · JSONL · SQLite · Markdown",
+        btnExport: "导出",
+        btnArchive: "归档",
+        btnUnarchive: "激活",
+        btnDelete: "删除",
+        toastExportSuccess: "导出成功",
+        toastExportFailed: "导出失败",
+        toastExportError: "导出出错",
+        toastImportSuccess: "导入成功！",
+        toastImportRestarting: "导入完成，正在自动重启 Codex Desktop...",
+        toastImportFailed: "导入失败",
+        toastInvalidFormat: "支持 JSON、JSONL、SQLite 或 Markdown",
+        toastUnsupportedStructure: "不支持的文件格式结构",
+        toastJsonError: "读取导入文件出错",
+        importSessionTitle: "选择要导入的会话",
+        importSessionDesc: "该文件包含多个会话，请选择一条。",
+        btnScanMemory: "扫描本机 Agent",
+        scanningMemory: "正在扫描本机 Agent 数据...",
+        memoryScanTitle: "本机 Agent 记忆",
+        memoryScanDesc: "选择需要导入到 Codex 的会话。",
+        noMemorySources: "没有发现可识别的本机 Agent 会话，请使用下方手动文件导入。",
+        importSelected: "导入选中",
+        selectAtLeastOne: "请至少选择一条会话",
+        scanFailed: "扫描本机 Agent 失败"
       }
     };
 
@@ -1309,38 +1483,6 @@ export function getDashboardHtml(): string {
     let currentTab = 'gateway';
     let activeSessionId = '';
     let configData = { providers: [] };
-    let gatewayModeActive = false;
-
-    function setGatewayUiState(active) {
-      gatewayModeActive = !!active;
-      const disabledIds = ['restart-codex-btn', 'reset-btn', 'i18n-btn-update-dropdown', 'models-restart-checkbox'];
-      disabledIds.forEach(id => {
-        const node = document.getElementById(id);
-        if (node) node.disabled = !gatewayModeActive;
-      });
-
-      const status = document.getElementById('i18n-status');
-      const dot = document.querySelector('.status-dot');
-      if (!gatewayModeActive) {
-        if (status) status.innerText = currentLang === 'zh' ? '原生直连（网关空闲）' : 'Native Direct (Gateway Idle)';
-        if (dot) dot.style.background = 'var(--color-text-muted)';
-      } else {
-        if (status) status.innerText = currentLang === 'zh' ? '网关已接管' : 'Gateway Active';
-        if (dot) dot.style.background = '';
-      }
-    }
-
-    async function loadGatewayStatus() {
-      try {
-        const response = await fetch('/api/gateway/status', { cache: 'no-store' });
-        if (!response.ok) throw new Error('gateway status unavailable');
-        const data = await response.json();
-        setGatewayUiState(data.active === true);
-      } catch (_) {
-        // Fail closed: without a confirmed active gateway, protect native mode.
-        setGatewayUiState(false);
-      }
-    }
 
     function switchTab(tabName) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -1399,6 +1541,14 @@ export function getDashboardHtml(): string {
       setText('i18n-label-voice-system-prompt', t.labelVoiceSystemPrompt);
       setText('i18n-session-manager-title', t.sessionManagerTitle);
       setText('i18n-loading-sessions', t.loadingSessions);
+      setText('i18n-import-title', t.importDropzoneTitle);
+      setText('i18n-import-desc', t.importDropzoneDesc);
+      setText('import-session-modal-title', t.importSessionTitle);
+      setText('import-session-modal-desc', t.importSessionDesc);
+      setText('scan-memory-btn', t.btnScanMemory);
+      setText('memory-scan-modal-title', t.memoryScanTitle);
+      setText('memory-scan-modal-desc', t.memoryScanDesc);
+      setText('memory-scan-import-btn', t.importSelected);
       
       const activeTitle = el('active-session-title');
       if (activeTitle && (activeTitle.innerText === 'Select a session from the left' || activeTitle.innerText === '请从左侧选择一个历史会话')) {
@@ -1418,8 +1568,8 @@ export function getDashboardHtml(): string {
         voiceLlmSelect.options[0].text = lang === 'zh' ? '-- 未设置 (使用默认) --' : '-- Not Set (Default) --';
       }
       
-      setGatewayUiState(gatewayModeActive);
       checkPermissionsStatus();
+      try { loadSessionsList(); } catch {}
     }
 
     function toggleLanguage() {
@@ -1464,11 +1614,6 @@ export function getDashboardHtml(): string {
         const activeIds = new Set(data.active || []);
         const container = document.getElementById('models-list-container');
         container.innerHTML = '';
-
-        if (data.mode === 'native' || !gatewayModeActive) {
-          container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);padding:2rem;">原生模式：模型由 ChatGPT / Codex 管理。未接入第三方模型，因此不会显示自定义模型。</div>';
-          return;
-        }
         
         (data.catalog || []).forEach(m => {
           const isActive = activeIds.has(m.id);
@@ -1486,9 +1631,10 @@ export function getDashboardHtml(): string {
             }
           };
           
+          const is1m = m.context_window === 1000000;
           item.innerHTML = \`
             <div class="model-checkbox-container">
-              <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \${isActive ? 'checked' : ''}>
+              <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \x24{isActive ? 'checked' : ''}>
               <div class="model-info">
                 <div class="model-display-name">\${m.display_name}</div>
                 <div class="model-slug">\${m.model}</div>
@@ -1496,7 +1642,11 @@ export function getDashboardHtml(): string {
             </div>
             <div style="display:flex;align-items:center;gap:0.75rem;">
               <label style="display:flex;align-items:center;gap:0.25rem;cursor:pointer;font-size:0.8rem;color:var(--color-text-muted);">
-                <input type="checkbox" class="vision-bridge-checkbox" data-id="\${m.id}" \${hasBridge ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-primary);">
+                <input type="checkbox" class="context-1m-checkbox" data-id="\${m.id}" \x24{is1m ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-secondary);">
+                <span>1M Context</span>
+              </label>
+              <label style="display:flex;align-items:center;gap:0.25rem;cursor:pointer;font-size:0.8rem;color:var(--color-text-muted);">
+                <input type="checkbox" class="vision-bridge-checkbox" data-id="\${m.id}" \x24{hasBridge ? 'checked' : ''} style="width:14px;height:14px;accent-color:var(--color-primary);">
                 <span>Vision Bridge</span>
               </label>
               \${badgeHtml}
@@ -1541,13 +1691,22 @@ export function getDashboardHtml(): string {
       const providers = (configData.providers || []).map(p => ({
         name: p.name,
         base_url: p.base_url,
-        api_key: p.api_key
+        api_key: p.api_key,
+        api_keys: p.api_keys
       })).filter(p => p.name !== providerName);
       
+      let apiKeys = undefined;
+      let finalApiKey = apiKey;
+      if (apiKey.includes(',')) {
+        apiKeys = apiKey.split(',').map(s => s.trim()).filter(Boolean);
+        finalApiKey = apiKeys[0] || '';
+      }
+
       providers.push({
         name: providerName,
         base_url: baseUrl,
-        api_key: apiKey
+        api_key: finalApiKey,
+        api_keys: apiKeys
       });
 
       // Get existing catalog models from UI or catalog
@@ -1600,6 +1759,8 @@ export function getDashboardHtml(): string {
       const activeIds = Array.from(checkedBoxes).map(cb => cb.getAttribute('data-id'));
       const visionBridgeBoxes = document.querySelectorAll('.vision-bridge-checkbox:checked');
       const visionBridgeIds = Array.from(visionBridgeBoxes).map(cb => cb.getAttribute('data-id'));
+      const context1mBoxes = document.querySelectorAll('.context-1m-checkbox:checked');
+      const context1mIds = Array.from(context1mBoxes).map(cb => cb.getAttribute('data-id'));
       const restartChecked = document.getElementById('models-restart-checkbox').checked;
       
       try {
@@ -1613,6 +1774,7 @@ export function getDashboardHtml(): string {
           body: JSON.stringify({
             active: activeIds,
             vision_bridge: visionBridgeIds,
+            context_1m: context1mIds,
             restart: restartChecked
           })
         });
@@ -1680,67 +1842,125 @@ export function getDashboardHtml(): string {
       }
     }
 
-    let subscriptionState = {};
-    async function loadSubscriptionStatus() {
+    async function checkCliStatus() {
       try {
-        const response = await fetch('/api/cli-bridge/status', { cache: 'no-store' });
-        if (!response.ok) throw new Error('status unavailable');
-        subscriptionState = await response.json();
-        const labels = { grok: 'Grok Build', claude: 'Claude Code', antigravity: 'Antigravity' };
-        for (const source of Object.keys(labels)) {
-          const state = subscriptionState[source] || {};
-          const status = document.getElementById('subscription-' + source + '-status');
-          const button = document.getElementById('subscription-' + source + '-button');
-          if (!status || !button) continue;
-          if (state.active) {
-            status.innerText = currentLang === 'zh' ? '已导入（待更新下拉菜单应用）' : 'Imported (apply via dropdown update)';
-            status.style.color = 'var(--color-success)';
-            button.disabled = false;
-            button.innerText = currentLang === 'zh' ? '清理 ' + labels[source] + ' 模型' : 'Clear ' + labels[source];
-            button.style.background = 'linear-gradient(135deg,#ff4d4f,#d9363e)';
-          } else if (state.detected) {
-            const detail = source === 'grok' && state.email ? '：' + state.email : '';
-            status.innerText = (currentLang === 'zh' ? '已检测到' : 'Detected') + detail;
-            status.style.color = 'var(--color-secondary)';
-            button.disabled = false;
-            button.innerText = currentLang === 'zh' ? '导入 ' + labels[source] : 'Import ' + labels[source];
-            button.style.background = '';
-          } else {
-            status.innerText = currentLang === 'zh' ? '未检测到本机登录' : 'No local login detected';
-            status.style.color = 'var(--color-text-muted)';
-            button.disabled = true;
-            button.innerText = currentLang === 'zh' ? '导入 ' + labels[source] : 'Import ' + labels[source];
-            button.style.background = '';
-          }
+        const res = await fetch('/api/cli-bridge/status');
+        const data = await res.json();
+
+        // Update Grok
+        const grokBadge = document.getElementById('cli-status-grok-badge');
+        const grokDetails = document.getElementById('cli-status-grok-details');
+        const grokBtn = document.getElementById('btn-activate-grok');
+        const grokDeactBtn = document.getElementById('btn-deactivate-grok');
+
+        if (data.grok.detected) {
+          grokBadge.innerText = data.grok.active ? (currentLang === 'zh' ? '已启用' : 'Active') : (currentLang === 'zh' ? '检测到会话' : 'Detected');
+          grokBadge.style.background = data.grok.active ? 'rgba(46,204,113,0.2)' : 'rgba(230,126,34,0.2)';
+          grokBadge.style.color = data.grok.active ? '#2ecc71' : '#e67e22';
+          
+          grokDetails.innerText = (currentLang === 'zh' ? '检测到会话：' : 'Session detected: ') + data.grok.email;
+          grokBtn.style.display = data.grok.active ? 'none' : 'block';
+          grokDeactBtn.style.display = data.grok.active ? 'block' : 'none';
+        } else {
+          grokBadge.innerText = currentLang === 'zh' ? '未检测到' : 'Not Detected';
+          grokBadge.style.background = 'rgba(231,76,60,0.15)';
+          grokBadge.style.color = '#e74c3c';
+          grokDetails.innerText = currentLang === 'zh' ? '请在终端运行 grok-cli 登录账号' : 'Please run grok-cli login in terminal';
+          grokBtn.style.display = 'none';
+          grokDeactBtn.style.display = 'none';
         }
-      } catch (_) {
-        for (const source of ['grok', 'claude', 'antigravity']) {
-          const status = document.getElementById('subscription-' + source + '-status');
-          if (status) status.innerText = currentLang === 'zh' ? '检测失败' : 'Detection unavailable';
+
+        // Update Claude
+        const claudeBadge = document.getElementById('cli-status-claude-badge');
+        const claudeDetails = document.getElementById('cli-status-claude-details');
+        const claudeBtn = document.getElementById('btn-activate-claude');
+        const claudeDeactBtn = document.getElementById('btn-deactivate-claude');
+
+        if (data.claude.detected) {
+          claudeBadge.innerText = data.claude.active ? (currentLang === 'zh' ? '已启用' : 'Active') : (currentLang === 'zh' ? '检测到会话' : 'Detected');
+          claudeBadge.style.background = data.claude.active ? 'rgba(46,204,113,0.2)' : 'rgba(230,126,34,0.2)';
+          claudeBadge.style.color = data.claude.active ? '#2ecc71' : '#e67e22';
+
+          claudeDetails.innerText = (currentLang === 'zh' ? '代理地址：' : 'Adapter URL: ') + data.claude.baseUrl;
+          claudeBtn.style.display = data.claude.active ? 'none' : 'block';
+          claudeDeactBtn.style.display = data.claude.active ? 'block' : 'none';
+        } else {
+          claudeBadge.innerText = currentLang === 'zh' ? '未检测到' : 'Not Detected';
+          claudeBadge.style.background = 'rgba(231,76,60,0.15)';
+          claudeBadge.style.color = '#e74c3c';
+          claudeDetails.innerText = currentLang === 'zh' ? '未检测到 Claude CLI 登录态' : 'No Claude CLI login state detected';
+          claudeBtn.style.display = 'none';
+          claudeDeactBtn.style.display = 'none';
         }
+
+        // Update Antigravity
+        const antiBadge = document.getElementById('cli-status-antigravity-badge');
+        const antiDetails = document.getElementById('cli-status-antigravity-details');
+        const antiBtn = document.getElementById('btn-activate-antigravity');
+        const antiDeactBtn = document.getElementById('btn-deactivate-antigravity');
+
+        if (data.antigravity.active) {
+          antiBadge.innerText = currentLang === 'zh' ? '已启用' : 'Active';
+          antiBadge.style.background = 'rgba(46,204,113,0.2)';
+          antiBadge.style.color = '#2ecc71';
+          antiDetails.innerText = currentLang === 'zh' ? '本地 AI 编码助手服务已就绪' : 'Local AI Agent service is ready';
+          antiBtn.style.display = 'none';
+          antiDeactBtn.style.display = 'block';
+        } else {
+          antiBadge.innerText = currentLang === 'zh' ? '未启用' : 'Inactive';
+          antiBadge.style.background = 'rgba(230,126,34,0.2)';
+          antiBadge.style.color = '#e67e22';
+          antiDetails.innerText = currentLang === 'zh' ? '模型未加入 Codex 列表' : 'Model not added to Codex';
+          antiBtn.style.display = 'block';
+          antiDeactBtn.style.display = 'none';
+        }
+      } catch (e) {
+        console.error(e);
       }
     }
 
-    async function toggleSubscription(source) {
-      const current = subscriptionState[source] || {};
-      const endpoint = current.active ? '/api/cli-bridge/deactivate' : '/api/cli-bridge/activate';
+    async function activateCli(cliName) {
       try {
-        const response = await fetch(endpoint, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cli: source })
+        const res = await fetch('/api/cli-bridge/activate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cli: cliName })
         });
-        if (!response.ok) {
-          const error = await response.json().catch(() => ({}));
-          throw new Error(error.error || 'Request failed');
+        if (res.ok) {
+          showToast(currentLang === 'zh' ? '🎉 模型配置成功！' : '🎉 Models configured successfully!', false);
+          await checkCliStatus();
+          await loadConfig();
+          await loadModels();
+        } else {
+          const err = await res.json();
+          showToast(err.error || 'Failed to activate', true);
         }
-        showToast(current.active
-          ? (currentLang === 'zh' ? '模型已清理；未重启。' : 'Models cleared without restart.')
-          : (currentLang === 'zh' ? '模型已导入；请在右侧更新下拉菜单。' : 'Models imported; apply from the dropdown panel.'));
-        await loadGatewayStatus();
-        await loadConfig();
-        await loadModels();
-        await loadSubscriptionStatus();
-      } catch (error) {
-        showToast(error.message || 'Subscription operation failed', true);
+      } catch (e) {
+        showToast(e.message, true);
+      }
+    }
+
+    async function deactivateCli(cliName) {
+      if (!confirm(currentLang === 'zh' ? '确认要清理所有属于 ' + cliName + ' 的模型和配置吗？' : 'Confirm to clean up all models and config for ' + cliName + '?')) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/cli-bridge/deactivate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cli: cliName })
+        });
+        if (res.ok) {
+          showToast(currentLang === 'zh' ? '🎉 模型清理成功！' : '🎉 Models cleaned up successfully!', false);
+          await checkCliStatus();
+          await loadConfig();
+          await loadModels();
+        } else {
+          const err = await res.json();
+          showToast(err.error || 'Failed to deactivate', true);
+        }
+      } catch (e) {
+        showToast(e.message, true);
       }
     }
 
@@ -1784,7 +2004,7 @@ export function getDashboardHtml(): string {
     }
 
     async function resetCodex() {
-      const msg = currentLang === 'zh' ? '还原后 ChatGPT 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native ChatGPT.';
+      const msg = currentLang === 'zh' ? '还原后 Codex 显示官方模型，自定义模型的对话将被隐藏。' : 'Reset restores native Codex.';
       showConfirm(msg, async () => {
         try {
           const response = await fetch('/api/reset', { method: 'POST' });
@@ -1804,7 +2024,7 @@ export function getDashboardHtml(): string {
         const response = await fetch('/api/sessions');
         const sessions = await response.json();
         
-        const hash = sessions.map(s => s.id + ':' + s.text + ':' + s.ts + ':' + s.archived).join('|');
+        const hash = sessions.map(s => s.id + ':' + s.text + ':' + s.ts + ':' + s.archived + ':' + (s.tokens || 0) + ':' + (s.context_window || 0)).join('|');
         if (hash === lastSessionsHash && isAutoRefresh) {
           return;
         }
@@ -1828,15 +2048,34 @@ export function getDashboardHtml(): string {
           
           const timeStr = new Date(s.ts).toLocaleTimeString();
           
+          let contextHtml = '';
+          if (s.tokens !== undefined && s.tokens > 0) {
+            const pct = Math.min(100, Math.round(s.tokens / s.context_window * 100));
+            const color = pct > 80 ? 'var(--color-danger)' : (pct > 60 ? '#f59e0b' : 'var(--color-success)');
+            contextHtml = \`
+              <div class="session-context-info" style="margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.25rem; pointer-events: none;">
+                <div style="background: rgba(255,255,255,0.05); border-radius: 4px; height: 6px; overflow: hidden; position: relative; width: 100%;">
+                  <div style="width: \${pct}%; height: 100%; background: \${color}; transition: width 0.3s ease;"></div>
+                </div>
+                <div style="font-size: 0.75rem; color: var(--color-text-muted); display: flex; justify-content: space-between;">
+                  <span>\${Math.round(s.tokens / 1000)}K / \${Math.round(s.context_window / 1000)}K (\${pct}%)</span>
+                  <span>\${({ provider: 'Actual', rollout_actual: 'Session actual', model_tokenizer: 'Tokenizer', model_estimate: 'Model est.', generic_estimate: 'Generic est.' })[s.token_source] || (s.is_estimated ? 'Est.' : 'Act.')}</span>
+                </div>
+              </div>
+            \`;
+          }
+          
           item.innerHTML = \`
             <div class="session-item-header">
               <span class="session-id-title">\${s.id.substring(0, 8)}...</span>
               <span class="session-time">\${timeStr}</span>
             </div>
             <div class="session-text-preview">\${escapeHtml(s.text)}</div>
+            \${contextHtml}
             <div class="session-actions-overlay">
-              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? '激活/Unarchive' : '归档/Archive'}</button>
-              <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">删除/Delete</button>
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); showExportModal('\${s.id}')" style="background: rgba(6, 182, 212, 0.15); color: var(--color-secondary); border-color: rgba(6, 182, 212, 0.25);">📤 \${i18nDict[currentLang].btnExport || 'Export'}</button>
+              <button class="session-btn session-btn-arc" onclick="event.stopPropagation(); toggleArchiveSession('\${s.id}', \${!s.archived})">\${s.archived ? (i18nDict[currentLang].btnUnarchive || 'Unarchive') : (i18nDict[currentLang].btnArchive || 'Archive')}</button>
+              <button class="session-btn session-btn-del" onclick="event.stopPropagation(); deleteSession('\${s.id}')">\${i18nDict[currentLang].btnDelete || 'Delete'}</button>
             </div>
           \`;
           container.appendChild(item);
@@ -2232,6 +2471,46 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
+    let orbRunning = false;
+    async function checkOrbStatus() {
+      try {
+        const response = await fetch('/api/orb/status');
+        const data = await response.json();
+        orbRunning = !!data.running;
+        const badge = document.getElementById('orb-status-badge');
+        const btn = document.getElementById('orb-toggle-btn');
+        if (badge) {
+          badge.innerText = orbRunning ? (currentLang === 'zh' ? '运行中' : 'Running') : (currentLang === 'zh' ? '关闭' : 'Offline');
+          badge.style.color = orbRunning ? 'var(--color-success)' : '#ef4444';
+          badge.style.background = orbRunning ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)';
+          badge.style.borderColor = orbRunning ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
+        }
+        if (btn) {
+          btn.innerText = orbRunning 
+            ? (currentLang === 'zh' ? '关闭置顶悬浮球 / Close Orb' : 'Close Desktop Orb')
+            : (currentLang === 'zh' ? '开启置顶悬浮球 / Launch Orb' : 'Launch Desktop Orb');
+          btn.style.background = orbRunning ? 'rgba(239, 68, 68, 0.15)' : 'var(--color-primary)';
+          btn.style.color = orbRunning ? '#ef4444' : 'white';
+          btn.style.border = orbRunning ? '1px solid rgba(239, 68, 68, 0.3)' : 'none';
+        }
+      } catch (err) {}
+    }
+
+    async function toggleDesktopOrb() {
+      const enable = !orbRunning;
+      showToast(enable ? '正在启动悬浮球...' : '正在关闭悬浮球...');
+      try {
+        const response = await fetch('/api/orb/launch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enable })
+        });
+        if (response.ok) {
+          setTimeout(checkOrbStatus, 1500);
+        }
+      } catch (err) {}
+    }
+
     async function createNewSession() {
       try {
         const response = await fetch('/api/sessions/new', {
@@ -2254,24 +2533,335 @@ export function getDashboardHtml(): string {
       } catch (err) {}
     }
 
+    let exportTargetSessionId = '';
+    function showExportModal(sid) {
+      exportTargetSessionId = sid;
+      document.getElementById('export-modal').classList.add('show');
+    }
+
+    async function executeExport(format) {
+      document.getElementById('export-modal').classList.remove('show');
+      if (!exportTargetSessionId) return;
+      try {
+        const response = await fetch('/api/sessions/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: exportTargetSessionId, format })
+        });
+        if (response.ok) {
+          const blob = await response.blob();
+          const disp = response.headers.get('Content-Disposition');
+          let filename = \`session_\${exportTargetSessionId}.\${format === 'markdown' ? 'md' : 'json'}\`;
+          if (disp && disp.includes('filename="')) {
+            filename = disp.split('filename="')[1].split('"')[0];
+          }
+          const link = document.createElement('a');
+          link.href = window.URL.createObjectURL(blob);
+          link.download = filename;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          window.URL.revokeObjectURL(link.href);
+          showToast(i18nDict[currentLang].toastExportSuccess || 'Exported successfully');
+        } else {
+          let message = i18nDict[currentLang].toastExportFailed || 'Export failed';
+          try {
+            const errorData = await response.json();
+            if (errorData.error) message += ': ' + errorData.error;
+          } catch {}
+          showToast(message);
+        }
+      } catch (err) {
+        showToast(i18nDict[currentLang].toastExportError || 'Export error');
+      }
+    }
+
+    function triggerImportFileInput() {
+      document.getElementById('import-file-input').click();
+    }
+
+    function closeMemoryScanModal() {
+      document.getElementById('memory-scan-modal').classList.remove('show');
+    }
+
+    function renderMemoryScanResults(agents) {
+      const container = document.getElementById('memory-scan-results');
+      container.innerHTML = '';
+      const t = i18nDict[currentLang];
+      if (!agents || agents.length === 0) {
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding: 2.5rem 1rem; text-align: center; color: var(--color-text-muted); font-size: 0.82rem;';
+        empty.textContent = t.noMemorySources;
+        container.appendChild(empty);
+        return;
+      }
+
+      agents.forEach((agent, agentIndex) => {
+        const section = document.createElement('div');
+        section.style.cssText = 'padding: 0.7rem 0; border-bottom: 1px solid rgba(255,255,255,0.08);';
+        const header = document.createElement('label');
+        header.style.cssText = 'display: flex; align-items: center; gap: 0.55rem; font-weight: 700; color: var(--color-text); cursor: pointer; margin-bottom: 0.45rem;';
+        const selectAgent = document.createElement('input');
+        selectAgent.type = 'checkbox';
+        selectAgent.dataset.agentIndex = String(agentIndex);
+        selectAgent.addEventListener('change', () => {
+          section.querySelectorAll('.memory-session-checkbox').forEach(input => {
+            input.checked = selectAgent.checked;
+          });
+        });
+        const title = document.createElement('span');
+        title.textContent = agent.name + ' (' + agent.session_count + ')';
+        header.appendChild(selectAgent);
+        header.appendChild(title);
+        section.appendChild(header);
+
+        (agent.sources || []).forEach(source => {
+          const pathLine = document.createElement('div');
+          pathLine.style.cssText = 'font-size: 0.67rem; color: var(--color-text-muted); margin: 0.3rem 0 0.35rem 1.6rem; word-break: break-all;';
+          pathLine.textContent = source.display_path + ' · ' + source.format.toUpperCase();
+          section.appendChild(pathLine);
+
+          (source.sessions || []).forEach(session => {
+            const row = document.createElement('label');
+            row.style.cssText = 'display: flex; align-items: flex-start; gap: 0.55rem; padding: 0.4rem 0.45rem; margin-left: 1.2rem; border-radius: 6px; cursor: pointer;';
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'memory-session-checkbox';
+            checkbox.dataset.sourceId = source.source_id;
+            checkbox.dataset.sessionId = session.id;
+            const text = document.createElement('span');
+            text.style.cssText = 'min-width: 0; font-size: 0.76rem; color: var(--color-text); line-height: 1.35;';
+            const details = [session.source, session.model].filter(Boolean).join(' · ');
+            const count = session.message_count ? session.message_count + ' messages' : '';
+            text.textContent = session.title + ([details, count].filter(Boolean).length ? ' · ' + [details, count].filter(Boolean).join(' · ') : '');
+            row.appendChild(checkbox);
+            row.appendChild(text);
+            section.appendChild(row);
+          });
+        });
+        container.appendChild(section);
+      });
+    }
+
+    async function scanLocalAgents() {
+      const modal = document.getElementById('memory-scan-modal');
+      const results = document.getElementById('memory-scan-results');
+      const scanButton = document.getElementById('scan-memory-btn');
+      modal.classList.add('show');
+      results.innerHTML = '';
+      const loading = document.createElement('div');
+      loading.style.cssText = 'padding: 3rem 1rem; text-align: center; color: var(--color-text-muted);';
+      loading.textContent = i18nDict[currentLang].scanningMemory;
+      results.appendChild(loading);
+      scanButton.disabled = true;
+      try {
+        const response = await fetch('/api/memory-sources/scan');
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Scan failed');
+        renderMemoryScanResults(data.agents || []);
+      } catch (error) {
+        results.innerHTML = '';
+        const failed = document.createElement('div');
+        failed.style.cssText = 'padding: 3rem 1rem; text-align: center; color: #ef4444;';
+        failed.textContent = (i18nDict[currentLang].scanFailed || 'Scan failed') + ': ' + error.message;
+        results.appendChild(failed);
+      } finally {
+        scanButton.disabled = false;
+      }
+    }
+
+    async function importSelectedMemorySources() {
+      const selected = Array.from(document.querySelectorAll('.memory-session-checkbox:checked'));
+      if (selected.length === 0) {
+        showToast(i18nDict[currentLang].selectAtLeastOne || 'Select at least one session');
+        return;
+      }
+      const button = document.getElementById('memory-scan-import-btn');
+      button.disabled = true;
+      let importedCount = 0;
+      try {
+        for (let index = 0; index < selected.length; index++) {
+          button.textContent = (index + 1) + ' / ' + selected.length;
+          const checkbox = selected[index];
+          const response = await fetch('/api/memory-sources/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              source_id: checkbox.dataset.sourceId,
+              session_id: checkbox.dataset.sessionId,
+              restart: false
+            })
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || 'Import failed');
+          importedCount++;
+        }
+        closeMemoryScanModal();
+        showToast((i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...') + ' (' + importedCount + ')');
+        await fetch('/api/restart-codex', { method: 'POST' });
+      } catch (error) {
+        showToast((i18nDict[currentLang].toastImportFailed || 'Import failed') + ': ' + error.message);
+        if (importedCount > 0) {
+          try {
+            await fetch('/api/restart-codex', { method: 'POST' });
+          } catch {}
+        }
+      } finally {
+        button.disabled = false;
+        button.textContent = i18nDict[currentLang].importSelected || 'Import Selected';
+      }
+    }
+
+    function handleImportFileSelect(e) {
+      const file = e.target.files[0];
+      if (file) processImportFile(file);
+      e.target.value = '';
+    }
+
+    function handleDragOver(e) {
+      e.preventDefault();
+      document.getElementById('import-dropzone').style.borderColor = 'var(--color-secondary)';
+      document.getElementById('import-dropzone').style.background = 'rgba(6, 182, 212, 0.05)';
+    }
+
+    function handleDragLeave(e) {
+      e.preventDefault();
+      document.getElementById('import-dropzone').style.borderColor = 'rgba(255,255,255,0.12)';
+      document.getElementById('import-dropzone').style.background = 'rgba(255,255,255,0.02)';
+    }
+
+    function handleFileDrop(e) {
+      e.preventDefault();
+      handleDragLeave(e);
+      const file = e.dataTransfer.files[0];
+      if (file) processImportFile(file);
+    }
+
+    let pendingImportPayload = null;
+
+    function arrayBufferToBase64(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      const chunkSize = 0x8000;
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    async function submitImportPayload(payload) {
+      const response = await fetch('/api/sessions/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      let responseData = {};
+      try { responseData = await response.json(); } catch {}
+
+      if (response.status === 409 && responseData.requires_session_selection) {
+        pendingImportPayload = payload;
+        const select = document.getElementById('import-session-select');
+        select.innerHTML = '';
+        (responseData.sessions || []).forEach(session => {
+          const option = document.createElement('option');
+          option.value = session.id;
+          const details = [session.source, session.model].filter(Boolean).join(' · ');
+          const count = session.message_count ? ' · ' + session.message_count + ' messages' : '';
+          option.textContent = session.title + (details ? ' · ' + details : '') + count;
+          select.appendChild(option);
+        });
+        document.getElementById('import-session-modal').classList.add('show');
+        return;
+      }
+
+      if (!response.ok) {
+        let message = i18nDict[currentLang].toastImportFailed || 'Import failed';
+        if (responseData.error) message += ': ' + responseData.error;
+        showToast(message);
+        return;
+      }
+
+      pendingImportPayload = null;
+      const baseMessage = responseData.restarted
+        ? (i18nDict[currentLang].toastImportRestarting || 'Import complete. Restarting Codex Desktop...')
+        : (i18nDict[currentLang].toastImportSuccess || 'Imported successfully!');
+      showToast(baseMessage + ' (' + (responseData.message_count || 0) + ')');
+      if (!responseData.restarted) {
+        loadSessionsList();
+        if (responseData.id) selectSession(responseData.id);
+      }
+    }
+
+    async function confirmImportSessionSelection() {
+      if (!pendingImportPayload) return;
+      const select = document.getElementById('import-session-select');
+      const selectedSessionId = select.value;
+      document.getElementById('import-session-modal').classList.remove('show');
+      await submitImportPayload({ ...pendingImportPayload, session_id: selectedSessionId });
+    }
+
+    function cancelImportSessionSelection() {
+      pendingImportPayload = null;
+      document.getElementById('import-session-modal').classList.remove('show');
+    }
+
+    async function processImportFile(file) {
+      if (!/\.(json|jsonl|db|sqlite|sqlite3|md|markdown)$/i.test(file.name)) {
+        showToast(i18nDict[currentLang].toastInvalidFormat || 'Unsupported import format');
+        return;
+      }
+      if (file.size > 48 * 1024 * 1024) {
+        showToast(currentLang === 'zh' ? '文件不能超过 48 MB' : 'File must be 48 MB or smaller');
+        return;
+      }
+      try {
+        const buffer = await file.arrayBuffer();
+        await submitImportPayload({
+          file_name: file.name,
+          file_base64: arrayBufferToBase64(buffer),
+          name: file.name.replace(/\.(json|jsonl|db|sqlite|sqlite3|md|markdown)$/i, ''),
+          restart: true
+        });
+      } catch {
+        showToast(i18nDict[currentLang].toastJsonError || 'Error reading import file');
+      }
+    }
+
     // Explicitly expose globally called button event handler actions to the browser window object
+    window.showExportModal = showExportModal;
+    window.executeExport = executeExport;
+    window.triggerImportFileInput = triggerImportFileInput;
+    window.scanLocalAgents = scanLocalAgents;
+    window.closeMemoryScanModal = closeMemoryScanModal;
+    window.importSelectedMemorySources = importSelectedMemorySources;
+    window.handleImportFileSelect = handleImportFileSelect;
+    window.handleDragOver = handleDragOver;
+    window.handleDragLeave = handleDragLeave;
+    window.handleFileDrop = handleFileDrop;
+    window.confirmImportSessionSelection = confirmImportSessionSelection;
+    window.cancelImportSessionSelection = cancelImportSessionSelection;
+
     window.createNewSession = createNewSession;
     window.clearAllSessions = clearAllSessions;
     window.enterActiveSession = enterActiveSession;
     window.deleteSession = deleteSession;
     window.toggleArchiveSession = toggleArchiveSession;
     window.launchVoiceBar = launchVoiceBar;
+    window.checkCliStatus = checkCliStatus;
+    window.activateCli = activateCli;
+    window.deactivateCli = deactivateCli;
 
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
-      await loadGatewayStatus();
       await loadConfig();
+      try { await checkCliStatus(); } catch {}
       await loadModels();
-      await loadSubscriptionStatus();
       await loadVoiceSettings();
       
       setupLogsPolling();
       setInterval(checkVoiceBarStatus, 3000);
+      setInterval(checkOrbStatus, 3000);
+      checkOrbStatus();
       setInterval(checkPermissionsStatus, 3000);
       setInterval(async () => {
         if (currentTab === 'sessions') {
