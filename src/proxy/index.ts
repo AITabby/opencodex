@@ -765,6 +765,11 @@ except Exception as e:
       }
     }
     if (raw === "antigravity-cli-auto") {
+      const ap = this.config.providers.find((p: any) => p.name === "antigravity");
+      if (ap && ap.base_url && ap.base_url.includes("opencode.ai")) {
+        const op = this.config.providers.find((p: any) => p.name === "opencode");
+        return op ? op.api_key : "dummy";
+      }
       const now = Date.now();
       if (this.antigravityTokenCache && (now - this.antigravityTokenCacheTime) < 300000) {
         return this.antigravityTokenCache;
@@ -1256,6 +1261,7 @@ stream_idle_timeout_ms = 600000
                   connInfo.lastMsg = msg;
                   const model = msg.model || "";
                   if (model) {
+                    console.log(`[DEBUG-MODEL-SELECTION] Client response.create requested model: ${model}`);
                     const catalog = this.getModelCatalog();
                     const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                     connInfo.isCustomMode = !!catalogEntry?.backend_provider;
@@ -1289,6 +1295,7 @@ stream_idle_timeout_ms = 600000
                   const catalog = this.getModelCatalog();
                   const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                   const isCustomModel = !!catalogEntry?.backend_provider;
+                  console.log(`[DEBUG-MODEL-SELECTION] Final routing check for model=${model}: isCustomModel=${isCustomModel}, isTitlePrompt=${isTitlePrompt}`);
 
                   if (isCustomModel || isTitlePrompt) {
                     isLocal = true;
