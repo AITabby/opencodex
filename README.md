@@ -1,4 +1,4 @@
-# OpenCodex 🚀
+# OpenCodex for macOS 🚀
 
 [English](#english) | [简体中文](#简体中文)
 
@@ -12,6 +12,12 @@
 
 ---
 
+> [!NOTE]
+> **macOS edition · v0.4.5-beta.1** — This repository tracks the macOS implementation only. It is designed for ChatGPT/Codex Desktop on macOS.
+
+> [!NOTE]
+> **Native mode first** — Starting OpenCodex does not proxy or modify native Codex. Add a third-party/subscription model, then explicitly update the Desktop model picker when you want to enable gateway mode. Resetting to native removes the gateway routing again.
+
 # English
 
 > [!IMPORTANT]
@@ -21,11 +27,12 @@
 
 ## 🌟 Key Features
 
-* **Zero-Config Setup**: Start the server, it auto-patches `~/.codex/config.toml` with backups. No CLI, no manual editing.
+* **Native-first, opt-in gateway**: Keep official GPT models on their native route. Add a third-party model only when needed, then apply it to the Desktop picker with one action. Native reset cleanly removes OpenCodex routing.
 * **Premium Web Dashboard** (`http://localhost:8765/dashboard`):
   * 🌐 Bilingual (EN/中文) with instant switch
   * 🔑 API key & endpoint management
-  * 📝 Add/delete custom models, toggle visibility in Codex
+  * 📝 Add/delete third-party models and subscription imports; manage only those custom entries while official GPT models remain native
+  * 🧠 Import complete local agent conversations and continue from their context in Codex Desktop
   * 📡 Live SSE log streaming
   * 🚀 One-click Codex restart
   * ↺ One-click reset to native Codex
@@ -55,11 +62,17 @@ npm install
 npm start
 ```
 
-Server starts, browser opens to the dashboard. Add your API key and model names, click save — done.
+The server starts and opens the dashboard. Adding a model only saves it; use **Update model picker** when you are ready to enable gateway mode for third-party models.
 
 ---
 
 # 简体中文
+
+> [!NOTE]
+> **macOS 版本 · v0.4.5-beta.1** —— 本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop。
+
+> [!NOTE]
+> **原生优先** —— 启动 OpenCodex 不会代理或修改原生 Codex。仅在添加第三方/订阅模型后，手动更新桌面端下拉菜单时才进入网关模式；还原原生会再次移除网关路由。
 
 > [!IMPORTANT]
 > **🌟 极光语音伴侣应用：** 强烈建议配合原生伴侣客户端 [OpenCodexBar](https://github.com/AITabby/opencodex-bar) 使用！为您的 Mac 开启系统级全局语音唤醒热键（`Option + Space`）、分贝波形联动与智能静音检测（VAD），以及悬浮于 macOS Dock 栏上方的极光毛玻璃跑马灯胶囊！
@@ -68,11 +81,12 @@ Server starts, browser opens to the dashboard. Add your API key and model names,
 
 ## 🌟 核心特性
 
-* **零配置启动**：启动后自动修补 `~/.codex/config.toml`，无需任何操作。
+* **原生优先、按需接管**：官方 GPT 始终保留原生通道；需要第三方模型时再添加，并通过一次“更新下拉菜单”显式启用。还原原生会干净移除 OpenCodex 路由。
 * **高颜值 Web 控制台**（`http://localhost:8765/dashboard`）：
   * 🌐 中英文一键切换
   * 🔑 图形化管理 API Key 和接口地址
-  * 📝 自由增删模型，勾选控制哪些显示在 Codex
+  * 📝 管理第三方模型与订阅导入；官方 GPT 保留在桌面端原生模型列表中
+  * 🧠 一键导入本机 Agent 完整会话，并在 Codex Desktop 中承接上下文继续对话
   * 📡 实时 SSE 日志流
   * 🚀 一键重启 Codex
   * ↺ 一键还原原生 Codex
@@ -102,4 +116,4 @@ npm install
 npm start
 ```
 
-启动后浏览器自动打开控制台，填写 API Key 和模型名，保存即可使用。
+启动后浏览器自动打开控制台。新增模型仅保存配置；当你准备让第三方模型出现在桌面端时，再点击“更新下拉菜单”。

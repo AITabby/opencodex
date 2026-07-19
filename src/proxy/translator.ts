@@ -257,7 +257,11 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
     _copyIfPresent(body, chat, "max_tokens");
   }
   _copyIfPresent(body, chat, "parallel_tool_calls");
-  _copyIfPresent(body, chat, "reasoning_effort");
+  // Desktop Responses requests carry the selected intensity under
+  // `reasoning.effort`; Chat-compatible upstreams expect `reasoning_effort`.
+  // Preserve an explicit legacy field if a caller already supplied one.
+  const reasoningEffort = body?.reasoning?.effort ?? body?.reasoning_effort;
+  if (reasoningEffort) chat.reasoning_effort = reasoningEffort;
 
   const tools = _responsesToolsToChatTools(body.tools);
   if (tools && tools.length > 0) {

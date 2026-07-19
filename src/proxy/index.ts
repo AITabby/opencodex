@@ -78,6 +78,50 @@ const activeSseClients = new Set<(payload: any) => void>();
 const logBuffer: any[] = [];
 const MAX_LOG_BUFFER = 200;
 
+const THIRD_PARTY_REASONING_LEVELS = [
+  { effort: "low", description: "Fast responses with lighter reasoning" },
+  { effort: "medium", description: "Balances speed and reasoning depth for everyday tasks" },
+  { effort: "high", description: "Greater reasoning depth for complex problems" },
+  { effort: "xhigh", description: "Extra high reasoning depth for complex problems" },
+  { effort: "max", description: "Maximum reasoning depth for the hardest problems" },
+  { effort: "ultra", description: "Maximum reasoning with automatic task delegation" }
+];
+
+const THIRD_PARTY_SERVICE_TIERS = [
+  { id: "priority", name: "Fast", description: "1.5x speed, increased usage" }
+];
+
+function normalizeThirdPartyModelCapabilities(model: any): any {
+  if (!model?.backend_provider) return model;
+  return {
+    ...model,
+    default_reasoning_level: model.default_reasoning_level || "medium",
+    supported_reasoning_levels: THIRD_PARTY_REASONING_LEVELS,
+    default_reasoning_summary: model.default_reasoning_summary ?? "none",
+    reasoning_summary_format: model.reasoning_summary_format ?? null,
+    default_verbosity: model.default_verbosity || "low",
+    support_verbosity: model.support_verbosity !== false,
+    additional_speed_tiers: model.additional_speed_tiers?.length ? model.additional_speed_tiers : ["fast"],
+    service_tiers: model.service_tiers?.length ? model.service_tiers : THIRD_PARTY_SERVICE_TIERS
+  };
+}
+
+function orderCatalogModels(models: any[]): any[] {
+  return models
+    .map((model, index) => ({ model: normalizeThirdPartyModelCapabilities(model), index }))
+    .sort((a, b) => {
+      const aNative = a.model.provider === "openai" && !a.model.backend_provider;
+      const bNative = b.model.provider === "openai" && !b.model.backend_provider;
+      if (aNative !== bNative) return aNative ? -1 : 1;
+      return a.index - b.index;
+    })
+    .map(({ model }) => model);
+}
+
+function isOfficialCatalogModel(model: any): boolean {
+  return model?.provider === "openai" && !model?.backend_provider;
+}
+
 export function addLog(tag: string, text: string, level: string = "info") {
   const timeStr = new Date().toLocaleTimeString();
   const payload = { time: timeStr, tag, text, level };
@@ -177,9 +221,10 @@ export class ProxyServer {
     this.ensureConfigDir();
     this.ensureCheckPermsHelper();
     this.loadConfig();
-    this.autoPatchCodexConfig();
+    // Starting the local service must leave a native Codex installation
+    // untouched. Gateway routing is enabled only by an explicit model import.
     this.mergeNativeModelsIntoCatalog();
-    this.autoPatchPlugins();
+    this.repairExistingImportedSessions();
     this.ensurePythonScripts();
     this.startVADDaemon();
   }
@@ -230,6 +275,26 @@ export class ProxyServer {
       this.vadProcess = null;
       this.vadCallbackQueue = [];
     });
+  }
+
+  private repairExistingImportedSessions() {
+    const roots = [
+      join(homedir(), ".codex", "sessions"),
+      join(homedir(), ".codex", "archived_sessions")
+    ];
+    let repaired = 0;
+    for (const root of roots) {
+      for (const rolloutPath of findRolloutFiles(root)) {
+        try {
+          if (repairImportedSessionProjection(rolloutPath)) repaired++;
+        } catch (error: any) {
+          console.error(`[OpenCodex Memory Bridge] Could not repair ${rolloutPath}: ${error.message}`);
+        }
+      }
+    }
+    if (repaired > 0) {
+      console.log(`[OpenCodex Memory Bridge] Repaired ${repaired} imported session projection(s).`);
+    }
   }
 
   private sendVADRequest(req: any): Promise<any> {
@@ -500,6 +565,11 @@ except Exception as e:
       }
     });
 
+    // The desktop picker follows catalog order. Keep official models first
+    // regardless of which subscription/custom provider was added most
+    // recently, then retain a stable order among third-party models.
+    catalog.models = orderCatalogModels(catalog.models);
+
     return catalog;
   }
 
@@ -520,6 +590,13 @@ except Exception as e:
         }
         return true;
       });
+
+      // Official entries stay in the shared catalog for Codex Desktop, but
+      // their visibility is never controlled by OpenCodex' custom-model UI.
+      catalog.models.forEach((model: any) => {
+        if (isOfficialCatalogModel(model)) model.visibility = "list";
+      });
+      catalog.models = orderCatalogModels(catalog.models);
 
       const jsonStr = JSON.stringify(catalog, null, 2);
       writeFileSync(p, jsonStr, "utf-8");
@@ -873,6 +950,9 @@ stream_idle_timeout_ms = 600000
     const catalogPath = join(this.configDir, "custom_model_catalog.json");
     if (!existsSync(tomlPath)) return;
     try {
+      // Materialize capability normalization and ordering before Codex Desktop
+      // reads model_catalog_json directly from disk.
+      this.saveModelCatalog(this.getModelCatalog());
       const content = readFileSync(tomlPath, "utf-8");
       let patched = stripManagedBlocks(content);
       const managedTop = `# >>> opencodex managed >>>
@@ -1635,13 +1715,16 @@ stream_idle_timeout_ms = 600000
         }
         this.saveConfig();
 
-        this.patchCodexConfig();
-        this.autoPatchPlugins();
-        if (data.restart) {
+        const enablesGateway = Array.isArray(data.models) && data.models.length > 0;
+        if (enablesGateway) {
+          this.patchCodexConfig();
+          this.autoPatchPlugins();
+        }
+        if (data.restart && enablesGateway) {
           this.restartCodexDesktop();
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", restarted: !!data.restart }));
+        res.end(JSON.stringify({ status: "success", restarted: !!data.restart && enablesGateway, gateway_active: enablesGateway || !isNativeModeEnabled() }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1650,17 +1733,19 @@ stream_idle_timeout_ms = 600000
     }
 
     if (path === "/api/models" && req.method === "GET") {
+      if (isNativeModeEnabled()) {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Cache-Control": "no-cache, no-store, must-revalidate"
+        });
+        res.end(JSON.stringify({ catalog: [], active: [], mode: "native" }));
+        return;
+      }
       // Returns complete model catalog & enabled models
       const catalog = this.getModelCatalog();
-      let models = catalog.models || [];
-
-      // If in gateway mode, hide native models in the dashboard UI
-      if (!isNativeModeEnabled()) {
-        models = models.filter((m: any) => {
-          const isNative = m.provider === "openai" && !m.backend_provider;
-          return !isNative;
-        });
-      }
+      // The dashboard manages only third-party/subscription models. Official
+      // models remain in the underlying catalog for the Desktop picker.
+      const models = (catalog.models || []).filter((model: any) => !isOfficialCatalogModel(model));
 
       const active = models.filter((m: any) => m.visibility === "list").map((m: any) => m.slug);
       
@@ -1684,6 +1769,11 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/models" && req.method === "POST") {
       try {
+        if (isNativeModeEnabled()) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Gateway is inactive in native mode" }));
+          return;
+        }
         const data = JSON.parse(body);
         console.log("[OpenCodex] Received POST /api/models data:", data);
         const activeIds = data.active || [];
@@ -1692,6 +1782,7 @@ stream_idle_timeout_ms = 600000
         
         if (catalog.models) {
           catalog.models.forEach((m: any) => {
+            if (isOfficialCatalogModel(m)) return;
             m.visibility = activeIds.includes(m.slug) ? "list" : "hide";
             m.vision_bridge_enabled = visionBridgeIds.includes(m.slug);
           });
@@ -2133,6 +2224,9 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/restart-codex" && req.method === "POST") {
       try {
+        // Restarting the desktop application is an operational command, not
+        // routing. It is also needed after native-mode session imports so the
+        // desktop reloads the newly written local rollout files.
         this.restartCodexDesktop();
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
@@ -2265,6 +2359,11 @@ stream_idle_timeout_ms = 600000
 
     if (path === "/api/reset" && req.method === "POST") {
       try {
+        if (isNativeModeEnabled()) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Already in native mode" }));
+          return;
+        }
         const tomlPath = join(homedir(), ".codex", "config.toml");
         if (existsSync(tomlPath)) {
           let content = readFileSync(tomlPath, "utf-8");
@@ -5366,6 +5465,141 @@ function getPreferredCodexCwd(): string {
   return homedir();
 }
 
+function isImportedResponseItem(item: any): boolean {
+  return item?.type === "response_item"
+    && item.payload?.type === "message"
+    && String(item.payload?.internal_chat_message_metadata_passthrough?.turn_id || "").startsWith(OPENCODEX_MEMORY_TURN_ID);
+}
+
+function messageTextFromResponseItem(item: any): string {
+  const content = Array.isArray(item?.payload?.content) ? item.payload.content : [];
+  return content.map((part: any) => typeof part?.text === "string" ? part.text : "").join("");
+}
+
+function repairImportedSessionProjection(rolloutPath: string, cwd = homedir(), model = "gpt-5.5"): boolean {
+  if (!rolloutPath || !existsSync(rolloutPath)) {
+    return false;
+  }
+
+  let lines: string[];
+  try {
+    lines = readFileSync(rolloutPath, "utf-8").split(/\r?\n/).filter(Boolean);
+  } catch {
+    return false;
+  }
+
+  const records = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  });
+  const importedItems = records.filter(isImportedResponseItem);
+  if (importedItems.length === 0) return false;
+
+  const isCurrentProjection = records.some((item: any) => item?.type === "turn_context"
+    && item.payload?.source === OPENCODEX_MEMORY_TURN_ID
+    && item.payload?.import_projection_version === 3);
+  if (isCurrentProjection) return false;
+
+  // The desktop renderer groups bubbles by turn lifecycle, not only by the
+  // `role` field. Build one native-shaped turn per imported user message.
+  const firstRecord = records.find((item: any) => item?.type === "session_meta");
+  if (!firstRecord) return false;
+  const reconstructed: any[] = [firstRecord];
+  const baseTime = Date.now();
+  let tick = 0;
+  let activeTurnId = "";
+  let lastAssistantMessage = "";
+  const timestamp = () => new Date(baseTime + tick++ * 10).toISOString();
+  const completeActiveTurn = () => {
+    if (!activeTurnId) return;
+    reconstructed.push({
+      timestamp: timestamp(),
+      type: "event_msg",
+      payload: {
+        type: "task_complete",
+        turn_id: activeTurnId,
+        last_agent_message: lastAssistantMessage,
+        completed_at: Math.floor((baseTime + tick * 10) / 1000),
+        duration_ms: 0,
+        time_to_first_token_ms: 0
+      }
+    });
+    activeTurnId = "";
+    lastAssistantMessage = "";
+  };
+  const startTurn = () => {
+    activeTurnId = `${OPENCODEX_MEMORY_TURN_ID}-${randomUUID()}`;
+    reconstructed.push({
+      timestamp: timestamp(),
+      type: "turn_context",
+      payload: {
+        turn_id: activeTurnId,
+        cwd,
+        workspace_roots: [cwd],
+        model,
+        source: OPENCODEX_MEMORY_TURN_ID,
+        import_projection_version: 3
+      }
+    });
+    reconstructed.push({
+      timestamp: timestamp(),
+      type: "event_msg",
+      payload: {
+        type: "task_started",
+        turn_id: activeTurnId,
+        started_at: Math.floor((baseTime + tick * 10) / 1000),
+        model_context_window: 200000,
+        collaboration_mode_kind: "default"
+      }
+    });
+  };
+
+  for (const record of importedItems) {
+    const role = record.payload?.role;
+    const message = messageTextFromResponseItem(record);
+    if ((role !== "user" && role !== "assistant") || !message || /^image\/(?:png|jpe?g|gif|webp)$/i.test(message.trim())) continue;
+    if (role === "user") {
+      completeActiveTurn();
+      startTurn();
+    } else if (!activeTurnId) {
+      startTurn();
+    }
+
+    const messageId = record.payload?.id || `import_${randomUUID()}`;
+    const responseItem = {
+      type: "response_item",
+      payload: {
+        type: "message",
+        id: messageId,
+        role,
+        content: [{ type: role === "assistant" ? "output_text" : "input_text", text: message }],
+        ...(role === "assistant" ? { phase: "final_answer" } : {}),
+        internal_chat_message_metadata_passthrough: { turn_id: activeTurnId }
+      }
+    };
+    const messageEvent = {
+      type: "event_msg",
+      payload: role === "user"
+        ? { type: "user_message", client_id: messageId, message, images: [], local_images: [], text_elements: [] }
+        : { type: "agent_message", message, phase: "final_answer", memory_citation: null }
+    };
+    // Native rollouts place a user response item before its event, but place
+    // the assistant event before its final response item. Desktop uses that
+    // ordering while reconstructing the left/right transcript.
+    if (role === "assistant") {
+      reconstructed.push({ timestamp: timestamp(), ...messageEvent });
+      reconstructed.push({ timestamp: timestamp(), ...responseItem });
+    } else {
+      reconstructed.push({ timestamp: timestamp(), ...responseItem });
+      reconstructed.push({ timestamp: timestamp(), ...messageEvent });
+    }
+    if (role === "assistant") lastAssistantMessage = message;
+  }
+  completeActiveTurn();
+
+  writeFileSync(rolloutPath, `${reconstructed.map((item) => JSON.stringify(item)).join("\n")}\n`, "utf-8");
+  return true;
+}
+
 function appendImportedSessionProjection(
   rolloutPath: string,
   title: string,
@@ -5377,48 +5611,90 @@ function appendImportedSessionProjection(
     throw new Error("Codex did not create a readable rollout file");
   }
 
-  let firstLine = "";
-  try {
-    const content = readFileSync(rolloutPath, "utf-8");
-    firstLine = content.split("\n", 1)[0] + "\n";
-  } catch {}
+  // `thread/inject_items` normally writes the message records for us. It does
+  // not, however, create the lifecycle events the desktop renderer uses.
+  // Repair those records in place instead of duplicating the conversation.
+  if (repairImportedSessionProjection(rolloutPath, cwd, model)) return;
+
+  const existingRollout = readFileSync(rolloutPath, "utf-8");
+  const hasImportedItems = existingRollout.includes(OPENCODEX_MEMORY_TURN_ID);
+  if (hasImportedItems) return;
 
   const projection: any[] = [];
-  const baseTime = Date.now() + 1000;
+  const baseTime = Date.now();
+  const turnId = OPENCODEX_MEMORY_TURN_ID;
+  let lastAssistantMessage = "";
+
+  projection.push({
+    timestamp: new Date(baseTime).toISOString(),
+    type: "turn_context",
+    payload: { turn_id: turnId, cwd, workspace_roots: [cwd], model, source: OPENCODEX_MEMORY_TURN_ID }
+  });
+  projection.push({
+    timestamp: new Date(baseTime).toISOString(),
+    type: "event_msg",
+    payload: { type: "task_started", turn_id: turnId, started_at: Math.floor(baseTime / 1000), model_context_window: 200000, collaboration_mode_kind: "default" }
+  });
 
   for (let i = 0; i < memory.messages.length; i++) {
     const msg = memory.messages[i];
-    if (msg.role !== "user" && msg.role !== "assistant") continue;
+    if (!["system", "developer", "user", "assistant"].includes(msg.role)) continue;
 
     const timestamp = new Date(baseTime + i * 1000).toISOString();
-    const turnId = randomUUID();
-    const msgId = msg.source_id && msg.source_id.includes("-") ? msg.source_id : randomUUID();
+    const msgId = msg.source_id || `msg_import_${randomUUID().replace(/-/g, "")}`;
 
+    // Codex Desktop reconstructs a thread from response_item records. The old
+    // importer wrote only event_msg records, which made the imported thread
+    // visible in the list but empty in the actual conversation window.
     projection.push({
       timestamp,
-      type: "turn_context",
+      type: "response_item",
       payload: {
-        turn_id: turnId,
-        cwd,
-        workspace_roots: [cwd],
-        model
+        type: "message",
+        id: msgId,
+        role: msg.role,
+        content: [{
+          type: msg.role === "assistant" ? "output_text" : "input_text",
+          text: msg.content
+        }],
+        ...(msg.role === "assistant" ? { phase: "final_answer" } : {}),
+        internal_chat_message_metadata_passthrough: { turn_id: turnId }
       }
     });
 
-    projection.push({
-      timestamp,
-      type: "event_msg",
-      payload: {
-        type: msg.role === "user" ? "user_message" : "assistant_message",
-        text: msg.content,
-        turn_id: turnId,
-        message_id: msgId
-      }
-    });
+    if (msg.role === "user" || msg.role === "assistant") {
+      if (msg.role === "assistant") lastAssistantMessage = msg.content;
+      projection.push({
+        timestamp,
+        type: "event_msg",
+        payload: {
+          type: msg.role === "user" ? "user_message" : "agent_message",
+          message: msg.content,
+          ...(msg.role === "user" ? { client_id: msgId, images: [], local_images: [], text_elements: [] } : { phase: "final_answer", memory_citation: null })
+        }
+      });
+    }
   }
 
-  const lines = firstLine + projection.map((item) => JSON.stringify(item)).join("\n") + "\n";
+  projection.push({
+    timestamp: new Date(baseTime + memory.messages.length * 1000).toISOString(),
+    type: "event_msg",
+    payload: {
+      type: "task_complete",
+      turn_id: turnId,
+      last_agent_message: lastAssistantMessage,
+      completed_at: Math.floor((baseTime + memory.messages.length * 1000) / 1000),
+      duration_ms: memory.messages.length * 1000,
+      time_to_first_token_ms: 0
+    }
+  });
+
+  const prefix = existingRollout.trimEnd();
+  const lines = `${prefix}${prefix ? "\n" : ""}${projection.map((item) => JSON.stringify(item)).join("\n")}\n`;
   writeFileSync(rolloutPath, lines, "utf-8");
+  // Keep the fallback path structurally identical to app-server injection:
+  // the renderer needs one completed lifecycle per user turn to retain roles.
+  repairImportedSessionProjection(rolloutPath, cwd, model);
 }
 
 async function updateImportedThreadState(threadId: string, preview: string): Promise<void> {

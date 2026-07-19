@@ -209,6 +209,50 @@ function parseJsonl(
   selectedSessionId?: string
 ): MemoryFileImportResult {
   const parsedItems = parseJsonlItems(text);
+
+  // Codex rollout files may contain historical/imported records whose shape
+  // resembles Claude JSONL. Detect the rollout envelope first; otherwise the
+  // Claude parser picks only one embedded segment and silently drops most of
+  // the conversation.
+  const isCodexRollout = parsedItems.some((item) => item?.type === "session_meta")
+    && parsedItems.some((item) => item?.type === "response_item" && item.payload?.type === "message");
+  if (isCodexRollout) {
+    // `response_item` includes system/developer envelopes that the desktop
+    // itself injects. Re-importing them makes those envelopes look like user
+    // bubbles. The event stream is the canonical, already-rendered dialogue.
+    const rawMessages = parsedItems
+      .filter((item) => item?.type === "event_msg"
+        && (item.payload?.type === "user_message" || item.payload?.type === "agent_message")
+        && typeof item.payload?.message === "string"
+        && item.payload.message.trim())
+      .map((item) => ({
+        role: item.payload.type === "user_message" ? "user" : "assistant",
+        content: item.payload.message,
+        id: item.payload.client_id || undefined
+      }));
+
+    // Very old Codex records may not have event messages. Only then use the
+    // message records, while excluding desktop-injected envelopes.
+    if (rawMessages.length === 0) {
+      rawMessages.push(...parsedItems
+        .filter((item) => item.type === "response_item" && item.payload?.type === "message")
+        .map((item) => messageFromJsonlItem(item)?.message)
+        .filter((message) => message && !/^\s*<(?:environment_context|permissions instructions|recommended_plugins|apps_instructions|plugins_instructions|skills_instructions)/i.test(contentText(message.content))));
+    }
+
+    const firstUser = rawMessages.find((message) => message.role === "user");
+    const title = contentText(firstUser?.content).replace(/\s+/g, " ").slice(0, 100) || fallbackTitle;
+    const memory = normalizeImportedMemory(rawMessages, title);
+    const metadata = parsedItems.find((item) => item?.type === "session_meta")?.payload || {};
+    memory.source = {
+      application: "Codex",
+      thread_id: metadata.session_id || metadata.id,
+      model_provider: metadata.model_provider,
+      cwd: metadata.cwd
+    };
+    return { detected_format: "jsonl", memory };
+  }
+
   if (parsedItems.some(
     (item) => (
       item?.type === "user" || item?.type === "assistant"
@@ -527,6 +571,7 @@ async function parseAntigravityDatabase(
     `);
     const firstUserText = firstUserRow
       .map((row) => antigravityMessageText(Buffer.from(row.step_payload || [])))
+      .filter((content) => !/^image\/(?:png|jpe?g|gif|webp)$/i.test(content.trim()))
       .find(Boolean);
     const title = firstUserText
       ? firstUserText.replace(/\s+/g, " ").slice(0, 80)
@@ -554,7 +599,10 @@ async function parseAntigravityDatabase(
     const messages: MemoryMessage[] = [];
     for (const row of rows) {
       const content = antigravityMessageText(Buffer.from(row.step_payload || []));
-      if (!content) continue;
+      // The Antigravity protobuf can contain an attachment MIME marker without
+      // its binary payload. It is not a chat message and must not become a
+      // visible "image/png" user bubble in the imported Codex history.
+      if (!content || /^image\/(?:png|jpe?g|gif|webp)$/i.test(content.trim())) continue;
       messages.push({
         role: Number(row.step_type) === 14 ? "user" : "assistant",
         content

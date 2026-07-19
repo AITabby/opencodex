@@ -822,11 +822,6 @@ export function getDashboardHtml(): string {
                 </div>
               </div>
 
-              <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-                <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
-                <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 Codex Desktop</label>
-              </div>
-              
               <button type="submit" class="action-btn" id="i18n-btn-save-config" style="margin-top: 0.5rem;">Save & Add Model</button>
             </form>
           </div>
@@ -1483,6 +1478,38 @@ export function getDashboardHtml(): string {
     let currentTab = 'gateway';
     let activeSessionId = '';
     let configData = { providers: [] };
+    let gatewayModeActive = false;
+
+    function setGatewayUiState(active) {
+      gatewayModeActive = !!active;
+      const controls = [
+        document.getElementById('restart-codex-btn'),
+        document.getElementById('reset-btn'),
+        document.getElementById('models-restart-checkbox'),
+        document.getElementById('i18n-btn-update-dropdown')
+      ].filter(Boolean);
+
+      controls.forEach(control => {
+        control.disabled = !gatewayModeActive;
+        control.style.opacity = gatewayModeActive ? '' : '0.42';
+        control.style.cursor = gatewayModeActive ? '' : 'not-allowed';
+      });
+
+      const restartLabel = document.getElementById('i18n-label-models-restart');
+      if (restartLabel) restartLabel.style.opacity = gatewayModeActive ? '' : '0.42';
+    }
+
+    async function loadGatewayStatus() {
+      try {
+        const response = await fetch('/api/gateway/status');
+        const data = await response.json();
+        setGatewayUiState(!!data.active);
+        return !!data.active;
+      } catch {
+        setGatewayUiState(false);
+        return false;
+      }
+    }
 
     function switchTab(tabName) {
       document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
@@ -1610,10 +1637,15 @@ export function getDashboardHtml(): string {
       try {
         const response = await fetch('/api/models');
         const data = await response.json();
-        
-        const activeIds = new Set(data.active || []);
         const container = document.getElementById('models-list-container');
         container.innerHTML = '';
+
+        if (data.mode === 'native' || !gatewayModeActive) {
+          container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);padding:2rem;line-height:1.6;">原生模式：官方模型由 Codex Desktop 自己管理。<br>添加第三方模型或导入订阅后，可在这里更新下拉菜单。</div>';
+          return;
+        }
+
+        const activeIds = new Set(data.active || []);
         
         (data.catalog || []).forEach(m => {
           const isActive = activeIds.has(m.id);
@@ -1664,7 +1696,9 @@ export function getDashboardHtml(): string {
     document.getElementById('config-form').onsubmit = async (e) => {
       e.preventDefault();
       
-      const restartChecked = document.getElementById('config-restart-checkbox').checked;
+      // Adding a provider/model only saves it. Applying it to the Desktop
+      // picker is an explicit action in the dropdown-model section below.
+      const restartChecked = false;
       const modelInput = document.getElementById('new-model-name').value.trim();
       const baseUrl = document.getElementById('new-base-url').value.trim();
       const apiKey = document.getElementById('new-api-key').value.trim();
@@ -1743,6 +1777,7 @@ export function getDashboardHtml(): string {
           document.getElementById('new-api-key').value = '';
           
           await loadConfig();
+          await loadGatewayStatus();
           await loadModels();
           await loadVoiceSettings();
         } else {
@@ -1796,7 +1831,7 @@ export function getDashboardHtml(): string {
       const apiKey = document.getElementById('vision-fallback-key').value.trim();
       const baseUrl = document.getElementById('vision-fallback-url').value.trim();
       const model = document.getElementById('vision-fallback-model').value.trim();
-      const restartChecked = document.getElementById('config-restart-checkbox').checked;
+      const restartChecked = false;
       
       const providers = (configData.providers || []).map(p => {
         if (p.name === 'opencode') {
@@ -1930,6 +1965,7 @@ export function getDashboardHtml(): string {
           showToast(currentLang === 'zh' ? '🎉 模型配置成功！' : '🎉 Models configured successfully!', false);
           await checkCliStatus();
           await loadConfig();
+          await loadGatewayStatus();
           await loadModels();
         } else {
           const err = await res.json();
@@ -1954,6 +1990,7 @@ export function getDashboardHtml(): string {
           showToast(currentLang === 'zh' ? '🎉 模型清理成功！' : '🎉 Models cleaned up successfully!', false);
           await checkCliStatus();
           await loadConfig();
+          await loadGatewayStatus();
           await loadModels();
         } else {
           const err = await res.json();
@@ -2011,7 +2048,8 @@ export function getDashboardHtml(): string {
           if (response.ok) {
             showToast(currentLang === 'zh' ? '已还原原生' : 'Reset complete');
             loadConfig();
-            loadModels();
+            await loadGatewayStatus();
+            await loadModels();
           }
         } catch (err) {}
       });
@@ -2853,6 +2891,7 @@ export function getDashboardHtml(): string {
 
     window.onload = async () => {
       try { setLanguage('zh'); } catch {}
+      await loadGatewayStatus();
       await loadConfig();
       try { await checkCliStatus(); } catch {}
       await loadModels();
