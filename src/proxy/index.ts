@@ -31,7 +31,8 @@ import {
   chatCompletionToResponse,
   extractNamespaceMap,
   ResponsesStreamState,
-  processVisionBridge
+  processVisionBridge,
+  customResponseIds
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
@@ -134,6 +135,8 @@ export class ProxyServer {
   private sessionSequenceNumberMap = new Map<string, number>();
   private customSessionQueues = new Map<any, Promise<void>>();
   private titleSessionHashes = new Set<string>();
+  private antigravityTokenCache = "";
+  private antigravityTokenCacheTime = 0;
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   public codexMcpClient: any = null;
@@ -638,6 +641,105 @@ except Exception as e:
   }
 
   private resolveKey(raw: string): string {
+    if (raw === "grok-cli-auto") {
+      try {
+        const cachePath = join(this.configDir, "grok_auth_cache.json");
+        let session: any = null;
+        if (existsSync(cachePath)) {
+          try {
+            session = JSON.parse(readFileSync(cachePath, "utf-8"));
+          } catch (e) {
+            console.error("[OpenCodex] Failed to parse grok_auth_cache.json:", e);
+          }
+        }
+        if (!session) {
+          const authPath = join(homedir(), ".grok", "auth.json");
+          if (existsSync(authPath)) {
+            const authData = JSON.parse(readFileSync(authPath, "utf-8"));
+            const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
+            if (sessionKey) {
+              session = authData[sessionKey];
+              console.log("[OpenCodex] Bootstrapped Grok CLI session into independent cache.");
+            }
+          }
+        }
+        if (session) {
+          const expiresAt = session.expires_at ? new Date(session.expires_at).getTime() : 0;
+          const now = Date.now();
+          if (session.key && expiresAt && (expiresAt - now > 300000)) {
+            return session.key;
+          }
+          console.log("[OpenCodex] Grok independent session is expired or expiring soon. Refreshing...");
+          const issuer = session.oidc_issuer || "https://auth.x.ai";
+          const clientId = session.oidc_client_id;
+          const refreshToken = session.refresh_token;
+          if (refreshToken && clientId) {
+            try {
+              const curlCmd = `curl -s -X POST ${issuer}/oauth2/token -d "grant_type=refresh_token&refresh_token=${refreshToken}&client_id=${clientId}"`;
+              const resStr = execSync(curlCmd, { encoding: "utf-8" });
+              const tokenData = JSON.parse(resStr);
+              if (tokenData && tokenData.access_token) {
+                session.key = tokenData.access_token;
+                if (tokenData.refresh_token) {
+                  session.refresh_token = tokenData.refresh_token;
+                }
+                if (tokenData.expires_in) {
+                  session.expires_at = new Date(Date.now() + tokenData.expires_in * 1000).toISOString();
+                }
+                writeFileSync(cachePath, JSON.stringify(session, null, 2), "utf-8");
+                console.log("[OpenCodex] Grok independent session successfully refreshed and saved.");
+                return tokenData.access_token;
+              } else {
+                console.error("[OpenCodex] Grok token refresh response invalid, clearing cache:", resStr);
+                try { unlinkSync(cachePath); } catch {}
+              }
+            } catch (refreshErr: any) {
+              console.error("[OpenCodex] Failed to refresh Grok token synchronously, clearing cache:", refreshErr.message);
+              try { unlinkSync(cachePath); } catch {}
+            }
+          }
+          if (session.key) return session.key;
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Grok CLI token:", e);
+      }
+    }
+    if (raw === "claude-cli-auto") {
+      try {
+        const claudeSettingsPath = join(homedir(), ".claude", "settings.json");
+        if (existsSync(claudeSettingsPath)) {
+          const settings = JSON.parse(readFileSync(claudeSettingsPath, "utf-8"));
+          return settings?.env?.ANTHROPIC_API_KEY || "";
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Claude CLI token:", e);
+      }
+    }
+    if (raw === "antigravity-cli-auto") {
+      const now = Date.now();
+      if (this.antigravityTokenCache && (now - this.antigravityTokenCacheTime) < 300000) {
+        return this.antigravityTokenCache;
+      }
+      try {
+        if (process.platform === "darwin") {
+          const stdout = execSync('security find-generic-password -a "antigravity" -s "gemini" -w', { encoding: "utf-8" }).trim();
+          if (stdout.startsWith("go-keyring-base64:")) {
+            const base64Data = stdout.substring("go-keyring-base64:".length);
+            const jsonStr = Buffer.from(base64Data, "base64").toString("utf-8");
+            const data = JSON.parse(jsonStr);
+            if (data?.token?.access_token) {
+              this.antigravityTokenCache = data.token.access_token;
+              this.antigravityTokenCacheTime = now;
+              return data.token.access_token;
+            }
+          }
+        }
+      } catch (e: any) {
+        console.error("[OpenCodex] Failed to auto-resolve Antigravity token:", e);
+      }
+      const op = this.config.providers.find((p: any) => p.name === "opencode");
+      return op ? op.api_key : "dummy";
+    }
     if (raw.startsWith("$")) {
       return process.env[raw.slice(1)] || "";
     }
@@ -1184,23 +1286,46 @@ stream_idle_timeout_ms = 600000
                   }
                 }
 
-                // If forwarding to official server, sanitize encrypted_content from client inputs
-                if (msg && Array.isArray(msg.input)) {
+                // If forwarding to official server, sanitize custom model references and encrypted_content from client inputs
+                if (msg) {
                   let mutated = false;
-                  for (const item of msg.input) {
-                    if (item && item.type === "reasoning" && typeof item.encrypted_content === "string") {
-                      if (item.encrypted_content.startsWith("anthropic-thinking-v1:")) {
-                        const prefix = "anthropic-thinking-v1:";
-                        try {
-                          const blob = item.encrypted_content.slice(prefix.length);
-                          const raw = Buffer.from(blob, "base64url").toString("utf-8");
-                          const decoded = JSON.parse(raw);
-                          if (decoded && decoded.thinking) {
-                            item.summary = [{ type: "summary_text", text: decoded.thinking }];
-                          }
-                        } catch {}
-                        delete item.encrypted_content;
+                  if (msg.type === "response.create") {
+                    if (msg.previous_response_id && customResponseIds.has(msg.previous_response_id)) {
+                      console.log(`[OpenCodex WS Proxy] Removing custom model previous_response_id reference: ${msg.previous_response_id}`);
+                      delete msg.previous_response_id;
+                      mutated = true;
+                    }
+                    if (Array.isArray(msg.input)) {
+                      const originalLength = msg.input.length;
+                      msg.input = msg.input.filter((item: any) => {
+                        if (item && item.id && item.id.startsWith("rs_")) {
+                          console.log(`[OpenCodex WS Proxy] Removing local reasoning item reference ${item.id} from input forwarded to official server.`);
+                          return false;
+                        }
+                        return true;
+                      });
+                      if (msg.input.length !== originalLength) {
                         mutated = true;
+                      }
+                    }
+                  }
+
+                  if (Array.isArray(msg.input)) {
+                    for (const item of msg.input) {
+                      if (item && item.type === "reasoning" && typeof item.encrypted_content === "string") {
+                        if (item.encrypted_content.startsWith("anthropic-thinking-v1:")) {
+                          const prefix = "anthropic-thinking-v1:";
+                          try {
+                            const blob = item.encrypted_content.slice(prefix.length);
+                            const raw = Buffer.from(blob, "base64url").toString("utf-8");
+                            const decoded = JSON.parse(raw);
+                            if (decoded && decoded.thinking) {
+                              item.summary = [{ type: "summary_text", text: decoded.thinking }];
+                            }
+                          } catch {}
+                          delete item.encrypted_content;
+                          mutated = true;
+                        }
                       }
                     }
                   }
@@ -1951,6 +2076,260 @@ stream_idle_timeout_ms = 600000
         }
         console.log("[OpenCodex] Reset to native state. Restarting Codex...");
         this.restartCodexDesktop();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/cli-bridge/status" && req.method === "GET") {
+      let grokDetected = false;
+      let grokEmail = "";
+      let grokExpiresAt = "";
+      let grokActive = false;
+
+      try {
+        const grokAuthPath = join(homedir(), ".grok", "auth.json");
+        if (existsSync(grokAuthPath)) {
+          const authData = JSON.parse(readFileSync(grokAuthPath, "utf-8"));
+          const sessionKey = Object.keys(authData).find(k => k.startsWith("https://auth.x.ai::"));
+          if (sessionKey && authData[sessionKey]?.key) {
+            grokDetected = true;
+            grokEmail = authData[sessionKey].email || "";
+            grokExpiresAt = authData[sessionKey].expires_at || "";
+          }
+        }
+      } catch {}
+
+      let claudeDetected = false;
+      let claudeBaseUrl = "";
+      let claudeActive = false;
+
+      try {
+        const claudeSettingsPath = join(homedir(), ".claude", "settings.json");
+        if (existsSync(claudeSettingsPath)) {
+          const settings = JSON.parse(readFileSync(claudeSettingsPath, "utf-8"));
+          if (settings?.env?.ANTHROPIC_API_KEY) {
+            claudeDetected = true;
+            claudeBaseUrl = settings?.env?.ANTHROPIC_BASE_URL || "https://api.anthropic.com/v1";
+          }
+        }
+      } catch {}
+
+      const catalog = this.getModelCatalog();
+      const hasGrokModel = catalog?.models?.some((m: any) => m.backend_provider === "grok");
+      const hasClaudeModel = catalog?.models?.some((m: any) => m.backend_provider === "claude");
+      const hasAntigravityModel = catalog?.models?.some((m: any) => m.backend_provider === "antigravity");
+
+      let antigravityActive = false;
+
+      if (this.config && Array.isArray(this.config.providers)) {
+        const gp = this.config.providers.find((p: any) => p.name === "grok");
+        if (gp && gp.api_key === "grok-cli-auto" && hasGrokModel) {
+          grokActive = true;
+        }
+        const cp = this.config.providers.find((p: any) => p.name === "claude");
+        if (cp && cp.api_key === "claude-cli-auto" && hasClaudeModel) {
+          claudeActive = true;
+        }
+        const ap = this.config.providers.find((p: any) => p.name === "antigravity");
+        if (ap && ap.api_key === "antigravity-cli-auto" && hasAntigravityModel) {
+          antigravityActive = true;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        grok: { detected: grokDetected, email: grokEmail, expiresAt: grokExpiresAt, active: grokActive },
+        claude: { detected: claudeDetected, baseUrl: claudeBaseUrl, active: claudeActive },
+        antigravity: { detected: true, active: antigravityActive }
+      }));
+      return;
+    }
+
+    if (path === "/api/cli-bridge/activate" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const cliName = data.cli;
+
+        if (cliName === "grok") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "grok");
+          providers.push({
+            name: "grok",
+            base_url: "https://api.x.ai/v1",
+            api_key: "grok-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "grok");
+            
+            const modelsToAdd = [
+              { slug: "grok-4.5", model: "grok-4.5", display_name: "grok-4.5", backend_model: "grok-4.5", context_window: 500000, max_context_window: 500000 },
+              { slug: "grok-4.3", model: "grok-4.3", display_name: "grok-4.3", backend_model: "grok-4.3", context_window: 1000000, max_context_window: 1000000 },
+              { slug: "grok-4.20-reasoning", model: "grok-4.20-0309-reasoning", display_name: "grok-4.20-reasoning", backend_model: "grok-4.20-0309-reasoning", context_window: 1000000, max_context_window: 1000000 }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "grok",
+                description: `Custom model: ${item.display_name} (grok)`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else if (cliName === "claude") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "claude");
+          providers.push({
+            name: "claude",
+            base_url: "claude-cli-auto-url",
+            api_key: "claude-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "claude");
+            
+            const modelsToAdd = [
+              { slug: "claude-3-5-sonnet", model: "claude-3-5-sonnet", display_name: "claude-3-5-sonnet", backend_model: "claude-3-5-sonnet-20241022", context_window: 200000, max_context_window: 200000 },
+              { slug: "claude-3-5-haiku", model: "claude-3-5-haiku", display_name: "claude-3-5-haiku", backend_model: "claude-3-5-haiku-20241022", context_window: 200000, max_context_window: 200000 }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "claude",
+                description: `Custom model: ${item.display_name} (claude)`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else if (cliName === "antigravity") {
+          let providers = this.config.providers || [];
+          providers = providers.filter((p: any) => p.name !== "antigravity");
+          providers.push({
+            name: "antigravity",
+            base_url: "https://opencode.ai/zen/go/v1",
+            api_key: "antigravity-cli-auto"
+          });
+          this.config.providers = providers;
+          this.saveConfig();
+
+          const catalog = this.getModelCatalog();
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          
+          if (catalog && Array.isArray(catalog.models)) {
+            catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "antigravity");
+            
+            const modelsToAdd = [
+              { slug: "gemini-3.5-flash-medium", model: "gemini-3.5-flash-medium", display_name: "Gemini 3.5 Flash (Medium)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.5-flash-high", model: "gemini-3.5-flash-high", display_name: "Gemini 3.5 Flash (High)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.1-pro-low", model: "gemini-3.1-pro-low", display_name: "Gemini 3.1 Pro (Low)", backend_model: "gpt-5.5" },
+              { slug: "gemini-3.1-pro-high", model: "gemini-3.1-pro-high", display_name: "Gemini 3.1 Pro (High)", backend_model: "gpt-5.5" },
+              { slug: "claude-sonnet-4.6-thinking", model: "claude-sonnet-4.6-thinking", display_name: "Claude Sonnet 4.6 (Thinking)", backend_model: "gpt-5.5" },
+              { slug: "claude-opus-4.6-thinking", model: "claude-opus-4.6-thinking", display_name: "Claude Opus 4.6 (Thinking)", backend_model: "gpt-5.6-terra" },
+              { slug: "gpt-oss-120b-medium", model: "gpt-oss-120b-medium", display_name: "GPT-OSS 120B (Medium)", backend_model: "deepseek-v4-pro" }
+            ];
+
+            for (const item of modelsToAdd) {
+              catalog.models.push({
+                ...baseModel,
+                ...item,
+                context_window: 200000,
+                max_context_window: 200000,
+                vision_bridge_enabled: false,
+                provider: "opencodex",
+                backend_provider: "antigravity",
+                description: `Antigravity model: ${item.display_name}`,
+                visibility: "list",
+                model_messages: {
+                  instructions_template: "You are Codex running on {model_name} through a local all-model shim. Be a helpful, direct coding collaborator.",
+                  instructions_variables: {
+                    model_name: item.slug
+                  }
+                }
+              });
+            }
+            this.saveModelCatalog(catalog);
+          }
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Invalid CLI name" }));
+          return;
+        }
+
+        this.loadConfig();
+        this.patchCodexConfig();
+        this.autoPatchPlugins();
+        
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/cli-bridge/deactivate" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const cliName = data.cli;
+
+        let providers = this.config.providers || [];
+        providers = providers.filter((p: any) => p.name !== cliName);
+        this.config.providers = providers;
+        this.saveConfig();
+
+        const catalog = this.getModelCatalog();
+        if (catalog && Array.isArray(catalog.models)) {
+          catalog.models = catalog.models.filter((m: any) => m.backend_provider !== cliName);
+          this.saveModelCatalog(catalog);
+        }
+
+        this.loadConfig();
+        this.patchCodexConfig();
+        this.autoPatchPlugins();
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
       } catch (err: any) {

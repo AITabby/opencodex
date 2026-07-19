@@ -18,6 +18,8 @@ const proxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.en
 const fetchDispatcher = proxyUrl ? new ProxyAgent({ uri: proxyUrl }) : undefined;
 
 const THINK_RE = /<think>[\s\S]*?<\/think>/gi;
+
+export const customResponseIds = new Set<string>();
 const SHIM_ENCRYPTED_CONTENT_PREFIX = "anthropic-thinking-v1:";
 let CURRENT_ACTIVE_APP = "Google Chrome";
 
@@ -724,6 +726,7 @@ export class ResponsesStreamState {
 
   constructor(model: string, namespaceMap?: Record<string, string>, sessionId?: string, onTextChunk?: (text: string) => void, onTextDone?: (text: string) => void, metadata?: any, isBackground?: boolean, sequenceNumberCallbacks?: { get: () => number, set: (seq: number) => void }) {
     this.responseId = `resp_${generateRandomHex(48)}`;
+    customResponseIds.add(this.responseId);
     this.messageItemId = `msg_${generateRandomHex(48)}`;
     this.model = model;
     this.namespaceMap = namespaceMap || {};
