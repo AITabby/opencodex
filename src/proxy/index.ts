@@ -5369,7 +5369,7 @@ function getPreferredCodexCwd(): string {
 function appendImportedSessionProjection(
   rolloutPath: string,
   title: string,
-  messageCount: number,
+  memory: OpenCodexMemoryPackage,
   cwd: string,
   model: string
 ): void {
@@ -5377,12 +5377,24 @@ function appendImportedSessionProjection(
     throw new Error("Codex did not create a readable rollout file");
   }
 
-  const timestamp = new Date().toISOString();
-  const turnId = randomUUID();
-  const userMessage = `Imported memory: ${title} (${messageCount} messages)`;
-  const assistantMessage = "The imported conversation is available as model-visible history. Continue normally from this thread.";
-  const projection = [
-    {
+  let firstLine = "";
+  try {
+    const content = readFileSync(rolloutPath, "utf-8");
+    firstLine = content.split("\n", 1)[0] + "\n";
+  } catch {}
+
+  const projection: any[] = [];
+  const baseTime = Date.now() - memory.messages.length * 1000;
+
+  for (let i = 0; i < memory.messages.length; i++) {
+    const msg = memory.messages[i];
+    if (msg.role !== "user" && msg.role !== "assistant") continue;
+
+    const timestamp = new Date(baseTime + i * 1000).toISOString();
+    const turnId = `turn_import_${randomUUID().replace(/-/g, "")}`;
+    const msgId = msg.source_id || `msg_import_${randomUUID().replace(/-/g, "")}`;
+
+    projection.push({
       timestamp,
       type: "turn_context",
       payload: {
@@ -5391,31 +5403,22 @@ function appendImportedSessionProjection(
         workspace_roots: [cwd],
         model
       }
-    },
-    {
-      timestamp,
-      type: "event_msg",
-      payload: {
-        type: "user_message",
-        text: userMessage,
-        turn_id: turnId,
-        message_id: `msg_user_${randomUUID()}`
-      }
-    },
-    {
-      timestamp,
-      type: "event_msg",
-      payload: {
-        type: "assistant_message",
-        text: assistantMessage,
-        turn_id: turnId,
-        message_id: `msg_assistant_${randomUUID()}`
-      }
-    }
-  ];
+    });
 
-  const lines = projection.map((item) => JSON.stringify(item)).join("\n") + "\n";
-  appendFileSync(rolloutPath, lines, "utf-8");
+    projection.push({
+      timestamp,
+      type: "event_msg",
+      payload: {
+        type: msg.role === "user" ? "user_message" : "assistant_message",
+        text: msg.content,
+        turn_id: turnId,
+        message_id: msgId
+      }
+    });
+  }
+
+  const lines = firstLine + projection.map((item) => JSON.stringify(item)).join("\n") + "\n";
+  writeFileSync(rolloutPath, lines, "utf-8");
 }
 
 async function updateImportedThreadState(threadId: string, preview: string): Promise<void> {
@@ -5496,7 +5499,7 @@ async function importMemoryIntoCodex(memory: OpenCodexMemoryPackage): Promise<{
       appendImportedSessionProjection(
         String(readResult.thread?.path || ""),
         threadName,
-        memory.messages.length,
+        memory,
         importCwd,
         String(startResult.model || "gpt-5.5")
       );
