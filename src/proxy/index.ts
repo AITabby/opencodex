@@ -4553,10 +4553,7 @@ stream_idle_timeout_ms = 600000
       isPrewarm = true;
     }
 
-    if (isPrewarm) {
-      console.log(`[OpenCodex WS Proxy] Ignoring prewarm request locally.`);
-      return;
-    }
+
 
     try {
       writeFileSync("/Users/aitabby/projects/opencodex/debug_req.json", JSON.stringify(reqBody, null, 2), "utf-8");
@@ -4673,6 +4670,13 @@ stream_idle_timeout_ms = 600000
       await streamState.start(async (payload) => {
         broadcastToClients(payload);
       });
+      if (isPrewarm) {
+        console.log(`[OpenCodex WS Proxy] Simulating prewarm response locally...`);
+        await streamState.finish(async (payload) => {
+          broadcastToClients(payload);
+        });
+        return;
+      }
     }
 
     if (catalogEntry?.backend_provider === "antigravity") {
@@ -4730,6 +4734,8 @@ stream_idle_timeout_ms = 600000
           dispatcher: fetchDispatcher
         });
 
+        console.log(`[OpenCodex WS Proxy] Antigravity response status: ${response.status}`);
+
         if (!response.ok) {
           const errorText = await response.text();
           let userFriendlyMsg = `Antigravity API Error: ${response.status} - ${errorText}`;
@@ -4757,6 +4763,7 @@ stream_idle_timeout_ms = 600000
               for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
+                console.log(`[OpenCodex WS Proxy] Antigravity raw chunk: ${trimmed}`);
                 try {
                   const data = JSON.parse(trimmed.slice(6));
                   const part = data.response?.candidates?.[0]?.content?.parts?.[0]?.text || data.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -4770,7 +4777,9 @@ stream_idle_timeout_ms = 600000
                       broadcastToClients(payload);
                     }, chunk);
                   }
-                } catch {}
+                } catch (pe: any) {
+                  console.error(`[OpenCodex WS Proxy] Antigravity parse chunk error: ${pe.message}`);
+                }
               }
             }
           } finally {
