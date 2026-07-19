@@ -765,11 +765,6 @@ except Exception as e:
       }
     }
     if (raw === "antigravity-cli-auto") {
-      const ap = this.config.providers.find((p: any) => p.name === "antigravity");
-      if (ap && ap.base_url && ap.base_url.includes("opencode.ai")) {
-        const op = this.config.providers.find((p: any) => p.name === "opencode");
-        return op ? op.api_key : "dummy";
-      }
       const now = Date.now();
       if (this.antigravityTokenCache && (now - this.antigravityTokenCacheTime) < 300000) {
         return this.antigravityTokenCache;
@@ -4678,6 +4673,127 @@ stream_idle_timeout_ms = 600000
       await streamState.start(async (payload) => {
         broadcastToClients(payload);
       });
+    }
+
+    if (catalogEntry?.backend_provider === "antigravity") {
+      try {
+        console.log(`[OpenCodex WS Proxy] Routing to Antigravity streamGenerateContent API...`);
+        const token = this.resolveKey("antigravity-cli-auto");
+        
+        let originalModel = catalogEntry.slug || requestedModel;
+        if (originalModel.includes("flash")) originalModel = "gemini-3.5-flash-low";
+        else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel.includes("sonnet") || originalModel.includes("opus") || originalModel === "gpt-5.5" || originalModel === "gpt-5.6-terra") originalModel = "gemini-3.1-pro-low";
+        else if (originalModel === "gpt-5.4-mini") originalModel = "gemini-3.5-flash-low";
+        else originalModel = "gemini-3.5-flash-low";
+
+        console.log(`[OpenCodex WS Proxy] Mapped model: ${requestedModel} -> ${originalModel}`);
+
+        const contents: any[] = [];
+        for (const m of chatBody.messages) {
+          if (m.role === "system") continue;
+          const role = m.role === "assistant" ? "model" : "user";
+          const text = m.content || "";
+          if (contents.length > 0 && contents[contents.length - 1].role === role) {
+            contents[contents.length - 1].parts[0].text += "\n" + text;
+          } else {
+            contents.push({
+              role,
+              parts: [{ text }]
+            });
+          }
+        }
+        if (contents.length > 0 && contents[0].role === "model") {
+          contents.unshift({
+            role: "user",
+            parts: [{ text: "Hello" }]
+          });
+        }
+
+        const antigravityPayload = {
+          project: "default-cli-project",
+          model: originalModel,
+          request: {
+            contents: contents,
+            generationConfig: {}
+          }
+        };
+
+        const response = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "User-Agent": "antigravity/hub/2.2.1 darwin/arm64",
+            "Accept-Encoding": "gzip"
+          },
+          body: JSON.stringify(antigravityPayload),
+          dispatcher: fetchDispatcher
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          let userFriendlyMsg = `Antigravity API Error: ${response.status} - ${errorText}`;
+          if (response.status === 401) {
+            userFriendlyMsg = `[OpenCodex Proxy Error] Antigravity 登录凭证已过期/无效，请在终端（PowerShell 或 CMD）运行 "agy login" 重新登录激活权限！`;
+          }
+          console.error(userFriendlyMsg);
+          ws.send(JSON.stringify({ error: { message: userFriendlyMsg } }));
+          return;
+        }
+
+        if (isStream && streamState) {
+          const reader = response.body!.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+
+          try {
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split("\n");
+              buffer = lines.pop() || "";
+
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
+                try {
+                  const data = JSON.parse(trimmed.slice(6));
+                  const part = data.response?.candidates?.[0]?.content?.parts?.[0]?.text || data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+                  if (part) {
+                    const chunk = {
+                      choices: [{
+                        delta: { content: part }
+                      }]
+                    };
+                    await streamState.writeChatDelta(async (payload) => {
+                      broadcastToClients(payload);
+                    }, chunk);
+                  }
+                } catch {}
+              }
+            }
+          } finally {
+            reader.releaseLock();
+          }
+
+          console.log(`[OpenCodex WS Proxy] Finalizing Antigravity stream...`);
+          await streamState.finish(async (payload) => {
+            broadcastToClients(payload);
+          });
+
+          const assistantMsg = streamState.getAssistantMessage();
+          if (assistantMsg) {
+            const currentHistory = this.customConversationHistory.get(sessionIdStr) || [];
+            this.customConversationHistory.set(sessionIdStr, currentHistory.concat(assistantMsg));
+          }
+        }
+        return;
+      } catch (err: any) {
+        console.error(`[OpenCodex WS Proxy Antigravity Handler Error] ${err.message}`);
+        ws.send(JSON.stringify({ error: { message: err.message } }));
+        return;
+      }
     }
 
     try {
