@@ -479,6 +479,13 @@ except Exception as e:
       return true;
     });
 
+    // Fix legacy/incorrect backend_model mappings for antigravity Gemini Flash models
+    catalog.models.forEach((m: any) => {
+      if (m.backend_provider === "antigravity" && m.slug?.startsWith("gemini-3.5-flash")) {
+        m.backend_model = "gpt-5.6-luna";
+      }
+    });
+
     return catalog;
   }
 
@@ -603,7 +610,7 @@ except Exception as e:
 
       const existing = existingModels.find((m: any) => m.slug === slug || m.model === slug);
       if (existing) {
-        const isNative = existing.slug === "gpt-5.5" || existing.slug === "gpt-5.4-mini" || (existing.provider === "openai" && !existing.backend_provider);
+        const isNative = existing.slug === "gpt-5.5" || existing.slug === "gpt-5.6-luna" || existing.slug === "gpt-5.4-mini" || (existing.provider === "openai" && !existing.backend_provider);
         if (isNative) {
           models.push({
             ...existing,
@@ -1146,7 +1153,7 @@ stream_idle_timeout_ms = 600000
             const msgStr = processedTData.toString();
             console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
             
-            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
+            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("gpt-5.6-luna") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
 
             if (!tIsBinary) {
               try {
@@ -2318,9 +2325,9 @@ stream_idle_timeout_ms = 600000
             catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "antigravity");
             
             const modelsToAdd = [
-              { slug: "gemini-3.5-flash-medium", model: "gemini-3.5-flash-medium", display_name: "Gemini 3.5 Flash (Medium)", backend_model: "gpt-5.4-mini" },
-              { slug: "gemini-3.5-flash-high", model: "gemini-3.5-flash-high", display_name: "Gemini 3.5 Flash (High)", backend_model: "gpt-5.4-mini" },
-              { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.4-mini" },
+              { slug: "gemini-3.5-flash-medium", model: "gemini-3.5-flash-medium", display_name: "Gemini 3.5 Flash (Medium)", backend_model: "gpt-5.6-luna" },
+              { slug: "gemini-3.5-flash-high", model: "gemini-3.5-flash-high", display_name: "Gemini 3.5 Flash (High)", backend_model: "gpt-5.6-luna" },
+              { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.6-luna" },
               { slug: "gemini-3.1-pro-low", model: "gemini-3.1-pro-low", display_name: "Gemini 3.1 Pro (Low)", backend_model: "gpt-5.5" },
               { slug: "gemini-3.1-pro-high", model: "gemini-3.1-pro-high", display_name: "Gemini 3.1 Pro (High)", backend_model: "gpt-5.5" },
               { slug: "claude-sonnet-4.6-thinking", model: "claude-sonnet-4.6-thinking", display_name: "Claude Sonnet 4.6 (Thinking)", backend_model: "gpt-5.5" },
