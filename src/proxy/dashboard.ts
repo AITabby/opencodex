@@ -825,8 +825,8 @@ export function getDashboardHtml(): string {
                 </div>
               </div>
 
-              <div style="display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem;">
-                <input type="checkbox" id="config-restart-checkbox" checked style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
+              <div style="display: none;">
+                <input type="checkbox" id="config-restart-checkbox" style="width: 18px; height: 18px; cursor: pointer; accent-color: var(--color-secondary);">
                 <label for="config-restart-checkbox" id="i18n-label-config-restart" style="cursor: pointer; user-select: none; font-size: 0.85rem; color: var(--color-text-muted);">保存后自动重启 ChatGPT Desktop</label>
               </div>
               

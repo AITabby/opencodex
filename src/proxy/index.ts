@@ -38,6 +38,17 @@ import {
 import { getDashboardHtml } from "./dashboard.js";
 import { getVisualizerHtml } from "./visualizer.js";
 
+export function isNativeModeEnabled(): boolean {
+  const tomlPath = join(homedir(), ".codex", "config.toml");
+  if (!existsSync(tomlPath)) return true;
+  try {
+    const content = readFileSync(tomlPath, "utf-8");
+    return !content.includes("opencodex managed");
+  } catch {
+    return true;
+  }
+}
+
 interface ProviderConfig {
   name: string;
   base_url: string;
@@ -445,19 +456,50 @@ except Exception as e:
 
   private getModelCatalog(): any {
     const p = join(this.configDir, "custom_model_catalog.json");
+    let catalog: any = { models: [] };
     if (existsSync(p)) {
       try {
-        return JSON.parse(readFileSync(p, "utf-8"));
+        catalog = JSON.parse(readFileSync(p, "utf-8"));
       } catch (err: any) {
         console.error(`[OpenCodex] Failed to read model catalog: ${err.message}`);
       }
     }
-    return { models: [] };
+    if (!catalog.models) catalog.models = [];
+
+    // Always filter out 5.4 and below, and codex-auto-review
+    catalog.models = catalog.models.filter((m: any) => {
+      const slug = m.slug || "";
+      if (slug === "codex-auto-review") return false;
+      if (slug === "gpt-5.4" || slug === "gpt-5.4-mini") return false;
+      const match = slug.match(/^gpt-(\d+\.\d+)/);
+      if (match) {
+        const version = parseFloat(match[1]);
+        if (version <= 5.4) return false;
+      }
+      return true;
+    });
+
+    return catalog;
   }
 
   private saveModelCatalog(catalog: any) {
     const p = join(this.configDir, "custom_model_catalog.json");
     try {
+      if (!catalog.models) catalog.models = [];
+
+      // Always filter out 5.4 and below, and codex-auto-review
+      catalog.models = catalog.models.filter((m: any) => {
+        const slug = m.slug || "";
+        if (slug === "codex-auto-review") return false;
+        if (slug === "gpt-5.4" || slug === "gpt-5.4-mini") return false;
+        const match = slug.match(/^gpt-(\d+\.\d+)/);
+        if (match) {
+          const version = parseFloat(match[1]);
+          if (version <= 5.4) return false;
+        }
+        return true;
+      });
+
       const jsonStr = JSON.stringify(catalog, null, 2);
       writeFileSync(p, jsonStr, "utf-8");
       console.error(`[OpenCodex] Saved custom model catalog to ${p}`);
@@ -1514,6 +1556,12 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    if (path === "/api/gateway/status" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ active: !isNativeModeEnabled() }));
+      return;
+    }
+
     if (path === "/api/config" && req.method === "POST") {
       try {
         const data = JSON.parse(body);
@@ -1581,21 +1629,31 @@ stream_idle_timeout_ms = 600000
     if (path === "/api/models" && req.method === "GET") {
       // Returns complete model catalog & enabled models
       const catalog = this.getModelCatalog();
-      const active = catalog.models?.filter((m: any) => m.visibility === "list").map((m: any) => m.slug) || [];
+      let models = catalog.models || [];
+
+      // If in gateway mode, hide native models in the dashboard UI
+      if (!isNativeModeEnabled()) {
+        models = models.filter((m: any) => {
+          const isNative = m.provider === "openai" && !m.backend_provider;
+          return !isNative;
+        });
+      }
+
+      const active = models.filter((m: any) => m.visibility === "list").map((m: any) => m.slug);
       
       res.writeHead(200, {
         "Content-Type": "application/json",
         "Cache-Control": "no-cache, no-store, must-revalidate"
       });
       res.end(JSON.stringify({
-        catalog: catalog.models?.map((m: any) => ({
+        catalog: models.map((m: any) => ({
           id: m.slug,
           model: m.model,
           provider: m.provider || "",
           display_name: m.display_name,
           no_image_support: m.input_modalities ? !m.input_modalities.includes("image") : true,
           vision_bridge_enabled: !!m.vision_bridge_enabled
-        })) || [],
+        })),
         active
       }));
       return;
