@@ -1171,14 +1171,6 @@ export function getDashboardHtml(): string {
               <input type="file" id="import-file-input" style="display: none;" accept=".json,.jsonl,.db,.sqlite,.sqlite3,.md,.markdown" onchange="handleImportFileSelect(event)">
             </div>
 
-            <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); padding: 0.75rem; border-radius: 12px; margin-bottom: 0.75rem;">
-              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.5rem;">
-                <span style="font-size: 0.85rem; font-weight: 600; color: var(--color-text);">桌面置顶悬浮球 / Desktop Orb</span>
-                <span id="orb-status-badge" style="font-size: 0.7rem; font-weight: 600; padding: 0.1rem 0.5rem; border-radius: 99px; background: rgba(239, 68, 68, 0.1); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.2);">关闭 / Offline</span>
-              </div>
-              <button class="action-btn" id="orb-toggle-btn" onclick="toggleDesktopOrb()" style="width: 100%; margin-top: 0; padding: 0.5rem; font-size: 0.8rem; background: var(--color-primary); color: white; border-radius: 8px;">开启置顶悬浮球 / Launch Orb</button>
-            </div>
-
             <div id="session-list-container" style="display: flex; flex-direction: column; gap: 0.75rem; overflow-y: auto; flex: 1;">
               <div style="text-align: center; color: var(--color-text-muted); padding: 2rem;" id="i18n-loading-sessions">Loading sessions...</div>
             </div>
@@ -2047,7 +2039,8 @@ export function getDashboardHtml(): string {
           const response = await fetch('/api/reset', { method: 'POST' });
           if (response.ok) {
             showToast(currentLang === 'zh' ? '已还原原生' : 'Reset complete');
-            loadConfig();
+            await loadConfig();
+            await checkCliStatus();
             await loadGatewayStatus();
             await loadModels();
           }
@@ -2266,6 +2259,21 @@ export function getDashboardHtml(): string {
     }
 
     function appendLogLine(time, tag, text, level) {
+      // Dashboard status/log polling is background traffic, not an
+      // operational event. Hide both new and previously buffered poll lines.
+      const quietPoll = tag === 'INFO'
+        && typeof text === 'string'
+        && text.includes('[OpenCodex] Request path:')
+        && [
+          '/api/logs/poll',
+          '/api/logs/stream',
+          '/api/gateway/status',
+          '/api/voice-settings',
+          '/api/voice-bar/status',
+          '/api/permissions',
+          '/api/cli-bridge/status'
+        ].some(path => text.includes(path));
+      if (quietPoll) return;
       const container = document.getElementById('console-logs');
       const line = document.createElement('div');
       line.className = \`log-line log-\${level || 'info'}\`;
@@ -2505,46 +2513,6 @@ export function getDashboardHtml(): string {
         });
         if (response.ok) {
           setTimeout(checkVoiceBarStatus, 2000);
-        }
-      } catch (err) {}
-    }
-
-    let orbRunning = false;
-    async function checkOrbStatus() {
-      try {
-        const response = await fetch('/api/orb/status');
-        const data = await response.json();
-        orbRunning = !!data.running;
-        const badge = document.getElementById('orb-status-badge');
-        const btn = document.getElementById('orb-toggle-btn');
-        if (badge) {
-          badge.innerText = orbRunning ? (currentLang === 'zh' ? '运行中' : 'Running') : (currentLang === 'zh' ? '关闭' : 'Offline');
-          badge.style.color = orbRunning ? 'var(--color-success)' : '#ef4444';
-          badge.style.background = orbRunning ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)';
-          badge.style.borderColor = orbRunning ? 'rgba(16, 185, 129, 0.2)' : 'rgba(239, 68, 68, 0.2)';
-        }
-        if (btn) {
-          btn.innerText = orbRunning 
-            ? (currentLang === 'zh' ? '关闭置顶悬浮球 / Close Orb' : 'Close Desktop Orb')
-            : (currentLang === 'zh' ? '开启置顶悬浮球 / Launch Orb' : 'Launch Desktop Orb');
-          btn.style.background = orbRunning ? 'rgba(239, 68, 68, 0.15)' : 'var(--color-primary)';
-          btn.style.color = orbRunning ? '#ef4444' : 'white';
-          btn.style.border = orbRunning ? '1px solid rgba(239, 68, 68, 0.3)' : 'none';
-        }
-      } catch (err) {}
-    }
-
-    async function toggleDesktopOrb() {
-      const enable = !orbRunning;
-      showToast(enable ? '正在启动悬浮球...' : '正在关闭悬浮球...');
-      try {
-        const response = await fetch('/api/orb/launch', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ enable })
-        });
-        if (response.ok) {
-          setTimeout(checkOrbStatus, 1500);
         }
       } catch (err) {}
     }
@@ -2899,8 +2867,6 @@ export function getDashboardHtml(): string {
       
       setupLogsPolling();
       setInterval(checkVoiceBarStatus, 3000);
-      setInterval(checkOrbStatus, 3000);
-      checkOrbStatus();
       setInterval(checkPermissionsStatus, 3000);
       setInterval(async () => {
         if (currentTab === 'sessions') {

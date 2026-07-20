@@ -65,6 +65,13 @@ function _decodeThinkingPayload(encoded: string): any | null {
   }
 }
 
+function responsesFunctionCallId(value: unknown, fallback: string): string {
+  if (typeof value === "string" && /^fc_[A-Za-z0-9_-]+$/.test(value)) {
+    return value;
+  }
+  return `fc_${generateRandomHex(32)}_${fallback}`;
+}
+
 export function extractNamespaceMap(tools: any[] | undefined): Record<string, string> {
   if (!Array.isArray(tools)) return {};
   const nsMap: Record<string, string> = {};
@@ -298,18 +305,19 @@ export function chatCompletionToResponse(payload: any, requestedModel: string, n
   }
 
   const toolCalls = message.tool_calls || [];
-  for (const call of toolCalls) {
+  for (const [index, call] of toolCalls.entries()) {
     const fn = call.function || {};
     const fnName = fn.name || "";
     const [unflattenedName, namespace] = unflattenToolCall(fnName, namespaceMap);
 
     const patchedArgs = patchToolCallArguments(unflattenedName, fn.arguments || "");
+    const callId = call.id || `call_${index}`;
 
     const item: any = {
-      id: call.id || "call_0",
+      id: responsesFunctionCallId(callId, String(index)),
       type: "function_call",
       status: "completed",
-      call_id: call.id || "call_0",
+      call_id: callId,
       name: unflattenedName,
       arguments: patchedArgs,
     };
@@ -912,7 +920,7 @@ export class ResponsesStreamState {
     if (!state) {
       const callId = call.id || `call_${index}`;
       state = {
-        id: callId,
+        id: responsesFunctionCallId(callId, String(index)),
         call_id: callId,
         name: fn.name || "",
         arguments: "",

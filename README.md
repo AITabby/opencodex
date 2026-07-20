@@ -13,7 +13,7 @@
 ---
 
 > [!NOTE]
-> **macOS edition · v0.4.5-beta.1** — This repository tracks the macOS implementation only. It is designed for ChatGPT/Codex Desktop on macOS.
+> **macOS edition · v0.4.5** — This repository tracks the macOS implementation only. It is designed for ChatGPT/Codex Desktop on macOS.
 
 > [!NOTE]
 > **Native mode first** — Starting OpenCodex does not proxy or modify native Codex. Add a third-party/subscription model, then explicitly update the Desktop model picker when you want to enable gateway mode. Resetting to native removes the gateway routing again.
@@ -69,7 +69,7 @@ The server starts and opens the dashboard. Adding a model only saves it; use **U
 # 简体中文
 
 > [!NOTE]
-> **macOS 版本 · v0.4.5-beta.1** —— 本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop。
+> **macOS 版本 · v0.4.5** —— 本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop。
 
 > [!NOTE]
 > **原生优先** —— 启动 OpenCodex 不会代理或修改原生 Codex。仅在添加第三方/订阅模型后，手动更新桌面端下拉菜单时才进入网关模式；还原原生会再次移除网关路由。

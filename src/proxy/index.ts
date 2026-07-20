@@ -62,6 +62,55 @@ export function isNativeModeEnabled(): boolean {
   }
 }
 
+const IMPORT_PROJECTION_VERSION = 4;
+
+function isNativeMessageId(value: unknown): boolean {
+  return typeof value === "string" && /^msg_[A-Za-z0-9_-]+$/.test(value);
+}
+
+function isNativeFunctionCallId(value: unknown): boolean {
+  return typeof value === "string" && /^fc_[A-Za-z0-9_-]+$/.test(value);
+}
+
+function nativeMessageId(value: unknown): string {
+  return isNativeMessageId(value)
+    ? String(value)
+    : `msg_import_${randomUUID().replace(/-/g, "")}`;
+}
+
+function nativeFunctionCallId(value: unknown): string {
+  return isNativeFunctionCallId(value)
+    ? String(value)
+    : `fc_import_${randomUUID().replace(/-/g, "")}`;
+}
+
+// ResponsesStreamState creates these IDs locally for third-party responses.
+// They are not persisted by the official Responses service and must not be
+// replayed when the same Codex thread is opened in native mode.
+function isGatewayLocalReasoningId(value: unknown): boolean {
+  return typeof value === "string" && /^rs_\d{13}_\d+$/.test(value);
+}
+
+function sanitizeResponsesForOfficial(reqBody: any): void {
+  if (!reqBody || typeof reqBody !== "object") return;
+
+  if (reqBody.previous_response_id && customResponseIds.has(reqBody.previous_response_id)) {
+    delete reqBody.previous_response_id;
+  }
+
+  if (!Array.isArray(reqBody.input)) return;
+  reqBody.input = reqBody.input.filter((item: any) => {
+    if (isGatewayLocalReasoningId(item?.id)) return false;
+    if (item?.type === "message" && item.id && !isNativeMessageId(item.id)) {
+      item.id = nativeMessageId(item.id);
+    }
+    if (item?.type === "function_call" && item.id && !isNativeFunctionCallId(item.id)) {
+      item.id = nativeFunctionCallId(item.id);
+    }
+    return true;
+  });
+}
+
 interface ProviderConfig {
   name: string;
   base_url: string;
@@ -110,8 +159,13 @@ function orderCatalogModels(models: any[]): any[] {
   return models
     .map((model, index) => ({ model: normalizeThirdPartyModelCapabilities(model), index }))
     .sort((a, b) => {
-      const aNative = a.model.provider === "openai" && !a.model.backend_provider;
-      const bNative = b.model.provider === "openai" && !b.model.backend_provider;
+      // Native models from models_cache.json did not always carry a provider
+      // field. Treat an un-managed GPT slug as official as well, while any
+      // explicit backend_provider always means a custom/subscription model.
+      const aNative = !a.model.backend_provider
+        && (a.model.provider === "openai" || /^gpt(?:-|$)/i.test(String(a.model.slug || a.model.model || "")));
+      const bNative = !b.model.backend_provider
+        && (b.model.provider === "openai" || /^gpt(?:-|$)/i.test(String(b.model.slug || b.model.model || "")));
       if (aNative !== bNative) return aNative ? -1 : 1;
       return a.index - b.index;
     })
@@ -119,7 +173,8 @@ function orderCatalogModels(models: any[]): any[] {
 }
 
 function isOfficialCatalogModel(model: any): boolean {
-  return model?.provider === "openai" && !model?.backend_provider;
+  return !model?.backend_provider
+    && (model?.provider === "openai" || /^gpt(?:-|$)/i.test(String(model?.slug || model?.model || "")));
 }
 
 export function addLog(tag: string, text: string, level: string = "info") {
@@ -205,6 +260,7 @@ export class ProxyServer {
   private titleSessionHashes = new Set<string>();
   private antigravityTokenCache = "";
   private antigravityTokenCacheTime = 0;
+  private antigravityTokenExpiry = 0;
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   private memorySourceFiles = new Map<string, ScannedMemorySource>();
@@ -283,10 +339,11 @@ export class ProxyServer {
       join(homedir(), ".codex", "archived_sessions")
     ];
     let repaired = 0;
+    const nativeMode = isNativeModeEnabled();
     for (const root of roots) {
       for (const rolloutPath of findRolloutFiles(root)) {
         try {
-          if (repairImportedSessionProjection(rolloutPath)) repaired++;
+          if (repairSessionProjectionForMode(rolloutPath, nativeMode)) repaired++;
         } catch (error: any) {
           console.error(`[OpenCodex Memory Bridge] Could not repair ${rolloutPath}: ${error.message}`);
         }
@@ -857,7 +914,10 @@ except Exception as e:
     }
     if (raw === "antigravity-cli-auto") {
       const now = Date.now();
-      if (this.antigravityTokenCache && (now - this.antigravityTokenCacheTime) < 300000) {
+      const cacheValidUntil = this.antigravityTokenExpiry > 0
+        ? this.antigravityTokenExpiry - 30000
+        : this.antigravityTokenCacheTime + 300000;
+      if (this.antigravityTokenCache && now < cacheValidUntil) {
         return this.antigravityTokenCache;
       }
       try {
@@ -870,6 +930,9 @@ except Exception as e:
             if (data?.token?.access_token) {
               this.antigravityTokenCache = data.token.access_token;
               this.antigravityTokenCacheTime = now;
+              const expiry = data.token.expiry || data.token.expires_at;
+              const expiryMs = expiry ? Date.parse(String(expiry)) : NaN;
+              this.antigravityTokenExpiry = Number.isFinite(expiryMs) ? expiryMs : 0;
               return data.token.access_token;
             }
           }
@@ -1443,9 +1506,19 @@ stream_idle_timeout_ms = 600000
                     if (Array.isArray(msg.input)) {
                       const originalLength = msg.input.length;
                       msg.input = msg.input.filter((item: any) => {
-                        if (item && item.id && item.id.startsWith("rs_")) {
+                        if (item && isGatewayLocalReasoningId(item.id)) {
                           console.log(`[OpenCodex WS Proxy] Removing local reasoning item reference ${item.id} from input forwarded to official server.`);
                           return false;
+                        }
+                        if (item?.type === "message" && item.id && !isNativeMessageId(item.id)) {
+                          console.log(`[OpenCodex WS Proxy] Normalizing invalid imported message id ${item.id} before forwarding to official server.`);
+                          item.id = nativeMessageId(item.id);
+                          mutated = true;
+                        }
+                        if (item?.type === "function_call" && item.id && !isNativeFunctionCallId(item.id)) {
+                          console.log(`[OpenCodex WS Proxy] Normalizing invalid function call id ${item.id} before forwarding to official server.`);
+                          item.id = nativeFunctionCallId(item.id);
+                          mutated = true;
                         }
                         return true;
                       });
@@ -1563,7 +1636,19 @@ stream_idle_timeout_ms = 600000
 
     let decompressedBody = rawBody;
     const contentEncoding = req.headers["content-encoding"];
-    console.log("[OpenCodex] Request path:", req.url, "Content-Encoding:", contentEncoding, "rawBody signature:", rawBody.slice(0, 4));
+    const requestPath = String(req.url || "").split("?", 1)[0];
+    const isQuietDashboardPoll = req.method === "GET" && new Set([
+      "/api/logs/poll",
+      "/api/logs/stream",
+      "/api/gateway/status",
+      "/api/voice-settings",
+      "/api/voice-bar/status",
+      "/api/permissions",
+      "/api/cli-bridge/status"
+    ]).has(requestPath);
+    if (!isQuietDashboardPoll) {
+      console.log("[OpenCodex] Request path:", req.url, "Content-Encoding:", contentEncoding, "rawBody signature:", rawBody.slice(0, 4));
+    }
     if (contentEncoding === "gzip") {
       try {
         decompressedBody = zlib.gunzipSync(rawBody);
@@ -2374,6 +2459,10 @@ stream_idle_timeout_ms = 600000
         if (existsSync(catalogPath)) {
           writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
         }
+        // Native Codex must not inherit temporary IDs emitted by the gateway.
+        // Normalize existing rollouts before restarting the desktop client so
+        // the first native continuation cannot replay rs_* or import_* items.
+        this.repairExistingImportedSessions();
         console.log("[OpenCodex] Reset to native state. Restarting Codex...");
         this.restartCodexDesktop();
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -3254,11 +3343,15 @@ stream_idle_timeout_ms = 600000
       }
 
       try {
+        // An official-model request can follow a third-party turn in the
+        // same desktop thread. Remove only gateway-local items before the
+        // request reaches the official Responses service.
+        sanitizeResponsesForOfficial(reqBody);
         console.log(`[OpenCodex Proxy] Forwarding HTTP ${req.method} for official model to: ${targetUrl}`);
         const officialRes = await fetch(targetUrl, {
           method: req.method,
           headers,
-          body: rawBody,
+          body: JSON.stringify(reqBody),
           dispatcher: fetchDispatcher
         });
 
@@ -4913,6 +5006,7 @@ stream_idle_timeout_ms = 600000
     }
 
     if (catalogEntry?.backend_provider === "antigravity") {
+      let antigravityStreamFinalized = false;
       try {
         console.log(`[OpenCodex WS Proxy] Routing to Antigravity streamGenerateContent API...`);
         const token = this.resolveKey("antigravity-cli-auto");
@@ -4955,6 +5049,8 @@ stream_idle_timeout_ms = 600000
           }
         };
 
+        const antigravityAbort = new AbortController();
+        const antigravityTimeout = setTimeout(() => antigravityAbort.abort(), 120000);
         const response = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
           method: "POST",
           headers: {
@@ -4964,8 +5060,10 @@ stream_idle_timeout_ms = 600000
             "Accept-Encoding": "gzip"
           },
           body: JSON.stringify(antigravityPayload),
+          signal: antigravityAbort.signal,
           dispatcher: fetchDispatcher
         });
+        clearTimeout(antigravityTimeout);
 
         console.log(`[OpenCodex WS Proxy] Antigravity response status: ${response.status}`);
 
@@ -4973,9 +5071,22 @@ stream_idle_timeout_ms = 600000
           const errorText = await response.text();
           let userFriendlyMsg = `Antigravity API Error: ${response.status} - ${errorText}`;
           if (response.status === 401) {
+            // Do not keep serving an expired OAuth token on the next turn.
+            // The Antigravity CLI may refresh the Keychain entry independently.
+            this.antigravityTokenCache = "";
+            this.antigravityTokenCacheTime = 0;
+            this.antigravityTokenExpiry = 0;
             userFriendlyMsg = `[OpenCodex Proxy Error] Antigravity 登录凭证已过期/无效，请在终端（PowerShell 或 CMD）运行 "agy login" 重新登录激活权限！`;
           }
           console.error(userFriendlyMsg);
+          if (isStream && streamState && !antigravityStreamFinalized) {
+            try {
+              await streamState.finish(async (payload) => {
+                broadcastToClients(payload);
+              });
+              antigravityStreamFinalized = true;
+            } catch {}
+          }
           ws.send(JSON.stringify({ error: { message: userFriendlyMsg } }));
           return;
         }
@@ -4985,34 +5096,42 @@ stream_idle_timeout_ms = 600000
           const decoder = new TextDecoder();
           let buffer = "";
 
+          const processAntigravitySseLine = async (line: string) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) return;
+            try {
+              const data = JSON.parse(trimmed.slice(6));
+              const parts = data.response?.candidates?.[0]?.content?.parts
+                || data.candidates?.[0]?.content?.parts
+                || [];
+              const text = Array.isArray(parts)
+                ? parts.map((part: any) => typeof part?.text === "string" ? part.text : "").join("")
+                : "";
+              if (text) {
+                await streamState.writeChatDelta(async (payload) => {
+                  broadcastToClients(payload);
+                }, { choices: [{ delta: { content: text } }] });
+              }
+            } catch (pe: any) {
+              console.error(`[OpenCodex WS Proxy] Antigravity parse chunk error: ${pe.message}`);
+            }
+          };
+
           try {
             while (true) {
               const { done, value } = await reader.read();
-              if (done) break;
+              if (done) {
+                // Some SSE servers close without a final blank line. Flush
+                // the last complete JSON event instead of silently dropping it.
+                if (buffer.trim()) await processAntigravitySseLine(buffer);
+                break;
+              }
               buffer += decoder.decode(value, { stream: true });
               const lines = buffer.split("\n");
               buffer = lines.pop() || "";
 
               for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) continue;
-                console.log(`[OpenCodex WS Proxy] Antigravity raw chunk: ${trimmed}`);
-                try {
-                  const data = JSON.parse(trimmed.slice(6));
-                  const part = data.response?.candidates?.[0]?.content?.parts?.[0]?.text || data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-                  if (part) {
-                    const chunk = {
-                      choices: [{
-                        delta: { content: part }
-                      }]
-                    };
-                    await streamState.writeChatDelta(async (payload) => {
-                      broadcastToClients(payload);
-                    }, chunk);
-                  }
-                } catch (pe: any) {
-                  console.error(`[OpenCodex WS Proxy] Antigravity parse chunk error: ${pe.message}`);
-                }
+                await processAntigravitySseLine(line);
               }
             }
           } finally {
@@ -5023,6 +5142,7 @@ stream_idle_timeout_ms = 600000
           await streamState.finish(async (payload) => {
             broadcastToClients(payload);
           });
+          antigravityStreamFinalized = true;
 
           const assistantMsg = streamState.getAssistantMessage();
           if (assistantMsg) {
@@ -5033,6 +5153,14 @@ stream_idle_timeout_ms = 600000
         return;
       } catch (err: any) {
         console.error(`[OpenCodex WS Proxy Antigravity Handler Error] ${err.message}`);
+        if (isStream && streamState && !antigravityStreamFinalized) {
+          try {
+            await streamState.finish(async (payload) => {
+              broadcastToClients(payload);
+            });
+            antigravityStreamFinalized = true;
+          } catch {}
+        }
         ws.send(JSON.stringify({ error: { message: err.message } }));
         return;
       }
@@ -5496,7 +5624,8 @@ function repairImportedSessionProjection(rolloutPath: string, cwd = homedir(), m
 
   const isCurrentProjection = records.some((item: any) => item?.type === "turn_context"
     && item.payload?.source === OPENCODEX_MEMORY_TURN_ID
-    && item.payload?.import_projection_version === 3);
+    && item.payload?.import_projection_version === IMPORT_PROJECTION_VERSION)
+    && importedItems.every((item: any) => isNativeMessageId(item.payload?.id));
   if (isCurrentProjection) return false;
 
   // The desktop renderer groups bubbles by turn lifecycle, not only by the
@@ -5537,7 +5666,7 @@ function repairImportedSessionProjection(rolloutPath: string, cwd = homedir(), m
         workspace_roots: [cwd],
         model,
         source: OPENCODEX_MEMORY_TURN_ID,
-        import_projection_version: 3
+        import_projection_version: IMPORT_PROJECTION_VERSION
       }
     });
     reconstructed.push({
@@ -5564,7 +5693,7 @@ function repairImportedSessionProjection(rolloutPath: string, cwd = homedir(), m
       startTurn();
     }
 
-    const messageId = record.payload?.id || `import_${randomUUID()}`;
+    const messageId = nativeMessageId(record.payload?.id);
     const responseItem = {
       type: "response_item",
       payload: {
@@ -5628,7 +5757,14 @@ function appendImportedSessionProjection(
   projection.push({
     timestamp: new Date(baseTime).toISOString(),
     type: "turn_context",
-    payload: { turn_id: turnId, cwd, workspace_roots: [cwd], model, source: OPENCODEX_MEMORY_TURN_ID }
+    payload: {
+      turn_id: turnId,
+      cwd,
+      workspace_roots: [cwd],
+      model,
+      source: OPENCODEX_MEMORY_TURN_ID,
+      import_projection_version: IMPORT_PROJECTION_VERSION
+    }
   });
   projection.push({
     timestamp: new Date(baseTime).toISOString(),
@@ -5641,7 +5777,7 @@ function appendImportedSessionProjection(
     if (!["system", "developer", "user", "assistant"].includes(msg.role)) continue;
 
     const timestamp = new Date(baseTime + i * 1000).toISOString();
-    const msgId = msg.source_id || `msg_import_${randomUUID().replace(/-/g, "")}`;
+    const msgId = nativeMessageId(msg.source_id);
 
     // Codex Desktop reconstructs a thread from response_item records. The old
     // importer wrote only event_msg records, which made the imported thread
@@ -5695,6 +5831,63 @@ function appendImportedSessionProjection(
   // Keep the fallback path structurally identical to app-server injection:
   // the renderer needs one completed lifecycle per user turn to retain roles.
   repairImportedSessionProjection(rolloutPath, cwd, model);
+}
+
+function repairSessionProjectionForMode(rolloutPath: string, nativeMode: boolean): boolean {
+  let changed = repairImportedSessionProjection(rolloutPath);
+  if (!nativeMode || !existsSync(rolloutPath)) return changed;
+
+  let records: any[];
+  try {
+    records = readFileSync(rolloutPath, "utf-8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+  } catch {
+    return changed;
+  }
+
+  const normalizedIds = new Map<string, string>();
+  for (const record of records) {
+    const payload = record?.payload;
+    if (record?.type !== "response_item" || !payload || typeof payload.id !== "string") continue;
+
+    if (payload.type === "message" && !isNativeMessageId(payload.id)) {
+      const normalized = nativeMessageId(payload.id);
+      normalizedIds.set(payload.id, normalized);
+      payload.id = normalized;
+      changed = true;
+    } else if (payload.type === "function_call" && !isNativeFunctionCallId(payload.id)) {
+      const normalized = nativeFunctionCallId(payload.id);
+      normalizedIds.set(payload.id, normalized);
+      payload.id = normalized;
+      changed = true;
+    }
+  }
+
+  const sanitized = records.filter((record: any) => {
+    const payload = record?.payload;
+    const id = payload?.id || record?.id;
+    if (record?.type === "response_item"
+      && payload?.type === "reasoning"
+      && isGatewayLocalReasoningId(id)) {
+      changed = true;
+      return false;
+    }
+    if (record?.type === "event_msg"
+      && payload?.type === "user_message"
+      && typeof payload.client_id === "string"
+      && normalizedIds.has(payload.client_id)) {
+      payload.client_id = normalizedIds.get(payload.client_id);
+      changed = true;
+    }
+    return true;
+  });
+
+  if (changed) {
+    writeFileSync(rolloutPath, `${sanitized.map((item) => JSON.stringify(item)).join("\n")}\n`, "utf-8");
+  }
+  return changed;
 }
 
 async function updateImportedThreadState(threadId: string, preview: string): Promise<void> {

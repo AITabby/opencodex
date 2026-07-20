@@ -10,7 +10,4 @@ pm2 start /Users/aitabby/projects/opencodex/dist/server.js --name "opencodex" >>
 echo "[$(date)] Waiting for server to initialize..." >> /tmp/opencodex_startup.log
 sleep 2
 
-echo "[$(date)] Spawning OpenCodexBar via Terminal.app to inherit GUI and microphone permissions..." >> /tmp/opencodex_startup.log
-osascript -e 'tell application "Terminal" to do script "cd \"/Users/aitabby/projects/opencodex-bar\" && ./.build/arm64-apple-macosx/release/OpenCodexBar & disown && exit"' >> /tmp/opencodex_startup.log 2>&1
-
-echo "[$(date)] OpenCodex startup sequence complete." >> /tmp/opencodex_startup.log
+echo "[$(date)] OpenCodex startup sequence complete. Voice Bar remains stopped until launched from the dashboard." >> /tmp/opencodex_startup.log
