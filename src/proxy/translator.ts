@@ -250,9 +250,11 @@ export function responsesToChat(body: any, upstreamModel: string, sessionId?: st
     }
   }
 
+  const finalMessages = ensureToolCallIntegrity(sanitizedMessages);
+
   const chat: any = {
     model: upstreamModel,
-    messages: sanitizedMessages.length > 0 ? sanitizedMessages : [{ role: "user", content: " " }],
+    messages: finalMessages.length > 0 ? finalMessages : [{ role: "user", content: " " }],
     stream: body.stream ?? true,
   };
 
@@ -460,11 +462,19 @@ function _responsesInputToMessages(value: any): any[] {
         CURRENT_ACTIVE_APP = appMatch[1].replace(/\.app$/, "");
       }
 
-      messages.push({
-        role: "tool",
-        tool_call_id: item.call_id,
-        content: outputText,
-      });
+      const outputCallId = item.call_id || item.id || "";
+      if (outputCallId) {
+        messages.push({
+          role: "tool",
+          tool_call_id: outputCallId,
+          content: outputText,
+        });
+      } else {
+        // No call id to pair with — strict OpenAI-compatible upstreams
+        // reject tool messages with an empty tool_call_id, so deliver the
+        // output as plain user context instead.
+        messages.push({ role: "user", content: outputText || " " });
+      }
       flushDeferred();
     } else if (itemType === "reasoning") {
       flushPendingAssistantToolCalls();
@@ -601,6 +611,68 @@ function _sanitizeChatMessages(messages: any[]): any[] {
     cleaned.push(current);
   }
   return cleaned;
+}
+
+/**
+ * Reconcile tool messages with assistant tool_calls so the sequence is
+ * always valid for strict OpenAI-compatible upstreams (e.g. Kimi), which
+ * hard-fail the whole request when a tool_call_id is empty, unknown, or
+ * left without a response.
+ *
+ * The desktop may rewrite call ids on its side, so pairing is done first
+ * by exact id, then healed in call order. Tool outputs with no call at
+ * all are downgraded to plain user context; assistant tool_calls that
+ * end up without any response are removed from the request.
+ */
+export function ensureToolCallIntegrity(messages: any[]): any[] {
+  const result = messages.map((m) => ({ ...m }));
+  const pending: { msgIndex: number; callIndex: number; id: string }[] = [];
+
+  for (let i = 0; i < result.length; i++) {
+    const m = result[i];
+    if (!m) continue;
+    if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      m.tool_calls.forEach((tc: any, callIndex: number) => {
+        if (!tc || typeof tc !== "object") return;
+        if (typeof tc.id !== "string" || !tc.id) {
+          tc.id = `call_auto_${i}_${callIndex}`;
+        }
+        pending.push({ msgIndex: i, callIndex, id: tc.id });
+      });
+    } else if (m.role === "tool") {
+      const id = typeof m.tool_call_id === "string" ? m.tool_call_id : "";
+      let hitIndex = id ? pending.findIndex((p) => p.id === id) : -1;
+      if (hitIndex >= 0) {
+        pending.splice(hitIndex, 1);
+        continue;
+      }
+      // Heal by call order: the desktop executes calls in order and lists
+      // outputs in the same order, so pair with the oldest unanswered call.
+      const next = pending.shift();
+      if (next) {
+        m.tool_call_id = next.id;
+      } else {
+        // No outstanding call — strict upstreams reject this message, so
+        // deliver the output as plain user context instead.
+        const content = typeof m.content === "string" ? m.content : _contentToText(m.content);
+        result[i] = { role: "user", content: content || " " };
+      }
+    }
+  }
+
+  // Any assistant tool_call still without a response must not reach the
+  // upstream; drop it (and the tool_calls array if it becomes empty).
+  for (const p of pending) {
+    const m = result[p.msgIndex];
+    if (m && m.role === "assistant" && Array.isArray(m.tool_calls)) {
+      m.tool_calls = m.tool_calls.filter((tc: any) => tc && tc.id !== p.id);
+      if (m.tool_calls.length === 0) {
+        delete m.tool_calls;
+        if (m.content === null || m.content === undefined) m.content = " ";
+      }
+    }
+  }
+  return result;
 }
 
 function _normalizeChatRoles(messages: any[]): any[] {
@@ -769,7 +841,10 @@ export class ResponsesStreamState {
     for (const key of Object.keys(this.toolCalls).map(Number).sort((a, b) => a - b)) {
       const tc = this.toolCalls[key];
       toolCalls.push({
-        id: tc.id,
+        // History is replayed to the upstream chat API, where the id must
+        // be the call id that later tool messages reference, not the
+        // responses-protocol item id (fc_...).
+        id: tc.call_id || tc.id,
         type: "function",
         function: {
           name: tc.name,

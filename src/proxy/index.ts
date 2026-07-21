@@ -33,7 +33,8 @@ import {
   extractNamespaceMap,
   ResponsesStreamState,
   processVisionBridge,
-  customResponseIds
+  customResponseIds,
+  ensureToolCallIntegrity
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
@@ -4943,6 +4944,9 @@ stream_idle_timeout_ms = 600000
       }
       return m;
     });
+    // Replayed history can contain tool outputs whose originating call is
+    // gone (truncation, aborted turns); strict upstreams reject those.
+    chatBody.messages = ensureToolCallIntegrity(chatBody.messages);
 
     // Sanitize empty/null content fields for MiniMax model
     if (mappedModelName.toLowerCase().includes("minimax")) {
