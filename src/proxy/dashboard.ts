@@ -1350,6 +1350,7 @@ export function getDashboardHtml(): string {
         btnClear: "Clear",
         connectingSse: "Connecting to Live SSE logs stream...",
         toastConfigSaved: "API key and model saved successfully!",
+        toastNameCollision: "Warning: {names} collides with an official model name and may be shadowed by it. Rename the custom model to guarantee custom routing.",
         toastConfigFailed: "Failed to save configs",
         toastConnFailed: "Failed to connect to backend",
         toastModelsSaved: "Codex dropdown selector list updated!",
@@ -1442,6 +1443,7 @@ export function getDashboardHtml(): string {
         btnClear: "清空日志",
         connectingSse: "正在连接实时日志流...",
         toastConfigSaved: "API 密钥和模型配置已保存！",
+        toastNameCollision: "警告：{names} 与官方模型同名，可能被官方模型覆盖。建议重命名自定义模型以确保走自定义渠道。",
         toastConfigFailed: "保存配置失败",
         toastConnFailed: "连接后端失败",
         toastModelsSaved: "Codex 下拉框模型列表更新成功！",
@@ -1822,7 +1824,11 @@ export function getDashboardHtml(): string {
         });
         
         if (response.ok) {
+          const result = await response.json().catch(() => ({}));
           showToast(i18nDict[currentLang].toastConfigSaved);
+          if (Array.isArray(result.name_collisions) && result.name_collisions.length > 0) {
+            showToast(i18nDict[currentLang].toastNameCollision.replace('{names}', result.name_collisions.join(', ')), true);
+          }
           // Clear form inputs immediately
           document.getElementById('new-model-name').value = '';
           document.getElementById('new-base-url').value = '';

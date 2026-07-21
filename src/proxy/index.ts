@@ -1781,6 +1781,25 @@ stream_idle_timeout_ms = 600000
           console.log(`[OpenCodex] Saved models from input: ${data.models.length} total.`);
         }
 
+        // Warn when a custom model reuses an official model name: the official
+        // catalog entry shadows the custom routing, so the custom provider
+        // would never receive these requests.
+        const collisionWarnings: string[] = [];
+        if (Array.isArray(data.models)) {
+          const seen = new Set<string>();
+          for (const id of data.models) {
+            const raw = String(id || "");
+            const sep = raw.indexOf(":");
+            if (sep < 0) continue; // official entries are bare slugs
+            const slug = raw.slice(sep + 1).trim();
+            if (!slug || seen.has(slug)) continue;
+            seen.add(slug);
+            if (isOfficialCatalogModel({ slug })) {
+              collisionWarnings.push(slug);
+            }
+          }
+        }
+
         // Clean up unused blank providers
         const catalog = this.getModelCatalog();
         const activeProviders = new Set<string>();
@@ -1810,7 +1829,7 @@ stream_idle_timeout_ms = 600000
           this.restartCodexDesktop();
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", restarted: !!data.restart && enablesGateway, gateway_active: enablesGateway || !isNativeModeEnabled() }));
+        res.end(JSON.stringify({ status: "success", restarted: !!data.restart && enablesGateway, gateway_active: enablesGateway || !isNativeModeEnabled(), name_collisions: collisionWarnings }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
