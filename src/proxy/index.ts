@@ -1669,7 +1669,13 @@ stream_idle_timeout_ms = 600000
       }
     } else if (contentEncoding === "zstd") {
       try {
-        decompressedBody = execSync("zstd -d", { input: rawBody });
+        if (typeof (zlib as any).zstdDecompressSync === "function") {
+          // Node ≥ 22.15: native zstd, no subprocess buffer limit
+          decompressedBody = (zlib as any).zstdDecompressSync(rawBody);
+        } else {
+          // Fallback: zstd CLI with a generous maxBuffer (default 1MB is too small)
+          decompressedBody = execSync("zstd -d", { input: rawBody, maxBuffer: 256 * 1024 * 1024 });
+        }
       } catch (err: any) {
         console.error("[OpenCodex] Failed to zstd decompress body:", err.message);
       }
