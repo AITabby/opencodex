@@ -771,7 +771,9 @@ except Exception as e:
             ...existing,
             slug: slug,
             model: slug,
-            backend_model: backendModel,
+            // Keep a previously customized backend_model unless the entry
+            // explicitly remaps it via "slug->backend" / "slug=backend".
+            backend_model: separator ? backendModel : (existing.backend_model || backendModel),
             provider: "opencodex",
             backend_provider: provider || existing.backend_provider || existing.provider
           });
