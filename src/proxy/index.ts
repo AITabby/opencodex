@@ -33,7 +33,9 @@ import {
   extractNamespaceMap,
   ResponsesStreamState,
   processVisionBridge,
-  customResponseIds
+  customResponseIds,
+  encodeLocalCompaction,
+  localCompactionMessage
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
@@ -588,6 +590,68 @@ except Exception as e:
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to save config: ${err.message}`);
     }
+  }
+
+  /**
+   * Serve a remote-compaction-v2 request without OpenAI's server: summarize
+   * the locally tracked session history via the chat upstream, replace the
+   * session history with the summary (this is what actually shrinks future
+   * requests), and emit exactly one `compaction` output item whose blob only
+   * this proxy can decode (see translator.ts). If the summarize call itself
+   * fails — e.g. the history already exceeds the upstream window — degrade
+   * to local truncation so the client still gets a valid compaction turn.
+   */
+  private async serveLocalCompaction(
+    streamState: ResponsesStreamState,
+    emit: (payload: any) => Promise<void>,
+    provider: any,
+    apiKey: string,
+    mappedModelName: string,
+    sessionIdStr: string,
+    history: any[]
+  ): Promise<void> {
+    const instruction = "You are a compaction assistant. Summarize the conversation so far into a compact brief that preserves: the user's goal, key decisions, files/code changed, errors encountered and fixes applied, and the current state with next steps. Reply in the same language as the conversation. Be concise but complete.";
+    let summary = "";
+    let usage: { input_tokens: number, output_tokens: number, total_tokens: number } | undefined;
+    try {
+      const messages = [
+        { role: "system", content: instruction },
+        ...history.filter((m: any) => m.role !== "system"),
+        { role: "user", content: "Summarize the conversation above now." }
+      ];
+      const abort = new AbortController();
+      const timeout = setTimeout(() => abort.abort(), 120000);
+      const resp = await fetch(`${provider.base_url}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model: mappedModelName, messages, stream: false }),
+        signal: abort.signal,
+        dispatcher: fetchDispatcher
+      } as any);
+      clearTimeout(timeout);
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`upstream ${resp.status}: ${errText.slice(0, 200)}`);
+      }
+      const data: any = await resp.json();
+      summary = String(data?.choices?.[0]?.message?.content || "").trim();
+      if (!summary) throw new Error("upstream returned an empty summary");
+      if (data.usage) {
+        usage = {
+          input_tokens: data.usage.prompt_tokens || 0,
+          output_tokens: data.usage.completion_tokens || 0,
+          total_tokens: data.usage.total_tokens || 0
+        };
+      }
+      this.customConversationHistory.set(sessionIdStr, [localCompactionMessage(summary)]);
+      console.log(`[OpenCodex] Local compaction served: summarized history (${summary.length} chars) for session ${sessionIdStr}`);
+    } catch (err: any) {
+      console.warn(`[OpenCodex] Compaction summary via upstream failed (${err.message}); falling back to local truncation.`);
+      const tail = history.filter((m: any) => m.role !== "system").slice(-12);
+      summary = "[Earlier conversation was truncated locally because it exceeded the model context window.]";
+      this.customConversationHistory.set(sessionIdStr, [localCompactionMessage(summary), ...tail]);
+    }
+    await streamState.finishWithCompaction(emit, encodeLocalCompaction(summary), usage);
   }
 
   private getModelCatalog(): any {
@@ -4879,6 +4943,23 @@ stream_idle_timeout_ms = 600000
       isPrewarm = true;
     }
 
+    // Remote compaction v2 asks the server for exactly one `compaction`
+    // output item — a shape only OpenAI's backend produces. Detect the
+    // trigger so chat-completions upstreams can be served via a local
+    // summarization bridge instead of failing client-side validation.
+    const compactionInputTypes = new Set<string>();
+    if (Array.isArray(reqBody.input)) {
+      for (const it of reqBody.input) {
+        const t = it && typeof it === "object" ? String(it.type || "") : "";
+        if (t.includes("compaction")) compactionInputTypes.add(t);
+      }
+    }
+    if (compactionInputTypes.size > 0) {
+      console.log(`[OpenCodex WS Proxy] Compaction-related input items: ${Array.from(compactionInputTypes).join(", ")}`);
+    }
+    const isCompactionRequest = compactionInputTypes.has("compaction_trigger")
+      || (Array.isArray(reqBody.input) && reqBody.input.some((it: any) => it && typeof it === "object" && it.type === "context_compaction" && !it.encrypted_content));
+
 
 
     try {
@@ -5001,6 +5082,19 @@ stream_idle_timeout_ms = 600000
         await streamState.finish(async (payload) => {
           broadcastToClients(payload);
         });
+        return;
+      }
+      if (isCompactionRequest) {
+        console.log(`[OpenCodex WS Proxy] Serving remote compaction locally for session ${sessionIdStr}...`);
+        await this.serveLocalCompaction(
+          streamState,
+          async (payload) => { broadcastToClients(payload); },
+          provider,
+          apiKey,
+          mappedModelName,
+          sessionIdStr,
+          chatBody.messages
+        );
         return;
       }
     }

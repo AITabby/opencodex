@@ -475,6 +475,19 @@ function _responsesInputToMessages(value: any): any[] {
         summary: item.summary || [],
         content: null,
       });
+    } else if (itemType === "compaction" || itemType === "context_compaction") {
+      // Locally synthesized compaction blob → restore the summary as plain
+      // context. Foreign (official server) blobs cannot be decoded here and
+      // are dropped; the proxy-side session history is authoritative.
+      const summary = decodeLocalCompaction(item.encrypted_content);
+      if (summary) {
+        flushPendingAssistantToolCalls();
+        flushDeferred();
+        messages.push(localCompactionMessage(summary));
+      }
+    } else if (itemType === "compaction_trigger") {
+      // Marker consumed by the WS handler to serve local compaction;
+      // it is not conversational content.
     }
   }
   flushPendingAssistantToolCalls();
@@ -601,6 +614,32 @@ function _sanitizeChatMessages(messages: any[]): any[] {
     cleaned.push(current);
   }
   return cleaned;
+}
+
+// ─── Local compaction bridge ───
+// Remote compaction v2 expects exactly one `compaction` output item, which
+// only OpenAI's server can generate. For chat-completions upstreams the
+// proxy summarizes the locally tracked history itself and emits a
+// proxy-defined blob; later requests carrying that blob are decoded back
+// into a plain context message here.
+const LOCAL_COMPACTION_PREFIX = "ocmp1.";
+
+export function encodeLocalCompaction(summary: string): string {
+  return LOCAL_COMPACTION_PREFIX + Buffer.from(JSON.stringify({ v: 1, summary }), "utf-8").toString("base64");
+}
+
+export function decodeLocalCompaction(encrypted: unknown): string | null {
+  if (typeof encrypted !== "string" || !encrypted.startsWith(LOCAL_COMPACTION_PREFIX)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(encrypted.slice(LOCAL_COMPACTION_PREFIX.length), "base64").toString("utf-8"));
+    return typeof parsed?.summary === "string" && parsed.summary.trim() ? parsed.summary : null;
+  } catch {
+    return null;
+  }
+}
+
+export function localCompactionMessage(summary: string): any {
+  return { role: "user", content: `[Conversation summary]\n${summary}` };
 }
 
 function _normalizeChatRoles(messages: any[]): any[] {
@@ -848,6 +887,54 @@ export class ResponsesStreamState {
               total_tokens: usage.total_tokens
             },
             model_context_window: finalResp.usage?.model_context_window || 200000
+          }
+        }
+      });
+    }
+  }
+
+  // Emit exactly one `compaction` output item — the shape remote compaction
+  // v2 validates on the client — carrying the proxy-defined summary blob.
+  async finishWithCompaction(writeSse: (payload: any) => Promise<void>, encryptedContent: string, usage?: { input_tokens: number, output_tokens: number, total_tokens: number }): Promise<void> {
+    const wrapped = this._wrap(writeSse);
+    const item = {
+      id: `cmp_${generateRandomHex(24)}`,
+      type: "compaction",
+      encrypted_content: encryptedContent,
+    };
+    const outputIndex = this.nextOutputIndex;
+    this.nextOutputIndex += 1;
+    await wrapped({ type: "response.output_item.added", item, output_index: outputIndex });
+    await wrapped({ type: "response.output_item.done", item, output_index: outputIndex });
+    if (this.onTextDone) {
+      try { this.onTextDone(this.messageText); } catch {}
+    }
+    const finalResp = this._response("completed", false, usage);
+    finalResp.output = [item];
+    finalResp.completed_at = Math.floor(Date.now() / 1000);
+    await wrapped({ type: "response.completed", response: finalResp });
+    await wrapped({ type: "response.done", response: finalResp });
+    if (usage) {
+      await wrapped({
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            last_token_usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: 0,
+              output_tokens: usage.output_tokens,
+              reasoning_output_tokens: 0,
+              total_tokens: usage.total_tokens
+            },
+            model_context_window: 200000
           }
         }
       });
