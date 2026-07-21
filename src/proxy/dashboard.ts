@@ -448,6 +448,25 @@ export function getDashboardHtml(): string {
       background: rgba(239, 68, 68, 0.3);
     }
 
+    .model-edit-btn {
+      background: rgba(6, 182, 212, 0.12);
+      border: 1px solid rgba(6, 182, 212, 0.3);
+      color: var(--color-secondary);
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: var(--transition-standard);
+      flex-shrink: 0;
+    }
+    .model-edit-btn:hover {
+      background: rgba(6, 182, 212, 0.28);
+    }
+
     /* Actions Button */
     .action-btn {
       background: linear-gradient(135deg, var(--color-primary), var(--color-secondary));
@@ -1229,6 +1248,41 @@ export function getDashboardHtml(): string {
     </div>
   </div>
 
+  <div class="modal-overlay" id="edit-model-modal">
+    <div class="modal-box" style="width: 400px; max-width: 92%; text-align: left;">
+      <h3 style="margin-bottom: 0.4rem; font-weight: 600; font-size: 1.05rem; color: var(--color-text);">编辑模型 / Edit Model</h3>
+      <p id="edit-model-slug" style="margin-bottom: 1rem; font-size: 0.75rem; color: var(--color-text-muted); font-family: 'JetBrains Mono', monospace;"></p>
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label style="display:block; margin-bottom: 0.35rem; font-size: 0.85rem; color: var(--color-text);">显示名称 / Display Name</label>
+        <input type="text" id="edit-model-display-name" placeholder="Kimi K3" style="width: 100%;">
+        <p style="font-size: 0.72rem; color: var(--color-text-muted); margin-top: 0.3rem;">在 Codex Desktop 下拉菜单中显示的名字。</p>
+      </div>
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label style="display:block; margin-bottom: 0.35rem; font-size: 0.85rem; color: var(--color-text);">上游模型 ID / Upstream Model ID</label>
+        <input type="text" id="edit-model-backend-model" placeholder="k3" style="width: 100%;">
+        <p style="font-size: 0.72rem; color: var(--color-text-muted); margin-top: 0.3rem;">实际发给上游 API 的 model 字段，需与服务商要求的模型 ID 一致。</p>
+      </div>
+      <div class="form-group" style="margin-bottom: 1rem;">
+        <label style="display:block; margin-bottom: 0.35rem; font-size: 0.85rem; color: var(--color-text);">接口地址 / Base URL</label>
+        <input type="text" id="edit-model-base-url" placeholder="https://api.example.com/v1" style="width: 100%;">
+      </div>
+      <div class="form-group" style="margin-bottom: 0.5rem;">
+        <label style="display:block; margin-bottom: 0.35rem; font-size: 0.85rem; color: var(--color-text);">API Key</label>
+        <div class="input-wrapper">
+          <input type="password" id="edit-model-api-key" placeholder="sk-..." style="width: 100%;">
+          <button type="button" class="toggle-visibility" onclick="togglePass('edit-model-api-key')">
+            <svg style="width: 20px; height: 20px;" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/></svg>
+          </button>
+        </div>
+        <p style="font-size: 0.72rem; color: var(--color-text-muted); margin-top: 0.3rem;">接口地址和 Key 属于 provider 配置，修改后对该 provider 下所有模型生效。</p>
+      </div>
+      <div class="modal-actions" style="margin-top: 1.25rem;">
+        <button class="modal-btn-cancel" onclick="document.getElementById('edit-model-modal').classList.remove('show')">取消 / Cancel</button>
+        <button class="modal-btn-confirm" onclick="saveEditModel()">保存 / Save</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="export-modal">
     <div class="modal-box" style="width: 320px; max-width: 90%;">
       <h3 style="margin-bottom: 1rem; font-weight: 600; font-size: 1.1rem; color: var(--color-text);">📤 导出对话历史 / Export Chat History</h3>
@@ -1296,6 +1350,7 @@ export function getDashboardHtml(): string {
         btnClear: "Clear",
         connectingSse: "Connecting to Live SSE logs stream...",
         toastConfigSaved: "API key and model saved successfully!",
+        toastNameCollision: "Warning: {names} collides with an official model name and may be shadowed by it. Rename the custom model to guarantee custom routing.",
         toastConfigFailed: "Failed to save configs",
         toastConnFailed: "Failed to connect to backend",
         toastModelsSaved: "Codex dropdown selector list updated!",
@@ -1388,6 +1443,7 @@ export function getDashboardHtml(): string {
         btnClear: "清空日志",
         connectingSse: "正在连接实时日志流...",
         toastConfigSaved: "API 密钥和模型配置已保存！",
+        toastNameCollision: "警告：{names} 与官方模型同名，可能被官方模型覆盖。建议重命名自定义模型以确保走自定义渠道。",
         toastConfigFailed: "保存配置失败",
         toastConnFailed: "连接后端失败",
         toastModelsSaved: "Codex 下拉框模型列表更新成功！",
@@ -1471,6 +1527,9 @@ export function getDashboardHtml(): string {
     let activeSessionId = '';
     let configData = { providers: [] };
     let gatewayModeActive = false;
+    let modelsCache = [];
+    let providersCache = [];
+    let editingModelId = null;
 
     function setGatewayUiState(active) {
       gatewayModeActive = !!active;
@@ -1638,6 +1697,8 @@ export function getDashboardHtml(): string {
         }
 
         const activeIds = new Set(data.active || []);
+        modelsCache = data.catalog || [];
+        providersCache = data.providers || [];
         
         (data.catalog || []).forEach(m => {
           const isActive = activeIds.has(m.id);
@@ -1649,7 +1710,7 @@ export function getDashboardHtml(): string {
           const item = document.createElement('div');
           item.className = 'model-item';
           item.onclick = (e) => {
-            if (e.target.type !== 'checkbox' && !e.target.classList.contains('model-delete-btn') && !e.target.closest('label')) {
+            if (e.target.type !== 'checkbox' && !e.target.classList.contains('model-delete-btn') && !e.target.classList.contains('model-edit-btn') && !e.target.closest('label')) {
               const cb = item.querySelector('.model-checkbox');
               cb.checked = !cb.checked;
             }
@@ -1661,7 +1722,7 @@ export function getDashboardHtml(): string {
               <input type="checkbox" class="model-checkbox" data-id="\${m.id}" \x24{isActive ? 'checked' : ''}>
               <div class="model-info">
                 <div class="model-display-name">\${m.display_name}</div>
-                <div class="model-slug">\${m.model}</div>
+                <div class="model-slug">\${m.model}\${m.backend_model && m.backend_model !== m.model ? ' → ' + m.backend_model : ''}</div>
               </div>
             </div>
             <div style="display:flex;align-items:center;gap:0.75rem;">
@@ -1674,6 +1735,7 @@ export function getDashboardHtml(): string {
                 <span>Vision Bridge</span>
               </label>
               \${badgeHtml}
+              <button class="model-edit-btn" onclick="openEditModel('\${m.id}')" title="编辑">✎</button>
               <button class="model-delete-btn" onclick="deleteModel('\${m.id}')" title="删除">✕</button>
             </div>
           \`;
@@ -1762,7 +1824,11 @@ export function getDashboardHtml(): string {
         });
         
         if (response.ok) {
+          const result = await response.json().catch(() => ({}));
           showToast(i18nDict[currentLang].toastConfigSaved);
+          if (Array.isArray(result.name_collisions) && result.name_collisions.length > 0) {
+            showToast(i18nDict[currentLang].toastNameCollision.replace('{names}', result.name_collisions.join(', ')), true);
+          }
           // Clear form inputs immediately
           document.getElementById('new-model-name').value = '';
           document.getElementById('new-base-url').value = '';
@@ -1990,6 +2056,51 @@ export function getDashboardHtml(): string {
         }
       } catch (e) {
         showToast(e.message, true);
+      }
+    }
+
+    function openEditModel(id) {
+      const m = (modelsCache || []).find(x => x.id === id);
+      if (!m) {
+        showToast(currentLang === 'zh' ? '未找到模型' : 'Model not found', true);
+        return;
+      }
+      editingModelId = id;
+      document.getElementById('edit-model-slug').innerText = id + (m.provider ? '  ·  ' + m.provider : '');
+      document.getElementById('edit-model-display-name').value = m.display_name || '';
+      document.getElementById('edit-model-backend-model').value = m.backend_model || m.model || '';
+      const prov = (providersCache || []).find(p => p.name === (m.backend_provider || m.provider)) || {};
+      document.getElementById('edit-model-base-url').value = prov.base_url || '';
+      document.getElementById('edit-model-api-key').value = prov.api_key || '';
+      document.getElementById('edit-model-modal').classList.add('show');
+    }
+
+    async function saveEditModel() {
+      if (!editingModelId) return;
+      const displayName = document.getElementById('edit-model-display-name').value.trim();
+      const backendModel = document.getElementById('edit-model-backend-model').value.trim();
+      const baseUrl = document.getElementById('edit-model-base-url').value.trim();
+      const apiKey = document.getElementById('edit-model-api-key').value.trim();
+      if (!displayName || !backendModel || !baseUrl || !apiKey) {
+        showToast(currentLang === 'zh' ? '请填写所有字段' : 'Please fill all fields', true);
+        return;
+      }
+      try {
+        const response = await fetch('/api/models/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: editingModelId, display_name: displayName, backend_model: backendModel, base_url: baseUrl, api_key: apiKey })
+        });
+        if (response.ok) {
+          document.getElementById('edit-model-modal').classList.remove('show');
+          showToast(currentLang === 'zh' ? '模型配置已更新' : 'Model updated');
+          loadModels();
+        } else {
+          const err = await response.json().catch(() => ({}));
+          showToast((currentLang === 'zh' ? '更新失败: ' : 'Update failed: ') + (err.error || response.status), true);
+        }
+      } catch (err) {
+        showToast(i18nDict[currentLang].toastConnFailed, true);
       }
     }
 

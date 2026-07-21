@@ -115,6 +115,7 @@ interface ProviderConfig {
   name: string;
   base_url: string;
   api_key: string;
+  api_keys?: string[];
   vision_model?: string;
 }
 
@@ -770,7 +771,9 @@ except Exception as e:
             ...existing,
             slug: slug,
             model: slug,
-            backend_model: backendModel,
+            // Keep a previously customized backend_model unless the entry
+            // explicitly remaps it via "slug->backend" / "slug=backend".
+            backend_model: separator ? backendModel : (existing.backend_model || backendModel),
             provider: "opencodex",
             backend_provider: provider || existing.backend_provider || existing.provider
           });
@@ -1780,6 +1783,25 @@ stream_idle_timeout_ms = 600000
           console.log(`[OpenCodex] Saved models from input: ${data.models.length} total.`);
         }
 
+        // Warn when a custom model reuses an official model name: the official
+        // catalog entry shadows the custom routing, so the custom provider
+        // would never receive these requests.
+        const collisionWarnings: string[] = [];
+        if (Array.isArray(data.models)) {
+          const seen = new Set<string>();
+          for (const id of data.models) {
+            const raw = String(id || "");
+            const sep = raw.indexOf(":");
+            if (sep < 0) continue; // official entries are bare slugs
+            const slug = raw.slice(sep + 1).trim();
+            if (!slug || seen.has(slug)) continue;
+            seen.add(slug);
+            if (isOfficialCatalogModel({ slug })) {
+              collisionWarnings.push(slug);
+            }
+          }
+        }
+
         // Clean up unused blank providers
         const catalog = this.getModelCatalog();
         const activeProviders = new Set<string>();
@@ -1809,7 +1831,7 @@ stream_idle_timeout_ms = 600000
           this.restartCodexDesktop();
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "success", restarted: !!data.restart && enablesGateway, gateway_active: enablesGateway || !isNativeModeEnabled() }));
+        res.end(JSON.stringify({ status: "success", restarted: !!data.restart && enablesGateway, gateway_active: enablesGateway || !isNativeModeEnabled(), name_collisions: collisionWarnings }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1843,9 +1865,16 @@ stream_idle_timeout_ms = 600000
           id: m.slug,
           model: m.model,
           provider: m.provider || "",
+          backend_provider: m.backend_provider || "",
           display_name: m.display_name,
+          backend_model: m.backend_model || "",
           no_image_support: m.input_modalities ? !m.input_modalities.includes("image") : true,
           vision_bridge_enabled: !!m.vision_bridge_enabled
+        })),
+        providers: (this.config.providers || []).map((p: any) => ({
+          name: p.name,
+          base_url: p.base_url || "",
+          api_key: p.api_key || ""
         })),
         active
       }));
@@ -1898,6 +1927,59 @@ stream_idle_timeout_ms = 600000
         }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "success" }));
+      } catch (err: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+      return;
+    }
+
+    if (path === "/api/models/update" && req.method === "POST") {
+      try {
+        const data = JSON.parse(body);
+        const slug = String(data.id || "");
+        const catalog = this.getModelCatalog();
+        const entry = (catalog.models || []).find((m: any) => m.slug === slug || m.model === slug);
+        if (!entry) {
+          res.writeHead(404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: `Model not found: ${slug}` }));
+          return;
+        }
+        if (isOfficialCatalogModel(entry)) {
+          res.writeHead(403, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Official models cannot be edited" }));
+          return;
+        }
+        if (typeof data.display_name === "string" && data.display_name.trim()) {
+          entry.display_name = data.display_name.trim();
+        }
+        if (typeof data.backend_model === "string" && data.backend_model.trim()) {
+          entry.backend_model = data.backend_model.trim();
+        }
+        this.saveModelCatalog(catalog);
+
+        // Optionally update the backing provider's endpoint/credentials.
+        const providerName = entry.backend_provider || entry.provider;
+        const provider = (this.config.providers || []).find((p: any) => p.name === providerName);
+        let providerUpdated = false;
+        if (provider) {
+          if (typeof data.base_url === "string" && data.base_url.trim()) {
+            provider.base_url = data.base_url.trim();
+            providerUpdated = true;
+          }
+          if (typeof data.api_key === "string" && data.api_key.trim()) {
+            provider.api_key = data.api_key.trim();
+            delete provider.api_keys;
+            providerUpdated = true;
+          }
+          if (providerUpdated) {
+            this.saveConfig();
+            this.loadConfig();
+          }
+        }
+        console.log(`[OpenCodex] Updated model: ${slug} (display_name=${entry.display_name}, backend_model=${entry.backend_model}, provider=${providerName}${providerUpdated ? " updated" : ""})`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "success", provider_updated: providerUpdated }));
       } catch (err: any) {
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
