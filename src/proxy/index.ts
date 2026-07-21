@@ -33,7 +33,8 @@ import {
   extractNamespaceMap,
   ResponsesStreamState,
   processVisionBridge,
-  customResponseIds
+  customResponseIds,
+  ensureToolCallIntegrity
 } from "./translator.js";
 
 import { getDashboardHtml } from "./dashboard.js";
@@ -285,13 +286,38 @@ export class ProxyServer {
     this.startVADDaemon();
   }
 
+  private resolveVadPython(): string {
+    // The VAD daemon needs torch + silero_vad, which may only exist in a
+    // specific interpreter. Probe candidates once and use the first that
+    // can import both; OPENCODEX_PYTHON overrides the search.
+    const candidates = [
+      process.env.OPENCODEX_PYTHON,
+      "python3",
+      "/usr/bin/python3",
+      "/opt/homebrew/bin/python3",
+    ].filter((c): c is string => !!c);
+    for (const candidate of candidates) {
+      try {
+        const probe = spawnSync(candidate, ["-c", "import torch, silero_vad"], { timeout: 30000 });
+        if (probe.status === 0) return candidate;
+      } catch {}
+    }
+    return "python3";
+  }
+
   private startVADDaemon() {
     if (this.vadProcess) return;
 
-    const scriptPath = "/Users/aitabby/projects/opencodex/src/proxy/silero_vad_daemon.py";
-    console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const scriptPath = join(moduleDir, "../../src/proxy/silero_vad_daemon.py");
+    if (!existsSync(scriptPath)) {
+      console.error(`[OpenCodex VAD] Daemon script not found at ${scriptPath}; voice VAD disabled.`);
+      return;
+    }
+    const pythonBin = this.resolveVadPython();
+    console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath} (python: ${pythonBin})`);
 
-    this.vadProcess = spawn("python3", [scriptPath]);
+    this.vadProcess = spawn(pythonBin, [scriptPath]);
     this.vadStdoutBuffer = "";
     this.vadCallbackQueue = [];
 
@@ -1669,7 +1695,13 @@ stream_idle_timeout_ms = 600000
       }
     } else if (contentEncoding === "zstd") {
       try {
-        decompressedBody = execSync("zstd -d", { input: rawBody });
+        if (typeof (zlib as any).zstdDecompressSync === "function") {
+          // Node ≥ 22.15: native zstd, no subprocess buffer limit
+          decompressedBody = (zlib as any).zstdDecompressSync(rawBody);
+        } else {
+          // Fallback: zstd CLI with a generous maxBuffer (default 1MB is too small)
+          decompressedBody = execSync("zstd -d", { input: rawBody, maxBuffer: 256 * 1024 * 1024 });
+        }
       } catch (err: any) {
         console.error("[OpenCodex] Failed to zstd decompress body:", err.message);
       }
@@ -4220,9 +4252,10 @@ stream_idle_timeout_ms = 600000
   private desktopWsClients = new Set<WebSocket>();
 
   private logWSPacket(direction: "IN" | "OUT", payload: any, sessionId?: string) {
+    if (!process.env.OPENCODEX_DEBUG_WS) return;
     const line = `[${new Date().toISOString()}] [${direction}] [Session: ${sessionId || "unknown"}] ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n`;
     try {
-      appendFileSync("/Users/aitabby/projects/opencodex/ws_packets.log", line, "utf-8");
+      appendFileSync(join(this.configDir, "ws_packets.log"), line, "utf-8");
     } catch (e) {}
   }
   private activeConnectionsBySession = new Map<string, {
@@ -4881,9 +4914,11 @@ stream_idle_timeout_ms = 600000
 
 
 
-    try {
-      writeFileSync("/Users/aitabby/projects/opencodex/debug_req.json", JSON.stringify(reqBody, null, 2), "utf-8");
-    } catch (e) {}
+    if (process.env.OPENCODEX_DEBUG_WS) {
+      try {
+        writeFileSync(join(this.configDir, "debug_req.json"), JSON.stringify(reqBody, null, 2), "utf-8");
+      } catch (e) {}
+    }
     const catalog = this.getModelCatalog();
     let catalogEntry = catalog.models?.find((m: any) => m.slug === requestedModel);
     
@@ -4937,6 +4972,9 @@ stream_idle_timeout_ms = 600000
       }
       return m;
     });
+    // Replayed history can contain tool outputs whose originating call is
+    // gone (truncation, aborted turns); strict upstreams reject those.
+    chatBody.messages = ensureToolCallIntegrity(chatBody.messages);
 
     // Sanitize empty/null content fields for MiniMax model
     if (mappedModelName.toLowerCase().includes("minimax")) {
