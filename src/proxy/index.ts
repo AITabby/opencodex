@@ -6,11 +6,11 @@
  */
 
 import http from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync, appendFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, statSync, rmSync, appendFileSync, watch, watchFile, openSync, readSync, closeSync, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { exec, spawn, spawnSync, execSync } from "node:child_process";
+import { exec, spawn, spawnSync, execSync, execFileSync } from "node:child_process";
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
 // @ts-ignore
@@ -50,6 +50,8 @@ import {
 import { parseMemoryFile, parseMemoryFilePath } from "./memory_file_import.js";
 import { scanLocalMemorySources, type ScannedMemorySource } from "./memory_source_scanner.js";
 import { withCodexAppServer } from "./codex_app_server.js";
+import { TaskEventBus, type CodexTaskEvent, type CodexTaskSource, type CodexTaskState } from "./task_events.js";
+import { TaskEventRelay, parseRelayKey } from "./task_event_relay.js";
 
 export function isNativeModeEnabled(): boolean {
   const tomlPath = join(homedir(), ".codex", "config.toml");
@@ -82,6 +84,35 @@ function nativeFunctionCallId(value: unknown): string {
   return isNativeFunctionCallId(value)
     ? String(value)
     : `fc_import_${randomUUID().replace(/-/g, "")}`;
+}
+
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "::1"]);
+
+function isAllowedLocalHost(hostHeader: string | undefined): boolean {
+  if (!hostHeader) return false;
+  const rawHost = hostHeader.trim().toLowerCase();
+  if (!rawHost) return false;
+
+  // URL.hostname handles both `localhost:8765` and `[::1]:8765` safely.
+  try {
+    const hostname = new URL(`http://${rawHost}`).hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return LOCAL_HOSTNAMES.has(hostname);
+  } catch {
+    return false;
+  }
+}
+
+function getAllowedLocalOrigin(originHeader: string | undefined, allowedPort: number): string | null {
+  if (!originHeader) return null;
+  try {
+    const origin = new URL(originHeader);
+    if (origin.protocol !== "http:" && origin.protocol !== "https:") return null;
+    if (origin.port !== String(allowedPort)) return null;
+    const hostname = origin.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+    return LOCAL_HOSTNAMES.has(hostname) ? origin.origin : null;
+  } catch {
+    return null;
+  }
 }
 
 // ResponsesStreamState creates these IDs locally for third-party responses.
@@ -139,11 +170,38 @@ const THIRD_PARTY_REASONING_LEVELS = [
 const THIRD_PARTY_SERVICE_TIERS = [
   { id: "priority", name: "Fast", description: "1.5x speed, increased usage" }
 ];
+const THIRD_PARTY_MODEL_PRIORITY = 100;
+
+function readAntigravityOAuthClient(): { clientId: string; clientSecret: string } | null {
+  const clientId = process.env.OPENCODEX_ANTIGRAVITY_OAUTH_CLIENT_ID?.trim();
+  const clientSecret = process.env.OPENCODEX_ANTIGRAVITY_OAUTH_CLIENT_SECRET?.trim();
+  if (clientId && clientSecret) return { clientId, clientSecret };
+
+  if (process.platform !== "darwin") return null;
+  try {
+    const raw = execFileSync("security", [
+      "find-generic-password",
+      "-a", "opencodex",
+      "-s", "antigravity-oauth-client",
+      "-w"
+    ], { encoding: "utf-8" }).trim();
+    const stored = JSON.parse(raw);
+    if (typeof stored?.client_id === "string" && stored.client_id
+      && typeof stored?.client_secret === "string" && stored.client_secret) {
+      return { clientId: stored.client_id, clientSecret: stored.client_secret };
+    }
+  } catch {}
+  return null;
+}
 
 function normalizeThirdPartyModelCapabilities(model: any): any {
   if (!model?.backend_provider) return model;
   return {
     ...model,
+    // Codex Desktop also sorts the picker by `priority`, not just by JSON
+    // array order. Subscription models are sometimes cloned from Sol and
+    // inherit priority 1, which puts them between the official models.
+    priority: Math.max(Number(model.priority) || 0, THIRD_PARTY_MODEL_PRIORITY),
     default_reasoning_level: model.default_reasoning_level || "medium",
     supported_reasoning_levels: THIRD_PARTY_REASONING_LEVELS,
     default_reasoning_summary: model.default_reasoning_summary ?? "none",
@@ -156,25 +214,67 @@ function normalizeThirdPartyModelCapabilities(model: any): any {
 }
 
 function orderCatalogModels(models: any[]): any[] {
+  const nativeOrder = new Map(getNativeModels().map((model: any, index: number) => [String(model.slug), index]));
   return models
     .map((model, index) => ({ model: normalizeThirdPartyModelCapabilities(model), index }))
     .sort((a, b) => {
       // Native models from models_cache.json did not always carry a provider
       // field. Treat an un-managed GPT slug as official as well, while any
       // explicit backend_provider always means a custom/subscription model.
-      const aNative = !a.model.backend_provider
-        && (a.model.provider === "openai" || /^gpt(?:-|$)/i.test(String(a.model.slug || a.model.model || "")));
-      const bNative = !b.model.backend_provider
-        && (b.model.provider === "openai" || /^gpt(?:-|$)/i.test(String(b.model.slug || b.model.model || "")));
+      const aNative = isOfficialCatalogModel(a.model);
+      const bNative = isOfficialCatalogModel(b.model);
       if (aNative !== bNative) return aNative ? -1 : 1;
+      if (aNative && bNative) {
+        const aNativeIndex = nativeOrder.get(String(a.model?.slug || a.model?.model));
+        const bNativeIndex = nativeOrder.get(String(b.model?.slug || b.model?.model));
+        if (aNativeIndex !== undefined && bNativeIndex !== undefined && aNativeIndex !== bNativeIndex) {
+          return aNativeIndex - bNativeIndex;
+        }
+      }
       return a.index - b.index;
     })
     .map(({ model }) => model);
 }
 
 function isOfficialCatalogModel(model: any): boolean {
-  return !model?.backend_provider
-    && (model?.provider === "openai" || /^gpt(?:-|$)/i.test(String(model?.slug || model?.model || "")));
+  if (!model) return false;
+  if (model.backend_provider) return false;
+  if (model.provider === "opencodex") return false;
+  const slug = String(model?.slug || model?.model || "");
+  if (getNativeModelSlugs().has(slug)) return true;
+  if (model?.provider === "openai") return true;
+  return /^gpt-5\.(5|6)(?:-|$)/i.test(slug);
+}
+
+function isTrulyNativeModel(model: any): boolean {
+  if (!model || typeof model.slug !== "string") return false;
+  if (model.backend_provider) return false;
+  if (model.provider === "opencodex") return false;
+  return true;
+}
+
+function getNativeModelSlugs(): Set<string> {
+  const slugs = new Set<string>();
+  try {
+    const cachePath = join(homedir(), ".codex", "models_cache.json");
+    if (!existsSync(cachePath)) return slugs;
+    const cached = JSON.parse(readFileSync(cachePath, "utf-8"));
+    for (const model of Array.isArray(cached?.models) ? cached.models : []) {
+      if (isTrulyNativeModel(model)) slugs.add(model.slug);
+    }
+  } catch {}
+  return slugs;
+}
+
+function getNativeModels(): any[] {
+  try {
+    const cachePath = join(homedir(), ".codex", "models_cache.json");
+    if (!existsSync(cachePath)) return [];
+    const cached = JSON.parse(readFileSync(cachePath, "utf-8"));
+    return Array.isArray(cached?.models) ? cached.models.filter(isTrulyNativeModel) : [];
+  } catch {
+    return [];
+  }
 }
 
 export function addLog(tag: string, text: string, level: string = "info") {
@@ -252,6 +352,8 @@ export class ProxyServer {
   private server: http.Server | null = null;
   public config!: ProxyConfig;
   private configDir = join(homedir(), ".opencodex");
+  private adminToken = "";
+  private listenPort = 8765;
   private initializedSessions = new Set<string>();
   private customConversationHistory = new Map<string, any[]>();
   private customModelSessions = new Set<string>();
@@ -272,17 +374,493 @@ export class ProxyServer {
   private vadProcess: any = null;
   private vadStdoutBuffer = "";
   private vadCallbackQueue: ((res: any) => void)[] = [];
+  private taskEvents = new TaskEventBus();
+  private taskEventRelay: TaskEventRelay | null = null;
+  private activeTaskEvents = new Map<string, {
+    taskId: string;
+    startedAt: number;
+    source: CodexTaskSource;
+    model?: string;
+    petTheme: "vortex" | "siri";
+    contextUsedTokens?: number;
+    contextWindowTokens?: number;
+    quotaUsedPercent?: number;
+    quotaWindowMinutes?: number;
+    quotaResetsAt?: number;
+    state: CodexTaskState;
+  }>();
+  private nativeSessionWatcher: FSWatcher | null = null;
+  private nativeRolloutFileWatches = new Set<string>();
+  private nativeRolloutOffsets = new Map<string, number>();
+  private nativeRolloutSessionIds = new Map<string, string>();
+  private nativeRolloutBuffers = new Map<string, string>();
+  private nativeRolloutReads = new Set<string>();
+  private nativeRolloutTurns = new Map<string, {
+    turnId?: string;
+    model?: string;
+    contextUsedTokens?: number;
+    contextWindowTokens?: number;
+    quotaUsedPercent?: number;
+    quotaWindowMinutes?: number;
+    quotaResetsAt?: number;
+  }>();
 
   constructor() {
     this.ensureConfigDir();
+    this.adminToken = this.loadOrCreateAdminToken();
     this.ensureCheckPermsHelper();
     this.loadConfig();
     // Starting the local service must leave a native Codex installation
     // untouched. Gateway routing is enabled only by an explicit model import.
     this.mergeNativeModelsIntoCatalog();
     this.repairExistingImportedSessions();
+    this.startNativeSessionObserver();
+    this.startTaskEventRelay();
     this.ensurePythonScripts();
     this.startVADDaemon();
+  }
+
+  private loadOrCreateAdminToken(): string {
+    const tokenPath = join(this.configDir, "admin_token");
+    try {
+      const existing = readFileSync(tokenPath, "utf-8").trim();
+      if (existing.length >= 32) return existing;
+    } catch {}
+
+    const token = `ocx_${randomUUID().replace(/-/g, "")}`;
+    try {
+      writeFileSync(tokenPath, token, { encoding: "utf-8", mode: 0o600 });
+    } catch (err: any) {
+      console.error(`[OpenCodex] Failed to persist dashboard admin token: ${err.message}`);
+    }
+    return token;
+  }
+
+  private hasAdminAccess(req: http.IncomingMessage): boolean {
+    const authorization = req.headers.authorization;
+    if (typeof authorization === "string" && authorization.startsWith("Bearer ")) {
+      if (authorization.slice("Bearer ".length).trim() === this.adminToken) return true;
+    }
+
+    const cookieHeader = req.headers.cookie || "";
+    for (const cookie of cookieHeader.split(";")) {
+      const [name, ...valueParts] = cookie.trim().split("=");
+      if (name === "opencodex_admin_token" && valueParts.join("=") === this.adminToken) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private requireAdmin(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+    if (this.hasAdminAccess(req)) return true;
+    res.writeHead(401, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    res.end(JSON.stringify({ error: "Dashboard authentication required" }));
+    return false;
+  }
+
+  private beginTaskEvent(
+    sessionId: string | undefined,
+    source: CodexTaskSource,
+    model?: string,
+    requestedTaskId?: unknown
+  ): string {
+    const sid = sessionId || "default";
+    const existing = this.activeTaskEvents.get(sid);
+    if (existing) {
+      // The native rollout can publish task_started before turn_context. If
+      // the model becomes known afterwards, update the existing projection
+      // instead of leaving the phone with the fallback "Codex" label.
+      if (model && model !== existing.model) {
+        this.syncNativeTaskMetrics(sid, { model });
+      }
+      return existing.taskId;
+    }
+
+    const taskId = typeof requestedTaskId === "string" && requestedTaskId.trim()
+      ? requestedTaskId.trim()
+      : `task_${randomUUID().replace(/-/g, "")}`;
+    const startedAt = Date.now();
+    const petTheme = this.getCurrentPetTheme();
+    this.activeTaskEvents.set(sid, { taskId, startedAt, source, model, petTheme, state: "running" });
+    this.taskEvents.publish({
+      taskId,
+      sessionId: sid,
+      state: "running",
+      source,
+      model,
+      petTheme,
+      contextUsedTokens: undefined,
+      contextWindowTokens: undefined,
+      quotaUsedPercent: undefined,
+      quotaWindowMinutes: undefined,
+      quotaResetsAt: undefined,
+      title: this.taskEventTitle("running")
+    });
+    return taskId;
+  }
+
+  private setTaskEventState(
+    sessionId: string | undefined,
+    state: Extract<CodexTaskState, "running" | "waiting">,
+    requiresAction = false
+  ): void {
+    const sid = sessionId || "default";
+    const active = this.activeTaskEvents.get(sid);
+    if (!active || active.state === state) return;
+
+    active.state = state;
+    this.taskEvents.publish({
+      taskId: active.taskId,
+      sessionId: sid,
+      state,
+      source: active.source,
+      model: active.model,
+      petTheme: active.petTheme,
+      contextUsedTokens: active.contextUsedTokens,
+      contextWindowTokens: active.contextWindowTokens,
+      quotaUsedPercent: active.quotaUsedPercent,
+      quotaWindowMinutes: active.quotaWindowMinutes,
+      quotaResetsAt: active.quotaResetsAt,
+      title: this.taskEventTitle(state),
+      requiresAction
+    });
+  }
+
+  private finishTaskEvent(
+    sessionId: string | undefined,
+    state: Extract<CodexTaskState, "completed" | "failed"> = "completed",
+    error?: string,
+    taskId?: string
+  ): void {
+    const sid = sessionId || "default";
+    const active = this.activeTaskEvents.get(sid);
+    if (!active || (taskId && active.taskId !== taskId)) return;
+
+    this.activeTaskEvents.delete(sid);
+    this.taskEvents.publish({
+      taskId: active.taskId,
+      sessionId: sid,
+      state,
+      source: active.source,
+      model: active.model,
+      petTheme: active.petTheme,
+      contextUsedTokens: active.contextUsedTokens,
+      contextWindowTokens: active.contextWindowTokens,
+      quotaUsedPercent: active.quotaUsedPercent,
+      quotaWindowMinutes: active.quotaWindowMinutes,
+      quotaResetsAt: active.quotaResetsAt,
+      title: this.taskEventTitle(state),
+      error: error ? error.slice(0, 240) : undefined,
+      elapsedMs: Math.max(0, Date.now() - active.startedAt)
+    });
+  }
+
+  private taskEventTitle(state: CodexTaskState): string {
+    switch (state) {
+      case "queued": return "排队中";
+      case "running": return "执行中";
+      case "waiting": return "等待确认";
+      case "completed": return "已完成";
+      case "failed": return "失败";
+    }
+  }
+
+  private hasUserTurnMessage(message: any): boolean {
+    if (!Array.isArray(message?.input)) return false;
+    return message.input.some((item: any) => {
+      if (item?.role !== "user") return false;
+      if (Array.isArray(item.content)) {
+        return item.content.some((part: any) => typeof part?.text === "string" && part.text.trim());
+      }
+      return typeof item.content === "string" && item.content.trim().length > 0;
+    });
+  }
+
+  private hasToolOutput(message: any): boolean {
+    return Array.isArray(message?.input) && message.input.some((item: any) =>
+      item?.type === "function_call_output" || item?.type === "custom_tool_call_output"
+    );
+  }
+
+  private getCurrentPetTheme(): "vortex" | "siri" {
+    const settingsPath = join(this.configDir, "voice_settings.json");
+    try {
+      const settings = JSON.parse(readFileSync(settingsPath, "utf-8"));
+      return settings?.hud_theme === "siri" ? "siri" : "vortex";
+    } catch {
+      return "vortex";
+    }
+  }
+
+  private startTaskEventRelay(): void {
+    const url = process.env.OPENCODEX_RELAY_URL?.trim();
+    const channel = process.env.OPENCODEX_RELAY_CHANNEL?.trim();
+    const token = process.env.OPENCODEX_RELAY_TOKEN?.trim();
+    const rawKey = process.env.OPENCODEX_RELAY_KEY?.trim();
+    if (!url || !channel || !token || !rawKey) return;
+    if (!url.startsWith("wss://")) {
+      console.error("[OpenCodex Task Relay] Disabled: relay URL must use wss://");
+      return;
+    }
+    const encryptionKey = parseRelayKey(rawKey);
+    if (!encryptionKey) {
+      console.error("[OpenCodex Task Relay] Disabled: key must be 32 bytes (hex or base64url)");
+      return;
+    }
+    this.taskEventRelay = new TaskEventRelay(this.taskEvents, { url, channel, token, encryptionKey });
+    this.taskEventRelay.start();
+    console.error("[OpenCodex Task Relay] Outbound encrypted relay enabled");
+  }
+
+  private startNativeSessionObserver(): void {
+    if (this.nativeSessionWatcher || process.platform !== "darwin") return;
+
+    const sessionsRoot = join(homedir(), ".codex", "sessions");
+    if (!existsSync(sessionsRoot)) return;
+
+    // Prime offsets so starting the gateway never replays old tasks into a
+    // phone notification. Only bytes appended after this point are observed.
+    for (const rolloutPath of findRolloutFiles(sessionsRoot)) {
+      this.primeNativeRollout(rolloutPath);
+      this.watchNativeRolloutFile(rolloutPath);
+    }
+
+    try {
+      this.nativeSessionWatcher = watch(sessionsRoot, { recursive: true }, (_event, filename) => {
+        const relative = filename ? String(filename) : "";
+        if (!relative.endsWith(".jsonl") || !relative.includes("rollout-")) return;
+        const rolloutPath = join(sessionsRoot, relative);
+        if (!this.nativeRolloutOffsets.has(rolloutPath)) {
+          // This file was created after the observer started, so consume its
+          // initial contents instead of treating them as historical data.
+          this.nativeRolloutOffsets.set(rolloutPath, 0);
+          this.nativeRolloutSessionIds.set(rolloutPath, this.sessionIdFromRolloutPath(rolloutPath));
+        }
+        this.watchNativeRolloutFile(rolloutPath);
+        setImmediate(() => this.consumeNativeRollout(rolloutPath));
+      });
+      this.nativeSessionWatcher.on("error", (error) => {
+        console.error(`[OpenCodex Native Task Observer] ${error.message}`);
+        this.nativeSessionWatcher?.close();
+        this.nativeSessionWatcher = null;
+      });
+      console.error(`[OpenCodex Native Task Observer] Watching ${sessionsRoot}`);
+    } catch (error: any) {
+      console.error(`[OpenCodex Native Task Observer] Unable to watch sessions: ${error.message}`);
+      this.nativeSessionWatcher = null;
+    }
+  }
+
+  private watchNativeRolloutFile(rolloutPath: string): void {
+    if (this.nativeRolloutFileWatches.has(rolloutPath)) return;
+    this.nativeRolloutFileWatches.add(rolloutPath);
+    watchFile(rolloutPath, { persistent: false, interval: 500 }, (current, previous) => {
+      if (current.size !== previous.size || current.mtimeMs !== previous.mtimeMs) {
+        this.consumeNativeRollout(rolloutPath);
+      }
+    });
+  }
+
+  private primeNativeRollout(rolloutPath: string): void {
+    try {
+      const size = statSync(rolloutPath).size;
+      this.nativeRolloutOffsets.set(rolloutPath, size);
+      this.nativeRolloutSessionIds.set(rolloutPath, this.sessionIdFromRolloutPath(rolloutPath));
+    } catch {}
+  }
+
+  private consumeNativeRollout(rolloutPath: string): void {
+    if (!existsSync(rolloutPath)) return;
+    if (this.nativeRolloutReads.has(rolloutPath)) return;
+    this.nativeRolloutReads.add(rolloutPath);
+
+    try {
+      const size = statSync(rolloutPath).size;
+      const previousOffset = this.nativeRolloutOffsets.get(rolloutPath);
+      if (previousOffset === undefined) {
+        this.primeNativeRollout(rolloutPath);
+        return;
+      }
+      if (size < previousOffset) {
+        this.nativeRolloutOffsets.set(rolloutPath, size);
+        this.nativeRolloutBuffers.delete(rolloutPath);
+        return;
+      }
+      if (size === previousOffset) return;
+
+      const fd = openSync(rolloutPath, "r");
+      const buffer = Buffer.alloc(size - previousOffset);
+      readSync(fd, buffer, 0, buffer.length, previousOffset);
+      closeSync(fd);
+      this.nativeRolloutOffsets.set(rolloutPath, size);
+
+      const sessionId = this.nativeRolloutSessionIds.get(rolloutPath) || this.sessionIdFromRolloutPath(rolloutPath);
+      this.nativeRolloutSessionIds.set(rolloutPath, sessionId);
+      const pending = `${this.nativeRolloutBuffers.get(rolloutPath) || ""}${buffer.toString("utf-8")}`;
+      const lines = pending.split(/\r?\n/);
+      const trailing = lines.pop() || "";
+      if (trailing) this.nativeRolloutBuffers.set(rolloutPath, trailing);
+      else this.nativeRolloutBuffers.delete(rolloutPath);
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          this.handleNativeRolloutRecord(sessionId, JSON.parse(line));
+        } catch {}
+      }
+    } catch (error: any) {
+      console.error(`[OpenCodex Native Task Observer] Failed to read ${rolloutPath}: ${error.message}`);
+    } finally {
+      this.nativeRolloutReads.delete(rolloutPath);
+    }
+  }
+
+  private sessionIdFromRolloutPath(rolloutPath: string): string {
+    const match = rolloutPath.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+    return match?.[1] || rolloutPath;
+  }
+
+  private syncNativeTaskMetrics(
+    sessionId: string,
+    metrics: {
+      model?: string;
+      contextUsedTokens?: number;
+      contextWindowTokens?: number;
+      quotaUsedPercent?: number;
+      quotaWindowMinutes?: number;
+      quotaResetsAt?: number;
+    }
+  ): void {
+    const active = this.activeTaskEvents.get(sessionId);
+    if (!active) return;
+
+    const next = {
+      model: metrics.model || active.model,
+      contextUsedTokens: metrics.contextUsedTokens ?? active.contextUsedTokens,
+      contextWindowTokens: metrics.contextWindowTokens ?? active.contextWindowTokens,
+      quotaUsedPercent: metrics.quotaUsedPercent ?? active.quotaUsedPercent,
+      quotaWindowMinutes: metrics.quotaWindowMinutes ?? active.quotaWindowMinutes,
+      quotaResetsAt: metrics.quotaResetsAt ?? active.quotaResetsAt
+    };
+    const changed = next.model !== active.model ||
+      next.contextUsedTokens !== active.contextUsedTokens ||
+      next.contextWindowTokens !== active.contextWindowTokens ||
+      next.quotaUsedPercent !== active.quotaUsedPercent ||
+      next.quotaWindowMinutes !== active.quotaWindowMinutes ||
+      next.quotaResetsAt !== active.quotaResetsAt;
+    if (!changed) return;
+
+    Object.assign(active, next);
+    this.taskEvents.publish({
+      taskId: active.taskId,
+      sessionId,
+      state: active.state,
+      source: active.source,
+      model: active.model,
+      petTheme: active.petTheme,
+      contextUsedTokens: active.contextUsedTokens,
+      contextWindowTokens: active.contextWindowTokens,
+      quotaUsedPercent: active.quotaUsedPercent,
+      quotaWindowMinutes: active.quotaWindowMinutes,
+      quotaResetsAt: active.quotaResetsAt,
+      title: this.taskEventTitle(active.state),
+      requiresAction: active.state === "waiting"
+    });
+  }
+
+  private handleNativeRolloutRecord(sessionId: string, record: any): void {
+    const payload = record?.payload;
+    const eventType = record?.type === "event_msg" ? payload?.type : undefined;
+    const turnId = record?.turn_id || payload?.turn_id || payload?.payload?.turn_id ||
+      payload?.internal_chat_message_metadata_passthrough?.turn_id;
+    // Different Codex desktop releases put model metadata on turn_context,
+    // task_started, or the enclosing record. Accept all of those shapes so
+    // the mobile projection is not dependent on one event ordering.
+    const modelCandidates = [
+      record?.model,
+      payload?.model,
+      payload?.payload?.model,
+      payload?.info?.model,
+      payload?.turn_context?.model
+    ];
+    const model = modelCandidates.find((value) => typeof value === "string" && value.trim()) as string | undefined;
+
+    const info = payload?.info || record?.info;
+    const usage = info?.last_token_usage || info?.total_token_usage || payload?.last_token_usage || payload?.total_token_usage;
+    const modelContextWindow = Number(
+      info?.model_context_window ?? payload?.model_context_window ?? record?.model_context_window
+    );
+    const contextUsedTokens = Number(usage?.input_tokens ?? usage?.total_tokens);
+    const primaryRateLimit = (payload?.rate_limits || record?.rate_limits)?.primary;
+    const quotaUsedPercent = Number(primaryRateLimit?.used_percent);
+    const quotaWindowMinutes = Number(primaryRateLimit?.window_minutes);
+    const quotaResetsAt = Number(primaryRateLimit?.resets_at);
+    const metrics = {
+      model: typeof model === "string" ? model : undefined,
+      contextUsedTokens: Number.isFinite(contextUsedTokens) ? contextUsedTokens : undefined,
+      contextWindowTokens: Number.isFinite(modelContextWindow) ? modelContextWindow : undefined,
+      quotaUsedPercent: Number.isFinite(quotaUsedPercent) ? quotaUsedPercent : undefined,
+      quotaWindowMinutes: Number.isFinite(quotaWindowMinutes) ? quotaWindowMinutes : undefined,
+      quotaResetsAt: Number.isFinite(quotaResetsAt) ? quotaResetsAt : undefined
+    };
+
+    if (turnId || model || Object.values(metrics).some((value) => value !== undefined)) {
+      const current = this.nativeRolloutTurns.get(sessionId) || {};
+      this.nativeRolloutTurns.set(sessionId, {
+        turnId: turnId || current.turnId,
+        model: model || current.model,
+        contextUsedTokens: metrics.contextUsedTokens ?? current.contextUsedTokens,
+        contextWindowTokens: metrics.contextWindowTokens ?? current.contextWindowTokens,
+        quotaUsedPercent: metrics.quotaUsedPercent ?? current.quotaUsedPercent,
+        quotaWindowMinutes: metrics.quotaWindowMinutes ?? current.quotaWindowMinutes,
+        quotaResetsAt: metrics.quotaResetsAt ?? current.quotaResetsAt
+      });
+      this.syncNativeTaskMetrics(sessionId, this.nativeRolloutTurns.get(sessionId) || metrics);
+    }
+
+    // Codex has used several names for approval/input pauses across desktop
+    // releases. Only inspect typed lifecycle records here; user text and tool
+    // arguments never enter the mobile status stream.
+    const lifecycleTypes = [eventType, record?.type, payload?.status, payload?.reason]
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.toLowerCase());
+    if (lifecycleTypes.some((value) => /(approval|permission|confirmation|request_user_input|waiting)/.test(value))) {
+      const current = this.nativeRolloutTurns.get(sessionId) || {};
+      if (current.turnId && !this.isBackgroundNativeModel(current.model)) {
+        this.beginTaskEvent(sessionId, "native", current.model, current.turnId);
+      }
+      this.setTaskEventState(sessionId, "waiting", true);
+      return;
+    }
+
+    // A user_message only means the prompt was submitted. `task_started` is
+    // the authoritative native lifecycle signal that the turn has actually
+    // begun; reasoning/tool/output events are useful fallbacks for releases
+    // that omit it. This also covers very short commands whose first output
+    // can arrive together with task completion.
+    if (eventType === "task_started" || eventType === "agent_reasoning" || eventType === "agent_message" || eventType === "mcp_tool_call_begin") {
+      const current = this.nativeRolloutTurns.get(sessionId) || {};
+      if (current.turnId && !this.isBackgroundNativeModel(current.model)) {
+        this.beginTaskEvent(sessionId, "native", current.model, current.turnId);
+      }
+      this.setTaskEventState(sessionId, "running");
+    }
+
+    if (eventType === "task_complete") {
+      this.finishTaskEvent(sessionId, "completed");
+      this.nativeRolloutTurns.delete(sessionId);
+      return;
+    }
+
+    if (eventType === "task_failed" || eventType === "turn_aborted") {
+      this.finishTaskEvent(sessionId, "failed", payload?.message || payload?.error || eventType);
+      this.nativeRolloutTurns.delete(sessionId);
+    }
+  }
+
+  private isBackgroundNativeModel(model?: string): boolean {
+    const normalized = model?.trim().toLowerCase().replace(/[\s_]+/g, "-");
+    return normalized === "codex-auto-review";
   }
 
   private startVADDaemon() {
@@ -617,7 +1195,7 @@ except Exception as e:
 
     // Fix legacy/incorrect backend_model mappings for antigravity Gemini Flash models
     catalog.models.forEach((m: any) => {
-      if (m.backend_provider === "antigravity" && m.slug?.startsWith("gemini-3.5-flash")) {
+      if (m.backend_provider === "antigravity" && (m.slug?.startsWith("gemini-3.5-flash") || m.slug?.startsWith("gemini-3.6-flash"))) {
         m.backend_model = "gpt-5.6-luna";
       }
     });
@@ -635,6 +1213,37 @@ except Exception as e:
     try {
       if (!catalog.models) catalog.models = [];
 
+      // The custom catalog is also read by Codex Desktop's model picker. A
+      // subscription import must never replace or reorder the native models
+      // from the local Codex cache. Reconcile them on every write so imports,
+      // activation, deletion, and model updates all preserve the same
+      // official-first ordering.
+      const nativeModels = getNativeModels();
+      for (const native of nativeModels) {
+        const index = catalog.models.findIndex((model: any) => model?.slug === native.slug);
+        if (index === -1) {
+          catalog.models.push({
+            ...native,
+            provider: "openai",
+            visibility: native.visibility || "list"
+          });
+          continue;
+        }
+
+        // A previous subscription import could leave a native slug carrying
+        // an old backend_provider. The local native cache is authoritative for
+        // exact native slugs, so repair that identity while preserving any
+        // desktop metadata already stored on the entry.
+        const current = catalog.models[index];
+        catalog.models[index] = {
+          ...current,
+          ...native,
+          provider: "openai",
+          visibility: native.visibility || current.visibility || "list"
+        };
+        delete catalog.models[index].backend_provider;
+      }
+
       // Always filter out 5.4 and below, and codex-auto-review
       catalog.models = catalog.models.filter((m: any) => {
         const slug = m.slug || "";
@@ -651,6 +1260,7 @@ except Exception as e:
       // Official entries stay in the shared catalog for Codex Desktop, but
       // their visibility is never controlled by OpenCodex' custom-model UI.
       catalog.models.forEach((model: any) => {
+        if (!model.model && model.slug) model.model = model.slug;
         if (isOfficialCatalogModel(model)) model.visibility = "list";
       });
       catalog.models = orderCatalogModels(catalog.models);
@@ -658,59 +1268,29 @@ except Exception as e:
       const jsonStr = JSON.stringify(catalog, null, 2);
       writeFileSync(p, jsonStr, "utf-8");
       console.error(`[OpenCodex] Saved custom model catalog to ${p}`);
+
+      // Keep Codex's own models_cache.json untouched. It is an internal cache
+      // with a client-owned schema and metadata; custom/subscription models
+      // belong exclusively in model_catalog_json. The stable gateway path
+      // relied on this separation, and writing the catalog into the cache can
+      // make Desktop fall back to its official-only list after a restart.
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to save custom model catalog: ${err.message}`);
     }
   }
 
   private mergeNativeModelsIntoCatalog() {
-    const cachePath = join(homedir(), ".codex", "models_cache.json");
-    if (!existsSync(cachePath)) {
-      console.log(`[OpenCodex] Native models cache not found at ${cachePath}. Skipping merge.`);
-      return;
-    }
-
     try {
-      const cacheData = JSON.parse(readFileSync(cachePath, "utf-8"));
-      const nativeModels = cacheData.models || [];
+      const nativeModels = getNativeModels();
       if (!Array.isArray(nativeModels) || nativeModels.length === 0) {
         return;
       }
 
       const catalog = this.getModelCatalog();
-      if (!catalog.models) {
-        catalog.models = [];
-      }
-
-      let updated = false;
-
-      for (const native of nativeModels) {
-        if (!native.slug) continue;
-        
-        const idx = catalog.models.findIndex((m: any) => m.slug === native.slug);
-        
-        if (idx === -1) {
-          catalog.models.push({
-            ...native,
-            provider: "openai",
-            visibility: "list"
-          });
-          updated = true;
-        } else {
-          // If this is a custom model, keep its provider as opencodex
-          const isCustomModel = !!catalog.models[idx].backend_provider || catalog.models[idx].slug.startsWith("mimo");
-          const expectedProvider = isCustomModel ? "opencodex" : "openai";
-          if (catalog.models[idx].provider !== expectedProvider) {
-            catalog.models[idx].provider = expectedProvider;
-            updated = true;
-          }
-        }
-      }
-
-      if (updated) {
-        this.saveModelCatalog(catalog);
-        console.log(`[OpenCodex] Successfully merged native OpenAI models into custom model catalog.`);
-      }
+      const before = JSON.stringify(catalog.models || []);
+      this.saveModelCatalog(catalog);
+      const after = JSON.stringify(this.getModelCatalog().models || []);
+      if (before !== after) console.log(`[OpenCodex] Synchronized native OpenAI models before custom/subscription models.`);
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to merge native models: ${err.message}`);
     }
@@ -758,7 +1338,11 @@ except Exception as e:
 
       const existing = existingModels.find((m: any) => m.slug === slug || m.model === slug);
       if (existing) {
-        const isNative = existing.slug === "gpt-5.5" || existing.slug === "gpt-5.6-luna" || existing.slug === "gpt-5.4-mini" || (existing.provider === "openai" && !existing.backend_provider);
+        // Do not infer native/custom status only from the provider string.
+        // Older subscription imports rewrote native entries to `opencodex`
+        // without a backend_provider, which made them jump above/below the
+        // wrong group on the next save.
+        const isNative = isOfficialCatalogModel(existing);
         if (isNative) {
           models.push({
             ...existing,
@@ -822,7 +1406,7 @@ except Exception as e:
         });
       }
     }
-    return { models };
+    return { models: orderCatalogModels(models) };
   }
 
   private findProvider(model: string, catalogEntry?: any): ProviderConfig | null {
@@ -837,7 +1421,7 @@ except Exception as e:
     return this.config.providers[0] || null;
   }
 
-  private resolveKey(raw: string): string {
+  private resolveKey(raw: string, forceRefresh = false): string {
     if (raw === "grok-cli-auto") {
       try {
         const cachePath = join(this.configDir, "grok_auth_cache.json");
@@ -917,7 +1501,7 @@ except Exception as e:
       const cacheValidUntil = this.antigravityTokenExpiry > 0
         ? this.antigravityTokenExpiry - 30000
         : this.antigravityTokenCacheTime + 300000;
-      if (this.antigravityTokenCache && now < cacheValidUntil) {
+      if (!forceRefresh && this.antigravityTokenCache && now < cacheValidUntil) {
         return this.antigravityTokenCache;
       }
       try {
@@ -928,10 +1512,91 @@ except Exception as e:
             const jsonStr = Buffer.from(base64Data, "base64").toString("utf-8");
             const data = JSON.parse(jsonStr);
             if (data?.token?.access_token) {
-              this.antigravityTokenCache = data.token.access_token;
-              this.antigravityTokenCacheTime = now;
               const expiry = data.token.expiry || data.token.expires_at;
               const expiryMs = expiry ? Date.parse(String(expiry)) : NaN;
+              const tokenIsValid = !forceRefresh && (!Number.isFinite(expiryMs) || expiryMs - 30000 > now);
+
+              if (tokenIsValid) {
+                this.antigravityTokenCache = data.token.access_token;
+                this.antigravityTokenCacheTime = now;
+                this.antigravityTokenExpiry = Number.isFinite(expiryMs) ? expiryMs : 0;
+                return data.token.access_token;
+              }
+
+              // Antigravity stores a Google OAuth refresh token in Keychain.
+              // Refresh it synchronously here because resolveKey() is used by
+              // both HTTP and WebSocket request paths. This keeps Gemini
+              // imports usable after the one-hour access token expires,
+              // without requiring the user to run `agy login` again.
+              const refreshToken = data.token.refresh_token;
+              const oauthClient = readAntigravityOAuthClient();
+              if (refreshToken && oauthClient) {
+                try {
+                  const refreshBody = execFileSync("curl", [
+                    "-sS",
+                    "--max-time", "15",
+                    "-X", "POST",
+                    "https://oauth2.googleapis.com/token",
+                    "-H", "Content-Type: application/x-www-form-urlencoded",
+                    "--data-urlencode", "grant_type=refresh_token",
+                    "--data-urlencode", `refresh_token=${refreshToken}`,
+                    "--data-urlencode", `client_id=${oauthClient.clientId}`,
+                    "--data-urlencode", `client_secret=${oauthClient.clientSecret}`
+                  ], { encoding: "utf-8" });
+                  const refreshed = JSON.parse(refreshBody);
+
+                  if (refreshed?.access_token) {
+                    const refreshedExpiry = new Date(
+                      now + (Number(refreshed.expires_in) || 3600) * 1000
+                    ).toISOString();
+                    data.token.access_token = refreshed.access_token;
+                    data.token.expiry = refreshedExpiry;
+                    data.token.expires_at = refreshedExpiry;
+                    if (refreshed.refresh_token) data.token.refresh_token = refreshed.refresh_token;
+
+                    const updatedSecret = `go-keyring-base64:${Buffer.from(JSON.stringify(data), "utf-8").toString("base64")}`;
+                    try {
+                      execFileSync("security", [
+                        "add-generic-password",
+                        "-a", "antigravity",
+                        "-s", "gemini",
+                        "-w", updatedSecret,
+                        "-U"
+                      ], { stdio: "ignore" });
+                    } catch (keychainErr: any) {
+                      // The refreshed token is still valid for this request;
+                      // a Keychain write failure should not turn it into an
+                      // empty Gemini response.
+                      console.error(`[OpenCodex] Refreshed Antigravity token, but could not update Keychain: ${keychainErr.message}`);
+                    }
+
+                    this.antigravityTokenCache = refreshed.access_token;
+                    this.antigravityTokenCacheTime = now;
+                    this.antigravityTokenExpiry = Date.parse(refreshedExpiry);
+                    console.log("[OpenCodex] Refreshed Antigravity login token from Keychain.");
+                    return refreshed.access_token;
+                  }
+
+                  console.error("[OpenCodex] Antigravity refresh response did not contain an access token.");
+                } catch (refreshErr: any) {
+                  console.error(`[OpenCodex] Failed to refresh Antigravity login token: ${refreshErr.message}`);
+                }
+              } else if (refreshToken) {
+                console.error("[OpenCodex] Antigravity refresh skipped: configure OAuth client settings in Keychain or environment.");
+              } else {
+                console.error("[OpenCodex] Antigravity login token expired and no refresh token was found.");
+                this.antigravityTokenCache = data.token.access_token;
+                this.antigravityTokenCacheTime = now;
+                this.antigravityTokenExpiry = Number.isFinite(expiryMs) ? expiryMs : 0;
+                return data.token.access_token;
+              }
+
+              // Keep the current token as a last-resort value if Google is
+              // temporarily unavailable during refresh. The caller can then
+              // surface the upstream status instead of silently switching to
+              // an unrelated provider key.
+              this.antigravityTokenCache = data.token.access_token;
+              this.antigravityTokenCacheTime = now;
               this.antigravityTokenExpiry = Number.isFinite(expiryMs) ? expiryMs : 0;
               return data.token.access_token;
             }
@@ -947,6 +1612,68 @@ except Exception as e:
       return process.env[raw.slice(1)] || "";
     }
     return raw;
+  }
+
+  private async fetchAntigravityModels(): Promise<any[]> {
+    try {
+      const token = this.resolveKey("antigravity-cli-auto");
+      const res = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "User-Agent": "antigravity/hub/2.2.1 darwin/arm64"
+        },
+        body: JSON.stringify({ project: "default-cli-project" }),
+        dispatcher: fetchDispatcher
+      });
+      if (!res.ok) {
+        console.error(`[OpenCodex] fetchAvailableModels returned status: ${res.status}`);
+        return [];
+      }
+      const data = await res.json() as any;
+      const modelsMap = data.models || {};
+      const modelIds: string[] = [];
+
+      if (Array.isArray(data.agentModelSorts) && data.agentModelSorts[0]?.groups?.[0]?.modelIds) {
+        modelIds.push(...data.agentModelSorts[0].groups[0].modelIds);
+      } else {
+        modelIds.push(...Object.keys(modelsMap));
+      }
+
+      const result: any[] = [];
+      const seen = new Set<string>();
+
+      for (const rawId of modelIds) {
+        const id = typeof rawId === "string" ? rawId.trim() : "";
+        if (!id) continue;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const info = modelsMap[id] || {};
+        let backendModel = "gpt-5.6-luna";
+        if (id.includes("pro") || id.includes("claude-sonnet")) {
+          backendModel = "gpt-5.5";
+        } else if (id.includes("claude-opus")) {
+          backendModel = "gpt-5.6-terra";
+        } else if (id.includes("oss")) {
+          backendModel = "deepseek-v4-pro";
+        }
+
+        result.push({
+          slug: id,
+          model: id,
+          display_name: typeof info.displayName === "string" && info.displayName.trim()
+            ? info.displayName.trim()
+            : id,
+          backend_model: backendModel
+        });
+      }
+      console.log(`[OpenCodex] Dynamically fetched ${result.length} models from Antigravity API.`);
+      return result;
+    } catch (err: any) {
+      console.error(`[OpenCodex] Failed to dynamically fetch Antigravity models: ${err.message}`);
+      return [];
+    }
   }
 
   private autoPatchCodexConfig() {
@@ -1013,17 +1740,19 @@ stream_idle_timeout_ms = 600000
     const catalogPath = join(this.configDir, "custom_model_catalog.json");
     if (!existsSync(tomlPath)) return;
     try {
-      // Materialize capability normalization and ordering before Codex Desktop
-      // reads model_catalog_json directly from disk.
-      this.saveModelCatalog(this.getModelCatalog());
+      const catalog = this.getModelCatalog();
+      const hasThirdPartyModels = (catalog?.models || []).some((m: any) => Boolean(m.backend_provider));
+      this.saveModelCatalog(catalog);
       const content = readFileSync(tomlPath, "utf-8");
       let patched = stripManagedBlocks(content);
-      const managedTop = `# >>> opencodex managed >>>
+
+      if (hasThirdPartyModels) {
+        const managedTop = `# >>> opencodex managed >>>
 model_catalog_json = "${catalogPath}"
 openai_base_url = "http://127.0.0.1:8765/v1"
 # <<< opencodex managed <<<
 `;
-      const managedProvider = `# >>> opencodex managed >>>
+        const managedProvider = `# >>> opencodex managed >>>
 [model_providers.opencodex]
 name = "OpenCodex"
 base_url = "http://127.0.0.1:8765/v1"
@@ -1035,9 +1764,12 @@ stream_max_retries = 3
 stream_idle_timeout_ms = 600000
 # <<< opencodex managed <<<
 `;
-      patched = managedTop + "\n" + patched + "\n\n" + managedProvider;
+        patched = managedTop + "\n" + patched + "\n\n" + managedProvider;
+        console.log(`[OpenCodex] Patched config.toml with opencodex provider.`);
+      } else {
+        console.log(`[OpenCodex] No third-party models active. Preserving clean native config.toml.`);
+      }
       writeFileSync(tomlPath, patched, "utf-8");
-      console.log(`[OpenCodex] Patched config.toml with opencodex provider.`);
     } catch (err: any) {
       console.error(`[OpenCodex] Failed to patch config.toml: ${err.message}`);
     }
@@ -1086,16 +1818,31 @@ stream_idle_timeout_ms = 600000
     }
   }
 
-  public restartCodexDesktop() {
+  public restartCodexDesktop(): Promise<void> {
     console.log("[OpenCodex] Executing background cold-restart of Codex Desktop...");
     const cmd = 'killall ChatGPT Codex "Codex Helper" "Codex Helper (Renderer)" "Codex Helper (GPU)" SkyComputerUseClient SkyComputerUseService bare-modifier-monitor 2>/dev/null; kill -9 $(ps aux | grep -i "codex app-server" | grep -v "grep" | awk \'{print $2}\') 2>/dev/null; sleep 1.5; open -a ChatGPT --args --remote-debugging-port=8315';
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) {
-        console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
-      } else {
-        console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
-      }
+    return new Promise((resolve) => {
+      exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+          console.error(`[OpenCodex] Codex restart completed with errors or status: ${err.message}`);
+        } else {
+          console.log("[OpenCodex] Codex Desktop successfully restarted in the background.");
+        }
+        resolve();
+      });
     });
+  }
+
+  private async waitForCodexCdp(timeoutMs = 10000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const response = await fetch("http://127.0.0.1:8315/json");
+        if (response.ok) return true;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return false;
   }
 
   public restartVoiceBar(method: "swift-run" | "app" = "swift-run") {
@@ -1166,6 +1913,7 @@ stream_idle_timeout_ms = 600000
   }
 
   start(port: number) {
+    this.listenPort = port;
     this.initCodexMcp();
     this.server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -1178,6 +1926,13 @@ stream_idle_timeout_ms = 600000
 
     const wss = new WebSocketServer({ noServer: true });
     this.server.on("upgrade", (request, socket, head) => {
+      const originHeader = typeof request.headers.origin === "string" ? request.headers.origin : undefined;
+      if (!isAllowedLocalHost(request.headers.host) || (originHeader && !getAllowedLocalOrigin(originHeader, this.listenPort))) {
+        socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       const isResponsesWs = url.pathname.startsWith("/v1/responses") || url.pathname.includes("responses");
 
@@ -1198,7 +1953,9 @@ stream_idle_timeout_ms = 600000
             lastMsg: null as any,
             isCustomMode: false,
             activeSessionId: sessionIdStr,
-            isGeneratingTitle: false
+            isGeneratingTitle: false,
+            pendingBackgroundResponse: false,
+            suppressOfficialResponse: false
           };
           if (sessionId && sessionId !== "default") {
             this.activeConnectionsBySession.set(sessionId, connInfo);
@@ -1279,6 +2036,43 @@ stream_idle_timeout_ms = 600000
           });
 
           let inJsonStream = false;
+          let jsonStreamText = "";
+          let jsonStreamPackets: { data: any; isBinary: boolean }[] = [];
+          let suppressJsonStream = false;
+
+          const isBackgroundJsonText = (text: string): boolean => {
+            if (!text || !text.trim().startsWith("{")) return false;
+            try {
+              const value = JSON.parse(text.trim());
+              return !!value && typeof value === "object" && (
+                Object.prototype.hasOwnProperty.call(value, "suggestions") ||
+                Object.prototype.hasOwnProperty.call(value, "exclude") ||
+                Object.prototype.hasOwnProperty.call(value, "title")
+              );
+            } catch {
+              return false;
+            }
+          };
+
+          const forwardOfficialPacket = (data: any, isBinary: boolean) => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+              clientWs.send(data, { binary: isBinary });
+            }
+            for (const otherWs of this.desktopWsClients) {
+              if (otherWs !== clientWs && otherWs.readyState === WebSocket.OPEN) {
+                otherWs.send(data, { binary: isBinary });
+              }
+            }
+          };
+
+          const flushJsonStreamPackets = () => {
+            for (const packet of jsonStreamPackets) {
+              forwardOfficialPacket(packet.data, packet.isBinary);
+            }
+            jsonStreamPackets = [];
+            jsonStreamText = "";
+            inJsonStream = false;
+          };
 
           targetWs.on("message", (tData, tIsBinary) => {
             const activeSid = connInfo.activeSessionId || sessionIdStr;
@@ -1310,7 +2104,11 @@ stream_idle_timeout_ms = 600000
             const msgStr = processedTData.toString();
             console.log(`[OpenCodex WS Proxy] Message from official server: ${tIsBinary ? "Binary" : msgStr.slice(0, 300)}`);
             
-            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream || (msgStr.includes("gpt-5.4-mini") || msgStr.includes("gpt-5.6-luna") || msgStr.includes("{\"title\"") || msgStr.includes("\"title\""));
+            // Do not use the model name in arbitrary metadata as a background
+            // signal. The official server includes its faster safety model in
+            // normal responses too, which previously caused unrelated frames
+            // to be misclassified.
+            let isTitleOrBackground = connInfo.isGeneratingTitle || inJsonStream;
 
             if (!tIsBinary) {
               try {
@@ -1331,6 +2129,15 @@ stream_idle_timeout_ms = 600000
                       this.titleSessionHashes.add(hash);
                     }
                   }
+                  if (connInfo.pendingBackgroundResponse) {
+                    connInfo.suppressOfficialResponse = true;
+                    connInfo.pendingBackgroundResponse = false;
+                    console.log(`[OpenCodex WS Proxy] Suppressing official background response ${payload.response.id || "unknown"}.`);
+                  }
+                }
+
+                if (connInfo.suppressOfficialResponse) {
+                  isTitleOrBackground = true;
                 }
                 
                 // Precise check if this payload belongs to a title session hash
@@ -1345,8 +2152,18 @@ stream_idle_timeout_ms = 600000
                 // Broadcast streaming text delta to active voice clients
                 if (payload.type === "response.output_text.delta" && payload.delta) {
                   const text = payload.delta;
-                  if (text.trim().startsWith("{")) {
+                  if (!inJsonStream && text.trim().startsWith("{")) {
                     inJsonStream = true;
+                    jsonStreamText = "";
+                    jsonStreamPackets = [];
+                    suppressJsonStream = false;
+                  }
+                  if (inJsonStream) {
+                    jsonStreamText += text;
+                    jsonStreamPackets.push({ data: processedTData, isBinary: tIsBinary });
+                    if (isBackgroundJsonText(jsonStreamText)) {
+                      suppressJsonStream = true;
+                    }
                   }
                   if (!inJsonStream && connInfo.lastMsg) {
                     const msg = JSON.stringify({ type: "model_chunk", text });
@@ -1354,39 +2171,63 @@ stream_idle_timeout_ms = 600000
                       try { voiceClient.send(msg); } catch {}
                     }
                   }
-                  if (inJsonStream && text.includes("}")) {
-                    inJsonStream = false;
+                }
+
+                if (payload.type === "response.output_text.done" && inJsonStream) {
+                  const finalText = typeof payload.text === "string" ? payload.text : jsonStreamText;
+                  if (isBackgroundJsonText(finalText)) {
+                    suppressJsonStream = true;
                   }
-                } 
+                  if (suppressJsonStream) {
+                    jsonStreamPackets = [];
+                    jsonStreamText = "";
+                    inJsonStream = false;
+                    isTitleOrBackground = true;
+                  } else {
+                    flushJsonStreamPackets();
+                    isTitleOrBackground = connInfo.suppressOfficialResponse || connInfo.isGeneratingTitle;
+                  }
+                }
+
+                if (suppressJsonStream) {
+                  isTitleOrBackground = true;
+                }
                 
                 // Broadcast completion
-                else if (payload.type === "response.completed" || payload.type === "response.output_item.done") {
+                if (payload.type === "response.completed" || payload.type === "response.output_item.done") {
                   inJsonStream = false;
                   if (payload.type === "response.completed") {
+                    this.finishTaskEvent(activeSid, "completed");
+                    const suppressingThisResponse = suppressJsonStream;
                     connInfo.isGeneratingTitle = false;
                     const msg = JSON.stringify({ type: "model_done", text: "" });
                     for (const voiceClient of this.activeWsClients) {
                       try { voiceClient.send(msg); } catch {}
                     }
+                    if (connInfo.suppressOfficialResponse) {
+                      connInfo.suppressOfficialResponse = false;
+                    }
+                    if (suppressingThisResponse) {
+                      isTitleOrBackground = true;
+                    }
+                    suppressJsonStream = false;
+                    jsonStreamPackets = [];
+                    jsonStreamText = "";
                   }
+                } else if (payload.type === "error") {
+                  this.finishTaskEvent(activeSid, "failed", payload.error?.message || payload.message || "Official response failed");
                 }
               } catch {}
             }
 
-            if (clientWs.readyState === WebSocket.OPEN) {
-              clientWs.send(processedTData, { binary: tIsBinary });
-            }
             if (!isTitleOrBackground) {
-              for (const otherWs of this.desktopWsClients) {
-                if (otherWs !== clientWs && otherWs.readyState === WebSocket.OPEN) {
-                  otherWs.send(processedTData, { binary: tIsBinary });
-                }
-              }
+              forwardOfficialPacket(processedTData, tIsBinary);
             }
           });
 
           targetWs.on("close", (code, reason) => {
             console.log(`[OpenCodex WS Proxy] Official target connection closed: ${code} - ${reason.toString()}`);
+            this.finishTaskEvent(connInfo.activeSessionId || sessionIdStr, "failed", `Official connection closed (${code})`);
             targetClosed = true;
             if (!clientClosed) {
               clientWs.close();
@@ -1395,6 +2236,7 @@ stream_idle_timeout_ms = 600000
 
           targetWs.on("error", (err) => {
             console.error("[OpenCodex WS Proxy Target Error]", err);
+            this.finishTaskEvent(connInfo.activeSessionId || sessionIdStr, "failed", err.message);
             clientWs.close();
           });
 
@@ -1417,7 +2259,7 @@ stream_idle_timeout_ms = 600000
                     const catalog = this.getModelCatalog();
                     const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
                     connInfo.isCustomMode = !!catalogEntry?.backend_provider;
-                    connInfo.isGeneratingTitle = model.includes("mini") || model.includes("title");
+                    connInfo.isGeneratingTitle = false;
                   }
                 }
                 const model = msg.model || "";
@@ -1443,6 +2285,12 @@ stream_idle_timeout_ms = 600000
                   }
                 }
 
+                connInfo.isGeneratingTitle = isTitlePrompt;
+                const hasUserTurn = this.hasUserTurnMessage(msg);
+                const hasToolOutput = this.hasToolOutput(msg);
+                const shouldEmitTaskEvent = msg.type === "response.create" &&
+                  !isTitlePrompt && (hasUserTurn || hasToolOutput);
+
                 if (model) {
                   const catalog = this.getModelCatalog();
                   const catalogEntry = catalog.models?.find((m: any) => m.slug === model);
@@ -1456,16 +2304,25 @@ stream_idle_timeout_ms = 600000
                       this.customModelSessions.add(activeSid);
                     }
                     console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Intercepted Custom Model/Title [${model}] locally for activeSid=${activeSid}.`);
-                    await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
+                    const taskId = isCustomModel && shouldEmitTaskEvent
+                      ? this.beginTaskEvent(
+                        activeSid,
+                        "gateway",
+                        model,
+                        msg.client_metadata?.turn_id || msg.client_metadata?.request_id
+                      )
+                      : undefined;
+                    try {
+                      await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
+                    } catch (err: any) {
+                      if (taskId) this.finishTaskEvent(activeSid, "failed", err?.message, taskId);
+                      throw err;
+                    }
+                    if (taskId) this.finishTaskEvent(activeSid, "completed", undefined, taskId);
                     return;
                   } else {
-                    const hasUserChatMessage = msg.input && Array.isArray(msg.input) && msg.input.some((item: any) => {
-                      if (item.role === "user" && item.content && Array.isArray(item.content)) {
-                        return item.content.some((part: any) => part.text && !part.text.includes("provide a short title") && !part.text.includes("task title based solely on the prompt"));
-                      }
-                      return false;
-                    });
-                    const isBackgroundRequest = isTitlePrompt || !hasUserChatMessage;
+                    const isBackgroundRequest = isTitlePrompt || (!hasUserTurn && !hasToolOutput);
+                    connInfo.pendingBackgroundResponse = isBackgroundRequest;
 
                     if (isBackgroundRequest && this.customModelSessions.has(activeSid)) {
                       isLocal = false;
@@ -1475,6 +2332,14 @@ stream_idle_timeout_ms = 600000
                       connInfo.isCustomMode = false;
                       this.customModelSessions.delete(activeSid);
                       console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Native Model [${model}] requested. Forwarding to official server.`);
+                      if (shouldEmitTaskEvent) {
+                        this.beginTaskEvent(
+                          activeSid,
+                          "native",
+                          model,
+                          msg.client_metadata?.turn_id || msg.client_metadata?.request_id
+                        );
+                      }
                     }
                   }
                 } else {
@@ -1485,7 +2350,21 @@ stream_idle_timeout_ms = 600000
                     console.log(`[DEBUG-CUSTOM-MODEL-FLOW] No model field in frame, but activeSid=${activeSid} is marked custom. Preserving isLocal=true.`);
                     if (msg.type === "response.create") {
                       console.log(`[DEBUG-CUSTOM-MODEL-FLOW] Intercepted local response.create without model field on custom session.`);
-                      await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
+                      const taskId = shouldEmitTaskEvent
+                        ? this.beginTaskEvent(
+                          activeSid,
+                          "gateway",
+                          undefined,
+                          msg.client_metadata?.turn_id || msg.client_metadata?.request_id
+                        )
+                        : undefined;
+                      try {
+                        await this.handleLocalResponsesWebSocketInline(clientWs, msg, { headers: request.headers, activeSessionId: activeSid });
+                      } catch (err: any) {
+                        if (taskId) this.finishTaskEvent(activeSid, "failed", err?.message, taskId);
+                        throw err;
+                      }
+                      if (taskId) this.finishTaskEvent(activeSid, "completed", undefined, taskId);
                       return;
                     }
                   } else {
@@ -1614,17 +2493,35 @@ stream_idle_timeout_ms = 600000
       console.error(`[OpenCodex] Proxy server port conflict: ${err.message}`);
     });
 
-    this.server.listen(port, "0.0.0.0");
-    console.error(`[OpenCodex] Unified HTTP server listening on port ${port}`);
+    // The gateway is a local desktop helper. Never expose its management API
+    // (including command execution) on the LAN or public network interface.
+    this.server.listen(port, "127.0.0.1");
+    console.error(`[OpenCodex] Unified HTTP server listening on 127.0.0.1:${port}`);
     console.error(`[OpenCodex] Web Dashboard UI → http://localhost:${port}/dashboard`);
   }
 
   stop() {
+    this.taskEventRelay?.dispose();
+    this.taskEventRelay = null;
+    this.nativeSessionWatcher?.close();
+    this.nativeSessionWatcher = null;
     this.server?.close();
   }
 
   private async handle(req: http.IncomingMessage, res: http.ServerResponse, rawBody: Buffer) {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    const originHeader = typeof req.headers.origin === "string" ? req.headers.origin : undefined;
+    const allowedOrigin = getAllowedLocalOrigin(originHeader, this.listenPort);
+    if (!isAllowedLocalHost(req.headers.host) || (originHeader && !allowedOrigin)) {
+      res.writeHead(403, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ error: "Local access only" }));
+      return;
+    }
+
+    if (allowedOrigin) {
+      res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+    }
     res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, session_id");
     
@@ -1640,6 +2537,7 @@ stream_idle_timeout_ms = 600000
     const isQuietDashboardPoll = req.method === "GET" && new Set([
       "/api/logs/poll",
       "/api/logs/stream",
+      "/api/task-events",
       "/api/gateway/status",
       "/api/voice-settings",
       "/api/voice-bar/status",
@@ -1682,7 +2580,11 @@ stream_idle_timeout_ms = 600000
 
     // ─── Web Dashboard Routes ───
     if (path === "/dashboard" || path === "/dashboard/") {
-      res.writeHead(200, { "Content-Type": "text/html" });
+      res.writeHead(200, {
+        "Content-Type": "text/html",
+        "Cache-Control": "no-store",
+        "Set-Cookie": `opencodex_admin_token=${this.adminToken}; HttpOnly; SameSite=Strict; Path=/`
+      });
       res.end(getDashboardHtml());
       return;
     }
@@ -1713,6 +2615,16 @@ stream_idle_timeout_ms = 600000
       return;
     }
 
+    // All management and dashboard APIs use the cookie issued above. The two
+    // gateway protocol endpoints remain available to Codex itself and are
+    // still protected by the loopback bind plus their normal API auth flow.
+    const isCodexProtocolRoute =
+      (path === "/v1/responses" && req.method === "POST") ||
+      (path === "/v1/chat/completions" && req.method === "POST");
+    if (!isCodexProtocolRoute && path !== "/health" && !this.requireAdmin(req, res)) {
+      return;
+    }
+
     if (path === "/api/logs/stream") {
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
@@ -1739,6 +2651,75 @@ stream_idle_timeout_ms = 600000
 
       req.on("close", () => {
         activeSseClients.delete(sender);
+        clearInterval(keepalive);
+      });
+      return;
+    }
+
+    if (path === "/api/task-events" && req.method === "GET") {
+      const activeOnly = url.searchParams.get("activeOnly") === "1";
+      const snapshotOnly = url.searchParams.get("snapshot") === "1";
+      const since = Number.parseInt(url.searchParams.get("since") || "0", 10);
+      const lastSequence = Number.isFinite(since) && since > 0 ? since : 0;
+
+      const activeSnapshot = Array.from(this.activeTaskEvents.entries()).map(([sessionId, active]) => ({
+        taskId: active.taskId,
+        sessionId,
+        state: active.state,
+        source: active.source,
+        model: active.model,
+        petTheme: active.petTheme,
+        contextUsedTokens: active.contextUsedTokens,
+        contextWindowTokens: active.contextWindowTokens,
+        quotaUsedPercent: active.quotaUsedPercent,
+        quotaWindowMinutes: active.quotaWindowMinutes,
+        quotaResetsAt: active.quotaResetsAt,
+        title: this.taskEventTitle(active.state),
+        requiresAction: false
+      }));
+
+      if (activeOnly && snapshotOnly) {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Cache-Control": "no-store"
+        });
+        res.end(JSON.stringify(this.taskEvents.snapshot(activeSnapshot)));
+        return;
+      }
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "X-Active-Tasks": String(activeSnapshot.length)
+      });
+      res.flushHeaders();
+
+      const sendEvent = (event: CodexTaskEvent) => {
+        try {
+          res.write(`id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`);
+        } catch {}
+      };
+
+      // Subscribe before taking the initial snapshot. Otherwise a
+      // task_complete that lands between snapshot creation and subscribe can
+      // be lost, leaving clients stuck on the previous running state.
+      const unsubscribe = this.taskEvents.subscribe(sendEvent);
+
+      const initialEvents = activeOnly
+        ? this.taskEvents.snapshot(activeSnapshot)
+        : this.taskEvents.since(lastSequence);
+      for (const event of initialEvents) {
+        sendEvent(event);
+      }
+
+      const keepalive = setInterval(() => {
+        try { res.write(":keepalive\n\n"); } catch { clearInterval(keepalive); }
+      }, 15000);
+
+      req.on("close", () => {
+        unsubscribe();
         clearInterval(keepalive);
       });
       return;
@@ -2556,7 +3537,11 @@ stream_idle_timeout_ms = 600000
           this.saveConfig();
 
           const catalog = this.getModelCatalog();
-          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro")
+            || getNativeModels().find((m: any) => m.slug === "gpt-5.6-luna")
+            || getNativeModels()[0]
+            || catalog?.models?.[0]
+            || {};
           
           if (catalog && Array.isArray(catalog.models)) {
             catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "grok");
@@ -2600,7 +3585,11 @@ stream_idle_timeout_ms = 600000
           this.saveConfig();
 
           const catalog = this.getModelCatalog();
-          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro")
+            || getNativeModels().find((m: any) => m.slug === "gpt-5.6-luna")
+            || getNativeModels()[0]
+            || catalog?.models?.[0]
+            || {};
           
           if (catalog && Array.isArray(catalog.models)) {
             catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "claude");
@@ -2643,21 +3632,28 @@ stream_idle_timeout_ms = 600000
           this.saveConfig();
 
           const catalog = this.getModelCatalog();
-          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro") || catalog?.models?.[0] || {};
+          const baseModel = catalog?.models?.find((m: any) => m.slug === "deepseek-v4-pro")
+            || getNativeModels().find((m: any) => m.slug === "gpt-5.6-luna")
+            || getNativeModels()[0]
+            || catalog?.models?.[0]
+            || {};
           
           if (catalog && Array.isArray(catalog.models)) {
             catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "antigravity");
             
-            const modelsToAdd = [
-              { slug: "gemini-3.5-flash-medium", model: "gemini-3.5-flash-medium", display_name: "Gemini 3.5 Flash (Medium)", backend_model: "gpt-5.6-luna" },
-              { slug: "gemini-3.5-flash-high", model: "gemini-3.5-flash-high", display_name: "Gemini 3.5 Flash (High)", backend_model: "gpt-5.6-luna" },
-              { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.6-luna" },
-              { slug: "gemini-3.1-pro-low", model: "gemini-3.1-pro-low", display_name: "Gemini 3.1 Pro (Low)", backend_model: "gpt-5.5" },
-              { slug: "gemini-3.1-pro-high", model: "gemini-3.1-pro-high", display_name: "Gemini 3.1 Pro (High)", backend_model: "gpt-5.5" },
-              { slug: "claude-sonnet-4.6-thinking", model: "claude-sonnet-4.6-thinking", display_name: "Claude Sonnet 4.6 (Thinking)", backend_model: "gpt-5.5" },
-              { slug: "claude-opus-4.6-thinking", model: "claude-opus-4.6-thinking", display_name: "Claude Opus 4.6 (Thinking)", backend_model: "gpt-5.6-terra" },
-              { slug: "gpt-oss-120b-medium", model: "gpt-oss-120b-medium", display_name: "GPT-OSS 120B (Medium)", backend_model: "deepseek-v4-pro" }
-            ];
+            let modelsToAdd = await this.fetchAntigravityModels();
+            if (!modelsToAdd || modelsToAdd.length === 0) {
+              modelsToAdd = [
+                { slug: "gemini-3.6-flash-high", model: "gemini-3.6-flash-high", display_name: "Gemini 3.6 Flash (High)", backend_model: "gpt-5.6-luna" },
+                { slug: "gemini-3.6-flash-medium", model: "gemini-3.6-flash-medium", display_name: "Gemini 3.6 Flash (Medium)", backend_model: "gpt-5.6-luna" },
+                { slug: "gemini-3.6-flash-low", model: "gemini-3.6-flash-low", display_name: "Gemini 3.6 Flash (Low)", backend_model: "gpt-5.6-luna" },
+                { slug: "gemini-3.5-flash-low", model: "gemini-3.5-flash-low", display_name: "Gemini 3.5 Flash (Low)", backend_model: "gpt-5.6-luna" },
+                { slug: "gemini-3.1-pro-low", model: "gemini-3.1-pro-low", display_name: "Gemini 3.1 Pro (Low)", backend_model: "gpt-5.5" },
+                { slug: "claude-sonnet-4-6", model: "claude-sonnet-4-6", display_name: "Claude Sonnet 4.6", backend_model: "gpt-5.5" },
+                { slug: "claude-opus-4.6-thinking", model: "claude-opus-4.6-thinking", display_name: "Claude Opus 4.6 (Thinking)", backend_model: "gpt-5.6-terra" },
+                { slug: "gpt-oss-120b-medium", model: "gpt-oss-120b-medium", display_name: "GPT-OSS 120B (Medium)", backend_model: "deepseek-v4-pro" }
+              ];
+            }
 
             for (const item of modelsToAdd) {
               catalog.models.push({
@@ -3057,6 +4053,13 @@ stream_idle_timeout_ms = 600000
             } catch {}
           }
 
+          // Official/native Codex responses bypass 8765 entirely.  Start the
+          // UI observer before submitting the prompt so it can capture the new
+          // assistant item and feed TTS through the existing voice websocket.
+          if (isNativeModeEnabled()) {
+            await this.startNativeVoiceResponseObserver();
+          }
+
           let result = await this.injectPromptViaCDP(prompt);
           if (result === "connection_failed") {
             console.warn("[OpenCodex Voice API] CDP connection failed. Attempting to relaunch Codex with debugging enabled...");
@@ -3064,6 +4067,9 @@ stream_idle_timeout_ms = 600000
             // Wait 5 seconds for Codex to restart and open
             await new Promise((resolve) => setTimeout(resolve, 5000));
             // Retry injection
+            if (isNativeModeEnabled()) {
+              await this.startNativeVoiceResponseObserver();
+            }
             result = await this.injectPromptViaCDP(prompt);
           }
 
@@ -3144,27 +4150,22 @@ stream_idle_timeout_ms = 600000
         const method = data.method === "app" ? "app" : "swift-run";
         
         const checkAndLaunch = async () => {
-          let isCDPOpen = false;
-          try {
-            const cdpRes = await fetch("http://127.0.0.1:8315/json");
-            if (cdpRes.ok) {
-              isCDPOpen = true;
-            }
-          } catch (e) {}
-
-          if (!isCDPOpen) {
-            console.log("[OpenCodex] Proactively relaunching Codex with debugging enabled since port 8315 is closed...");
-            this.restartCodexDesktop();
-            // Wait 3.5 seconds for Codex to restart cleanly
-            await new Promise((resolve) => setTimeout(resolve, 3500));
+          // Voice control relies on Codex being launched with the CDP flag.
+          // An already-open 8315 port is not sufficient: it may belong to an
+          // old Codex process that was started without remote debugging.
+          console.log("[OpenCodex] Restarting Codex with CDP before launching Voice Bar...");
+          await this.restartCodexDesktop();
+          const cdpReady = await this.waitForCodexCdp();
+          if (!cdpReady) {
+            console.warn("[OpenCodex] Codex CDP port 8315 did not become ready before Voice Bar launch.");
           }
-
           this.restartVoiceBar(method);
+          return cdpReady;
         };
 
         checkAndLaunch().then(() => {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "success", method }));
+          res.end(JSON.stringify({ status: "success", method, codex_restarted: true }));
         }).catch((err) => {
           res.writeHead(500, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: err.message }));
@@ -3338,7 +4339,9 @@ stream_idle_timeout_ms = 600000
           }
         } catch {}
       }
-      if (realToken && !headers["authorization"]) {
+      const incomingAuthorization = headers["authorization"] || "";
+      const isPlaceholderAuthorization = /\b(dummy|opencodex)\b/i.test(incomingAuthorization);
+      if (realToken && (!incomingAuthorization || isPlaceholderAuthorization)) {
         headers["authorization"] = `Bearer ${realToken}`;
       }
 
@@ -3434,6 +4437,19 @@ stream_idle_timeout_ms = 600000
     });
 
     const namespaceMap = extractNamespaceMap(processedReqBody.tools);
+    const requestInstructions = typeof processedReqBody.instructions === "string" ? processedReqBody.instructions : "";
+    const isTitleRequest = requestInstructions.includes("provide a short title") ||
+      requestInstructions.includes("task title based solely on the prompt");
+    const shouldEmitHttpTask = isCustomModel && !isTitleRequest &&
+      (this.hasUserTurnMessage(processedReqBody) || this.hasToolOutput(processedReqBody));
+    const httpTaskId = shouldEmitHttpTask
+      ? this.beginTaskEvent(
+        sessionIdStr,
+        "gateway",
+        requestedModel,
+        processedReqBody.client_metadata?.turn_id || processedReqBody.client_metadata?.request_id
+      )
+      : undefined;
 
     try {
       if (isStream) {
@@ -3447,7 +4463,10 @@ stream_idle_timeout_ms = 600000
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
+      if (httpTaskId) this.finishTaskEvent(sessionIdStr, "failed", err?.message, httpTaskId);
+      return;
     }
+    if (httpTaskId) this.finishTaskEvent(sessionIdStr, "completed", undefined, httpTaskId);
   }
 
   private async streamResponses(
@@ -3506,26 +4525,34 @@ stream_idle_timeout_ms = 600000
     const decoder = new TextDecoder();
     let buffer = "";
 
+    const processResponseSseLine = async (line: string) => {
+      const parsedLine = parseSseJsonLine(line);
+      if (!parsedLine) return;
+      try {
+        const chunk = parsedLine.payload;
+        logUpstreamToolCalls(requestedModel, chunk);
+        await streamState.writeChatDelta(async (payload) => {
+          res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        }, chunk);
+      } catch {
+        // A provider may split a malformed/non-JSON SSE line; ignore it.
+      }
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) await processResponseSseLine(buffer);
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
-          if (!trimmed.startsWith("data: ")) continue;
-          try {
-            const chunk = JSON.parse(trimmed.slice(6));
-            await streamState.writeChatDelta(async (payload) => {
-              res.write(`data: ${JSON.stringify(payload)}\n\n`);
-            }, chunk);
-          } catch {
-            // ignore JSON parsing chunks error
-          }
+          await processResponseSseLine(line);
         }
       }
     } finally {
@@ -3747,34 +4774,40 @@ stream_idle_timeout_ms = 600000
     let buffer = "";
 
     let accumulatedText = "";
+    const processChatSseLine = (line: string) => {
+      const parsedLine = parseSseJsonLine(line);
+      if (!parsedLine) return;
+      try {
+        const rawChunk = parsedLine.raw;
+        res.write(`data: ${rawChunk}\n\n`);
+        const parsed = parsedLine.payload;
+        const content = parsed.choices?.[0]?.delta?.content || "";
+        if (content) {
+          accumulatedText += content;
+          const msg = JSON.stringify({ type: "model_chunk", text: content });
+          for (const wsClient of this.activeWsClients) {
+            try { wsClient.send(msg); } catch {}
+          }
+        }
+      } catch {
+        // Ignore non-JSON provider keep-alive lines.
+      }
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          if (buffer.trim()) processChatSseLine(buffer);
+          break;
+        }
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || trimmed === "data: [DONE]") continue;
-          if (!trimmed.startsWith("data: ")) continue;
-          try {
-            const rawChunk = trimmed.slice(6);
-            res.write(`data: ${rawChunk}\n\n`);
-            
-            const parsed = JSON.parse(rawChunk);
-            const content = parsed.choices?.[0]?.delta?.content || "";
-            if (content) {
-              accumulatedText += content;
-              const msg = JSON.stringify({ type: "model_chunk", text: content });
-              for (const wsClient of this.activeWsClients) {
-                try { wsClient.send(msg); } catch {}
-              }
-            }
-          } catch {
-            // ignore
-          }
+          processChatSseLine(line);
         }
       }
     } finally {
@@ -4218,6 +5251,226 @@ stream_idle_timeout_ms = 600000
 
   private activeWsClients = new Set<WebSocket>();
   private desktopWsClients = new Set<WebSocket>();
+  // Native Codex responses do not pass through this proxy.  Keep one short-lived
+  // CDP observer for voice requests so OpenCodexBar can still receive the same
+  // model_chunk/model_done events that it receives in gateway mode.
+  private nativeVoiceObserverWs: WebSocket | null = null;
+  private nativeVoiceObserverTimer: NodeJS.Timeout | null = null;
+  private nativeVoiceObserverRun = 0;
+
+  private stopNativeVoiceResponseObserver() {
+    this.nativeVoiceObserverRun += 1;
+    if (this.nativeVoiceObserverTimer) {
+      clearTimeout(this.nativeVoiceObserverTimer);
+      this.nativeVoiceObserverTimer = null;
+    }
+    if (this.nativeVoiceObserverWs) {
+      try { this.nativeVoiceObserverWs.close(); } catch {}
+      this.nativeVoiceObserverWs = null;
+    }
+  }
+
+  private broadcastNativeVoiceChunk(text: string) {
+    if (!text) return;
+    const payload = JSON.stringify({ type: "model_chunk", text });
+    for (const ws of this.activeWsClients) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+      } catch {}
+    }
+  }
+
+  private broadcastNativeVoiceDone(text: string) {
+    const payload = JSON.stringify({ type: "model_done", text: text || "" });
+    for (const ws of this.activeWsClients) {
+      try {
+        if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+      } catch {}
+    }
+  }
+
+  /**
+   * Observe the native Codex UI after a voice prompt is injected.  In native
+   * mode the response is delivered directly by Codex, so the proxy's normal
+   * Responses/WebSocket hooks never see it.  This observer only mirrors the
+   * rendered assistant text to the local voice bar; it does not alter Codex's
+   * request or response.
+   */
+  private async startNativeVoiceResponseObserver(): Promise<void> {
+    this.stopNativeVoiceResponseObserver();
+    const run = this.nativeVoiceObserverRun;
+
+    try {
+      const response = await fetch("http://127.0.0.1:8315/json");
+      const targets: any[] = await response.json() as any[];
+      const pageTarget = targets.find((t: any) =>
+        t.type === "page" &&
+        t.url.includes("index.html") &&
+        !t.url.includes("avatar-overlay") &&
+        !t.url.includes("initialRoute") &&
+        t.webSocketDebuggerUrl
+      );
+      if (!pageTarget) {
+        console.warn("[OpenCodex Native Voice] Codex CDP page not found; voice reply observer disabled.");
+        return;
+      }
+
+      const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+      this.nativeVoiceObserverWs = ws;
+      const snapshotExpression = `(() => ({
+        messages: [...document.querySelectorAll('[data-content-search-unit-key$=":assistant"]')].map((el) => ({
+          key: el.getAttribute('data-content-search-unit-key') || '',
+          text: [...el.querySelectorAll('[data-selected-text-overlay-target]')]
+            .map((node) => (node.innerText || node.textContent || '').trim())
+            .filter(Boolean).join('\\n').trim()
+        })),
+        generating: [...document.querySelectorAll('button')].some((button) => {
+          const label = ((button.getAttribute('aria-label') || '') + ' ' + (button.getAttribute('title') || '') + ' ' + (button.innerText || '')).toLowerCase();
+          return label.includes('stop generating') || label.includes('停止生成') || label.includes('停止');
+        })
+      }))()`;
+
+      let resolveBaseline: (() => void) | null = null;
+      const baselineReady = new Promise<void>((resolve) => {
+        resolveBaseline = resolve;
+      });
+
+      // Keep the observer alive in the background, but let the caller wait
+      // until the pre-submit baseline has definitely been captured.
+      void new Promise<void>((resolve) => {
+        let settled = false;
+        const finish = () => {
+          if (!settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const baselineKeys = new Set<string>();
+        let baselineCaptured = false;
+        let lastKey = "";
+        let emittedText = "";
+        let latestText = "";
+        let stablePolls = 0;
+        let queryId = 1;
+        const deadline = Date.now() + 120_000;
+
+        const sendSnapshot = () => {
+          if (run !== this.nativeVoiceObserverRun || ws.readyState !== WebSocket.OPEN) {
+            finish();
+            return;
+          }
+          const id = queryId++;
+          ws.send(JSON.stringify({
+            id,
+            method: "Runtime.evaluate",
+            params: { expression: snapshotExpression, returnByValue: true }
+          }));
+          (ws as any).__nativeVoiceQueryId = id;
+        };
+
+        const poll = () => {
+          if (run !== this.nativeVoiceObserverRun || Date.now() > deadline || ws.readyState !== WebSocket.OPEN) {
+            if (run === this.nativeVoiceObserverRun) this.stopNativeVoiceResponseObserver();
+            finish();
+            return;
+          }
+          this.nativeVoiceObserverTimer = setTimeout(sendSnapshot, 250);
+        };
+
+        ws.on("open", () => {
+          ws.send(JSON.stringify({
+            id: 1,
+            method: "Runtime.evaluate",
+            params: { expression: snapshotExpression, returnByValue: true }
+          }));
+          (ws as any).__nativeVoiceQueryId = 1;
+        });
+
+        ws.on("message", (data) => {
+          if (run !== this.nativeVoiceObserverRun) {
+            finish();
+            return;
+          }
+          try {
+            const message = JSON.parse(data.toString());
+            if (message.id !== (ws as any).__nativeVoiceQueryId) return;
+            const value = message.result?.result?.value;
+            if (!value || !Array.isArray(value.messages)) {
+              poll();
+              return;
+            }
+
+            if (message.id === 1 && !baselineCaptured) {
+              baselineCaptured = true;
+              for (const item of value.messages) {
+                if (item.key) baselineKeys.add(item.key);
+              }
+              resolveBaseline?.();
+              resolveBaseline = null;
+              poll();
+              return;
+            }
+
+            const candidates = value.messages.filter((item: any) => item.key && !baselineKeys.has(item.key));
+            const current = candidates[candidates.length - 1];
+            if (!current) {
+              poll();
+              return;
+            }
+
+            const currentKey = String(current.key);
+            const currentText = typeof current.text === "string" ? current.text : "";
+            if (currentKey !== lastKey) {
+              lastKey = currentKey;
+              emittedText = "";
+              stablePolls = 0;
+            }
+
+            if (currentText === latestText) stablePolls += 1;
+            else stablePolls = 0;
+            latestText = currentText;
+
+            if (currentText && currentText.startsWith(emittedText)) {
+              const delta = currentText.slice(emittedText.length);
+              if (delta) this.broadcastNativeVoiceChunk(delta);
+              emittedText = currentText;
+            } else if (currentText && currentText !== emittedText) {
+              // A newly-rendered assistant item can replace a transient status
+              // item.  Send the current text once rather than corrupting it by
+              // attempting a character-level diff across two different items.
+              this.broadcastNativeVoiceChunk(currentText);
+              emittedText = currentText;
+            }
+
+            const generating = Boolean(value.generating);
+            if (currentText && !generating && stablePolls >= 3) {
+              console.log(`[OpenCodex Native Voice] Native response complete (${currentText.length} chars).`);
+              this.broadcastNativeVoiceDone(currentText);
+              this.stopNativeVoiceResponseObserver();
+              finish();
+              return;
+            }
+          } catch {}
+          poll();
+        });
+
+        ws.on("error", (error) => {
+          console.warn(`[OpenCodex Native Voice] CDP observer error: ${error.message}`);
+          resolveBaseline?.();
+          resolveBaseline = null;
+          finish();
+        });
+        ws.on("close", () => {
+          resolveBaseline?.();
+          resolveBaseline = null;
+          finish();
+        });
+      });
+      await baselineReady;
+    } catch (error: any) {
+      console.warn(`[OpenCodex Native Voice] Failed to start response observer: ${error.message}`);
+    }
+  }
 
   private logWSPacket(direction: "IN" | "OUT", payload: any, sessionId?: string) {
     const line = `[${new Date().toISOString()}] [${direction}] [Session: ${sessionId || "unknown"}] ${typeof payload === "string" ? payload : JSON.stringify(payload)}\n`;
@@ -5012,27 +6265,14 @@ stream_idle_timeout_ms = 600000
         const token = this.resolveKey("antigravity-cli-auto");
         
         let originalModel = catalogEntry.slug || requestedModel;
-        if (originalModel.includes("flash")) originalModel = "gemini-3.5-flash-low";
-        else if (originalModel.includes("pro") || originalModel.includes("claude") || originalModel.includes("sonnet") || originalModel.includes("opus") || originalModel === "gpt-5.5" || originalModel === "gpt-5.6-terra") originalModel = "gemini-3.1-pro-low";
-        else if (originalModel === "gpt-5.4-mini") originalModel = "gemini-3.5-flash-low";
-        else originalModel = "gemini-3.5-flash-low";
+        if (!originalModel || originalModel === "gpt-5.4-mini") {
+          originalModel = "gemini-3.6-flash-low";
+        }
 
         console.log(`[OpenCodex WS Proxy] Mapped model: ${requestedModel} -> ${originalModel}`);
 
-        const contents: any[] = [];
-        for (const m of chatBody.messages) {
-          if (m.role === "system") continue;
-          const role = m.role === "assistant" ? "model" : "user";
-          const text = m.content || "";
-          if (contents.length > 0 && contents[contents.length - 1].role === role) {
-            contents[contents.length - 1].parts[0].text += "\n" + text;
-          } else {
-            contents.push({
-              role,
-              parts: [{ text }]
-            });
-          }
-        }
+        const contents = buildAntigravityContents(chatBody.messages);
+        const systemInstruction = buildAntigravitySystemInstruction(chatBody.messages);
         if (contents.length > 0 && contents[0].role === "model") {
           contents.unshift({
             role: "user",
@@ -5040,29 +6280,53 @@ stream_idle_timeout_ms = 600000
           });
         }
 
+        const antigravityTools = buildAntigravityTools(chatBody.tools);
+
         const antigravityPayload = {
           project: "default-cli-project",
           model: originalModel,
           request: {
             contents: contents,
+            ...(systemInstruction ? { systemInstruction: { parts: [{ text: systemInstruction }] } } : {}),
+            ...(antigravityTools.length > 0 ? {
+              tools: [{ functionDeclarations: antigravityTools }],
+              toolConfig: { functionCallingConfig: { mode: "AUTO" } }
+            } : {}),
             generationConfig: {}
           }
         };
 
         const antigravityAbort = new AbortController();
         const antigravityTimeout = setTimeout(() => antigravityAbort.abort(), 120000);
-        const response = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json",
-            "User-Agent": "antigravity/hub/2.2.1 darwin/arm64",
-            "Accept-Encoding": "gzip"
-          },
-          body: JSON.stringify(antigravityPayload),
-          signal: antigravityAbort.signal,
-          dispatcher: fetchDispatcher
-        });
+        const fetchAntigravity = (authToken: string) => fetch(
+          "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse",
+          {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${authToken}`,
+              "Content-Type": "application/json",
+              "User-Agent": "antigravity/hub/2.2.1 darwin/arm64",
+              "Accept-Encoding": "gzip"
+            },
+            body: JSON.stringify(antigravityPayload),
+            signal: antigravityAbort.signal,
+            dispatcher: fetchDispatcher
+          }
+        );
+        let response = await fetchAntigravity(token);
+        if (response.status === 401) {
+          // A token can be revoked before its recorded expiry. Force one
+          // Keychain refresh and retry the same request before reporting an
+          // authentication failure to Codex.
+          this.antigravityTokenCache = "";
+          this.antigravityTokenCacheTime = 0;
+          this.antigravityTokenExpiry = 0;
+          const refreshedToken = this.resolveKey("antigravity-cli-auto", true);
+          if (refreshedToken && refreshedToken !== token) {
+            console.log("[OpenCodex WS Proxy] Antigravity returned 401; retrying once with refreshed login token.");
+            response = await fetchAntigravity(refreshedToken);
+          }
+        }
         clearTimeout(antigravityTimeout);
 
         console.log(`[OpenCodex WS Proxy] Antigravity response status: ${response.status}`);
@@ -5095,22 +6359,65 @@ stream_idle_timeout_ms = 600000
           const reader = response.body!.getReader();
           const decoder = new TextDecoder();
           let buffer = "";
+          let antigravityText = "";
+          let antigravityEventCount = 0;
+          const antigravityToolArguments = new Map<number, string>();
+          const antigravityToolNames = new Map<number, string>();
 
           const processAntigravitySseLine = async (line: string) => {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed === "data: [DONE]" || !trimmed.startsWith("data: ")) return;
+            const parsedLine = parseSseJsonLine(line);
+            if (!parsedLine) return;
             try {
-              const data = JSON.parse(trimmed.slice(6));
-              const parts = data.response?.candidates?.[0]?.content?.parts
-                || data.candidates?.[0]?.content?.parts
-                || [];
-              const text = Array.isArray(parts)
-                ? parts.map((part: any) => typeof part?.text === "string" ? part.text : "").join("")
-                : "";
+              const data = parsedLine.payload;
+              antigravityEventCount++;
+              const functionCalls = extractAntigravityFunctionCalls(data);
+              for (const call of functionCalls) {
+                const index = call.index;
+                const name = call.name || antigravityToolNames.get(index) || "";
+                const args = call.arguments || "";
+                const previousArgs = antigravityToolArguments.get(index) || "";
+                const previousName = antigravityToolNames.get(index) || "";
+                const nameDelta = previousName && name.startsWith(previousName)
+                  ? name.slice(previousName.length)
+                  : previousName === name ? "" : name;
+                const argsDelta = args.startsWith(previousArgs)
+                  ? args.slice(previousArgs.length)
+                  : previousArgs === args ? "" : args;
+                antigravityToolNames.set(index, name);
+                antigravityToolArguments.set(index, args);
+                if (nameDelta || argsDelta) {
+                  await streamState.writeChatDelta(async (payload) => {
+                    broadcastToClients(payload);
+                  }, {
+                    choices: [{
+                      delta: {
+                        tool_calls: [{
+                          index,
+                          id: call.id || `call_${index}`,
+                          type: "function",
+                          function: { name: nameDelta, arguments: argsDelta }
+                        }]
+                      }
+                    }]
+                  });
+                }
+              }
+              const text = extractAntigravityText(data);
               if (text) {
+                // Gemini may send the complete accumulated candidate text on
+                // each SSE event instead of a delta. Only forward the suffix.
+                const delta = text.startsWith(antigravityText)
+                  ? text.slice(antigravityText.length)
+                  : text;
+                antigravityText = text.startsWith(antigravityText)
+                  ? text
+                  : antigravityText + delta;
+                if (!delta) return;
                 await streamState.writeChatDelta(async (payload) => {
                   broadcastToClients(payload);
-                }, { choices: [{ delta: { content: text } }] });
+                }, { choices: [{ delta: { content: delta } }] });
+              } else if ((data.response?.candidates || data.candidates) && functionCalls.length === 0) {
+                console.warn(`[OpenCodex WS Proxy] Antigravity event ${antigravityEventCount} contained no visible text.`);
               }
             } catch (pe: any) {
               console.error(`[OpenCodex WS Proxy] Antigravity parse chunk error: ${pe.message}`);
@@ -5121,6 +6428,7 @@ stream_idle_timeout_ms = 600000
             while (true) {
               const { done, value } = await reader.read();
               if (done) {
+                buffer += decoder.decode();
                 // Some SSE servers close without a final blank line. Flush
                 // the last complete JSON event instead of silently dropping it.
                 if (buffer.trim()) await processAntigravitySseLine(buffer);
@@ -5139,6 +6447,12 @@ stream_idle_timeout_ms = 600000
           }
 
           console.log(`[OpenCodex WS Proxy] Finalizing Antigravity stream...`);
+          const antigravityAssistant = streamState.getAssistantMessage();
+          if (!antigravityAssistant.content && (!antigravityAssistant.tool_calls || antigravityAssistant.tool_calls.length === 0)) {
+            await streamState.writeChatDelta(async (payload) => {
+              broadcastToClients(payload);
+            }, { choices: [{ delta: { content: "[OpenCodex Proxy Error] 上游返回了空内容，请重试。" } }] });
+          }
           await streamState.finish(async (payload) => {
             broadcastToClients(payload);
           });
@@ -5193,6 +6507,23 @@ stream_idle_timeout_ms = 600000
           while (true) {
             const { done, value } = await reader.read();
             if (done) {
+              buffer += decoder.decode();
+              if (buffer.trim()) {
+                const trailingLines = buffer.split("\n");
+              for (const line of trailingLines) {
+                  const parsedLine = parseSseJsonLine(line);
+                  if (!parsedLine) continue;
+                  try {
+                    const chunk = parsedLine.payload;
+                    logUpstreamToolCalls(requestedModel, chunk);
+                    await streamState.writeChatDelta(async (payload) => {
+                      broadcastToClients(payload);
+                    }, chunk);
+                  } catch (parseErr: any) {
+                    console.error(`[OpenCodex WS Proxy] Error parsing trailing delta: ${parseErr.message}`);
+                  }
+                }
+              }
               console.log(`[OpenCodex WS Proxy] Upstream stream reader finished. Total chunks: ${chunkCount}`);
               break;
             }
@@ -5202,11 +6533,11 @@ stream_idle_timeout_ms = 600000
             buffer = lines.pop() || "";
 
             for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed || trimmed === "data: [DONE]") continue;
-              if (!trimmed.startsWith("data: ")) continue;
+              const parsedLine = parseSseJsonLine(line);
+              if (!parsedLine) continue;
               try {
-                const chunk = JSON.parse(trimmed.slice(6));
+                const chunk = parsedLine.payload;
+                logUpstreamToolCalls(requestedModel, chunk);
                 await streamState.writeChatDelta(async (payload) => {
                   broadcastToClients(payload);
                 }, chunk);
@@ -5220,6 +6551,12 @@ stream_idle_timeout_ms = 600000
         }
 
         console.log(`[OpenCodex WS Proxy] Finalizing stream...`);
+        const assistantBeforeFinish = streamState.getAssistantMessage();
+        if (!assistantBeforeFinish.content && (!assistantBeforeFinish.tool_calls || assistantBeforeFinish.tool_calls.length === 0)) {
+          await streamState.writeChatDelta(async (payload) => {
+            broadcastToClients(payload);
+          }, { choices: [{ delta: { content: "[OpenCodex Proxy Error] 上游返回了空内容，请重试。" } }] });
+        }
         await streamState.finish(async (payload) => {
           broadcastToClients(payload);
         });
@@ -5567,6 +6904,177 @@ function pcmToWav(pcm: Buffer, sampleRate: number, channels: number, bitsPerSamp
 
 function stripManagedBlocks(content: string): string {
   return content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
+}
+
+function sanitizeGeminiSchema(value: any): any {
+  if (Array.isArray(value)) return value.map(sanitizeGeminiSchema);
+  if (!value || typeof value !== "object") return value;
+
+  // Cloud Code uses the Gemini/OpenAPI schema subset. These JSON-Schema keys
+  // are valid for Responses/Chat but are rejected or ignored by Gemini.
+  const unsupported = new Set(["$schema", "additionalProperties", "default", "examples", "example", "oneOf", "anyOf", "allOf", "const"]);
+  const out: any = {};
+  for (const [key, child] of Object.entries(value)) {
+    if (unsupported.has(key)) continue;
+    if (key === "type" && typeof child === "string") {
+      out[key] = child.toUpperCase();
+    } else {
+      out[key] = sanitizeGeminiSchema(child);
+    }
+  }
+  return out;
+}
+
+function buildAntigravityTools(chatTools: any[] | undefined): any[] {
+  if (!Array.isArray(chatTools)) return [];
+  return chatTools
+    .map((tool: any) => tool?.function)
+    .filter((fn: any) => fn && typeof fn.name === "string" && fn.name.length > 0)
+    .map((fn: any) => ({
+      name: fn.name.slice(0, 64),
+      description: typeof fn.description === "string" ? fn.description.slice(0, 10000) : "",
+      parameters: sanitizeGeminiSchema(fn.parameters || { type: "OBJECT", properties: {} })
+    }));
+}
+
+function buildAntigravityContents(messages: any[]): any[] {
+  const contents: any[] = [];
+  const toolCallNames = new Map<string, string>();
+
+  const append = (role: "user" | "model", part: any) => {
+    if (!part) return;
+    const previous = contents[contents.length - 1];
+    if (previous?.role === role) {
+      previous.parts.push(part);
+    } else {
+      contents.push({ role, parts: [part] });
+    }
+  };
+
+  for (const message of Array.isArray(messages) ? messages : []) {
+    if (!message || message.role === "system") continue;
+    if (message.role === "assistant") {
+      const text = typeof message.content === "string" ? message.content : "";
+      if (text) append("model", { text });
+      for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+        const fn = call?.function || {};
+        const callId = String(call?.id || `call_${toolCallNames.size}`);
+        const args = parseJsonObject(fn.arguments);
+        toolCallNames.set(callId, String(fn.name || ""));
+        append("model", { functionCall: { name: String(fn.name || ""), args } });
+      }
+      continue;
+    }
+    if (message.role === "tool") {
+      const callId = String(message.tool_call_id || "");
+      const name = toolCallNames.get(callId) || callId || "tool_result";
+      const raw = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+      const response = parseJsonObject(raw);
+      append("user", { functionResponse: { name, response: response && typeof response === "object" ? response : { result: response } } });
+      continue;
+    }
+    const text = typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+    if (text) append("user", { text });
+  }
+  return contents;
+}
+
+function buildAntigravitySystemInstruction(messages: any[]): string {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message: any) => message?.role === "system")
+    .map((message: any) => typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? ""))
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function parseJsonObject(value: any): any {
+  if (value && typeof value === "object") return value;
+  if (typeof value === "string") {
+    try { return JSON.parse(value); } catch {}
+  }
+  return value ?? {};
+}
+
+function logUpstreamToolCalls(model: string, chunk: any): void {
+  const choice = chunk?.choices?.[0];
+  const calls = choice?.delta?.tool_calls || choice?.message?.tool_calls
+    || (choice?.delta?.function_call ? [{ function: choice.delta.function_call }] : [])
+    || (choice?.message?.function_call ? [{ function: choice.message.function_call }] : []);
+  if (!Array.isArray(calls) || calls.length === 0) return;
+  const names = calls
+    .map((call: any) => call?.function?.name || call?.name || "unknown")
+    .filter(Boolean);
+  if (names.length > 0) {
+    console.log(`[OpenCodex Tool Trace] ${model}: upstream tool call(s): ${names.join(", ")}`);
+  }
+}
+
+function extractAntigravityFunctionCalls(payload: any): Array<{ index: number; id?: string; name: string; arguments: string }> {
+  const candidates = [
+    payload?.response?.candidates,
+    payload?.candidates,
+    payload?.response?.response?.candidates
+  ];
+  const result: Array<{ index: number; id?: string; name: string; arguments: string }> = [];
+  for (const list of candidates) {
+    if (!Array.isArray(list)) continue;
+    for (const candidate of list) {
+      const parts = candidate?.content?.parts || candidate?.parts || [];
+      if (!Array.isArray(parts)) continue;
+      for (const part of parts) {
+        const call = part?.functionCall || part?.function_call;
+        if (!call || typeof call !== "object") continue;
+        const index = Number.isFinite(Number(call.index)) ? Number(call.index) : result.length;
+        result.push({
+          index,
+          id: typeof call.id === "string" ? call.id : undefined,
+          name: String(call.name || ""),
+          arguments: JSON.stringify(call.args ?? call.arguments ?? {})
+        });
+      }
+    }
+  }
+  return result;
+}
+
+function extractAntigravityText(payload: any): string {
+  const candidates = [
+    payload?.response?.candidates,
+    payload?.candidates,
+    payload?.response?.response?.candidates
+  ];
+  for (const list of candidates) {
+    if (!Array.isArray(list)) continue;
+    const candidate = list[0];
+    if (!candidate) continue;
+    const parts = candidate.content?.parts || candidate.parts || [];
+    if (Array.isArray(parts)) {
+      const text = parts
+        .map((part: any) => typeof part?.text === "string" ? part.text : "")
+        .join("");
+      if (text) return text;
+    }
+    if (typeof candidate.text === "string" && candidate.text) {
+      return candidate.text;
+    }
+  }
+  if (typeof payload?.response?.text === "string") return payload.response.text;
+  if (typeof payload?.text === "string") return payload.text;
+  return "";
+}
+
+function parseSseJsonLine(line: string): { raw: string; payload: any } | null {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed === "[DONE]" || trimmed === "data: [DONE]" || trimmed === "data:[DONE]") {
+    return null;
+  }
+  const raw = trimmed.startsWith("data:") ? trimmed.slice(5).trim() : trimmed;
+  if (!raw.startsWith("{")) return null;
+  try {
+    return { raw, payload: JSON.parse(raw) };
+  } catch {
+    return null;
+  }
 }
 
 function getDefaultCatalog() {

@@ -802,7 +802,11 @@ export class ResponsesStreamState {
         await this._closeReasoning(wrapped, rState);
       }
     }
-    if (!this.messageOpened) {
+    // A tool-only assistant turn must not create a synthetic blank message
+    // before the function_call items. Some Codex clients interpret that blank
+    // message as the model's answer and never surface/dispatch the tool call.
+    const hasToolCalls = Object.keys(this.toolCalls).length > 0;
+    if (!this.messageOpened && !hasToolCalls) {
       await this._openMessage(wrapped);
     }
     if (this.messageOpened && !this.messageClosed) {
@@ -860,12 +864,20 @@ export class ResponsesStreamState {
     if (!choice) return;
     const delta = choice.delta || {};
 
-    const reasoning = delta.reasoning_content || delta.reasoning;
+    const reasoning = delta.reasoning_content || delta.reasoning || choice.message?.reasoning_content;
     if (reasoning) {
       await this._chatReasoningDelta(wrapped, reasoning);
     }
 
-    const content = delta.content;
+    const rawContent = delta.content ?? delta.text ?? choice.text ?? choice.message?.content;
+    const content = Array.isArray(rawContent)
+      ? rawContent.map((part: any) => {
+          if (typeof part === "string") return part;
+          if (typeof part?.text === "string") return part.text;
+          if (typeof part?.content === "string") return part.content;
+          return "";
+        }).join("")
+      : typeof rawContent === "string" ? rawContent : "";
     if (content) {
       for (const key of Object.keys(this.reasoningBlocks)) {
         const rState = this.reasoningBlocks[key];
@@ -883,7 +895,19 @@ export class ResponsesStreamState {
       }
     }
 
-    const toolCalls = delta.tool_calls || [];
+    // Providers are not consistent about whether streamed tool calls live in
+    // `delta.tool_calls`, `message.tool_calls`, or the legacy singular
+    // `function_call` field. Normalize all three shapes here so the Responses
+    // side sees one stable function_call stream.
+    const toolCalls = Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0
+      ? delta.tool_calls
+      : Array.isArray(choice.message?.tool_calls) && choice.message.tool_calls.length > 0
+        ? choice.message.tool_calls
+        : delta.function_call
+          ? [{ index: 0, type: "function", function: delta.function_call }]
+          : choice.message?.function_call
+            ? [{ index: 0, type: "function", function: choice.message.function_call }]
+            : [];
     for (const call of toolCalls) {
       await this._chatToolDelta(wrapped, call);
     }
@@ -935,7 +959,12 @@ export class ResponsesStreamState {
     }
 
     // Defer ensureToolOpened until we have the complete name (which is when arguments start streaming or the tool closes)
-    const argDelta = fn.arguments || "";
+    const rawArguments = fn.arguments;
+    const argDelta = typeof rawArguments === "string"
+      ? rawArguments
+      : rawArguments === undefined || rawArguments === null
+        ? ""
+        : JSON.stringify(rawArguments);
     if (argDelta) {
       if (!state.added) {
         await this._ensureToolOpened(writeSse, state);
