@@ -46,7 +46,7 @@ Now, simulate a beginner running the OpenCodex setup wizard for the first time:
     *   **Language Selection**: Enter `2` for **简体中文** (or `1` for **English**).
     *   **Conflict Clearance**: Observe the wizard automatically detecting and freeing port `8765` and unloading conflicting services.
     *   **DeepSeek Key**: Paste your OpenCode/DeepSeek API Key when prompted:
-        `sk-LyjwiyqgDyyhQ5xhy8a9bALhtI7irtDHusLvy6o58qRFCdDQCajHNxIs4tmYK6ug`
+        `<REVOKED_API_KEY>`
     *   **OpenCode Key**: Press **Enter** to use the pre-packaged default key.
     *   **Activation**: Verify the wizard successfully surgeons `~/.codex/config.toml` and writes presets.
 
@@ -139,7 +139,7 @@ Finally, test Codex Desktop's visual features using the text-only DeepSeek model
     *   **选择语言**：输入 `2` 选择 **简体中文**（或输入 `1` 选择 **English**）。
     *   **清理冲突**：观察向导自动检测并释放占用 `8765` 端口的冲突进程。
     *   **DeepSeek Key 键入**：粘贴您的 OpenCode 密钥：
-        `sk-LyjwiyqgDyyhQ5xhy8a9bALhtI7irtDHusLvy6o58qRFCdDQCajHNxIs4tmYK6ug`
+        `<REVOKED_API_KEY>`
     *   **OpenCode Key 键入**：直接敲击 **回车 (Enter)** 使用默认预设值。
     *   **写入激活**：观察向导对 `config.toml` 实施的手术级注入并生成预设。
 

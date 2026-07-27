@@ -1,0 +1,7 @@
+# Replace relay.example.com after purchasing/configuring the domain.
+relay.example.com {
+    reverse_proxy 127.0.0.1:8787
+}
+
+# Until a domain exists, keep the relay bound to loopback and validate it with:
+# curl http://127.0.0.1:8787/health

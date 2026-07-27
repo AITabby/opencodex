@@ -1,0 +1,542 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		272F69F016DFB3EAAE38A9BD /* KeychainStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E084B351B63462C27817BCA2 /* KeychainStore.swift */; };
+		2FCC6709CEBB56EFAF141899 /* CodexTaskWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6AC5E486C579AA6671AA8FF3 /* CodexTaskWidget.swift */; };
+		30EE2381D52B89A68CB97872 /* TaskEventModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 631D6A6A92449837421F9B41 /* TaskEventModels.swift */; };
+		598755BC72558EA76FE4C605 /* NotificationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 08C3B70F88C6C05932F0F04A /* NotificationManager.swift */; };
+		7574B7ACCAE5C529FB218DCD /* TaskRelayClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BA09320DC5A90D31724A86E /* TaskRelayClient.swift */; };
+		88549228E2E6B2CF28BE2243 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = F6E39FC524D17D31BEAFD61C /* LaunchScreen.storyboard */; };
+		9A32D9E6A71D14F91047CDBD /* CodexTaskWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 80DDAD04187F6983BEE2547D /* CodexTaskWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A0EEFC12A369DAD717AE6DDC /* TaskActivityCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = E39A02B14329A3E950F3CE9F /* TaskActivityCoordinator.swift */; };
+		ACF388829632E9BEE34934B4 /* OpenCodexMobileApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = C438DA5BCCA72367302D24A2 /* OpenCodexMobileApp.swift */; };
+		B8BE08544B014C8A6BD76452 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = E100A4C7C0C63FB278AF0346 /* LaunchScreen.storyboard */; };
+		C1B13EF8A74E64D5A13B5D40 /* CodexTaskAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB76001C8A19C8F410F32EE4 /* CodexTaskAttributes.swift */; };
+		C4885E5B545C92ACD2FDA94E /* TaskEventClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ACD0C8E2A486BA2329B70F4 /* TaskEventClient.swift */; };
+		D85AFEB22F9B7B4B46B483F2 /* MobileModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 227902BBD833F2503D600FBE /* MobileModel.swift */; };
+		E7224E066578BFEF25CE5A20 /* CodexTaskAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB76001C8A19C8F410F32EE4 /* CodexTaskAttributes.swift */; };
+		A68C090E5D3140B9A6A21F1A /* cyber-cat.png in Resources */ = {isa = PBXBuildFile; fileRef = A68C090C5D3140B9A6A21F1A /* cyber-cat.png */; };
+		A68C090F5D3140B9A6A21F1A /* star-sprite.png in Resources */ = {isa = PBXBuildFile; fileRef = A68C090D5D3140B9A6A21F1A /* star-sprite.png */; };
+		A68C09105D3140B9A6A21F1A /* cyber-cat.png in Resources */ = {isa = PBXBuildFile; fileRef = A68C090C5D3140B9A6A21F1A /* cyber-cat.png */; };
+		A68C09115D3140B9A6A21F1A /* star-sprite.png in Resources */ = {isa = PBXBuildFile; fileRef = A68C090D5D3140B9A6A21F1A /* star-sprite.png */; };
+		A68C09145D3140B9A6A21F1A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A68C09165D3140B9A6A21F1A /* Assets.xcassets */; };
+		A68C09155D3140B9A6A21F1A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A68C09165D3140B9A6A21F1A /* Assets.xcassets */; };
+		F9D587B65AFFC3B5BD100BD4 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0529DDA488E75B5C15566107 /* ContentView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		55D2B0FB814407BEFF031B97 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = D6E84710EB9B013EF4D24D80 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8B2DF198D842234F73B3F767;
+			remoteInfo = CodexTaskWidgetExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		82C2B972D43EA754B3AD9069 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				9A32D9E6A71D14F91047CDBD /* CodexTaskWidgetExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		00EC65BF3C995156F9F15897 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		0529DDA488E75B5C15566107 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		08C3B70F88C6C05932F0F04A /* NotificationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationManager.swift; sourceTree = "<group>"; };
+		1BA09320DC5A90D31724A86E /* TaskRelayClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskRelayClient.swift; sourceTree = "<group>"; };
+		227902BBD833F2503D600FBE /* MobileModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileModel.swift; sourceTree = "<group>"; };
+		4ACD0C8E2A486BA2329B70F4 /* TaskEventClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskEventClient.swift; sourceTree = "<group>"; };
+		631D6A6A92449837421F9B41 /* TaskEventModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskEventModels.swift; sourceTree = "<group>"; };
+		6AC5E486C579AA6671AA8FF3 /* CodexTaskWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTaskWidget.swift; sourceTree = "<group>"; };
+		80DDAD04187F6983BEE2547D /* CodexTaskWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = CodexTaskWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		BB76001C8A19C8F410F32EE4 /* CodexTaskAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CodexTaskAttributes.swift; sourceTree = "<group>"; };
+		C438DA5BCCA72367302D24A2 /* OpenCodexMobileApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenCodexMobileApp.swift; sourceTree = "<group>"; };
+		C5CE3BD9D446C5D937BEA84C /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
+		DAA843DAF86E3AD94A587EA0 /* OpenCodexMobile.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = OpenCodexMobile.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		DB26F8916F62BAE95613F9EF /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		E084B351B63462C27817BCA2 /* KeychainStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainStore.swift; sourceTree = "<group>"; };
+		E100A4C7C0C63FB278AF0346 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		E39A02B14329A3E950F3CE9F /* TaskActivityCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TaskActivityCoordinator.swift; sourceTree = "<group>"; };
+		A68C090C5D3140B9A6A21F1A /* cyber-cat.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "cyber-cat.png"; sourceTree = "<group>"; };
+		A68C090D5D3140B9A6A21F1A /* star-sprite.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "star-sprite.png"; sourceTree = "<group>"; };
+		A68C09165D3140B9A6A21F1A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		46E9ED715396E05BB7B5339D /* CodexTaskWidgetExtension */ = {
+			isa = PBXGroup;
+			children = (
+				6AC5E486C579AA6671AA8FF3 /* CodexTaskWidget.swift */,
+				DB26F8916F62BAE95613F9EF /* Info.plist */,
+			);
+			path = CodexTaskWidgetExtension;
+			sourceTree = "<group>";
+		};
+		69AFFF10137EC5B95B07A6DF /* OpenCodexMobile */ = {
+			isa = PBXGroup;
+			children = (
+				A68C09165D3140B9A6A21F1A /* Assets.xcassets */,
+				A68C09125D3140B9A6A21F1A /* Pets */,
+				0529DDA488E75B5C15566107 /* ContentView.swift */,
+				00EC65BF3C995156F9F15897 /* Info.plist */,
+				E084B351B63462C27817BCA2 /* KeychainStore.swift */,
+				E100A4C7C0C63FB278AF0346 /* LaunchScreen.storyboard */,
+				227902BBD833F2503D600FBE /* MobileModel.swift */,
+				08C3B70F88C6C05932F0F04A /* NotificationManager.swift */,
+				C438DA5BCCA72367302D24A2 /* OpenCodexMobileApp.swift */,
+				E39A02B14329A3E950F3CE9F /* TaskActivityCoordinator.swift */,
+				4ACD0C8E2A486BA2329B70F4 /* TaskEventClient.swift */,
+				631D6A6A92449837421F9B41 /* TaskEventModels.swift */,
+				1BA09320DC5A90D31724A86E /* TaskRelayClient.swift */,
+				F6E39FC524D17D31BEAFD61C /* LaunchScreen.storyboard */,
+			);
+			path = OpenCodexMobile;
+			sourceTree = "<group>";
+		};
+		A68C09125D3140B9A6A21F1A /* Pets */ = {
+			isa = PBXGroup;
+			children = (
+				A68C090C5D3140B9A6A21F1A /* cyber-cat.png */,
+				A68C090D5D3140B9A6A21F1A /* star-sprite.png */,
+			);
+			name = Pets;
+			path = Resources/Pets;
+			sourceTree = "<group>";
+		};
+		B8A32E2869EE1761FA836723 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				80DDAD04187F6983BEE2547D /* CodexTaskWidgetExtension.appex */,
+				DAA843DAF86E3AD94A587EA0 /* OpenCodexMobile.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D1412C656249C3892C55BBFB /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				BB76001C8A19C8F410F32EE4 /* CodexTaskAttributes.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		ED1168627712D6F705E7E05A = {
+			isa = PBXGroup;
+			children = (
+				46E9ED715396E05BB7B5339D /* CodexTaskWidgetExtension */,
+				69AFFF10137EC5B95B07A6DF /* OpenCodexMobile */,
+				D1412C656249C3892C55BBFB /* Shared */,
+				B8A32E2869EE1761FA836723 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		8B2DF198D842234F73B3F767 /* CodexTaskWidgetExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 6F7DEDD45858F237A99C20BA /* Build configuration list for PBXNativeTarget "CodexTaskWidgetExtension" */;
+			buildPhases = (
+				CE0754034477809915AF87D6 /* Sources */,
+				A68C09135D3140B9A6A21F1A /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = CodexTaskWidgetExtension;
+			packageProductDependencies = (
+			);
+			productName = CodexTaskWidgetExtension;
+			productReference = 80DDAD04187F6983BEE2547D /* CodexTaskWidgetExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
+		EC39ED3D62BA74D5577285E5 /* OpenCodexMobile */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 5FE32EB52E9E9F119E27C1A6 /* Build configuration list for PBXNativeTarget "OpenCodexMobile" */;
+			buildPhases = (
+				8BFB4C04A0B32B12DEAD4A99 /* Sources */,
+				EF18A9CBD9B9035A8B029BCC /* Resources */,
+				82C2B972D43EA754B3AD9069 /* Embed Foundation Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D0ABEB34F30D7B629594576E /* PBXTargetDependency */,
+			);
+			name = OpenCodexMobile;
+			packageProductDependencies = (
+			);
+			productName = OpenCodexMobile;
+			productReference = DAA843DAF86E3AD94A587EA0 /* OpenCodexMobile.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D6E84710EB9B013EF4D24D80 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					8B2DF198D842234F73B3F767 = {
+						ProvisioningStyle = Automatic;
+					};
+					EC39ED3D62BA74D5577285E5 = {
+						ProvisioningStyle = Automatic;
+					};
+				};
+			};
+			buildConfigurationList = 3923C9AAAE97DB95A92F0109 /* Build configuration list for PBXProject "OpenCodexMobile" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = ED1168627712D6F705E7E05A;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = B8A32E2869EE1761FA836723 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				EC39ED3D62BA74D5577285E5 /* OpenCodexMobile */,
+				8B2DF198D842234F73B3F767 /* CodexTaskWidgetExtension */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		EF18A9CBD9B9035A8B029BCC /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A68C09145D3140B9A6A21F1A /* Assets.xcassets in Resources */,
+				A68C090E5D3140B9A6A21F1A /* cyber-cat.png in Resources */,
+				A68C090F5D3140B9A6A21F1A /* star-sprite.png in Resources */,
+				B8BE08544B014C8A6BD76452 /* LaunchScreen.storyboard in Resources */,
+				88549228E2E6B2CF28BE2243 /* LaunchScreen.storyboard in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A68C09135D3140B9A6A21F1A /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A68C09155D3140B9A6A21F1A /* Assets.xcassets in Resources */,
+				A68C09105D3140B9A6A21F1A /* cyber-cat.png in Resources */,
+				A68C09115D3140B9A6A21F1A /* star-sprite.png in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		8BFB4C04A0B32B12DEAD4A99 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				E7224E066578BFEF25CE5A20 /* CodexTaskAttributes.swift in Sources */,
+				F9D587B65AFFC3B5BD100BD4 /* ContentView.swift in Sources */,
+				272F69F016DFB3EAAE38A9BD /* KeychainStore.swift in Sources */,
+				D85AFEB22F9B7B4B46B483F2 /* MobileModel.swift in Sources */,
+				598755BC72558EA76FE4C605 /* NotificationManager.swift in Sources */,
+				ACF388829632E9BEE34934B4 /* OpenCodexMobileApp.swift in Sources */,
+				A0EEFC12A369DAD717AE6DDC /* TaskActivityCoordinator.swift in Sources */,
+				C4885E5B545C92ACD2FDA94E /* TaskEventClient.swift in Sources */,
+				30EE2381D52B89A68CB97872 /* TaskEventModels.swift in Sources */,
+				7574B7ACCAE5C529FB218DCD /* TaskRelayClient.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		CE0754034477809915AF87D6 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				C1B13EF8A74E64D5A13B5D40 /* CodexTaskAttributes.swift in Sources */,
+				2FCC6709CEBB56EFAF141899 /* CodexTaskWidget.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D0ABEB34F30D7B629594576E /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8B2DF198D842234F73B3F767 /* CodexTaskWidgetExtension */;
+			targetProxy = 55D2B0FB814407BEFF031B97 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin PBXVariantGroup section */
+		F6E39FC524D17D31BEAFD61C /* LaunchScreen.storyboard */ = {
+			isa = PBXVariantGroup;
+			children = (
+				C5CE3BD9D446C5D937BEA84C /* Base */,
+			);
+			name = LaunchScreen.storyboard;
+			sourceTree = "<group>";
+		};
+/* End PBXVariantGroup section */
+
+/* Begin XCBuildConfiguration section */
+		251906EFC5CAE5D09AF44A75 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		29BDBC38F12066AC778C8A4A /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = 83TZ7W8ZXY;
+				INFOPLIST_FILE = CodexTaskWidgetExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.6;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.aitabby.opencodex.mobile.task-widget";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		56547C83AE3B967F93BB4CC4 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = 83TZ7W8ZXY;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = OpenCodex;
+				INFOPLIST_KEY_CFBundleShortVersionString = 1.0.6;
+				INFOPLIST_KEY_CFBundleVersion = 6;
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aitabby.opencodex.mobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		87F71E2D7171F4C5AAA6FED6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = 83TZ7W8ZXY;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = OpenCodex;
+				INFOPLIST_KEY_CFBundleShortVersionString = 1.0.6;
+				INFOPLIST_KEY_CFBundleVersion = 6;
+				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.6;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aitabby.opencodex.mobile;
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		AB67B4D3AC48B0CFC2B30725 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 6;
+				DEVELOPMENT_TEAM = 83TZ7W8ZXY;
+				INFOPLIST_FILE = CodexTaskWidgetExtension/Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.6;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.aitabby.opencodex.mobile.task-widget";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B5FAAD665777F3DBEB2267D6 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3923C9AAAE97DB95A92F0109 /* Build configuration list for PBXProject "OpenCodexMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				251906EFC5CAE5D09AF44A75 /* Debug */,
+				B5FAAD665777F3DBEB2267D6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		5FE32EB52E9E9F119E27C1A6 /* Build configuration list for PBXNativeTarget "OpenCodexMobile" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				56547C83AE3B967F93BB4CC4 /* Debug */,
+				87F71E2D7171F4C5AAA6FED6 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		6F7DEDD45858F237A99C20BA /* Build configuration list for PBXNativeTarget "CodexTaskWidgetExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				29BDBC38F12066AC778C8A4A /* Debug */,
+				AB67B4D3AC48B0CFC2B30725 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D6E84710EB9B013EF4D24D80 /* Project object */;
+}

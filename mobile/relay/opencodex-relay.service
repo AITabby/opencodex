@@ -1,0 +1,23 @@
+[Unit]
+Description=OpenCodex mobile task relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=opencodex-relay
+Group=opencodex-relay
+WorkingDirectory=/opt/opencodex-relay
+EnvironmentFile=/etc/opencodex-relay/relay.env
+ExecStart=/usr/bin/node /opt/opencodex-relay/server.mjs
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/opencodex-relay
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

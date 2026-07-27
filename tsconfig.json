@@ -4,14 +4,13 @@
     "module": "ES2022",
     "moduleResolution": "node",
     "outDir": "dist",
-    "rootDir": "src",
-    "strict": true,
-    "esModuleInterop": true,
     "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "declaration": true,
     "sourceMap": true
   },
-  "include": ["src/**/*"],
+  "include": ["src_v2/**/*"],
   "exclude": ["node_modules", "dist"]
 }

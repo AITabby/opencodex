@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>OpenCodex</string>
+	<key>CFBundleExecutable</key>
+	<string>OpenCodex</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.aitabby.opencodex</string>
+	<key>CFBundleIconFile</key>
+	<string>OpenCodex.icns</string>
+	<key>CFBundleName</key>
+	<string>OpenCodex</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OpenCodex 需要麦克风权限以使用语音栏。</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<!-- The gateway owns one local port and one background process per user. -->
+	<key>LSMultipleInstancesProhibited</key>
+	<true/>
+</dict>
+</plist>

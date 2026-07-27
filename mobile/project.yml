@@ -1,0 +1,46 @@
+name: OpenCodexMobile
+options:
+  minimumXcodeGenVersion: 2.38
+  deploymentTarget:
+    iOS: "16.2"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    DEVELOPMENT_TEAM: ""
+targets:
+  OpenCodexMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: OpenCodexMobile
+      - path: Shared
+    settings:
+      base:
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        PRODUCT_BUNDLE_IDENTIFIER: com.aitabby.opencodex.mobile
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: OpenCodex
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_UILaunchStoryboardName: LaunchScreen
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - target: CodexTaskWidgetExtension
+
+  CodexTaskWidgetExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: CodexTaskWidgetExtension
+      - path: Shared
+    info:
+      path: CodexTaskWidgetExtension/Info.plist
+      properties:
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.aitabby.opencodex.mobile.task-widget
+        CODE_SIGN_STYLE: Automatic

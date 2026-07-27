@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.opencodex.OpenCodexBar</string>
+    <key>CFBundleName</key>
+    <string>OpenCodexBar</string>
+    <key>CFBundleVersion</key>
+    <string>1.2.3</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.3</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OpenCodexBar requires microphone access for voice command input and transcription.</string>
+</dict>
+</plist>

@@ -9,3 +9,19 @@ launch_opencodex_bar.sh
 debug_req.json
 debug_*.json
 test_cdp.js
+
+# Local macOS application build output.
+macos-app/.build/
+macos-app/build/
+
+# Swift voice companion build output.
+voice/**/.build/
+voice/**/OpenCodexBar.app/
+voice/voice-runtime/
+
+# Separate source archives are local release artifacts.
+archives/
+
+# Xcode per-user state is machine-specific and must not be published.
+mobile/OpenCodexMobile.xcodeproj/xcuserdata/
+mobile/OpenCodexMobile.xcodeproj/project.xcworkspace/xcuserdata/

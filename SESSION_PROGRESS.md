@@ -3,7 +3,7 @@
 ## 已完成的功能
 
 ### 1. 豆包 TTS 修复
-- `src/proxy/index.ts` 中 `synthesizeSpeechDoubao` 已修复为 V3 streaming API
+- `src_v2/server/gateway.ts` 中 `synthesizeSpeechDoubao` 已修复为 V3 streaming API
 - 响应格式是 NDJSON（每行一个 JSON，data 字段是 base64），需要解码拼接
 - 修复：`Buffer.from(json.data, 'base64')` 拼接所有 chunks
 
@@ -13,7 +13,7 @@
 - 格式：`system_prompt + "\n\n用户说：" + user_message`
 - 已验证生效（bar 日志有 `[Prompt] System prompt loaded`）
 
-### 3. 会话管理 API（`src/proxy/index.ts`）
+### 3. 会话管理 API（`src_v2/server/gateway.ts`）
 - `GET /api/sessions` - 会话列表（扫描 ~/.codex/sessions/ 目录）
 - `GET /api/sessions/:id` - 对话详情（解析 rollout JSONL）
 - `DELETE /api/sessions/:id` - 删除会话
@@ -21,7 +21,7 @@
 - `POST /api/sessions/:id/unarchive` - 取消归档
 - `POST /api/sessions/activate` - 激活会话（WebSocket 通知 bar）
 
-### 4. 网关页前端（`src/proxy/dashboard.ts`）
+### 4. 网关页前端（`src_v2/services/dashboard.ts`）
 - Tab 切换：网关管理 / 会话管理
 - 左边：API 密钥配置（模型名 + URL + Key）+ 添加按钮
 - 右边：已配置模型下拉列表
@@ -29,7 +29,7 @@
 - 会话列表：实时更新，点击查看详情，删除有二次确认
 - 保存后 localStorage 记住当前 tab
 
-### 5. 会话管理 API（`src/proxy/index.ts`）
+### 5. 会话管理 API（`src_v2/server/gateway.ts`）
 - `GET /api/sessions` - 扫描 ~/.codex/sessions/ 目录返回列表
 - `GET /api/sessions/:id` - 解析 rollout JSONL 返回对话记录
 - `DELETE /api/sessions/:id` - 删除 rollout 文件和索引

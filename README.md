@@ -13,25 +13,28 @@
 ---
 
 > [!NOTE]
-> **macOS edition · v0.4.6** — This repository tracks the macOS implementation only. It is designed for ChatGPT/Codex Desktop on macOS.
+> **macOS edition · v1.0.2** — Stable macOS source release. This repository tracks the macOS implementation only and is designed for ChatGPT/Codex Desktop on macOS. The DMG package is published separately when ready.
 
 > [!NOTE]
-> **Native mode first** — Starting OpenCodex does not proxy or modify native Codex. Add a third-party/subscription model, then explicitly update the Desktop model picker when you want to enable gateway mode. Resetting to native removes the gateway routing again.
+> **Native mode first** — Starting OpenCodex does not proxy or modify native Codex. The Provider Workspace keeps official Codex on its native route and only sends explicitly installed third-party models to the local gateway. Resetting to native removes the gateway routing again.
 
 # English
 
 > [!IMPORTANT]
-> **🌟 Premium Voice Companion App:** To experience the absolute state of the art in desktop voice assistants, combine this server with the native companion client [OpenCodexBar](https://github.com/AITabby/opencodex-bar)! Run the server, compile the bar, and instantly enjoy system-wide voice hotkeys (`Option + Space`), real-time decibel Audio-Reactive VAD, and a gorgeous cinematic single-line scrolling frosted-glass visualizer capsule floating right above your Dock!
+> **🌟 Premium Voice:** macOS release packages embed the OpenCodexBar voice component, so users get system-wide voice hotkeys (`Option + Space`), real-time decibel-reactive VAD, and the floating frosted-glass visualizer without installing a separate companion app. Development runs can still use an external OpenCodexBar build.
 
 **OpenCodex** is a plug-and-play local gateway that unlocks Codex Desktop for third-party APIs, featuring a premium web dashboard, custom Computer Use engine, and Vision Bridge for text-only models.
 
 ## 🌟 Key Features
 
 * **Native-first, opt-in gateway**: Keep official GPT models on their native route. Add a third-party model only when needed, then apply it to the Desktop picker with one action. Native reset cleanly removes OpenCodex routing.
-* **Premium Web Dashboard** (`http://localhost:8765/dashboard`):
-  * 🌐 Bilingual (EN/中文) with instant switch
-  * 🔑 API key & endpoint management
-  * 📝 Add/delete third-party models and subscription imports; manage only those custom entries while official GPT models remain native
+* **macOS Provider Workspace** (`http://localhost:8765/dashboard`):
+  * 🛡️ Visible native-route protection: official Codex stays direct while third-party routing is isolated
+  * 🔑 API keys saved to macOS Keychain, explicit connection testing, and per-provider rollback
+  * 🧩 Provider catalogue for Kimi Code, Qwen, Z.AI GLM, MiniMax, DeepSeek and OpenAI-compatible endpoints
+  * 🔄 One-time local subscription login for Grok and Antigravity with automatic OAuth access-token refresh, live model validation, and no provider fallback
+  * 🧪 Local no-network provider simulator for setup and model-contract testing without a subscription
+  * 📝 Add/delete third-party models while official GPT models remain native
   * 🧠 Import complete local agent conversations and continue from their context in Codex Desktop
   * 📡 Live SSE log streaming
   * 🚀 One-click Codex restart
@@ -50,7 +53,7 @@
 
 ### Prerequisites
 - macOS
-- Node.js v18+
+- Node.js v20+
 - Codex Desktop installed
 
 ### Install & Run
@@ -59,6 +62,7 @@
 git clone https://github.com/AITabby/opencodex.git
 cd opencodex
 npm install
+npm run build:all
 npm start
 ```
 
@@ -69,23 +73,26 @@ The server starts and opens the dashboard. Adding a model only saves it; use **U
 # 简体中文
 
 > [!NOTE]
-> **macOS 版本 · v0.4.6** —— 本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop。
+> **macOS 版本 · v1.0.2** —— 稳定版 macOS 源码发布。本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop；DMG 安装包准备好后另行发布。
 
 > [!NOTE]
-> **原生优先** —— 启动 OpenCodex 不会代理或修改原生 Codex。仅在添加第三方/订阅模型后，手动更新桌面端下拉菜单时才进入网关模式；还原原生会再次移除网关路由。
+> **原生优先** —— 启动 OpenCodex 不会代理或修改原生 Codex。Provider Workspace 将官方 Codex 固定保留在原生路线，只有显式安装的第三方模型才进入本地网关；还原原生会再次移除网关路由。
 
 > [!IMPORTANT]
-> **🌟 极光语音伴侣应用：** 强烈建议配合原生伴侣客户端 [OpenCodexBar](https://github.com/AITabby/opencodex-bar) 使用！为您的 Mac 开启系统级全局语音唤醒热键（`Option + Space`）、分贝波形联动与智能静音检测（VAD），以及悬浮于 macOS Dock 栏上方的极光毛玻璃跑马灯胶囊！
+> **🌟 极光语音：** macOS 发布包会内置 OpenCodexBar 语音组件，为您的 Mac 开启系统级全局语音唤醒热键（`Option + Space`）、分贝波形联动与智能静音检测（VAD），以及悬浮于 macOS Dock 栏上方的极光毛玻璃跑马灯胶囊；开发运行仍可使用独立的 OpenCodexBar 构建目录。
 
 **OpenCodex** 是一款即插即用的本地网关，为 Codex Desktop 解锁第三方 API。配备高颜值 Web 控制台、自研 Computer Use 引擎，以及让纯文本模型也能看图操作的 Vision Bridge。
 
 ## 🌟 核心特性
 
 * **原生优先、按需接管**：官方 GPT 始终保留原生通道；需要第三方模型时再添加，并通过一次“更新下拉菜单”显式启用。还原原生会干净移除 OpenCodex 路由。
-* **高颜值 Web 控制台**（`http://localhost:8765/dashboard`）：
-  * 🌐 中英文一键切换
-  * 🔑 图形化管理 API Key 和接口地址
-  * 📝 管理第三方模型与订阅导入；官方 GPT 保留在桌面端原生模型列表中
+* **macOS 服务商工作台**（`http://localhost:8765/dashboard`）：
+  * 🛡️ 可见的原生路线保护：官方 Codex 直连，第三方模型独立进入网关
+  * 🔑 API Key 存入 macOS Keychain，连接测试与单服务商回滚均需显式操作
+  * 🧩 内置 Kimi Code、Qwen、智谱 GLM、MiniMax、DeepSeek 与 OpenAI 兼容接口目录
+  * 🔄 Grok 与 Antigravity 支持一次登录、OAuth 登录态自动续期、实时模型验证，并且不会错误回退到其他服务商
+  * 🧪 没有订阅也能使用本地无网络模拟器检查模型与工具调用配置
+  * 📝 管理第三方模型；官方 GPT 保留在桌面端原生模型列表中
   * 🧠 一键导入本机 Agent 完整会话，并在 Codex Desktop 中承接上下文继续对话
   * 📡 实时 SSE 日志流
   * 🚀 一键重启 Codex
@@ -104,7 +111,7 @@ The server starts and opens the dashboard. Adding a model only saves it; use **U
 
 ### 准备工作
 - macOS 系统
-- Node.js v18+
+- Node.js v20+
 - 已安装 Codex Desktop
 
 ### 安装与启动
@@ -113,6 +120,7 @@ The server starts and opens the dashboard. Adding a model only saves it; use **U
 git clone https://github.com/AITabby/opencodex.git
 cd opencodex
 npm install
+npm run build:all
 npm start
 ```
 

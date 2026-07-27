@@ -1,0 +1,271 @@
+/**
+ * Request Transformer for CodexBridge (OpenCodex V2)
+ * Converts OpenAI Responses API input items into Chat Completions messages array.
+ */
+
+import {
+  ResponsesRequestBody,
+  ChatCompletionRequestBody,
+  ChatMessage,
+  ChatTool,
+  ResponseInputItem,
+  ResponseTool,
+} from "./types.js";
+import { AdapterFactory } from "../adapters/factory.js";
+
+const THINK_TAG_REGEX = /<think>[\s\S]*?<\/think>/gi;
+
+export function stripThinkTags(text: string): string {
+  return text ? text.replace(THINK_TAG_REGEX, "") : "";
+}
+
+function contentToText(content: any): string {
+  let raw = "";
+  if (typeof content === "string") raw = content;
+  else if (Array.isArray(content)) {
+    raw = content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (typeof part === "object" && part !== null && "text" in part) {
+          return String(part.text || "");
+        }
+        return "";
+      })
+      .join("");
+  } else if (typeof content === "object" && content !== null && "text" in content) {
+    raw = String(content.text || "");
+  } else {
+    raw = String(content || "");
+  }
+  return stripInternalCodexEnvelopes(raw);
+}
+
+function stripInternalCodexEnvelopes(content: string): string {
+  if (!content) return "";
+  let clean = content;
+  clean = clean.replace(/<app-context>[\s\S]*?<\/app-context>/gi, "");
+  clean = clean.replace(/<collaboration_mode>[\s\S]*?<\/collaboration_mode>/gi, "");
+  clean = clean.replace(/<apps_instructions>[\s\S]*?<\/apps_instructions>/gi, "");
+  clean = clean.replace(/<plugins_instructions>[\s\S]*?<\/plugins_instructions>/gi, "");
+  clean = clean.replace(/<skills_instructions>[\s\S]*?<\/skills_instructions>/gi, "");
+  clean = clean.replace(/<recommended_plugins>[\s\S]*?<\/recommended_plugins>/gi, "");
+  clean = clean.replace(/<environment_context>[\s\S]*?<\/environment_context>/gi, "");
+  return clean.trim();
+}
+
+export function responsesInputToChatMessages(input?: ResponseInputItem[]): ChatMessage[] {
+  if (!Array.isArray(input) || input.length === 0) return [];
+
+  const messages: ChatMessage[] = [];
+
+  for (const item of input) {
+    if (typeof item === "string") {
+      messages.push({ role: "user", content: item });
+      continue;
+    }
+    if (typeof item !== "object" || item === null) continue;
+
+    const itemType = item.type;
+
+    if ((itemType === "message" || !itemType) && "role" in item) {
+      let role = item.role || "user";
+      if (role === "developer") role = "system";
+      const content = contentToText(item.content);
+
+      const last = messages[messages.length - 1];
+      if (last && last.role === role && role === "assistant" && !last.tool_calls) {
+        const existingText = typeof last.content === "string" ? last.content : "";
+        last.content = existingText && content ? `${existingText}\n${content}` : existingText || content;
+      } else {
+        messages.push({
+          role: role as any,
+          content,
+        });
+      }
+    } else if (itemType === "function_call") {
+      const callId = item.call_id || item.id || `call_${Date.now()}`;
+      const argsStr = typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {});
+      const toolCall = {
+        id: callId,
+        type: "function" as const,
+        function: {
+          name: item.name || "",
+          arguments: argsStr,
+        },
+      };
+
+      const last = messages[messages.length - 1];
+      if (last && last.role === "assistant") {
+        if (!last.tool_calls) last.tool_calls = [];
+        last.tool_calls.push(toolCall);
+      } else {
+        messages.push({
+          role: "assistant",
+          content: "",
+          tool_calls: [toolCall],
+        });
+      }
+    } else if (itemType === "function_call_output") {
+      messages.push({
+        role: "tool",
+        tool_call_id: item.call_id,
+        content: contentToText(item.output),
+      });
+    }
+  }
+
+  return messages;
+}
+
+const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "exec_command",
+      description: "Execute a bash shell command in the local workspace to read files or run git commands",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: { type: "string", description: "The shell command to run" }
+        },
+        required: ["cmd"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_file",
+      description: "View content of a file in the workspace",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "File path to view" }
+        },
+        required: ["path"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_dir",
+      description: "List files in a workspace directory",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Directory path" }
+        },
+        required: ["path"]
+      }
+    }
+  }
+];
+
+export function convertToolsToChatTools(tools?: ResponseTool[]): ChatTool[] {
+  if (!Array.isArray(tools) || tools.length === 0) return DEFAULT_WORKSPACE_TOOLS;
+  const result: ChatTool[] = [];
+
+  for (const rawTool of tools) {
+    if (typeof rawTool !== "object" || rawTool === null) continue;
+    const tool = rawTool as any;
+
+    if (tool.type === "function" && tool.function) {
+      result.push({
+        type: "function",
+        function: tool.function,
+      });
+    } else if (tool.type === "namespace") {
+      const nsName = tool.name || "";
+      const funcs = tool.functions || tool.tools || [];
+      for (const f of funcs) {
+        if (typeof f !== "object" || f === null) continue;
+        const fnName = f.name || "";
+        const fullName = nsName.endsWith("__") ? `${nsName}${fnName}` : `${nsName}_${fnName}`;
+        result.push({
+          type: "function",
+          function: {
+            name: fullName,
+            description: f.description || "",
+            parameters: f.parameters || { type: "object", properties: {} },
+          },
+        });
+      }
+    } else if ("name" in tool && typeof tool.name === "string") {
+      result.push({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description || "",
+          parameters: tool.parameters || { type: "object", properties: {} },
+        },
+      });
+    }
+  }
+
+  return result.length > 0 ? result : DEFAULT_WORKSPACE_TOOLS;
+}
+
+export function mergeConsecutiveMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (!Array.isArray(messages) || messages.length === 0) return [];
+  const merged: ChatMessage[] = [];
+
+  for (const msg of messages) {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.role === msg.role && !prev.tool_calls && !msg.tool_calls && prev.role !== "tool") {
+      const prevText = contentToText(prev.content);
+      const msgText = contentToText(msg.content);
+      prev.content = prevText && msgText ? `${prevText}\n\n${msgText}` : prevText || msgText;
+    } else {
+      merged.push({ ...msg });
+    }
+  }
+
+  return merged;
+}
+
+import { SessionHistoryService } from "../services/session_history.js";
+
+export function transformResponsesToChat(
+  body: ResponsesRequestBody,
+  upstreamModel: string,
+  sessionId?: string
+): ChatCompletionRequestBody {
+  const messages: ChatMessage[] = [];
+  const tools = convertToolsToChatTools(body.tools);
+  const toolNames = tools.map((t) => t.function.name).join("`, `");
+
+  let systemPrompt = body.instructions ? stripInternalCodexEnvelopes(body.instructions) : "";
+  systemPrompt += `\n\nTool Contract & Permission Directive: You are an active AI coding agent running inside Codex with full local workspace permissions. Valid tool names for this turn are exactly \`${toolNames}\`. Call only these listed names with their argument keys. When asked to inspect code, review files, run git status/diff, or explore directories, NEVER claim you cannot read local files or ask the user to paste code—invoke function calls (\`exec_command\`, \`view_file\`, \`list_dir\`) IMMEDIATELY.`;
+
+  messages.push({
+    role: "system",
+    content: systemPrompt.trim(),
+  });
+
+  const rawInput = (body.input && body.input.length > 0) ? body.input : ((body as any).messages || []);
+  const inputMessages = responsesInputToChatMessages(rawInput);
+  const repairedMessages = SessionHistoryService.repairAndMergeHistory(inputMessages, sessionId);
+  messages.push(...repairedMessages);
+
+  // Apply model-specific adapter (DeepSeek, MiniMax, Anthropic, Google)
+  const adapter = AdapterFactory.getAdapter(undefined, undefined);
+  const sanitizedMessages = adapter.sanitizeMessages(messages);
+  const mergedMessages = mergeConsecutiveMessages(sanitizedMessages);
+
+  const chatBody: ChatCompletionRequestBody = {
+    model: upstreamModel,
+    messages: mergedMessages.length > 0 ? mergedMessages : [{ role: "user", content: " " }],
+    stream: body.stream ?? true,
+  };
+
+  if (tools.length > 0) {
+    chatBody.tools = tools;
+  }
+
+  if (body.temperature !== undefined) chatBody.temperature = body.temperature;
+  if (body.top_p !== undefined) chatBody.top_p = body.top_p;
+  if (body.max_output_tokens !== undefined) chatBody.max_tokens = body.max_output_tokens;
+
+  return chatBody;
+}

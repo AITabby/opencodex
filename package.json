@@ -1,10 +1,12 @@
 {
   "name": "opencodex",
-  "version": "0.4.6",
+  "version": "1.0.2",
   "description": "OpenCodex - The Unified Codex Desktop Unlocker, Custom Model Gateway & Computer Use Router",
   "type": "module",
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc && mv dist/server.js dist/gateway-entry.js && printf 'import \"./gateway-entry.js\";\\n' > dist/server.js",
+    "build:all": "./scripts/build-all.sh",
+    "test": "npm run build && node --test test/*.test.mjs",
     "start": "node dist/server.js",
     "dev": "tsc --watch",
     "postinstall": "tsc"
@@ -13,12 +15,17 @@
     "@modelcontextprotocol/sdk": "^1.6.0",
     "https-proxy-agent": "^9.1.0",
     "node-pty": "^1.1.0",
+    "sql.js": "^1.14.1",
     "undici": "^8.5.0",
     "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
+    "@types/sql.js": "^1.4.11",
     "@types/ws": "^8.18.1",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11"
   }
 }
