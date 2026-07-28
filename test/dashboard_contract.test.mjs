@@ -35,3 +35,10 @@ test("dashboard uses the gateway admin cookie without embedding credentials", as
   assert.match(text, /fetch\(/);
   assert.match(text, /api\('\/api\/providers'\)/);
 });
+
+test("dashboard refreshes subscription status after every model deletion path", async () => {
+  const text = await source();
+  assert.match(text, /post\('\/api\/models\/delete',\{id:id\}\);await syncDashboardState\(\)/);
+  assert.match(text, /post\('\/api\/models\/delete',\{ids:ids\}\);await syncDashboardState\(\)/);
+  assert.match(text, /post\('\/api\/providers\/delete',\{name:name\}\);await syncDashboardState\(\)/);
+});

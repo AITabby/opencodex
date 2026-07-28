@@ -345,6 +345,37 @@ function writeAntigravityAuth(auth: AntigravityAuth): void {
   ], { stdio: "ignore" });
 }
 
+export function selectAntigravityOAuthClientId(binary: string, clientIds: string[]): string | undefined {
+  // Recent Antigravity language servers can contain more than one Google
+  // OAuth client ID.  Array order is not a contract: the first ID may belong
+  // to an internal service and will make an otherwise valid refresh token
+  // fail with `invalid_client`.
+  const ranked = clientIds
+    .map((value) => {
+      const index = binary.indexOf(value);
+      const context = binary
+        .slice(Math.max(0, index - 400), index + value.length + 400)
+        .toLowerCase();
+      const score =
+        (context.includes("client") ? 4 : 0) +
+        (context.includes("oauth") ? 3 : 0) +
+        (context.includes("token") ? 2 : 0) +
+        (value.length === 75 ? 1 : 0);
+      return { value, score };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  return ranked[0]?.value || clientIds.find((value) => value.length === 75) || clientIds[0];
+}
+
+export function extractAntigravityOAuthClientSecrets(binary: string): string[] {
+  // Google OAuth web client secrets use the `GOCSPX-` prefix followed by a
+  // 28-character payload.  Some language-server builds place two secrets
+  // next to each other without a delimiter; a broad `{20,100}` match would
+  // incorrectly merge them into one unusable value.
+  return [...new Set(binary.match(/GOCSPX-[A-Za-z0-9_-]{28}/g) || [])];
+}
+
 function readAntigravityOAuthClient(): { clientId: string; clientSecret: string } | null {
   const clientIdFromEnv = String(process.env.OPENCODEX_ANTIGRAVITY_OAUTH_CLIENT_ID || "").trim();
   const clientSecretFromEnv = String(process.env.OPENCODEX_ANTIGRAVITY_OAUTH_CLIENT_SECRET || "").trim();
@@ -359,10 +390,8 @@ function readAntigravityOAuthClient(): { clientId: string; clientSecret: string 
       if (!fs.existsSync(appPath)) continue;
       const binary = fs.readFileSync(appPath, "utf8");
       const clientIds = [...new Set(binary.match(/[0-9][A-Za-z0-9._-]{20,80}\.apps\.googleusercontent\.com/g) || [])];
-      const clientSecrets = [...new Set(binary.match(/GOCSPX-[A-Za-z0-9_-]{20,100}/g) || [])];
-      // The Antigravity OAuth client ID is the 75-character Google client ID;
-      // other IDs in the language server belong to internal services.
-      const clientId = clientIds.find((value) => value.length === 75) || clientIds[0];
+      const clientSecrets = extractAntigravityOAuthClientSecrets(binary);
+      const clientId = selectAntigravityOAuthClientId(binary, clientIds);
       if (clientId && clientSecrets[0]) return { clientId, clientSecret: clientSecrets[0] };
     } catch {
       // A missing or unreadable local app should not break normal token use.

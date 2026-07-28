@@ -1350,24 +1350,8 @@ if __name__ == "__main__":
         try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
       }
       if (!Array.isArray(catalog.models)) catalog.models = [];
-      const hadThirdPartyModels = catalog.models.some((model: any) => Boolean(catalogModelOwner(model)));
       const before = JSON.stringify(catalog.models);
       preserveOfficialModels(catalog);
-
-      // Keep the existing first-run convenience for Cursor, but do not use
-      // catalog length as the signal: official native models are present too.
-      if (!hadThirdPartyModels && hasCursorCredential()) {
-        const liveModels = await this.fetchCursorModelsDynamic();
-        if (liveModels.length > 0) {
-          for (const model of liveModels) {
-            const slug = String(model.slug || "").trim();
-            if (!slug) continue;
-            upsertProviderCatalogModel(catalog, slug, slug, model.name || slug, "cursor");
-          }
-          preserveOfficialModels(catalog);
-          console.log(`[OpenCodex Gateway] Restored ${liveModels.length} Cursor models into the empty managed catalog.`);
-        }
-      }
 
       if (before !== JSON.stringify(catalog.models)) {
         try {
@@ -2971,7 +2955,64 @@ if __name__ == "__main__":
             } catch {}
           }
 
-          // 2. Grok CLI Agent
+          // 2. Cursor Agent transcripts (JSONL under ~/.cursor/projects)
+          const cursorProjectsDir = path.join(os.homedir(), ".cursor", "projects");
+          if (fs.existsSync(cursorProjectsDir)) {
+            try {
+              const cursorSessions: any[] = [];
+              const scanCursorDir = (dir: string) => {
+                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                  const fullPath = path.join(dir, entry.name);
+                  if (entry.isDirectory()) {
+                    scanCursorDir(fullPath);
+                    continue;
+                  }
+                  if (!entry.isFile() || !entry.name.endsWith(".jsonl") || !dir.includes(`${path.sep}agent-transcripts`)) continue;
+                  try {
+                    const lines = fs.readFileSync(fullPath, "utf-8").split("\n").filter(Boolean);
+                    let title = `Cursor Session ${entry.name.slice(0, 8)}`;
+                    let messageCount = 0;
+                    for (const line of lines) {
+                      const parsed = JSON.parse(line);
+                      const content = Array.isArray(parsed.message?.content) ? parsed.message.content : [];
+                      const text = content.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
+                      if (!text || !["user", "assistant"].includes(parsed.role)) continue;
+                      messageCount += 1;
+                      if (parsed.role === "user" && title.startsWith("Cursor Session ")) {
+                        const match = text.match(/<user_query>([\s\S]*?)<\/user_query>/);
+                        const candidate = (match ? match[1] : text).replace(/<timestamp>[\s\S]*?<\/timestamp>/g, "").trim();
+                        if (candidate) title = candidate.replace(/\s+/g, " ").slice(0, 80);
+                      }
+                    }
+                    cursorSessions.push({
+                      id: entry.name.replace(/\.jsonl$/, ""),
+                      title,
+                      source: "cursor",
+                      project: path.basename(path.dirname(path.dirname(dir))),
+                      message_count: messageCount,
+                      updated_at: fs.statSync(fullPath).mtimeMs
+                    });
+                  } catch {}
+                }
+              };
+              scanCursorDir(cursorProjectsDir);
+              cursorSessions.sort((a, b) => b.updated_at - a.updated_at);
+              if (cursorSessions.length > 0) {
+                agents.push({
+                  name: "Cursor Agent",
+                  session_count: cursorSessions.length,
+                  sources: [{
+                    source_id: "cursor_agent_transcripts",
+                    display_path: "~/.cursor/projects/*/agent-transcripts",
+                    format: "jsonl",
+                    sessions: cursorSessions.slice(0, 100)
+                  }]
+                });
+              }
+            } catch {}
+          }
+
+          // 3. Grok CLI Agent
           const grokDir = path.join(os.homedir(), ".grok", "sessions");
           if (fs.existsSync(grokDir)) {
             try {
@@ -3325,7 +3366,71 @@ if __name__ == "__main__":
               }
             }
 
-            // 2. Grok CLI import
+            // 2. Cursor Agent transcript import
+            let cursorTranscriptPath = "";
+            const cursorProjectsDir = path.join(os.homedir(), ".cursor", "projects");
+            if (sourceId === "cursor_agent_transcripts" && fs.existsSync(cursorProjectsDir)) {
+              const findCursorTranscript = (dir: string) => {
+                for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                  const fullPath = path.join(dir, entry.name);
+                  if (entry.isDirectory()) {
+                    findCursorTranscript(fullPath);
+                    if (cursorTranscriptPath) return;
+                  } else if (entry.isFile() && entry.name === `${sessionId}.jsonl` && dir.includes(`${path.sep}agent-transcripts`)) {
+                    cursorTranscriptPath = fullPath;
+                    return;
+                  }
+                }
+              };
+              findCursorTranscript(cursorProjectsDir);
+            }
+            if (sourceId === "cursor_agent_transcripts" && cursorTranscriptPath && fs.existsSync(cursorTranscriptPath)) {
+              sourceMatched = true;
+              importedLines.push(JSON.stringify({
+                timestamp: now.toISOString(),
+                type: "session_meta",
+                payload: {
+                  session_id: sessionId,
+                  id: sessionId,
+                  timestamp: now.toISOString(),
+                  cwd: os.homedir(),
+                  originator: "Cursor Agent",
+                  cli_version: "unknown",
+                  source: "cursor",
+                  thread_source: "user",
+                  model_provider: "cursor"
+                }
+              }));
+              let cursorMessageIndex = 0;
+              const cursorLines = fs.readFileSync(cursorTranscriptPath, "utf-8").split("\n").filter(Boolean);
+              for (const line of cursorLines) {
+                try {
+                  const parsed = JSON.parse(line);
+                  if (!(["user", "assistant"].includes(parsed.role))) continue;
+                  const content = Array.isArray(parsed.message?.content) ? parsed.message.content : [];
+                  const text = content.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
+                  if (!text || text === "[REDACTED]") continue;
+                  const match = text.match(/<user_query>([\s\S]*?)<\/user_query>/);
+                  const cleaned = (match ? match[1] : text).replace(/<timestamp>[\s\S]*?<\/timestamp>/g, "").replace(/\[REDACTED\]/g, "").trim();
+                  if (!cleaned) continue;
+                  const role = parsed.role === "user" ? "user" : "assistant";
+                  const timestamp = now.toISOString();
+                  const messageId = `msg_import_${sessionId.replace(/[^A-Za-z0-9_-]/g, "")}_${cursorMessageIndex++}`;
+                  importedLines.push(JSON.stringify({
+                    timestamp,
+                    type: "event_msg",
+                    payload: { type: role === "user" ? "user_message" : "agent_message", message: cleaned }
+                  }));
+                  importedLines.push(JSON.stringify({
+                    timestamp,
+                    type: "response_item",
+                    payload: { type: "message", id: messageId, role, content: [{ type: role === "user" ? "input_text" : "output_text", text: cleaned }] }
+                  }));
+                } catch {}
+              }
+            }
+
+            // 3. Grok CLI import
             let grokSessionDir = "";
             const grokBaseDir = path.join(os.homedir(), ".grok", "sessions");
             if (fs.existsSync(grokBaseDir)) {

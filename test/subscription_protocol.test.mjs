@@ -14,6 +14,10 @@ import {
   cursorNativeToolRequest,
   frameConnectMessage,
 } from "../dist/services/cursor_protocol.js";
+import {
+  selectAntigravityOAuthClientId,
+  extractAntigravityOAuthClientSecrets,
+} from "../dist/services/subscription_auth.js";
 import { create, fromBinary } from "@bufbuild/protobuf";
 import {
   AgentClientMessageSchema,
@@ -26,6 +30,21 @@ import {
 function bytes(...values) {
   return Uint8Array.from(values);
 }
+
+test("Antigravity OAuth discovery selects the client ID by local vendor context", () => {
+  const internalId = "111111111111111111111111111111111111111111111111111111111111111111111111111.apps.googleusercontent.com";
+  const antigravityId = "222222222222222222222222222222222222222222222222222222222222222222222222222.apps.googleusercontent.com";
+  const binary = `internal google ${internalId} padding ${"x".repeat(500)} oauth client token ${antigravityId}`;
+
+  assert.equal(selectAntigravityOAuthClientId(binary, [internalId, antigravityId]), antigravityId);
+});
+
+test("Antigravity OAuth discovery does not merge adjacent client secrets", () => {
+  const first = `GOCSPX-${"a".repeat(28)}`;
+  const second = `GOCSPX-${"b".repeat(28)}`;
+
+  assert.deepEqual(extractAntigravityOAuthClientSecrets(`${first}${second}`), [first, second]);
+});
 
 test("Cursor unary requests are raw protobuf, not Connect response frames", () => {
   const request = encodeAvailableModelsRequest();

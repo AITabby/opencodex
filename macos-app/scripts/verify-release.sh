@@ -5,7 +5,9 @@ SCRIPT_DIR="${0:A:h}"
 APP_ROOT="${SCRIPT_DIR:h:h}"
 BUILD_ROOT="$APP_ROOT/macos-app/build"
 APP_BUNDLE="$BUILD_ROOT/OpenCodex.app"
-DMG_PATH="${OPENCODEX_DMG_PATH:-$BUILD_ROOT/OpenCodex-1.0.0-arm64.dmg}"
+cd "$APP_ROOT"
+VERSION="$(node -p 'require("./package.json").version')"
+DMG_PATH="${OPENCODEX_DMG_PATH:-$BUILD_ROOT/OpenCodex-${VERSION}-arm64.dmg}"
 REQUIRE_SIGNED="${OPENCODEX_REQUIRE_SIGNED:-0}"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
@@ -33,6 +35,7 @@ done
 short_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_BUNDLE/Contents/Info.plist")
 bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_BUNDLE/Contents/Info.plist")
 print "App: $bundle_id $short_version"
+[[ "$short_version" == "$VERSION" ]] || { print -u2 "Version mismatch: package.json=$VERSION, App=$short_version"; exit 1; }
 
 if codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
   print "Code signature: valid"

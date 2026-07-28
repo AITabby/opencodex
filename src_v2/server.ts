@@ -4,7 +4,8 @@
 
 import { CodexBridgeServer } from "./server/gateway.js";
 
-const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 8765;
+const configuredPort = process.env.OPENCODEX_PORT || process.env.PORT || "8765";
+const port = parseInt(configuredPort, 10);
 const server = new CodexBridgeServer(port);
 
 server.start().catch((err) => {

@@ -5,7 +5,9 @@ SCRIPT_DIR="${0:A:h}"
 APP_ROOT="${SCRIPT_DIR:h:h}"
 PACKAGE_ROOT="$APP_ROOT/macos-app"
 APP_BUNDLE="$PACKAGE_ROOT/build/OpenCodex.app"
-DMG_PATH="$PACKAGE_ROOT/build/OpenCodex-1.0.0-arm64.dmg"
+cd "$APP_ROOT"
+VERSION="$(node -p 'require("./package.json").version')"
+DMG_PATH="$PACKAGE_ROOT/build/OpenCodex-${VERSION}-arm64.dmg"
 PROFILE="${OPENCODEX_NOTARY_PROFILE:-}"
 
 if [[ -z "$PROFILE" ]]; then

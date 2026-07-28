@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { deriveProviderNamespace, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {
@@ -71,4 +72,10 @@ test("legacy provider-owned entries migrate to the provider namespace", () => {
   assert.equal(migrated?.slug, "deepseek/deepseek-chat");
   assert.equal(migrated?.backend_model, "deepseek-chat");
   assert.equal(migrated?.display_name, "deepseek/deepseek-chat");
+});
+
+test("gateway startup does not re-import Cursor from login presence alone", async () => {
+  const source = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /Restored .* Cursor models into the empty managed catalog/);
+  assert.doesNotMatch(source, /if \(!hadThirdPartyModels && hasCursorCredential\(\)\)/);
 });
