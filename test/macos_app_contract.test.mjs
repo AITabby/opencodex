@@ -46,16 +46,21 @@ test("DMG uses a standard Applications drag-install layout", async () => {
 });
 
 test("desktop app publishes the runtime port and uses the embedded voice bar", async () => {
-  const [app, gatewayProcess, info] = await Promise.all([
+  const [app, gatewayProcess, info, serverEntry, startEntry] = await Promise.all([
     read("macos-app/Sources/OpenCodex/OpenCodexApp.swift"),
     read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
-    read("macos-app/Info.plist")
+    read("macos-app/Info.plist"),
+    read("src_v2/server.ts"),
+    read("src_v2/start.ts")
   ]);
   assert.match(app, /applicationShouldTerminateAfterLastWindowClosed/);
   assert.match(app, /applicationShouldHandleReopen/);
+  assert.match(gatewayProcess, /OPENCODEX_PORT/);
   assert.match(gatewayProcess, /OPENCODEX_VOICE_BAR_PATH/);
   assert.match(gatewayProcess, /gateway_runtime_/);
   assert.match(gatewayProcess, /OPENCODEX_DATA_DIR/);
+  assert.match(serverEntry, /process\.env\.OPENCODEX_PORT/);
+  assert.match(startEntry, /process\.env\.OPENCODEX_PORT/);
   assert.match(info, /LSMultipleInstancesProhibited/);
 });
 
