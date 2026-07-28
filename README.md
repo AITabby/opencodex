@@ -4,7 +4,16 @@
 
 网关、语音、会话管理、第三方模型和 Agent 工具，都整合在一个 macOS 应用里。
 
-作者：[@youngxxxxu](https://x.com/youngxxxxu)
+<p align="center">
+  <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
+  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
+  <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
+</p>
+
+<p align="center">
+  <a href="#简体中文">简体中文</a> · <a href="#english">English</a>
+</p>
 
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg">⬇️ 下载 OpenCodex v1.0.3</a>
@@ -22,9 +31,11 @@
   <a href="./assets/demo.mp4">▶️ 查看应用演示视频</a>
 </p>
 
-> macOS Apple Silicon arm64 版本 · v1.0.3 · 未签名本地测试版
+> macOS Apple Silicon arm64 · v1.0.3 · 当前 DMG 未经过 Apple 签名
 
-## OpenCodex 是什么？
+## 简体中文
+
+### OpenCodex 是什么？
 
 OpenCodex 是一个运行在本机的 Codex Desktop 控制中心。
 
@@ -33,32 +44,56 @@ OpenCodex 是一个运行在本机的 Codex Desktop 控制中心。
 - 接入 API Key、OpenAI Compatible 接口和本机订阅
 - 管理第三方模型，并让它们出现在 Codex Desktop 的模型菜单中
 - 使用语音助手、会话管理和本地 Agent 工具
-- 让 Computer Use、截图和模型路由在一个应用里协同工作
+- 让模型路由、语音和本地 Agent 能力在一个应用里协同工作
 
-你只需要安装 Codex Desktop 和 OpenCodex App，打开应用后即可进入本地控制中心。
-
-## 你可以用它做什么？
+### 核心能力
 
 | 模块 | 用途 |
 | --- | --- |
 | 🌐 网关 | 管理服务商、API Key、模型和本机订阅，按需启用第三方模型 |
 | 🎙️ 语音 | 配置语音识别、语音合成和全局语音栏 |
 | 💬 会话 | 查看本地 Codex 会话，扫描和导入其他 Agent 的完整上下文 |
-| 🖥️ Computer Use | 结合截图、鼠标、键盘和窗口控制完成桌面任务 |
-| 🛡️ 原生保护 | 官方 Codex 模型、原生登录、MCP 和 Computer Use 路径保持独立 |
+| 🛡️ 原生保护 | 官方 Codex 模型和原生登录路径保持独立 |
 
-## 安装使用
+### 为什么需要 OpenCodex？
 
-### 普通用户
+Codex Desktop 原生体验很顺手，但第三方模型、订阅、语音和本机会话通常分散在不同工具里。OpenCodex 把这些能力集中到一个本地控制中心，同时保留 Codex 自身的原生能力。
+
+官方 Codex 模型始终保留在原生路径；只有用户明确添加的第三方模型才会进入 OpenCodex 网关。不同服务商的模型使用独立命名空间，避免同名模型互相覆盖。
+
+### 工作方式
+
+```text
+Codex Desktop
+      │
+      ▼
+OpenCodex App
+  ├── 本地网关：第三方模型与服务商管理
+  ├── 语音栏：STT / TTS / 全局语音交互
+  └── 会话中心：扫描、查看、导入 Agent 会话
+```
+
+### 当前功能
+
+- API Key 服务商预设与自定义 OpenAI Compatible 接口
+- 本机订阅登录态检测、导入、刷新和实时模型验证
+- 服务商模型命名空间，避免不同厂商出现同名模型冲突
+- 模型添加、测试、删除和订阅状态实时同步
+- 本地会话浏览、Agent 会话扫描与上下文导入
+- 实时网关日志与一键重启/还原原生 Codex
+
+### 安装使用
+
+#### 普通用户
 
 1. 确保已经安装 Codex Desktop。
 2. 下载 [OpenCodex-1.0.3-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg)。
-3. 将 OpenCodex 拖入 Applications 并打开。
+3. 将 OpenCodex 拖入 `Applications` 并打开。
 4. 在应用内管理网关、语音和会话功能。
 
 当前 DMG 未经过 Apple 签名。首次打开时，如果 macOS 阻止运行，请前往“系统设置 → 隐私与安全性”允许打开。
 
-### 从源码运行
+#### 从源码运行
 
 ```bash
 git clone https://github.com/AITabby/opencodex.git
@@ -74,30 +109,11 @@ npm start
 http://localhost:8765/dashboard
 ```
 
-## 工作方式
+### 项目状态
 
-```text
-Codex Desktop
-      │
-      ▼
-OpenCodex App
-  ├── 本地网关：第三方模型与服务商管理
-  ├── 语音栏：STT / TTS / 全局语音交互
-  ├── 会话中心：扫描、查看、导入 Agent 会话
-  └── Computer Use：截图、窗口、鼠标和键盘工具
-```
+当前发布版本为 `v1.0.3`，面向 macOS Apple Silicon。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
 
-官方 Codex 模型始终保留在原生路径；只有用户明确添加的第三方模型才会进入 OpenCodex 网关。删除模型或还原原生模式后，不会影响 Codex 官方模型。
-
-## 当前能力
-
-- API Key 服务商预设与自定义 OpenAI Compatible 接口
-- 本机订阅登录态检测、导入、刷新和实时模型验证
-- 服务商模型命名空间，避免不同厂商出现同名模型冲突
-- 模型添加、测试、删除和订阅状态实时同步
-- 本地会话浏览、Agent 会话扫描与上下文导入
-- macOS 原生 Computer Use 与 Vision Bridge
-- 实时网关日志与一键重启/还原原生 Codex
+---
 
 ## English
 
@@ -105,10 +121,64 @@ OpenCodex App
 
 OpenCodex brings the gateway, voice, session management, third-party models, and agent tools into one macOS application.
 
-- Download the [OpenCodex v1.0.3 arm64 DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg)
-- Manage providers, API keys, subscriptions, and model routing locally
-- Configure voice, browse sessions, and import external agent context
-- Use Computer Use and vision capabilities from one control center
-- Keep native Codex models and native routing protected
+It works alongside Codex Desktop instead of replacing it. Native Codex models and native routing remain separate, while explicitly added third-party models can be managed through the local OpenCodex gateway.
 
-OpenCodex requires Codex Desktop on macOS. The current DMG is an unsigned local beta build for Apple Silicon Macs.
+### What it includes
+
+| Module | What it does |
+| --- | --- |
+| 🌐 Gateway | Manage providers, API keys, subscriptions, and third-party models |
+| 🎙️ Voice | Configure speech recognition, speech synthesis, and the global voice bar |
+| 💬 Sessions | Browse local Codex sessions and import external agent context |
+| 🛡️ Native protection | Keep native Codex models and native login isolated |
+
+### Why OpenCodex?
+
+Codex Desktop provides a great native experience, but third-party models, subscriptions, voice, and local agent sessions are often scattered across separate tools. OpenCodex brings them together in one local control center while keeping Codex itself intact.
+
+Official Codex models stay on their native route. Only models explicitly added by the user are sent through the OpenCodex gateway. Provider namespaces prevent models with the same name from overwriting each other.
+
+### Key features
+
+- Built-in provider presets and custom OpenAI-compatible endpoints
+- Local subscription detection, import, refresh, and live model validation
+- Provider-scoped model names to avoid cross-provider naming conflicts
+- Real-time synchronization for adding, testing, deleting, and importing models
+- Local session browser and external agent conversation import
+- Live gateway logs and one-click restart or native reset
+
+### Installation
+
+1. Install Codex Desktop on macOS.
+2. Download the [OpenCodex v1.0.3 Apple Silicon DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg).
+3. Drag OpenCodex into `Applications` and launch it.
+4. Manage providers, voice, sessions, and third-party models from the app.
+
+The current DMG is unsigned. If macOS blocks the first launch, allow it from **System Settings → Privacy & Security**.
+
+### Run from source
+
+```bash
+git clone https://github.com/AITabby/opencodex.git
+cd opencodex
+npm install
+npm run build:all
+npm start
+```
+
+Then open:
+
+```text
+http://localhost:8765/dashboard
+```
+
+### Project status
+
+The current release is `v1.0.3` for macOS Apple Silicon. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
+
+### Links
+
+- [GitHub Repository](https://github.com/AITabby/opencodex)
+- [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
+- [Download OpenCodex v1.0.3](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg)
+- [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)
