@@ -66,6 +66,12 @@ function isValidAccessToken(token: unknown, expiry: unknown, now = Date.now()): 
   return expiryMs === null || expiryMs - now > REFRESH_SKEW_MS;
 }
 
+function isStillUsableAccessToken(token: unknown, expiry: unknown, now = Date.now()): boolean {
+  if (typeof token !== "string" || token.trim().length === 0) return false;
+  const expiryMs = isUsableExpiry(expiry);
+  return expiryMs === null || expiryMs > now;
+}
+
 function writeJsonSecure(filePath: string, value: unknown): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -476,7 +482,12 @@ export class SubscriptionAuthService {
     const refreshed = await this.antigravityRefresh;
     if (refreshed) return refreshed;
 
-    return !forceRefresh && isValidAccessToken(accessToken, expiry) ? accessToken : null;
+    // A refresh can fail transiently while the current token is still valid.
+    // Keep that token for the caller; the API request can then succeed or
+    // trigger the normal one-time 401/403 refresh path. Treating the
+    // refresh-skew window as an immediate logout made subscription imports
+    // fail even though the desktop session was still usable.
+    return !forceRefresh && isStillUsableAccessToken(accessToken, expiry) ? accessToken : null;
   }
 
   public static getClaudeApiKey(): string | null {

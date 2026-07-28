@@ -226,34 +226,221 @@ function recordSubscriptionTest(dataDir: string, providerName: string, status: P
 }
 
 
-function preserveOfficialModels(catalog: any): void {
+function catalogModelOwner(model: any): string {
+  const owner = normalizeNamespace(String(model?.backend_provider || model?.provider_name || ""));
+  return owner === "opencode-go" ? "opencode" : owner;
+}
 
+function catalogModelSlug(model: any): string {
+  return String(model?.slug || model?.model || model?.id || "").trim();
+}
+
+function normalizeNamespace(value: string): string {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64);
+}
+
+export function deriveProviderNamespace(requestedName: string, baseUrl: string): string {
+  const requested = normalizeNamespace(requestedName);
+  const aliases: Record<string, string> = { "opencode-go": "opencode" };
+  if (requested && requested !== "custom") return aliases[requested] || requested;
+
+  let hostname = "";
+  try { hostname = new URL(baseUrl).hostname.toLowerCase(); } catch {}
+  const knownHosts: Array<[string, string]> = [
+    ["deepseek.com", "deepseek"],
+    ["x.ai", "xai"],
+    ["openrouter.ai", "openrouter"],
+    ["minimaxi.com", "minimax"],
+    ["moonshot.cn", "kimi"],
+    ["aliyuncs.com", "qwen"],
+    ["siliconflow.cn", "siliconflow"],
+    ["opencode.ai", "opencode"],
+    ["volces.com", "volcengine"],
+    ["anthropic.com", "claude"],
+    ["openai.com", "openai"],
+  ];
+  const known = knownHosts.find(([suffix]) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+  if (known) return known[1];
+
+  const labels = hostname.split(".").filter(Boolean).filter((label) => !["api", "www", "llm", "gateway", "chat"].includes(label));
+  if (labels.length > 1) labels.pop();
+  const derived = normalizeNamespace(labels.join("-"));
+  return derived || "custom";
+}
+
+function providerUrlFingerprint(baseUrl: string): string {
+  try {
+    const url = new URL(baseUrl);
+    return `${url.hostname.toLowerCase()}${url.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return String(baseUrl || "").trim().toLowerCase();
+  }
+}
+
+function stableShortHash(value: string): string {
+  let hash = 2166136261;
+  for (const char of value) {
+    hash ^= char.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36).slice(0, 6);
+}
+
+function namespaceModelSlug(providerName: string, rawSlug: string): string {
+  const owner = normalizeNamespace(providerName) || "provider";
+  const slug = String(rawSlug || "").trim();
+  if (!slug) return `${owner}/model`;
+  return slug.toLowerCase().startsWith(`${owner}/`) ? slug : `${owner}/${slug}`;
+}
+
+function providerDisplayName(providerName: string, rawSlug: string): string {
+  const owner = normalizeNamespace(providerName) || "provider";
+  const slug = String(rawSlug || "").trim();
+  const unscoped = slug.toLowerCase().startsWith(`${owner}/`)
+    ? slug.slice(owner.length + 1)
+    : slug;
+  return `${owner}/${unscoped || "model"}`;
+}
+
+function isOfficialCachedModel(model: any): boolean {
+  const slug = catalogModelSlug(model).toLowerCase();
+  if (!slug || slug === "codex-auto-review" || catalogModelOwner(model)) return false;
+  const provider = String(model?.provider || model?.model_provider || "").trim().toLowerCase();
+  return provider === "openai" || /^(gpt-|o\d|codex-|chatgpt)/i.test(slug);
+}
+
+function readOfficialModelMap(): Map<string, any> {
+  const official = new Map<string, any>();
+  const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+  try {
+    const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+    for (const model of Array.isArray(cache.models) ? cache.models : []) {
+      if (isOfficialCachedModel(model)) official.set(catalogModelSlug(model).toLowerCase(), model);
+    }
+  } catch {}
+
+  // The cache is normally authoritative. If it is absent or empty, ask the
+  // native Codex installation for its current catalog instead of inventing a
+  // list. This keeps official models independent from imported providers.
+  if (official.size === 0) {
+    for (const model of CatalogSyncService.getOfficialModels()) {
+      const slug = catalogModelSlug(model).toLowerCase();
+      if (slug && slug !== "codex-auto-review") official.set(slug, model);
+    }
+  }
+  return official;
+}
+
+function scopedCatalogSlug(providerName: string, rawSlug: string, usedSlugs: Set<string>): string {
+  const base = `${providerName}/${rawSlug}`;
+  let candidate = base;
+  let suffix = 2;
+  while (usedSlugs.has(candidate.toLowerCase())) {
+    candidate = `${base}-${suffix++}`;
+  }
+  return candidate;
+}
+
+export function upsertProviderCatalogModel(
+  catalog: any,
+  rawSlug: string,
+  backendModel: string,
+  displayName: string,
+  providerName: string
+): void {
   if (!catalog || typeof catalog !== "object") return;
   if (!Array.isArray(catalog.models)) catalog.models = [];
 
-  const existingMap = new Map<string, any>();
+  const slug = String(rawSlug || "").trim();
+  const backend = String(backendModel || slug).trim();
+  const owner = normalizeNamespace(providerName);
+  if (!slug || !backend || !owner) return;
+  const canonicalSlug = namespaceModelSlug(owner, slug);
 
-  const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
-  if (fs.existsSync(cachePath)) {
-    try {
-      const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
-      if (Array.isArray(cache.models)) {
-        for (const m of cache.models) {
-          if (m.slug && (m.provider === "openai" || m.model_provider === "openai" || m.slug.startsWith("gpt-") || m.slug.startsWith("o1") || m.slug.startsWith("o3") || m.slug.startsWith("chatgpt"))) {
-            if (m.provider !== "opencodex" && m.model_provider !== "opencodex" && !m.backend_provider) {
-              existingMap.set(m.slug, m);
-            }
-          }
-        }
+  const owned = catalog.models.find((model: any) => {
+    if (catalogModelOwner(model) !== owner) return false;
+    const modelSlug = catalogModelSlug(model).toLowerCase();
+    const modelBackend = String(model?.backend_model || "").trim().toLowerCase();
+    return modelSlug === canonicalSlug.toLowerCase()
+      || modelSlug === slug.toLowerCase()
+      || modelBackend === slug.toLowerCase()
+      || modelBackend === backend.toLowerCase();
+  });
+  if (owned) {
+    owned.slug = canonicalSlug;
+    owned.model = canonicalSlug;
+    owned.backend_model = backend;
+    owned.display_name = providerDisplayName(owner, canonicalSlug);
+    return;
+  }
+
+  const usedSlugs = new Set<string>(catalog.models
+    .map((model: any) => catalogModelSlug(model).toLowerCase())
+    .filter((slug: string) => Boolean(slug)));
+  const catalogSlug = usedSlugs.has(canonicalSlug.toLowerCase())
+    ? scopedCatalogSlug(owner, slug, usedSlugs)
+    : canonicalSlug;
+  const entry = buildFullCatalogEntry(catalogSlug, owner);
+  entry.backend_model = backend;
+  entry.display_name = providerDisplayName(owner, catalogSlug);
+  catalog.models.push(entry);
+}
+
+export function preserveOfficialModels(catalog: any): void {
+  if (!catalog || typeof catalog !== "object") return;
+  if (!Array.isArray(catalog.models)) catalog.models = [];
+
+  const officialMap = readOfficialModelMap();
+  const usedSlugs = new Set<string>(officialMap.keys());
+  const ownerless: any[] = [];
+  const thirdParty: any[] = [];
+
+  for (const model of catalog.models) {
+    const slug = catalogModelSlug(model);
+    if (!slug) continue;
+    const key = slug.toLowerCase();
+    const owner = catalogModelOwner(model);
+
+    if (!owner) {
+      if (officialMap.has(key)) continue;
+      if (!usedSlugs.has(key)) {
+        usedSlugs.add(key);
+        ownerless.push(model);
       }
-    } catch {}
+      continue;
+    }
+
+    // Every provider-owned model gets a stable namespace, even when there is
+    // no current collision. This makes future imports and provider changes
+    // order-independent.
+    const rawSlug = slug.toLowerCase().startsWith(`${owner}/`)
+      ? slug.slice(owner.length + 1)
+      : slug;
+    const canonical = namespaceModelSlug(owner, rawSlug);
+    const alias = usedSlugs.has(canonical.toLowerCase())
+      ? scopedCatalogSlug(owner, rawSlug, usedSlugs)
+      : canonical;
+    const backendModel = String(model.backend_model || rawSlug).trim();
+    const moved = {
+      ...model,
+      slug: alias,
+      model: alias,
+      backend_provider: owner,
+      backend_model: backendModel,
+      display_name: providerDisplayName(owner, alias)
+    };
+    usedSlugs.add(alias.toLowerCase());
+    thirdParty.push(moved);
   }
 
-  for (const m of catalog.models) {
-    existingMap.set(m.slug, m);
-  }
-
-  catalog.models = Array.from(existingMap.values());
+  // Official native entries are deliberately first; the web endpoint filters
+  // them out, while the desktop client receives them before third-party ones.
+  catalog.models = [...officialMap.values(), ...ownerless, ...thirdParty];
 }
 
 
@@ -559,24 +746,38 @@ export class CodexBridgeServer {
     }
   }
 
-  private findCatalogProvider(rawModelName: string, providers: ProviderConfig[]): ProviderConfig | null {
+  private findCatalogMatches(rawModelName: string): any[] {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
-    if (!requested) return null;
+    if (!requested) return [];
     const catalog = this.readImportedModelCatalog();
-    const candidates = (entry: any): string[] => [
-      entry.slug, entry.model, entry.backend_model, entry.id, entry.display_name
+    const identityCandidates = (entry: any): string[] => [
+      entry.slug, entry.model, entry.id
+    ].filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .map((value) => value.trim().toLowerCase());
+    const backendCandidates = (entry: any): string[] => [
+      entry.backend_model, entry.display_name
     ].filter((value): value is string => typeof value === "string" && value.trim().length > 0)
       .map((value) => value.trim().toLowerCase());
 
-    let matches = catalog.filter((entry) => candidates(entry).some((value) => value === requested));
-    if (matches.length === 0 && requested.length >= 3) {
+    const exactIdentityMatches = catalog.filter((entry) => identityCandidates(entry).some((value) => value === requested));
+    if (exactIdentityMatches.length > 0) return exactIdentityMatches;
+
+    const exactBackendMatches = catalog.filter((entry) => backendCandidates(entry).some((value) => value === requested));
+    if (exactBackendMatches.length > 0) return exactBackendMatches;
+
+    if (requested.length >= 3) {
       // Accept a short UI alias such as "opus" only when it resolves to one
       // subscription provider. Ambiguous aliases deliberately do not guess.
-      matches = catalog.filter((entry) => candidates(entry).some((value) => value.includes(requested)));
+      return catalog.filter((entry) => [...identityCandidates(entry), ...backendCandidates(entry)].some((value) => value.includes(requested)));
     }
+    return [];
+  }
+
+  private findCatalogProvider(rawModelName: string, providers: ProviderConfig[]): ProviderConfig | null {
+    const matches = this.findCatalogMatches(rawModelName);
 
     const providerNames = Array.from(new Set(matches
-      .map((entry) => String(entry.backend_provider || entry.provider_name || "").trim().toLowerCase())
+      .map((entry) => catalogModelOwner(entry))
       .filter(Boolean)));
     if (providerNames.length !== 1) return null;
 
@@ -595,15 +796,22 @@ export class CodexBridgeServer {
       || { name: providerName, baseUrl: "", models: matches.map((entry) => String(entry.slug || entry.model || "")).filter(Boolean) };
   }
 
+  private findCatalogBackendModel(rawModelName: string): string | null {
+    const matches = this.findCatalogMatches(rawModelName);
+    const owned = matches.find((entry) => catalogModelOwner(entry));
+    if (!owned) return null;
+    return String(owned.backend_model || owned.model || owned.slug || "").trim() || null;
+  }
+
 
   private isNativeCatalogModel(rawModelName: string): boolean {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
     if (!requested) return false;
     const catalog = this.readImportedModelCatalog();
     return catalog.some((entry: any) => {
-      const owner = String(entry.backend_provider || entry.provider_name || "").trim();
+      const owner = catalogModelOwner(entry);
       if (owner) return false;
-      return [entry.slug, entry.model, entry.backend_model, entry.id, entry.display_name]
+      return [entry.slug, entry.model, entry.id]
         .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
         .some((value) => value.trim().toLowerCase() === requested);
     });
@@ -933,60 +1141,75 @@ if __name__ == "__main__":
     });
   }
 
+  private antigravityModelFetchError = "";
+
   private async fetchAntigravityModelsDynamic(): Promise<Array<{ slug: string; name: string }>> {
+    this.antigravityModelFetchError = "";
     try {
       let token = await SubscriptionAuthService.getAntigravityAccessToken();
 
-      if (token) {
-        let res = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", {
+      if (!token) {
+        this.antigravityModelFetchError = hasAntigravityCredential()
+          ? "检测到 Antigravity 登录态，但访问令牌已失效且刷新失败；请在 Antigravity 中重新登录"
+          : "未检测到 Antigravity 登录凭证，请先完成登录";
+        return [];
+      }
+
+      const fetchModels = async (accessToken: string): Promise<Response> => fetch(
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+        {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${token}`,
+            "Authorization": `Bearer ${accessToken}`,
             "Content-Type": "application/json",
             "User-Agent": "antigravity/hub/2.2.1 darwin/arm64"
           },
-          body: JSON.stringify({ project: "default-cli-project" })
-        });
-        if (res.status === 401 || res.status === 403) {
-          token = await SubscriptionAuthService.getAntigravityAccessToken(true);
-          if (token) {
-            res = await fetch("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${token}`,
-                "Content-Type": "application/json",
-                "User-Agent": "antigravity/hub/2.2.1 darwin/arm64"
-              },
-              body: JSON.stringify({ project: "default-cli-project" })
-            });
-          }
-        }
-        if (res.ok) {
-          const data = await res.json() as any;
-          const modelsMap = data.models || {};
-          const result: Array<{ slug: string; name: string }> = [];
-          const seen = new Set<string>();
+          body: JSON.stringify({ project: "default-cli-project" }),
+          signal: AbortSignal.timeout(30000),
+        },
+      );
 
-          let modelIds: string[] = [];
-          if (Array.isArray(data.agentModelSorts) && data.agentModelSorts[0]?.groups?.[0]?.modelIds) {
-            modelIds = data.agentModelSorts[0].groups[0].modelIds;
-          } else {
-            modelIds = Object.keys(modelsMap);
-          }
+      let res = await fetchModels(token);
+      if (res.status === 401 || res.status === 403) {
+        const refreshedToken = await SubscriptionAuthService.getAntigravityAccessToken(true);
+        if (refreshedToken) res = await fetchModels(refreshedToken);
+      }
+      if (!res.ok) {
+        this.antigravityModelFetchError = `Antigravity 模型目录请求失败（HTTP ${res.status}）`;
+        return [];
+      }
 
-          for (const id of modelIds) {
-            if (!id || seen.has(id)) continue;
-            seen.add(id);
-            const info = modelsMap[id] || {};
-            const displayName = info.displayName || id;
-            result.push({ slug: id, name: displayName });
-          }
+      const data = await res.json() as any;
+      const modelsMap = data.models && typeof data.models === "object" ? data.models : {};
+      const result: Array<{ slug: string; name: string }> = [];
+      const seen = new Set<string>();
 
-          if (result.length > 0) return result;
+      // The desktop client can place models in multiple groups. Preserve the
+      // vendor ordering while collecting every group, then fall back to the
+      // model map for responses without sort metadata.
+      const modelIds: string[] = [];
+      for (const sort of Array.isArray(data.agentModelSorts) ? data.agentModelSorts : []) {
+        for (const group of Array.isArray(sort?.groups) ? sort.groups : []) {
+          for (const id of Array.isArray(group?.modelIds) ? group.modelIds : []) {
+            if (typeof id === "string" && id.trim()) modelIds.push(id.trim());
+          }
         }
       }
+      if (modelIds.length === 0) modelIds.push(...Object.keys(modelsMap));
+
+      for (const id of modelIds) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const info = modelsMap[id] || {};
+        const displayName = info.displayName || id;
+        result.push({ slug: id, name: displayName });
+      }
+      if (result.length > 0) return result;
+
+      this.antigravityModelFetchError = "Antigravity 实时模型目录返回成功，但没有可用模型";
     } catch (err: any) {
-      console.error("[OpenCodex] Dynamic model fetch failed:", err?.message);
+      this.antigravityModelFetchError = `Antigravity 模型目录请求异常：${err?.message || "未知错误"}`;
+      console.error("[OpenCodex] Dynamic Antigravity model fetch failed:", err?.message);
     }
 
     // Do not manufacture subscription models when the live catalog request
@@ -1117,32 +1340,44 @@ if __name__ == "__main__":
     const configPath = path.join(os.homedir(), ".codex", "config.toml");
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
-    // Native mode deliberately leaves the imported catalog empty. Only
-    // hydrate it when the managed gateway block is active.
-    if (managedConfig.includes("opencodex managed") && hasCursorCredential()) {
+    // Native mode deliberately leaves the imported catalog untouched. In
+    // managed mode, always repair the catalog first so native Codex models
+    // cannot disappear just because a third-party entry was deleted.
+    if (managedConfig.includes("opencodex managed")) {
       const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
       let catalog: any = { models: [] };
       if (fs.existsSync(catalogPath)) {
         try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
       }
       if (!Array.isArray(catalog.models)) catalog.models = [];
-      if (catalog.models.length === 0) {
+      const hadThirdPartyModels = catalog.models.some((model: any) => Boolean(catalogModelOwner(model)));
+      const before = JSON.stringify(catalog.models);
+      preserveOfficialModels(catalog);
+
+      // Keep the existing first-run convenience for Cursor, but do not use
+      // catalog length as the signal: official native models are present too.
+      if (!hadThirdPartyModels && hasCursorCredential()) {
         const liveModels = await this.fetchCursorModelsDynamic();
         if (liveModels.length > 0) {
-          const existing = new Set<string>();
           for (const model of liveModels) {
             const slug = String(model.slug || "").trim();
-            if (!slug || existing.has(slug.toLowerCase())) continue;
-            existing.add(slug.toLowerCase());
-            const entry = buildFullCatalogEntry(slug, "cursor");
-            entry.display_name = model.name || slug;
-            catalog.models.push(entry);
+            if (!slug) continue;
+            upsertProviderCatalogModel(catalog, slug, slug, model.name || slug, "cursor");
           }
           preserveOfficialModels(catalog);
+          console.log(`[OpenCodex Gateway] Restored ${liveModels.length} Cursor models into the empty managed catalog.`);
+        }
+      }
+
+      if (before !== JSON.stringify(catalog.models)) {
+        try {
           fs.mkdirSync(path.dirname(catalogPath), { recursive: true, mode: 0o700 });
           fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), { encoding: "utf-8", mode: 0o600 });
           try { fs.chmodSync(catalogPath, 0o600); } catch {}
-          console.log(`[OpenCodex Gateway] Restored ${liveModels.length} Cursor models into the empty managed catalog.`);
+        } catch (err: any) {
+          // A read-only test/container home must not prevent the gateway from
+          // starting. The next writable start will persist the repair.
+          console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
         }
       }
     }
@@ -1258,7 +1493,7 @@ if __name__ == "__main__":
             const apiKey = CredentialStore.resolveApiKey(provider);
             const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
             const providerUrl = rawUrl.endsWith("/chat/completions") ? rawUrl : `${rawUrl.replace(/\/$/, "")}/chat/completions`;
-            const upstreamModel = requestedModel;
+            const upstreamModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
 
             await this.router.handleResponses(body, upstreamModel, apiKey, providerUrl, res, provider.name);
           } catch (err: any) {
@@ -1350,7 +1585,10 @@ if __name__ == "__main__":
             const effectiveModels = (p.models || []).filter((model: string) => {
               const raw = String(model);
               const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
-              return catalogModels.some((cm: any) => cm.slug === alias || cm.id === alias || cm.display_name === alias);
+              return catalogModels.some((cm: any) =>
+                catalogModelOwner(cm) === normalizeNamespace(p.name)
+                && [cm.slug, cm.id, cm.display_name, cm.backend_model].filter(Boolean).some((value: any) => String(value) === alias)
+              );
             });
             const hasActiveModel = effectiveModels.length > 0;
 
@@ -1365,7 +1603,15 @@ if __name__ == "__main__":
               status,
               test_status: p.last_test_status || "untested",
               credential_storage: hasApiKey ? (p.credential_ref ? "keychain" : "local-secure-store") : "none",
-              active_models: effectiveModels.map((m: string) => ({ id: m, enabled: true }))
+              active_models: effectiveModels.map((m: string) => {
+                const raw = String(m);
+                const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
+                const catalogModel = catalogModels.find((cm: any) =>
+                  catalogModelOwner(cm) === normalizeNamespace(p.name)
+                  && [cm.slug, cm.id, cm.display_name, cm.backend_model].filter(Boolean).some((value: any) => String(value) === alias)
+                );
+                return { id: catalogModel?.slug || alias, enabled: true };
+              })
             };
           });
 
@@ -1378,18 +1624,33 @@ if __name__ == "__main__":
         if (req.method === "POST" && url.pathname === "/api/providers") {
           try {
             const body = await this.parseJsonBody(req);
-            const providerName = String(body.name || body.preset_id || "custom").trim().toLowerCase();
+            const requestedProviderName = String(body.name || body.preset_id || "custom").trim().toLowerCase();
+            const presetId = String(body.preset_id || requestedProviderName).trim().toLowerCase();
             const baseUrl = String(body.base_url || "").trim();
             const apiKey = String(body.api_key || "").trim();
             const selectedModels: string[] = Array.isArray(body.selected_models) ? body.selected_models : [];
 
             let providers = CredentialStore.loadProviders();
-            let provider = providers.find((p: any) => p.name === providerName);
+            let provider = providers.find((p: any) => p.name === requestedProviderName)
+              || providers.find((p: any) => p.preset_id === presetId);
+            let providerName = provider?.preset_id === "custom" && provider.name && provider.name !== "custom"
+              ? normalizeNamespace(provider.name)
+              : deriveProviderNamespace(provider?.preset_id || requestedProviderName, baseUrl);
             if (!provider) {
-              provider = { name: providerName, preset_id: body.preset_id || providerName, baseUrl, models: selectedModels };
+              const conflict = providers.find((p: any) => normalizeNamespace(p.name) === providerName);
+              if (conflict && providerUrlFingerprint((conflict as any).baseUrl || (conflict as any).base_url) !== providerUrlFingerprint(baseUrl)) {
+                providerName = `${providerName}-${stableShortHash(providerUrlFingerprint(baseUrl))}`;
+              }
+            } else if (provider.name === "custom") {
+              provider.name = providerName;
+            }
+            if (!provider) {
+              provider = { name: providerName, preset_id: presetId, baseUrl, models: selectedModels };
               providers.push(provider);
             } else {
               provider.baseUrl = baseUrl || provider.baseUrl;
+              provider.name = providerName;
+              provider.preset_id = presetId;
               // The dashboard sends the complete current list. Replace the
               // stored list so removals and edits are reflected on reopen.
               provider.models = Array.from(new Set(selectedModels));
@@ -1415,29 +1676,23 @@ if __name__ == "__main__":
                 try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
               }
               if (!Array.isArray(catalog.models)) catalog.models = [];
+              preserveOfficialModels(catalog);
 
-              const officialModels = CatalogSyncService.getOfficialModels();
-              const existingMap = new Map<string, any>();
-              for (const m of catalog.models) {
-                existingMap.set(m.slug.toLowerCase(), m);
-              }
-              for (const off of officialModels) {
-                if (!existingMap.has(off.slug.toLowerCase())) {
-                  existingMap.set(off.slug.toLowerCase(), off);
-                }
-              }
-
-              const modelSlug = (modelStr: string) => {
+              const desiredSlugs = new Set<string>();
+              for (const modelStr of selectedModels) {
                 const separator = modelStr.includes("=") ? "=" : (modelStr.includes("->") ? "->" : "");
-                return (separator ? modelStr.split(separator)[0] : modelStr).trim().toLowerCase();
-              };
-              const desiredSlugs = new Set(selectedModels.map(modelSlug));
-              for (const [slug, entry] of existingMap) {
-                const owner = String(entry.backend_provider || entry.provider_name || "").trim().toLowerCase();
-                if (owner === providerName && !desiredSlugs.has(slug.toLowerCase())) {
-                  existingMap.delete(slug);
+                const parts = separator ? modelStr.split(separator) : [modelStr];
+                for (const part of parts) {
+                  const value = String(part || "").trim().toLowerCase();
+                  if (value) desiredSlugs.add(value);
                 }
               }
+              catalog.models = catalog.models.filter((entry: any) => {
+                if (catalogModelOwner(entry) !== providerName) return true;
+                return ![entry.slug, entry.model, entry.backend_model]
+                  .filter(Boolean)
+                  .some((value: any) => desiredSlugs.has(String(value).trim().toLowerCase()));
+              });
 
               for (const modelStr of selectedModels) {
                 let slug = modelStr;
@@ -1451,15 +1706,10 @@ if __name__ == "__main__":
                   slug = parts[0].trim();
                   backendModel = parts[1].trim();
                 }
-
-                const entry = buildFullCatalogEntry(slug, providerName);
-                if (backendModel !== slug) {
-                  entry.backend_model = backendModel;
-                }
-                existingMap.set(slug.toLowerCase(), entry);
+                upsertProviderCatalogModel(catalog, slug, backendModel, slug, providerName);
               }
 
-              catalog.models = Array.from(existingMap.values());
+              preserveOfficialModels(catalog);
               fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
               // Ensure opencodex managed block is enabled in config.toml
@@ -1549,26 +1799,16 @@ if __name__ == "__main__":
               try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
             }
             if (!Array.isArray(catalog.models)) catalog.models = [];
+            preserveOfficialModels(catalog);
 
             const addModel = (slug: string, name: string, providerName: string) => {
-              const existing = catalog.models.find((m: any) => m.slug === slug);
-              if (!existing) {
-                const entry = buildFullCatalogEntry(slug, providerName);
-                entry.display_name = name;
-                catalog.models.push(entry);
-              } else if (!existing.backend_provider) {
-                existing.backend_provider = providerName;
-                existing.provider = "opencodex";
-                existing.model_provider = "opencodex";
-                existing.backend_model = existing.backend_model || slug;
-                existing.display_name = name || existing.display_name || slug;
-              }
+              upsertProviderCatalogModel(catalog, slug, slug, name, providerName);
             };
 
             if (cli === "antigravity") {
               const dynamicModels = await this.fetchAntigravityModelsDynamic();
               if (dynamicModels.length === 0) {
-                throw new Error("Antigravity 没有返回实时可用模型，未执行导入；不会使用内置兜底模型");
+                throw new Error(this.antigravityModelFetchError || "Antigravity 没有返回实时可用模型，未执行导入；不会使用内置兜底模型");
               }
               catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "antigravity");
               for (const m of dynamicModels) {
@@ -1663,9 +1903,9 @@ if __name__ == "__main__":
                 liveModels.length > 0 ? "connected" : "failed",
                 liveModels.length > 0
                   ? `Google Antigravity 订阅正常，已获取 ${liveModels.length} 个实时模型`
-                  : hasAntigravityCredential()
+                  : this.antigravityModelFetchError || (hasAntigravityCredential()
                     ? "检测到 Antigravity 登录态，但实时模型获取失败；登录态可能已过期或被撤销"
-                    : "未检测到 Antigravity 登录凭证，请先完成登录"
+                    : "未检测到 Antigravity 登录凭证，请先完成登录")
               );
               return;
             }
@@ -3439,8 +3679,15 @@ if __name__ == "__main__":
           if (fs.existsSync(catalogPath)) {
             try {
               const data = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
-              const nativePresets = new Set(["gpt-5.4-mini", "gpt-5.4", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]);
-              catalog = (data.models || []).filter((m: any) => Boolean(m.backend_provider) || !nativePresets.has(m.slug));
+              const before = JSON.stringify(data.models || []);
+              preserveOfficialModels(data);
+              if (before !== JSON.stringify(data.models || [])) {
+                fs.writeFileSync(catalogPath, JSON.stringify(data, null, 2), "utf-8");
+              }
+              // Official native models are not web-managed models. They stay
+              // in the desktop catalog, but only provider-owned entries are
+              // exposed here for third-party management.
+              catalog = (data.models || []).filter((m: any) => Boolean(catalogModelOwner(m)));
             } catch {}
           }
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -3497,7 +3744,8 @@ if __name__ == "__main__":
               const nextModels = (provider.models || []).filter((model: string) => {
                 const raw = String(model);
                 const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
-                return !ids.includes(raw) && !ids.includes(alias.trim());
+                const namespaced = namespaceModelSlug(provider.name, alias.trim());
+                return !ids.includes(raw) && !ids.includes(alias.trim()) && !ids.includes(namespaced);
               });
               if (nextModels.length !== (provider.models || []).length) {
                 provider.models = nextModels;
@@ -3510,7 +3758,15 @@ if __name__ == "__main__":
             if (fs.existsSync(catalogPath)) {
               const data = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
               if (Array.isArray(data.models)) {
-                data.models = data.models.filter((m: any) => !ids.includes(m.id) && !ids.includes(m.slug));
+                preserveOfficialModels(data);
+                data.models = data.models.filter((model: any) => {
+                  // Native Codex models are immutable from the web manager.
+                  if (!catalogModelOwner(model)) return true;
+                  return ![model.id, model.slug, model.model, model.backend_model]
+                    .filter(Boolean)
+                    .some((value: any) => ids.includes(String(value)));
+                });
+                preserveOfficialModels(data);
                 fs.writeFileSync(catalogPath, JSON.stringify(data, null, 2), "utf-8");
               }
             }
@@ -3540,6 +3796,7 @@ if __name__ == "__main__":
                   catalog.models = catalog.models.filter((model: any) =>
                     String(model.backend_provider || model.provider_name || "").toLowerCase() !== String(providerName).toLowerCase()
                   );
+                  preserveOfficialModels(catalog);
                   fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
                 }
               } catch {}

@@ -1,0 +1,74 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { deriveProviderNamespace, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+
+test("custom providers derive a stable namespace from known and unknown URLs", () => {
+  assert.equal(deriveProviderNamespace("custom", "https://api.deepseek.com/v1"), "deepseek");
+  assert.equal(deriveProviderNamespace("custom", "https://llm.acme-lab.net/v1"), "acme-lab");
+  assert.equal(deriveProviderNamespace("my-gateway", "https://api.example.com/v1"), "my-gateway");
+});
+
+test("third-party model with an official slug gets a provider namespace", () => {
+  const catalog = {
+    models: [{
+      slug: "gpt-5.5",
+      model: "gpt-5.5",
+      display_name: "GPT-5.5"
+    }]
+  };
+
+  upsertProviderCatalogModel(catalog, "gpt-5.5", "gpt-5.5", "GPT-5.5", "cursor");
+
+  assert.equal(catalog.models.length, 2);
+  assert.equal(catalog.models[0].slug, "gpt-5.5");
+  assert.equal(catalog.models[0].backend_provider, undefined);
+  assert.equal(catalog.models[1].slug, "cursor/gpt-5.5");
+  assert.equal(catalog.models[1].backend_model, "gpt-5.5");
+  assert.equal(catalog.models[1].backend_provider, "cursor");
+  assert.equal(catalog.models[1].display_name, "cursor/gpt-5.5");
+});
+
+test("updating an owned namespaced model does not overwrite the native model", () => {
+  const catalog = {
+    models: [
+      { slug: "gpt-5.5", model: "gpt-5.5" },
+      { slug: "cursor/gpt-5.5", model: "cursor/gpt-5.5", backend_model: "gpt-5.5", backend_provider: "cursor" }
+    ]
+  };
+
+  upsertProviderCatalogModel(catalog, "gpt-5.5", "gpt-5.5", "Cursor GPT-5.5", "cursor");
+
+  assert.equal(catalog.models.length, 2);
+  assert.equal(catalog.models[0].backend_provider, undefined);
+  assert.equal(catalog.models[1].slug, "cursor/gpt-5.5");
+  assert.equal(catalog.models[1].backend_model, "gpt-5.5");
+  assert.equal(catalog.models[1].display_name, "cursor/gpt-5.5");
+});
+
+test("provider-owned models are namespaced even without a collision", () => {
+  const catalog = { models: [] };
+
+  upsertProviderCatalogModel(catalog, "deepseek-chat", "deepseek-chat", "DeepSeek Chat", "deepseek");
+
+  assert.equal(catalog.models[0].slug, "deepseek/deepseek-chat");
+  assert.equal(catalog.models[0].backend_model, "deepseek-chat");
+  assert.equal(catalog.models[0].display_name, "deepseek/deepseek-chat");
+});
+
+test("legacy provider-owned entries migrate to the provider namespace", () => {
+  const catalog = {
+    models: [{
+      slug: "deepseek-chat",
+      model: "deepseek-chat",
+      backend_model: "deepseek-chat",
+      backend_provider: "deepseek"
+    }]
+  };
+
+  preserveOfficialModels(catalog);
+
+  const migrated = catalog.models.find((model) => model.backend_provider === "deepseek");
+  assert.equal(migrated?.slug, "deepseek/deepseek-chat");
+  assert.equal(migrated?.backend_model, "deepseek-chat");
+  assert.equal(migrated?.display_name, "deepseek/deepseek-chat");
+});
