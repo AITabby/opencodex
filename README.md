@@ -13,7 +13,7 @@
 ---
 
 > [!NOTE]
-> **macOS edition · v1.0.2** — Stable macOS source release. This repository tracks the macOS implementation only and is designed for ChatGPT/Codex Desktop on macOS. The DMG package is published separately when ready.
+> **macOS edition · v1.0.3** — Stable macOS source release. This repository tracks the macOS implementation only and is designed for ChatGPT/Codex Desktop on macOS. The DMG package is published separately when ready.
 
 > [!NOTE]
 > **Native mode first** — Starting OpenCodex does not proxy or modify native Codex. The Provider Workspace keeps official Codex on its native route and only sends explicitly installed third-party models to the local gateway. Resetting to native removes the gateway routing again.
@@ -73,7 +73,7 @@ The server starts and opens the dashboard. Adding a model only saves it; use **U
 # 简体中文
 
 > [!NOTE]
-> **macOS 版本 · v1.0.2** —— 稳定版 macOS 源码发布。本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop；DMG 安装包准备好后另行发布。
+> **macOS 版本 · v1.0.3** —— 稳定版 macOS 源码发布。本仓库仅维护 macOS 实现，面向 macOS 上的 ChatGPT/Codex Desktop；DMG 安装包准备好后另行发布。
 
 > [!NOTE]
 > **原生优先** —— 启动 OpenCodex 不会代理或修改原生 Codex。Provider Workspace 将官方 Codex 固定保留在原生路线，只有显式安装的第三方模型才进入本地网关；还原原生会再次移除网关路由。

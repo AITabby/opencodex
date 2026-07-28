@@ -233,17 +233,25 @@ export function transformResponsesToChat(
 ): ChatCompletionRequestBody {
   const messages: ChatMessage[] = [];
   const tools = convertToolsToChatTools(body.tools);
-  const toolNames = tools.map((t) => t.function.name).join("`, `");
 
   let systemPrompt = body.instructions ? stripInternalCodexEnvelopes(body.instructions) : "";
-  systemPrompt += `\n\nTool Contract & Permission Directive: You are an active AI coding agent running inside Codex with full local workspace permissions. Valid tool names for this turn are exactly \`${toolNames}\`. Call only these listed names with their argument keys. When asked to inspect code, review files, run git status/diff, or explore directories, NEVER claim you cannot read local files or ask the user to paste code—invoke function calls (\`exec_command\`, \`view_file\`, \`list_dir\`) IMMEDIATELY.`;
 
-  messages.push({
-    role: "system",
-    content: systemPrompt.trim(),
-  });
+  if (systemPrompt.trim()) {
+    messages.push({
+      role: "system",
+      content: systemPrompt.trim(),
+    });
+  }
 
-  const rawInput = (body.input && body.input.length > 0) ? body.input : ((body as any).messages || []);
+  // Responses API also permits input to be a plain string. Keep it as a
+  // user message instead of treating the non-array string as an empty input;
+  // otherwise the synthetic tool directive above can become the provider's
+  // only user-visible prompt.
+  const rawInput = typeof (body as any).input === "string"
+    ? [(body as any).input]
+    : (Array.isArray(body.input) && body.input.length > 0)
+      ? body.input
+      : ((body as any).messages || []);
   const inputMessages = responsesInputToChatMessages(rawInput);
   const repairedMessages = SessionHistoryService.repairAndMergeHistory(inputMessages, sessionId);
   messages.push(...repairedMessages);

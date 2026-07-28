@@ -38,6 +38,17 @@ test("v2 transformer handles responses to chat conversion cleanly", () => {
   assert.equal(chat.messages[3].tool_call_id, "call_123");
 });
 
+test("v2 transformer preserves string Responses input as a user message", () => {
+  const chat = transformResponsesToChat({
+    model: "composer-2.5",
+    input: "你好",
+  }, "composer-2.5");
+
+  assert.equal(chat.messages.at(-1)?.role, "user");
+  assert.equal(chat.messages.at(-1)?.content, "你好");
+  assert.equal(chat.messages.some((message) => String(message.content).includes("Tool Contract & Permission Directive")), false);
+});
+
 test("v2 stream engine keeps third-party reasoning internal and emits text", async () => {
   const events = [];
   const engine = new ResponsesStreamEngine("mock-coder", "turn-123");

@@ -10,6 +10,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 
 const GROK_AUTH_PATH = path.join(os.homedir(), ".grok", "auth.json");
@@ -17,6 +18,24 @@ const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
 const ANTIGRAVITY_KEYCHAIN_SERVICE = "gemini";
 const ANTIGRAVITY_KEYCHAIN_PREFIX = "go-keyring-base64:";
 const REFRESH_SKEW_MS = 5 * 60 * 1000;
+const CURSOR_STATE_DB = path.join(os.homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb");
+const CURSOR_APP_BUNDLE = "/Applications/Cursor.app/Contents/Resources/app/out/vs/workbench/workbench.desktop.main.js";
+const CURSOR_AUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
+const CLAUDE_COOKIE_DB = path.join(os.homedir(), "Library", "Application Support", "Claude", "Cookies");
+const CLAUDE_SAFE_STORAGE_SERVICE = "Claude Safe Storage";
+const CLAUDE_SAFE_STORAGE_ACCOUNT = "Claude Key";
+const CLAUDE_TOKEN_CACHE = path.join(os.homedir(), ".opencodex", "claude_desktop_auth.json");
+const CLAUDE_CODE_CREDENTIALS = path.join(os.homedir(), ".claude", ".credentials.json");
+const CLAUDE_API_HOST = "https://api.anthropic.com";
+// Keep these values aligned with the installed Claude Code OAuth client. The
+// Claude Desktop cookie is only used to authorize this first-party OAuth
+// exchange; the resulting token is the same subscription credential used by
+// Claude Code and the model catalog.
+const CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
+const CLAUDE_CODE_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_OAUTH_HOST = "https://platform.claude.com";
+const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 
 const ANTIGRAVITY_APP_PATHS = [
   "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
@@ -32,7 +51,10 @@ function isUsableExpiry(value: unknown): number | null {
     return value < 10_000_000_000 ? value * 1000 : value;
   }
   if (typeof value === "string" && value.trim()) {
-    const parsed = Date.parse(value);
+    const numeric = Number(value);
+    const parsed = Number.isFinite(numeric)
+      ? (numeric < 10_000_000_000 ? numeric * 1000 : numeric)
+      : Date.parse(value);
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
@@ -90,6 +112,222 @@ function readAntigravityAuth(): AntigravityAuth | null {
   }
 }
 
+type CursorCredentials = { accessToken: string | null; refreshToken: string | null };
+type ClaudeDesktopToken = { accessToken: string; refreshToken: string; expiresAt: number };
+type ClaudeCookieRow = { name?: string; value?: string; encrypted_value?: string };
+type ClaudeCookieDiagnostic = { name: string; encrypted: boolean; decryptedLength: number; printable: boolean };
+let lastClaudeCookieDiagnostics: ClaudeCookieDiagnostic[] = [];
+
+function sqlQuote(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function readCursorCredentials(): CursorCredentials {
+  const envToken = String(process.env.CURSOR_API_KEY || "").trim();
+  if (envToken) return { accessToken: envToken, refreshToken: null };
+  if (process.platform !== "darwin" || !fs.existsSync(CURSOR_STATE_DB)) {
+    return { accessToken: null, refreshToken: null };
+  }
+
+  try {
+    const raw = execFileSync("sqlite3", [
+      "-json",
+      CURSOR_STATE_DB,
+      "SELECT key, CAST(value AS TEXT) AS value FROM ItemTable WHERE key IN ('cursorAuth/accessToken','cursorAuth/refreshToken');"
+    ], { encoding: "utf-8", maxBuffer: 1024 * 1024 }).trim();
+    const rows = raw ? JSON.parse(raw) as Array<{ key?: string; value?: string }> : [];
+    const values = new Map(rows.map((row) => [String(row.key || ""), String(row.value || "")]));
+    return {
+      accessToken: values.get("cursorAuth/accessToken") || null,
+      refreshToken: values.get("cursorAuth/refreshToken") || null,
+    };
+  } catch {
+    return { accessToken: null, refreshToken: null };
+  }
+}
+
+function writeCursorCredentials(accessToken: string, refreshToken: string): void {
+  if (!fs.existsSync(CURSOR_STATE_DB)) return;
+  const sql = [
+    `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('cursorAuth/accessToken',${sqlQuote(accessToken)});`,
+    `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('cursorAuth/refreshToken',${sqlQuote(refreshToken)});`,
+  ].join(" ");
+  try {
+    execFileSync("sqlite3", [CURSOR_STATE_DB, sql], { stdio: "ignore" });
+  } catch {
+    // Cursor may keep the database locked while it is running. The in-memory
+    // token remains usable; the next refresh can retry persistence.
+  }
+}
+
+function decryptClaudeCookieValue(row: ClaudeCookieRow, safeStorageKey: string): string {
+  if (typeof row.value === "string" && row.value) return row.value;
+  const encrypted = String(row.encrypted_value || "");
+  if (!encrypted) return "";
+
+  // Chromium's macOS cookie format currently uses v10. Keep the parser
+  // version-tolerant for future v11/v12 records, while retaining the same
+  // AES-CBC payload layout used by Claude Desktop.
+  if (!/^(763130|763131|763132)/i.test(encrypted)) return "";
+  const keyMaterials = [Buffer.from(safeStorageKey, "utf-8")];
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(safeStorageKey)) {
+    try {
+      const decoded = Buffer.from(safeStorageKey, "base64");
+      if (decoded.length > 0) keyMaterials.unshift(decoded);
+    } catch {}
+  }
+  for (const keyMaterial of keyMaterials) {
+    try {
+      const masterKeys = [] as Buffer[];
+      // Newer Electron safeStorage entries are base64-encoded random AES
+      // keys; Chromium's legacy path derives the AES key from a passphrase.
+      if (keyMaterial.length === 16) masterKeys.push(keyMaterial);
+      masterKeys.push(crypto.pbkdf2Sync(
+        keyMaterial,
+        Buffer.from("saltysalt", "utf-8"),
+        1003,
+        16,
+        "sha1",
+      ));
+      for (const masterKey of masterKeys) {
+        let plaintext: Buffer;
+        try {
+          const decipher = crypto.createDecipheriv("aes-128-cbc", masterKey, Buffer.alloc(16, 0x20));
+          plaintext = Buffer.concat([
+            decipher.update(Buffer.from(encrypted.slice(6), "hex")),
+            decipher.final(),
+          ]);
+        } catch {
+          continue;
+        }
+      // Cookies schema v24 prefixes the plaintext with a 32-byte SHA-256
+      // digest of the host key. Leaving it attached makes an otherwise valid
+      // token contain binary bytes and causes Node's Authorization header to
+      // fail before the upstream request is sent.
+      const cookieValue = plaintext.length > 32 ? plaintext.subarray(32) : plaintext;
+      const decoded = cookieValue.toString("utf-8");
+      const firstBinary = decoded.search(/[^\x20-\x7e]/);
+      const value = firstBinary >= 0 ? decoded.slice(0, firstBinary) : decoded;
+      if (value) return value;
+      }
+    } catch {}
+  }
+  return "";
+}
+
+function readClaudeDesktopCookies(): { sessionKey: string; organizationUuid: string } | null {
+  if (process.platform !== "darwin" || !fs.existsSync(CLAUDE_COOKIE_DB)) return null;
+  try {
+    const safeStorageKey = execFileSync("security", [
+      "find-generic-password", "-s", CLAUDE_SAFE_STORAGE_SERVICE,
+      "-a", CLAUDE_SAFE_STORAGE_ACCOUNT, "-w"
+    ], { encoding: "utf-8", timeout: 5000 }).trim();
+    if (!safeStorageKey) return null;
+
+    const raw = execFileSync("sqlite3", [
+      "-json", CLAUDE_COOKIE_DB,
+      "SELECT name, value, hex(encrypted_value) AS encrypted_value FROM cookies " +
+      "WHERE host_key IN ('.claude.ai','claude.ai') AND name IN " +
+      "('sessionKeyV2','sessionKey','sessionKeyV3','sessionKeyLC','sessionKeyV3LC','lastActiveOrg') " +
+      "ORDER BY CASE name " +
+      "WHEN 'sessionKey' THEN 1 WHEN 'sessionKeyV3' THEN 2 WHEN 'sessionKeyV2' THEN 3 " +
+      "WHEN 'sessionKeyLC' THEN 4 WHEN 'sessionKeyV3LC' THEN 5 ELSE 6 END;"
+    ], { encoding: "utf-8", timeout: 5000, maxBuffer: 1024 * 1024 }).trim();
+    const rows = raw ? JSON.parse(raw) as ClaudeCookieRow[] : [];
+    const values = new Map<string, string>();
+    lastClaudeCookieDiagnostics = [];
+    for (const row of rows) {
+      const name = String(row.name || "");
+      if (values.has(name)) continue;
+      const decrypted = decryptClaudeCookieValue(row, safeStorageKey);
+      lastClaudeCookieDiagnostics.push({
+        name,
+        encrypted: Boolean(row.encrypted_value),
+        decryptedLength: decrypted.length,
+        printable: decrypted.length > 0 && /^[\x20-\x7e]+$/.test(decrypted),
+      });
+      if (decrypted) values.set(name, decrypted);
+    }
+    const sessionKey = ["sessionKey", "sessionKeyV3", "sessionKeyV2", "sessionKeyLC", "sessionKeyV3LC"]
+      .map((name) => (values.get(name) || "").trim())
+      // Prefer a usable decrypted cookie. A stale/rotated cookie can decrypt
+      // to arbitrary bytes while a newer V2/V3 cookie is still valid.
+      .find((value) => value.length > 0 && /^[\x20-\x7e]+$/.test(value)) || "";
+    const organizationValue = values.get("lastActiveOrg") || "";
+    const organizationUuid = organizationValue.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] || "";
+    if (!sessionKey || !/^[\x20-\x7e]+$/.test(sessionKey) || !/^[0-9a-f-]{36}$/i.test(organizationUuid)) return null;
+    return { sessionKey, organizationUuid };
+  } catch {
+    return null;
+  }
+}
+
+function readClaudeDesktopToken(): ClaudeDesktopToken | null {
+  try {
+    if (!fs.existsSync(CLAUDE_TOKEN_CACHE)) return null;
+    const value = JSON.parse(fs.readFileSync(CLAUDE_TOKEN_CACHE, "utf-8"));
+    if (
+      typeof value?.accessToken === "string" && value.accessToken &&
+      typeof value?.refreshToken === "string" && value.refreshToken &&
+      typeof value?.expiresAt === "number"
+    ) return value as ClaudeDesktopToken;
+  } catch {}
+  return null;
+}
+
+function writeClaudeDesktopToken(value: ClaudeDesktopToken): void {
+  writeJsonSecure(CLAUDE_TOKEN_CACHE, value);
+}
+
+function base64Url(value: Buffer): string {
+  return value.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+export function getClaudeDesktopVersion(): string {
+  try {
+    const infoPath = "/Applications/Claude.app/Contents/Info.plist";
+    const version = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleShortVersionString", infoPath], { encoding: "utf-8" }).trim();
+    if (version) return version;
+  } catch {}
+  return "unknown";
+}
+
+function jwtExpiry(token: string): number | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const value = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+    return isUsableExpiry(value.exp);
+  } catch {
+    return null;
+  }
+}
+
+export function getCursorClientVersion(): string {
+  try {
+    const infoPath = "/Applications/Cursor.app/Contents/Info.plist";
+    const version = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleShortVersionString", infoPath], { encoding: "utf-8" }).trim();
+    if (version) return version;
+  } catch {}
+  return "unknown";
+}
+
+function getCursorAuthClientId(): string {
+  const configured = String(process.env.OPENCODEX_CURSOR_AUTH_CLIENT_ID || "").trim();
+  if (configured) return configured;
+  // Cursor keeps this public OAuth client id in the installed desktop bundle.
+  // Read the installed client first so a future client rotation does not
+  // require a gateway release. The fallback is the current public desktop id.
+  try {
+    if (fs.existsSync(CURSOR_APP_BUNDLE)) {
+      const source = fs.readFileSync(CURSOR_APP_BUNDLE, "utf-8");
+      const candidate = source.match(/Cvr="([A-Za-z0-9]{32})",Evr="prod\.authentication\.cursor\.sh"/)?.[1];
+      if (candidate) return candidate;
+    }
+  } catch {}
+  return CURSOR_AUTH_CLIENT_ID;
+}
+
 function writeAntigravityAuth(auth: AntigravityAuth): void {
   const raw = `${ANTIGRAVITY_KEYCHAIN_PREFIX}${Buffer.from(JSON.stringify(auth), "utf-8").toString("base64")}`;
   execFileSync("security", [
@@ -130,6 +368,9 @@ function readAntigravityOAuthClient(): { clientId: string; clientSecret: string 
 export class SubscriptionAuthService {
   private static grokRefresh: Promise<string | null> | null = null;
   private static antigravityRefresh: Promise<string | null> | null = null;
+  private static cursorRefresh: Promise<string | null> | null = null;
+  private static claudeRefresh: Promise<string | null> | null = null;
+  private static claudeLastAuthFailure = "not_attempted";
 
   public static hasGrokCredential(): boolean {
     return Boolean(readGrokSession());
@@ -236,5 +477,286 @@ export class SubscriptionAuthService {
     if (refreshed) return refreshed;
 
     return !forceRefresh && isValidAccessToken(accessToken, expiry) ? accessToken : null;
+  }
+
+  public static getClaudeApiKey(): string | null {
+    const envKey = process.env.CLAUDE_API_KEY || process.env.ANTHROPIC_API_KEY;
+    if (envKey) return envKey;
+    const claudeJson = path.join(os.homedir(), ".claude.json");
+    if (fs.existsSync(claudeJson)) {
+      try {
+        const data = JSON.parse(fs.readFileSync(claudeJson, "utf-8"));
+        if (data.primaryApiKey) return data.primaryApiKey;
+      } catch {}
+    }
+    return null;
+  }
+
+  private static getClaudeEnvironmentToken(): string | null {
+    const token = String(process.env.CLAUDE_CODE_OAUTH_TOKEN || process.env.ANTHROPIC_AUTH_TOKEN || "").trim();
+    return token || null;
+  }
+
+  private static getClaudeCodeToken(): ClaudeDesktopToken | null {
+    try {
+      if (!fs.existsSync(CLAUDE_CODE_CREDENTIALS)) return null;
+      const data = JSON.parse(fs.readFileSync(CLAUDE_CODE_CREDENTIALS, "utf-8"));
+      const oauth = data?.claudeAiOauth || data;
+      const accessToken = String(oauth?.accessToken || oauth?.access_token || "").trim();
+      if (!accessToken) return null;
+      return {
+        accessToken,
+        refreshToken: String(oauth.refreshToken || oauth.refresh_token || "").trim(),
+        expiresAt: isUsableExpiry(oauth.expiresAt ?? oauth.expires_at) || Number.MAX_SAFE_INTEGER,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private static async refreshClaudeDesktopToken(): Promise<string | null> {
+    const cached = readClaudeDesktopToken();
+    if (!cached?.refreshToken) {
+      this.claudeLastAuthFailure = "no_cached_refresh_token";
+      return null;
+    }
+    try {
+      const response = await fetch(`${CLAUDE_OAUTH_HOST}/v1/oauth/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "anthropic-beta": CLAUDE_OAUTH_BETA,
+          "User-Agent": "claude-code",
+        },
+        body: JSON.stringify({
+          grant_type: "refresh_token",
+          refresh_token: cached.refreshToken,
+          client_id: CLAUDE_CODE_CLIENT_ID,
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!response.ok) {
+        this.claudeLastAuthFailure = `refresh_http_${response.status}`;
+        return null;
+      }
+      const refreshed = await response.json() as any;
+      if (typeof refreshed.access_token !== "string" || !refreshed.access_token) {
+        this.claudeLastAuthFailure = "refresh_missing_access_token";
+        return null;
+      }
+      const next: ClaudeDesktopToken = {
+        accessToken: refreshed.access_token,
+        refreshToken: String(refreshed.refresh_token || cached.refreshToken),
+        expiresAt: Date.now() + (Number(refreshed.expires_in) || 3600) * 1000,
+      };
+      writeClaudeDesktopToken(next);
+      return next.accessToken;
+    } catch {
+      this.claudeLastAuthFailure = "refresh_network_error";
+      return null;
+    }
+  }
+
+  private static async exchangeClaudeDesktopToken(): Promise<string | null> {
+    const cookies = readClaudeDesktopCookies();
+    if (!cookies) {
+      this.claudeLastAuthFailure = "desktop_cookie_unavailable";
+      return null;
+    }
+
+    const codeVerifier = base64Url(crypto.randomBytes(32));
+    const codeChallenge = base64Url(crypto.createHash("sha256").update(codeVerifier, "utf-8").digest());
+    const stateAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    const stateBytes = crypto.randomBytes(32);
+    let state = "";
+    for (const byte of stateBytes) state += stateAlphabet[byte % stateAlphabet.length];
+
+    let stage = "authorize_request";
+    try {
+      const authorizeResponse = await fetch(`${CLAUDE_API_HOST}/v1/oauth/${cookies.organizationUuid}/authorize`, {
+        method: "POST",
+        headers: {
+          "anthropic-version": "2023-06-01",
+          "Authorization": `Bearer ${cookies.sessionKey}`,
+          "Content-Type": "application/json",
+          "anthropic-client-platform": "DESKTOP_APP",
+          "anthropic-client-version": getClaudeDesktopVersion(),
+        },
+        body: JSON.stringify({
+          response_type: "code",
+          client_id: CLAUDE_CODE_CLIENT_ID,
+          organization_uuid: cookies.organizationUuid,
+          redirect_uri: CLAUDE_CODE_REDIRECT_URI,
+          scope: CLAUDE_CODE_SCOPE,
+          state,
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!authorizeResponse.ok) {
+        const errorBody = await authorizeResponse.json().catch(() => ({})) as any;
+        const errorCode = String(errorBody?.error?.code || errorBody?.error?.type || errorBody?.error_code || errorBody?.error || "")
+          .replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+        const errorDetail = String(errorBody?.error_description || errorBody?.message || errorBody?.error?.message || errorBody?.error?.details?.error_code || errorBody?.detail || "")
+          .replace(/https?:\/\/[^\s]+/g, "url").replace(/[^A-Za-z0-9 _-]/g, "_").slice(0, 48).trim();
+        this.claudeLastAuthFailure = `authorize_http_${authorizeResponse.status}${errorCode ? `_${errorCode}` : ""}${errorDetail ? `_${errorDetail}` : ""}`;
+        return null;
+      }
+      stage = "authorize_response";
+      const authorizeBody = await authorizeResponse.json() as any;
+      const redirectUri = String(authorizeBody.redirect_uri || "");
+      if (!redirectUri) {
+        this.claudeLastAuthFailure = "authorize_missing_redirect";
+        return null;
+      }
+      const code = new URL(redirectUri).searchParams.get("code");
+      if (!code) {
+        this.claudeLastAuthFailure = "authorize_missing_code";
+        return null;
+      }
+
+      stage = "token_request";
+      const tokenResponse = await fetch(`${CLAUDE_OAUTH_HOST}/v1/oauth/token`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "anthropic-beta": CLAUDE_OAUTH_BETA,
+          "User-Agent": "claude-code",
+        },
+        body: JSON.stringify({
+          grant_type: "authorization_code",
+          client_id: CLAUDE_CODE_CLIENT_ID,
+          code,
+          redirect_uri: CLAUDE_CODE_REDIRECT_URI,
+          state,
+          code_verifier: codeVerifier,
+        }),
+        signal: AbortSignal.timeout(20000),
+      });
+      if (!tokenResponse.ok) {
+        const errorBody = await tokenResponse.json().catch(() => ({})) as any;
+        const errorCode = String(errorBody?.error?.code || errorBody?.error?.type || errorBody?.error_code || errorBody?.error || "")
+          .replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 40);
+        const errorDetail = String(errorBody?.error_description || errorBody?.message || errorBody?.error?.message || errorBody?.error?.details?.error_code || errorBody?.detail || "")
+          .replace(/https?:\/\/[^\s]+/g, "url").replace(/[^A-Za-z0-9 _-]/g, "_").slice(0, 48).trim();
+        this.claudeLastAuthFailure = `token_http_${tokenResponse.status}${errorCode ? `_${errorCode}` : ""}${errorDetail ? `_${errorDetail}` : ""}`;
+        return null;
+      }
+      stage = "token_response";
+      const tokenBody = await tokenResponse.json() as any;
+      if (typeof tokenBody.access_token !== "string" || !tokenBody.access_token || typeof tokenBody.refresh_token !== "string") {
+        this.claudeLastAuthFailure = "token_missing_access_or_refresh";
+        return null;
+      }
+      const token: ClaudeDesktopToken = {
+        accessToken: tokenBody.access_token,
+        refreshToken: tokenBody.refresh_token,
+        expiresAt: Date.now() + (Number(tokenBody.expires_in) || 3600) * 1000,
+      };
+      writeClaudeDesktopToken(token);
+      return token.accessToken;
+    } catch (error: any) {
+      const kind = String(error?.cause?.code || error?.name || "error").replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 32);
+      this.claudeLastAuthFailure = `desktop_exchange_${stage}_${kind}`;
+      return null;
+    }
+  }
+
+  public static async getClaudeAccessToken(forceRefresh = false): Promise<string | null> {
+    this.claudeLastAuthFailure = "no_usable_token";
+    const apiKey = this.getClaudeApiKey();
+    if (apiKey) {
+      this.claudeLastAuthFailure = "api_key";
+      return apiKey;
+    }
+
+    const environmentToken = this.getClaudeEnvironmentToken();
+    if (environmentToken) {
+      this.claudeLastAuthFailure = "environment_token";
+      return environmentToken;
+    }
+
+    const cached = readClaudeDesktopToken() || this.getClaudeCodeToken();
+    if (!forceRefresh && cached && cached.expiresAt - Date.now() > REFRESH_SKEW_MS) {
+      this.claudeLastAuthFailure = "cached_token";
+      return cached.accessToken;
+    }
+
+    if (!this.claudeRefresh) {
+      this.claudeRefresh = (async () => {
+        const refreshed = await this.refreshClaudeDesktopToken();
+        if (refreshed) return refreshed;
+        return this.exchangeClaudeDesktopToken();
+      })().finally(() => { this.claudeRefresh = null; });
+    }
+    const refreshed = await this.claudeRefresh;
+    if (refreshed) return refreshed;
+    return !forceRefresh && cached && cached.expiresAt > Date.now() ? cached.accessToken : null;
+  }
+
+  public static getClaudeAuthFailure(): string {
+    return this.claudeLastAuthFailure;
+  }
+
+  public static getClaudeCookieDiagnostics(): ClaudeCookieDiagnostic[] {
+    return lastClaudeCookieDiagnostics.map((item) => ({ ...item }));
+  }
+
+  public static getCursorApiKey(): string | null {
+    return readCursorCredentials().accessToken;
+  }
+
+  private static async refreshCursorToken(): Promise<string | null> {
+    const credentials = readCursorCredentials();
+    if (!credentials.refreshToken) return null;
+    const response = await fetch("https://api2.cursor.sh/oauth/token", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-cursor-client-type": "desktop",
+      },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        client_id: getCursorAuthClientId(),
+        refresh_token: credentials.refreshToken,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!response.ok) return null;
+    const refreshed = await response.json() as any;
+    const accessToken = String(refreshed.access_token || "").trim();
+    if (!accessToken) return null;
+    writeCursorCredentials(accessToken, accessToken);
+    return accessToken;
+  }
+
+  public static async getCursorAccessToken(forceRefresh = false): Promise<string | null> {
+    const credentials = readCursorCredentials();
+    const token = credentials.accessToken;
+    if (!token) return null;
+    if (!forceRefresh && isValidAccessToken(token, jwtExpiry(token))) return token;
+
+    if (!this.cursorRefresh) {
+      this.cursorRefresh = this.refreshCursorToken().finally(() => { this.cursorRefresh = null; });
+    }
+    const refreshed = await this.cursorRefresh;
+    if (refreshed) return refreshed;
+    return !forceRefresh && isValidAccessToken(token, jwtExpiry(token)) ? token : null;
+  }
+
+  public static hasClaudeCredential(): boolean {
+    return Boolean(
+      this.getClaudeApiKey() ||
+      this.getClaudeEnvironmentToken() ||
+      readClaudeDesktopCookies() ||
+      readClaudeDesktopToken() ||
+      this.getClaudeCodeToken(),
+    );
+  }
+
+  public static hasCursorCredential(): boolean {
+    const credentials = readCursorCredentials();
+    return Boolean(credentials.accessToken || credentials.refreshToken);
   }
 }

@@ -16,6 +16,8 @@ import { CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
 import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
+import { fetchCursorModels } from "../services/cursor_protocol.js";
+import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { handleWebRtcProxy } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 
@@ -199,7 +201,12 @@ function recordSubscriptionImport(dataDir: string, providerName: string): void {
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const statePath = path.join(dataDir, "subscription_imports.json");
   const imports = readSubscriptionImports(dataDir);
-  imports[providerName] = { ...imports[providerName], imported_at: new Date().toISOString() };
+  imports[providerName] = {
+    ...imports[providerName],
+    imported_at: new Date().toISOString(),
+    last_test_status: "untested",
+    last_test_message: "订阅已导入，等待测试连接"
+  };
   fs.writeFileSync(statePath, JSON.stringify(imports, null, 2), { encoding: "utf-8", mode: 0o600 });
   fs.chmodSync(statePath, 0o600);
 }
@@ -218,12 +225,52 @@ function recordSubscriptionTest(dataDir: string, providerName: string, status: P
   fs.chmodSync(statePath, 0o600);
 }
 
+
+function preserveOfficialModels(catalog: any): void {
+
+  if (!catalog || typeof catalog !== "object") return;
+  if (!Array.isArray(catalog.models)) catalog.models = [];
+
+  const existingMap = new Map<string, any>();
+
+  const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+  if (fs.existsSync(cachePath)) {
+    try {
+      const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+      if (Array.isArray(cache.models)) {
+        for (const m of cache.models) {
+          if (m.slug && (m.provider === "openai" || m.model_provider === "openai" || m.slug.startsWith("gpt-") || m.slug.startsWith("o1") || m.slug.startsWith("o3") || m.slug.startsWith("chatgpt"))) {
+            if (m.provider !== "opencodex" && m.model_provider !== "opencodex" && !m.backend_provider) {
+              existingMap.set(m.slug, m);
+            }
+          }
+        }
+      }
+    } catch {}
+  }
+
+  for (const m of catalog.models) {
+    existingMap.set(m.slug, m);
+  }
+
+  catalog.models = Array.from(existingMap.values());
+}
+
+
 function hasAntigravityCredential(): boolean {
   return SubscriptionAuthService.hasAntigravityCredential();
 }
 
 function hasGrokCredential(): boolean {
   return SubscriptionAuthService.hasGrokCredential();
+}
+
+function hasClaudeCredential(): boolean {
+  return SubscriptionAuthService.hasClaudeCredential();
+}
+
+function hasCursorCredential(): boolean {
+  return SubscriptionAuthService.hasCursorCredential();
 }
 
 function hasCatalogModelsForProvider(catalogModels: any[], providerName: string): boolean {
@@ -374,6 +421,7 @@ export class CodexBridgeServer {
   private port: number;
   private server: http.Server | null = null;
   private router = new GatewayRouter();
+  private claudeModelFetchError = "";
   public config: any = { providers: [] };
   private readonly dataDir: string;
   private readonly adminToken: string;
@@ -533,9 +581,20 @@ export class CodexBridgeServer {
     if (providerNames.length !== 1) return null;
 
     const providerName = providerNames[0];
+    const subscriptionKeys = ["antigravity", "grok", "claude", "cursor"];
+    if (subscriptionKeys.includes(providerName)) {
+      return {
+        name: providerName,
+        preset_id: providerName,
+        baseUrl: `https://subscription.${providerName}.internal`,
+        models: matches.map((entry) => String(entry.slug || entry.model || "")).filter(Boolean)
+      };
+    }
+
     return providers.find((provider) => provider.name.toLowerCase() === providerName || provider.preset_id?.toLowerCase() === providerName)
       || { name: providerName, baseUrl: "", models: matches.map((entry) => String(entry.slug || entry.model || "")).filter(Boolean) };
   }
+
 
   private isNativeCatalogModel(rawModelName: string): boolean {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
@@ -975,16 +1034,118 @@ if __name__ == "__main__":
     } catch (err: any) {
       console.error("[OpenCodex] Dynamic Grok model fetch failed:", err?.message);
     }
+    return [];
+  }
 
-    // Subscription imports must reflect the provider's live response only.
+  private async fetchClaudeModelsDynamic(): Promise<Array<{ slug: string; name: string }>> {
+    this.claudeModelFetchError = "";
+    try {
+      const token = await SubscriptionAuthService.getClaudeAccessToken();
+      if (!token) {
+        const failure = SubscriptionAuthService.getClaudeAuthFailure();
+        this.claudeModelFetchError = failure.includes("requires a Pro or Max subscription")
+          ? "已读取 Claude 登录态，但 Claude Code 订阅要求 Pro 或 Max 套餐"
+          : failure.startsWith("authorize_http_403")
+            ? "已读取 Claude 登录态，但 Claude 上游拒绝了订阅授权"
+            : failure.startsWith("desktop_cookie_unavailable")
+              ? "未能读取 Claude Desktop 登录态，请重新登录 Claude"
+              : "Claude 登录态无法换取可用订阅令牌";
+        return [];
+      }
+      const isApiKey = token.startsWith("sk-ant-");
+      const headers: Record<string, string> = {
+        "Authorization": `Bearer ${token}`,
+        "anthropic-version": "2023-06-01",
+        "Accept": "application/json",
+      };
+      if (isApiKey) {
+        headers["x-api-key"] = token;
+      } else {
+        headers["anthropic-beta"] = "oauth-2025-04-20";
+        headers["anthropic-client-platform"] = "DESKTOP_APP";
+        headers["anthropic-client-version"] = getClaudeDesktopVersion();
+      }
+      const res = await fetch("https://api.anthropic.com/v1/models?beta=true", {
+        headers,
+        signal: AbortSignal.timeout(15000),
+      });
+      if (res.ok) {
+        const data = await res.json() as any;
+        if (Array.isArray(data.data) && data.data.length > 0) {
+          return data.data
+            .filter((m: any) => m?.id)
+            .map((m: any) => ({ slug: String(m.id), name: String(m.display_name || m.id) }));
+        }
+      } else {
+        const errorText = (await res.text()).replace(/\s+/g, " ");
+        this.claudeModelFetchError = /requires a Pro or Max subscription/i.test(errorText)
+          ? "已读取 Claude 登录态，但 Claude Code 订阅要求 Pro 或 Max 套餐"
+          : res.status === 401
+            ? "Claude 订阅令牌已失效，请重新登录 Claude"
+            : `Claude 模型目录请求失败（HTTP ${res.status}）`;
+      }
+    } catch (err: any) {
+      console.error("[OpenCodex] Dynamic Claude model fetch failed:", err?.message);
+      this.claudeModelFetchError = "Claude 模型目录请求异常，请稍后重试";
+    }
+    return [];
+  }
+
+  private async fetchCursorModelsDynamic(): Promise<Array<{ slug: string; name: string }>> {
+    try {
+      let token = await SubscriptionAuthService.getCursorAccessToken();
+      if (!token) return [];
+      let result = await fetchCursorModels(token, getCursorClientVersion(), AbortSignal.timeout(15000));
+      if (result.length > 0) return result;
+
+      token = await SubscriptionAuthService.getCursorAccessToken(true);
+      if (!token) return [];
+      result = await fetchCursorModels(token, getCursorClientVersion(), AbortSignal.timeout(15000));
+      return result;
+    } catch (err: any) {
+      console.error("[OpenCodex] Dynamic Cursor model fetch failed:", err?.message);
+    }
     return [];
   }
 
   public async start(overridePort?: number): Promise<void> {
+
     if (overridePort && typeof overridePort === "number") {
       this.port = overridePort;
     }
     this.ensurePythonScripts();
+    const configPath = path.join(os.homedir(), ".codex", "config.toml");
+    let managedConfig = "";
+    try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+    // Native mode deliberately leaves the imported catalog empty. Only
+    // hydrate it when the managed gateway block is active.
+    if (managedConfig.includes("opencodex managed") && hasCursorCredential()) {
+      const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+      let catalog: any = { models: [] };
+      if (fs.existsSync(catalogPath)) {
+        try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
+      }
+      if (!Array.isArray(catalog.models)) catalog.models = [];
+      if (catalog.models.length === 0) {
+        const liveModels = await this.fetchCursorModelsDynamic();
+        if (liveModels.length > 0) {
+          const existing = new Set<string>();
+          for (const model of liveModels) {
+            const slug = String(model.slug || "").trim();
+            if (!slug || existing.has(slug.toLowerCase())) continue;
+            existing.add(slug.toLowerCase());
+            const entry = buildFullCatalogEntry(slug, "cursor");
+            entry.display_name = model.name || slug;
+            catalog.models.push(entry);
+          }
+          preserveOfficialModels(catalog);
+          fs.mkdirSync(path.dirname(catalogPath), { recursive: true, mode: 0o700 });
+          fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), { encoding: "utf-8", mode: 0o600 });
+          try { fs.chmodSync(catalogPath, 0o600); } catch {}
+          console.log(`[OpenCodex Gateway] Restored ${liveModels.length} Cursor models into the empty managed catalog.`);
+        }
+      }
+    }
     return new Promise(async (resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
@@ -1007,7 +1168,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.1-beta.1", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.3", opencodex: true }));
           return;
         }
 
@@ -1341,18 +1502,42 @@ if __name__ == "__main__":
           }
           const hasAntigravity = hasAntigravityCredential();
           const hasGrok = hasGrokCredential();
-          // Existing catalog entries are not proof of a Claude subscription or an import action.
-          const hasClaude = false;
+          const hasClaude = hasClaudeCredential();
+          const hasCursor = hasCursorCredential();
+
+          const imports = readSubscriptionImports(this.dataDir);
 
           const status = {
-            antigravity: { detected: hasAntigravity, active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity") },
-            grok: { detected: hasGrok, active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok") },
-            claude: { detected: hasClaude, active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude") }
+            antigravity: {
+              detected: hasAntigravity,
+              active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity"),
+              test_status: imports.antigravity?.last_test_status || "untested",
+              test_message: imports.antigravity?.last_test_message || ""
+            },
+            grok: {
+              detected: hasGrok,
+              active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"),
+              test_status: imports.grok?.last_test_status || "untested",
+              test_message: imports.grok?.last_test_message || ""
+            },
+            claude: {
+              detected: hasClaude,
+              active: hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"),
+              test_status: imports.claude?.last_test_status || "untested",
+              test_message: imports.claude?.last_test_message || ""
+            },
+            cursor: {
+              detected: hasCursor,
+              active: hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"),
+              test_status: imports.cursor?.last_test_status || "untested",
+              test_message: imports.cursor?.last_test_message || ""
+            }
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
           return;
         }
+
 
         if (req.method === "POST" && url.pathname === "/api/cli-bridge/activate") {
           try {
@@ -1372,10 +1557,6 @@ if __name__ == "__main__":
                 entry.display_name = name;
                 catalog.models.push(entry);
               } else if (!existing.backend_provider) {
-                // Official Codex entries can have the same slug but no
-                // subscription owner. Annotate them with the owner returned
-                // by the subscription model pull instead of leaving routing
-                // to a provider-name heuristic.
                 existing.backend_provider = providerName;
                 existing.provider = "opencodex";
                 existing.model_provider = "opencodex";
@@ -1402,8 +1583,27 @@ if __name__ == "__main__":
               for (const m of dynamicGrokModels) {
                 addModel(m.slug, m.name, "grok");
               }
+            } else if (cli === "claude") {
+              const dynamicClaudeModels = await this.fetchClaudeModelsDynamic();
+              if (dynamicClaudeModels.length === 0) {
+                throw new Error(this.claudeModelFetchError || "Claude 没有返回可用模型，未执行导入；请检查本机登录态");
+              }
+              catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "claude");
+              for (const m of dynamicClaudeModels) {
+                addModel(m.slug, m.name, "claude");
+              }
+            } else if (cli === "cursor") {
+              const dynamicCursorModels = await this.fetchCursorModelsDynamic();
+              if (dynamicCursorModels.length === 0) {
+                throw new Error("Cursor 没有返回可用模型，未执行导入；请检查本机登录态");
+              }
+              catalog.models = catalog.models.filter((m: any) => m.backend_provider !== "cursor");
+              for (const m of dynamicCursorModels) {
+                addModel(m.slug, m.name, "cursor");
+              }
             }
 
+            preserveOfficialModels(catalog);
             fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
             // Also ensure opencodex block is enabled in config.toml
@@ -1435,7 +1635,7 @@ if __name__ == "__main__":
             let apiKey = body.api_key || body.apiKey;
 
             const finishTest = (status: ProviderTestStatus, message: string) => {
-              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude") {
+              if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor") {
                 recordSubscriptionTest(this.dataDir, providerName, status, message);
               } else {
                 recordProviderTest(providerName, status, message);
@@ -1482,6 +1682,33 @@ if __name__ == "__main__":
               );
               return;
             }
+
+            if (providerName === "claude") {
+              const liveModels = await this.fetchClaudeModelsDynamic();
+              finishTest(
+                liveModels.length > 0 ? "connected" : "failed",
+                liveModels.length > 0
+                  ? `Claude 订阅正常，已获取 ${liveModels.length} 个可用模型`
+                  : this.claudeModelFetchError || (hasClaudeCredential()
+                    ? "检测到 Claude 登录态，但可用模型获取失败"
+                    : "Claude 本机登录态不存在或已失效，请先完成 Claude 登录")
+              );
+              return;
+            }
+
+            if (providerName === "cursor") {
+              const liveModels = await this.fetchCursorModelsDynamic();
+              finishTest(
+                liveModels.length > 0 ? "connected" : "failed",
+                liveModels.length > 0
+                  ? `Cursor 订阅正常，已获取 ${liveModels.length} 个可用模型`
+                  : hasCursorCredential()
+                    ? "检测到 Cursor 登录态，但可用模型获取失败"
+                    : "未检测到 Cursor 登录凭证，请先完成登录"
+              );
+              return;
+            }
+
 
             if (!baseUrl) {
               finishTest("failed", "未配置 Endpoint / Base URL");

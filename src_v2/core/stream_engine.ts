@@ -223,6 +223,10 @@ export class ResponsesStreamEngine {
     return this.responseId;
   }
 
+  public getMessageText(): string {
+    return this.messageText;
+  }
+
   private wrap(writeSse: (payload: any) => Promise<void>) {
     return async (payload: any) => {
       if (payload && typeof payload === "object" && typeof payload.type === "string" && payload.type.startsWith("response.")) {
