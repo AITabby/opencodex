@@ -10,6 +10,8 @@
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg">⬇️ 下载 OpenCodex v1.0.3</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.3">查看 Release</a>
+  ·
+  <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
 
 <p align="center">
