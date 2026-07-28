@@ -35,3 +35,11 @@ test("dashboard uses the gateway admin cookie without embedding credentials", as
   assert.match(text, /fetch\(/);
   assert.match(text, /api\('\/api\/providers'\)/);
 });
+
+test("sidebar settings icon matches the primary navigation size", async () => {
+  const text = await source();
+  assert.match(
+    text,
+    /\.app-safety \.ico\{[^}]*width:20px[^}]*height:20px[^}]*margin:0[^}]*font-size:18px/,
+  );
+});
