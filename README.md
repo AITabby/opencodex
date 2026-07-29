@@ -2,12 +2,13 @@
 
 ### 把 Codex Desktop 变成你的本地 AI 工作台
 
-网关、语音、会话管理、第三方模型和 Agent 工具，都整合在一个 macOS 应用里。
+网关、语音、会话管理、第三方模型和 Agent 工具，都整合在一个 macOS / Windows 桌面应用里。
 
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe"><img src="https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat-square&logo=windows" alt="Windows 10/11"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
 
@@ -17,6 +18,8 @@
 
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg">⬇️ 下载 OpenCodex v1.0.3</a>
+  ·
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe">🪟 下载 Windows 版</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.3">查看 Release</a>
   ·
@@ -31,13 +34,15 @@
   <a href="./assets/demo.mp4">▶️ 查看应用演示视频</a>
 </p>
 
-> macOS Apple Silicon arm64 · v1.0.3 · 当前 DMG 未经过 Apple 签名
+> macOS Apple Silicon arm64 · Windows 10/11 · v1.0.3 · 当前 macOS DMG 未经过 Apple 签名
+
+> ✅ 当前 Release 的 DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 
 ## 简体中文
 
 ### OpenCodex 是什么？
 
-OpenCodex 是一个运行在本机的 Codex Desktop 控制中心。
+OpenCodex 是一个运行在本机的 Codex Desktop 控制中心，提供 macOS 和 Windows 桌面版本。
 
 它不替换 Codex，也不把官方模型藏起来，而是在 Codex 旁边提供一层可管理的本地能力：
 
@@ -91,7 +96,17 @@ OpenCodex App
 3. 将 OpenCodex 拖入 `Applications` 并打开。
 4. 在应用内管理网关、语音和会话功能。
 
+DMG 版本已经包含网关所需的独立运行时，普通用户无需在终端执行启动命令，也无需自行配置 Node.js 环境。使用前只需要安装 Codex Desktop，并在应用内完成需要的服务商或本机订阅配置。
+
 当前 DMG 未经过 Apple 签名。首次打开时，如果 macOS 阻止运行，请前往“系统设置 → 隐私与安全性”允许打开。
+
+#### Windows 10/11
+
+1. 确保已经安装 Codex Desktop。
+2. 下载 [OpenCodex-1.0.3-win-x64.exe](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe)。
+3. 运行安装程序并打开 OpenCodex。
+
+Windows 安装包已经包含本地网关和桌面应用窗口。Windows 用户不需要额外安装 Node.js 或 .NET SDK，也不需要通过终端启动网关。
 
 #### 从源码运行
 
@@ -111,7 +126,7 @@ http://localhost:8765/dashboard
 
 ### 项目状态
 
-当前发布版本为 `v1.0.3`，面向 macOS Apple Silicon。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
+当前发布版本为 `v1.0.3`，提供 macOS Apple Silicon 和 Windows 10/11 安装包。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
 
 ---
 
@@ -119,7 +134,7 @@ http://localhost:8765/dashboard
 
 ### A local AI workspace for Codex Desktop
 
-OpenCodex brings the gateway, voice, session management, third-party models, and agent tools into one macOS application.
+OpenCodex brings the gateway, voice, session management, third-party models, and agent tools into one desktop application for macOS and Windows.
 
 It works alongside Codex Desktop instead of replacing it. Native Codex models and native routing remain separate, while explicitly added third-party models can be managed through the local OpenCodex gateway.
 
@@ -154,7 +169,17 @@ Official Codex models stay on their native route. Only models explicitly added b
 3. Drag OpenCodex into `Applications` and launch it.
 4. Manage providers, voice, sessions, and third-party models from the app.
 
+The DMG includes the standalone runtime required by the gateway. End users do not need to install Node.js, npm, or Homebrew, and do not need to start the gateway from a terminal. Install Codex Desktop first, then configure providers or local subscriptions inside OpenCodex.
+
 The current DMG is unsigned. If macOS blocks the first launch, allow it from **System Settings → Privacy & Security**.
+
+#### Windows 10/11
+
+1. Install Codex Desktop.
+2. Download the [OpenCodex v1.0.3 Windows installer](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe).
+3. Run the installer and launch OpenCodex.
+
+The Windows installer includes the local gateway and native app window. Windows users do not need Node.js or the .NET SDK, and do not need to start the gateway from a terminal.
 
 ### Run from source
 
@@ -174,11 +199,12 @@ http://localhost:8765/dashboard
 
 ### Project status
 
-The current release is `v1.0.3` for macOS Apple Silicon. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
+The current release is `v1.0.3` for macOS Apple Silicon and Windows 10/11. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
 
 ### Links
 
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
 - [Download OpenCodex v1.0.3](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-arm64.dmg)
+- [Download OpenCodex v1.0.3 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)
