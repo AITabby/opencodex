@@ -108,6 +108,8 @@ DMG 版本已经包含网关所需的独立运行时，普通用户无需在终�
 
 Windows 安装包已经包含本地网关和桌面应用窗口。Windows 用户不需要额外安装 Node.js 或 .NET SDK，也不需要通过终端启动网关。
 
+> 注意：Windows 当前只发布桌面应用安装包，不提供单独的命令行版本。
+
 #### 从源码运行
 
 ```bash
@@ -180,6 +182,8 @@ The current DMG is unsigned. If macOS blocks the first launch, allow it from **S
 3. Run the installer and launch OpenCodex.
 
 The Windows installer includes the local gateway and native app window. Windows users do not need Node.js or the .NET SDK, and do not need to start the gateway from a terminal.
+
+> Note: Windows is currently distributed only as a desktop application installer. A standalone command-line version is not provided.
 
 ### Run from source
 
