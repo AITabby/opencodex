@@ -21,6 +21,28 @@ if [[ -z "$NODE_BINARY" || ! -x "$NODE_BINARY" ]]; then
   exit 1
 fi
 
+# The app bundle contains one Node executable, not the user's Homebrew
+# installation. Reject runtimes that require external dylibs so a package
+# cannot look complete while its gateway exits immediately after launch.
+validate_node_runtime() {
+  local runtime_version node_links unsupported_links
+  if ! runtime_version="$($NODE_BINARY --version 2>&1)"; then
+    print -u2 "Node.js runtime cannot execute: $NODE_BINARY"
+    print -u2 "$runtime_version"
+    exit 1
+  fi
+  node_links="$(otool -L "$NODE_BINARY")"
+  unsupported_links="$(print -r -- "$node_links" | grep -E '(@rpath/|/opt/homebrew/|/usr/local/(Cellar|opt)/)' || true)"
+  if [[ -n "$unsupported_links" ]]; then
+    print -u2 "Node.js runtime is not self-contained and cannot be bundled safely: $NODE_BINARY"
+    print -u2 "$unsupported_links"
+    print -u2 "Use a standalone Node.js binary with OPENCODEX_NODE_BINARY=/path/to/node."
+    exit 1
+  fi
+  print "Using self-contained Node.js $runtime_version from $NODE_BINARY"
+}
+validate_node_runtime
+
 # Bundle the small portable voice tools so local Whisper and Edge TTS do not
 # depend on Homebrew, a system Python installation, or a user's PATH.
 UVX_BINARY="${OPENCODEX_UVX_BINARY:-$(command -v uvx || true)}"

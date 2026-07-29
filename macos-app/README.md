@@ -18,7 +18,7 @@
 ./macos-app/scripts/package-app.sh
 ```
 
-产物为 `macos-app/build/OpenCodex.app`。打包时会把当前 Node runtime、`dist/`、`node_modules/`、VAD Python 资源，以及 `uv`、`uvx`、`ffmpeg` 语音运行时放入应用资源，因此用户不需要预装 Node、PM2、Python 或 Homebrew 音频工具。首次使用本地 Whisper 或 Edge TTS 时，内置 `uvx` 可能需要联网准备对应 Python 包；本地模型路径会直接传给 Whisper，不要求重新下载模型。若本机 Python 缺少 Silero/PyTorch，VAD 会自动降级为内置能量 VAD。
+产物为 `macos-app/build/OpenCodex.app`。打包时会把自包含的 Node runtime、`dist/`、`node_modules/`、VAD Python 资源，以及 `uv`、`uvx`、`ffmpeg` 语音运行时放入应用资源，因此用户不需要预装 Node、PM2、Python 或 Homebrew 音频工具。打包脚本会检查 Node 的动态库依赖；如果当前 Node 来自 Homebrew 或依赖 `@rpath/libnode.*.dylib`，脚本会明确拒绝打包。请使用独立 Node 二进制，或显式设置 `OPENCODEX_NODE_BINARY=/path/to/node`。首次使用本地 Whisper 或 Edge TTS 时，内置 `uvx` 可能需要联网准备对应 Python 包；本地模型路径会直接传给 Whisper，不要求重新下载模型。若本机 Python 缺少 Silero/PyTorch，VAD 会自动降级为内置能量 VAD。
 
 语音 STT/TTS API Key 只保存到 macOS Keychain；`voice_settings.json` 只保存 Keychain 引用，Dashboard 和 API 只返回掩码。旧版本遗留的明文 Key 会在首次读取语音设置时迁移；如果 Keychain 不可用则会清除明文并提示重新填写。
 

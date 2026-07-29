@@ -5,17 +5,21 @@ import { readFile } from "node:fs/promises";
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
 test("macOS packaging carries the complete voice runtime", async () => {
-  const [packageScript, verifyScript, gateway, app, server] = await Promise.all([
+  const [packageScript, verifyScript, gateway, app, server, start] = await Promise.all([
     read("macos-app/scripts/package-app.sh"),
     read("macos-app/scripts/verify-release.sh"),
     read("src_v2/server/gateway.ts"),
     read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
-    read("src_v2/server.ts")
+    read("src_v2/server.ts"),
+    read("src_v2/start.ts")
   ]);
   assert.match(packageScript, /voice-runtime\/uvx/);
   assert.match(packageScript, /voice-runtime\/uv/);
   assert.match(packageScript, /voice-runtime\/ffmpeg/);
   assert.match(packageScript, /src_v2\/assets/);
+  assert.match(packageScript, /otool -L/);
+  assert.match(packageScript, /@rpath\/|opt\/homebrew|usr\/local\/\(Cellar\|opt\)/);
+  assert.match(packageScript, /OPENCODEX_NODE_BINARY/);
   assert.match(verifyScript, /voice-runtime\/uvx/);
   assert.match(verifyScript, /src_v2\/assets\/opencodex-logo-compact\.png/);
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);
@@ -24,6 +28,7 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(app, /OPENCODEX_VOICE_BAR_PATH/);
   assert.match(app, /gateway_runtime_/);
   assert.match(server, /process\.env\.OPENCODEX_PORT/);
+  assert.match(start, /process\.env\.OPENCODEX_PORT/);
 });
 
 test("repository build includes the bundled OpenCodexBar source", async () => {
