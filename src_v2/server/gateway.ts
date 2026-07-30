@@ -18,7 +18,7 @@ import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_s
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
-import { handleWebRtcProxy } from "./webrtc_proxy.js";
+import { handleWebRtcProxy, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 
@@ -1505,7 +1505,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.3", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.4", opencodex: true }));
           return;
         }
 
@@ -1518,24 +1518,21 @@ if __name__ == "__main__":
         }
 
         // Native OpenAI Realtime / Audio / Voice transparent HTTP proxy
-        if (url.pathname.startsWith("/v1/realtime") || url.pathname.startsWith("/v1/audio") || url.pathname.startsWith("/v1/voice") || url.pathname.includes("realtime")) {
-          const targetUrl = `https://api.openai.com${url.pathname}${url.search}`;
-          const skipHeaders = new Set(["host", "content-length", "transfer-encoding", "connection", "accept-encoding", "content-encoding"]);
-          const forwardHeaders: Record<string, string> = {};
-          for (const [k, v] of Object.entries(req.headers)) {
-            if (skipHeaders.has(k.toLowerCase())) continue;
-            if (typeof v === "string") forwardHeaders[k] = v;
-            else if (Array.isArray(v)) forwardHeaders[k] = v.join(", ");
-          }
-          forwardHeaders["host"] = "api.openai.com";
+        if (url.pathname.startsWith("/v1/realtime") || url.pathname.startsWith("/v1/audio") || url.pathname.startsWith("/v1/voice") || url.pathname.startsWith("/backend-api/")) {
+          const realtimeUpstream = resolveRealtimeUpstream(req, { localAdminToken: this.adminToken });
+          const targetUrl = realtimeUpstream.targetUrl;
 
           try {
             const rawBody = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await this.parseRawBuffer(req) : undefined;
             const upstreamRes = await fetchUpstream(targetUrl, {
               method: req.method,
-              headers: forwardHeaders,
+              headers: {
+                ...realtimeUpstream.headers,
+                host: realtimeUpstream.targetHost,
+                "accept-encoding": "identity",
+              },
               body: rawBody ? new Uint8Array(rawBody) : undefined,
-              operation: "realtime-http",
+              operation: realtimeUpstream.nativeSession ? "realtime-native-http" : "realtime-api-http",
             });
 
             const respHeaders: Record<string, string> = {};
@@ -4568,8 +4565,8 @@ if __name__ == "__main__":
 
       this.server.on("upgrade", (req, socket, head) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-        if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice")) {
-          handleWebRtcProxy(req, socket, head);
+        if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname.startsWith("/backend-api/")) {
+          handleWebRtcProxy(req, socket, head, { localAdminToken: this.adminToken });
           return;
         }
 
