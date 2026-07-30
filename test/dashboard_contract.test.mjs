@@ -14,13 +14,6 @@ test("dashboard contains the complete voice configuration and one CDP launch pat
   assert.match(text, /updateVoiceRuntimeStatus/);
 });
 
-test("dashboard exposes a one-shot GPT-Live work-model selector", async () => {
-  const text = await source();
-  for (const marker of ["live-work-model", "arm-live-work-model", "/api/realtime-settings", "下一次 Live 干活"]) {
-    assert.match(text, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  }
-});
-
 test("dashboard keeps session import, scan, and delete controls", async () => {
   const text = await source();
   for (const marker of ["session-import-input", "session-scan-modal", "import-scanned-sessions", "deleteActiveSession", "session-message-image"]) {

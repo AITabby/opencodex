@@ -21,7 +21,7 @@ import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/sub
 import { handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
-import { REALTIME_MODEL_OVERRIDE_TTL_MS, armRealtimeWorkModel, consumeRealtimeWorkModel, loadRealtimeSettings, normalizeRealtimeWorkModel } from "../services/realtime_settings.js";
+import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -169,6 +169,15 @@ function maskVoiceSettings(settings: any): any {
 }
 
 type ProviderTestStatus = "untested" | "connected" | "failed" | "simulated";
+
+type LiveModelPickerWaiter = {
+  requestId: string;
+  sessionKey: string;
+  models: string[];
+  createdAt: number;
+  resolve: (model: string) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 function recordProviderTest(providerName: string, status: ProviderTestStatus, message: string): void {
   const name = String(providerName || "").trim().toLowerCase();
@@ -664,8 +673,9 @@ export class CodexBridgeServer {
   public config: any = { providers: [] };
   private readonly dataDir: string;
   private readonly adminToken: string;
+  private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
+  private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private realtimeActiveUntil = 0;
-  private realtimeWorkModelBySession = new Map<string, { model: string; expiresAt: number }>();
 
   constructor(port = 8765) {
     this.port = port;
@@ -699,52 +709,6 @@ export class CodexBridgeServer {
     return this.realtimeActiveUntil > Date.now();
   }
 
-  private realtimeWorkModelSessionKey(body: any): string {
-    const metadata = body?.client_metadata || {};
-    return String(
-      metadata.session_id ||
-      metadata.thread_id ||
-      metadata.conversation_id ||
-      body?.session_id ||
-      body?.thread_id ||
-      body?.conversation_id ||
-      "__active__",
-    ).trim() || "__active__";
-  }
-
-  private resolveRealtimeWorkModel(body: any): string {
-    if (!this.isRealtimeActive()) {
-      this.realtimeWorkModelBySession.clear();
-      return "";
-    }
-
-    const now = Date.now();
-    const key = this.realtimeWorkModelSessionKey(body);
-    const pending = loadRealtimeSettings(this.dataDir).pending_work_model;
-    if (pending) {
-      const override = consumeRealtimeWorkModel(this.dataDir);
-      if (override.model) {
-        this.realtimeWorkModelBySession.set(key, {
-          model: override.model,
-          expiresAt: now + REALTIME_MODEL_OVERRIDE_TTL_MS,
-        });
-      }
-    }
-
-    let binding = this.realtimeWorkModelBySession.get(key);
-    if (binding?.expiresAt <= now) {
-      this.realtimeWorkModelBySession.delete(key);
-      binding = undefined;
-    }
-    if (!binding) binding = this.realtimeWorkModelBySession.get("__active__");
-    if (!binding) return "";
-    if (binding.expiresAt <= now) {
-      this.realtimeWorkModelBySession.delete("__active__");
-      return "";
-    }
-    return binding.model;
-  }
-
   private availableRealtimeWorkModels(): string[] {
     const models = new Set<string>();
     const addCatalog = (catalogPath: string) => {
@@ -759,6 +723,83 @@ export class CodexBridgeServer {
     addCatalog(path.join(os.homedir(), ".codex", "models_catalog.json"));
     addCatalog(path.join(os.homedir(), ".opencodex", "custom_model_catalog.json"));
     return Array.from(models).sort((a, b) => a.localeCompare(b));
+  }
+
+  private async chooseLiveWorkModel(body: any): Promise<string> {
+    if (!this.isRealtimeActive()) {
+      this.liveModelBindings.clear();
+      return "";
+    }
+
+    const now = Date.now();
+    const sessionKey = liveModelSessionKey(body);
+    const existing = this.liveModelBindings.get(sessionKey);
+    if (existing?.expiresAt > now && isToolContinuation(body)) return existing.model;
+    if (existing) this.liveModelBindings.delete(sessionKey);
+    if (!isLikelyLiveWorkRequest(body)) return "";
+
+    const models = this.availableRealtimeWorkModels();
+    if (models.length === 0) {
+      console.warn("[OpenCodex Realtime] No models available for the Live picker; falling back to the desktop model");
+      return "";
+    }
+
+    const requestId = randomUUID();
+    const selected = await new Promise<string>((resolve) => {
+      const timer = setTimeout(() => {
+        this.liveModelPickerWaiters.delete(requestId);
+        resolve("");
+      }, LIVE_MODEL_PICKER_TIMEOUT_MS);
+      this.liveModelPickerWaiters.set(requestId, {
+        requestId,
+        sessionKey,
+        models,
+        createdAt: now,
+        resolve,
+        timer,
+      });
+    });
+
+    if (selected) {
+      this.liveModelBindings.set(sessionKey, {
+        model: selected,
+        expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
+      });
+    }
+    return selected;
+  }
+
+  private pendingLiveModelPicker(): any {
+    const waiter = Array.from(this.liveModelPickerWaiters.values())
+      .sort((a, b) => a.createdAt - b.createdAt)[0];
+    if (!waiter) return { pending: false, realtime_active: this.isRealtimeActive() };
+    return {
+      pending: true,
+      realtime_active: this.isRealtimeActive(),
+      request_id: waiter.requestId,
+      models: waiter.models,
+      created_at: waiter.createdAt,
+    };
+  }
+
+  private resolveLiveModelPicker(requestId: unknown, model: unknown): { ok: boolean; error?: string; cancelled?: boolean } {
+    const id = typeof requestId === "string" ? requestId.trim() : "";
+    const waiter = this.liveModelPickerWaiters.get(id);
+    if (!waiter) return { ok: false, error: "模型选择请求已过期" };
+    const selected = normalizeRealtimeWorkModel(model);
+    if (!selected) {
+      clearTimeout(waiter.timer);
+      this.liveModelPickerWaiters.delete(id);
+      waiter.resolve("");
+      return { ok: true, cancelled: true };
+    }
+    if (!waiter.models.includes(selected)) {
+      return { ok: false, error: "所选模型不在当前可用模型列表中" };
+    }
+    clearTimeout(waiter.timer);
+    this.liveModelPickerWaiters.delete(id);
+    waiter.resolve(selected);
+    return { ok: true };
   }
 
   private acquireServerLock(): void {
@@ -1661,13 +1702,10 @@ if __name__ == "__main__":
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
           try {
             const body = await this.parseJsonBody(req);
-            let effectiveBody = body;
-            const realtimeWorkModel = this.resolveRealtimeWorkModel(body);
-            if (realtimeWorkModel) {
-              effectiveBody = { ...body, model: realtimeWorkModel };
-              if (body.model !== realtimeWorkModel) {
-                console.log(`[OpenCodex Realtime] Applied Live work model: ${body.model || "(default)"} -> ${realtimeWorkModel}`);
-              }
+            const liveWorkModel = await this.chooseLiveWorkModel(body);
+            const effectiveBody = liveWorkModel ? { ...body, model: liveWorkModel } : body;
+            if (liveWorkModel && body.model !== liveWorkModel) {
+              console.log(`[OpenCodex Realtime] Applied selected Live work model: ${body.model || "(default)"} -> ${liveWorkModel}`);
             }
             console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
             const rawRequestedModel = effectiveBody.model || "deepseek-v4-pro";
@@ -1717,30 +1755,18 @@ if __name__ == "__main__":
           return;
         }
 
-        if (req.method === "GET" && url.pathname === "/api/realtime-settings") {
-          const settings = loadRealtimeSettings(this.dataDir);
+        if (req.method === "GET" && url.pathname === "/api/live-model-picker/pending") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            ...settings,
-            realtime_active: this.isRealtimeActive(),
-            available_models: this.availableRealtimeWorkModels(),
-          }));
+          res.end(JSON.stringify(this.pendingLiveModelPicker()));
           return;
         }
 
-        if (req.method === "POST" && url.pathname === "/api/realtime-settings") {
+        if (req.method === "POST" && url.pathname === "/api/live-model-picker/resolve") {
           try {
-            const data = await this.parseJsonBody(req);
-            const model = normalizeRealtimeWorkModel(data?.work_model);
-            const available = this.availableRealtimeWorkModels();
-            if (model && !available.includes(model)) {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: `模型 "${model}" 不在当前 Codex/网关模型目录中` }));
-              return;
-            }
-            const settings = armRealtimeWorkModel(model, this.dataDir);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ ...settings, realtime_active: this.isRealtimeActive() }));
+            const body = await this.parseJsonBody(req);
+            const result = this.resolveLiveModelPicker(body?.request_id, body?.model);
+            res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
           } catch (err: any) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
