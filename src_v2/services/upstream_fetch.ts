@@ -1,4 +1,4 @@
-import { Agent, type Dispatcher } from "undici";
+import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
 
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -142,7 +142,11 @@ export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOpt
   const maxAttempts = Math.max(1, Math.min(3, Math.floor(options.maxAttempts ?? DEFAULT_ATTEMPTS)));
   const timeoutMs = Math.max(1_000, options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   const retryDelayMs = Math.max(0, options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);
-  const fetchImpl = options.fetchImpl || fetch;
+  // The dispatcher is created by the bundled undici dependency. Pair it with
+  // undici's fetch as well; Node's built-in fetch may use a different
+  // embedded undici version and rejects this Agent with `invalid
+  // onRequestStart method` before any network request is sent.
+  const fetchImpl = options.fetchImpl || (undiciFetch as unknown as typeof fetch);
   const replayableBody = isReplayableBody(options.body);
   const requestInit: RequestInit & { dispatcher?: Dispatcher } = { ...options };
   delete (requestInit as any).operation;
