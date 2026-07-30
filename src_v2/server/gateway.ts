@@ -21,6 +21,7 @@ import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/sub
 import { handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
+import { REALTIME_MODEL_OVERRIDE_TTL_MS, armRealtimeWorkModel, consumeRealtimeWorkModel, loadRealtimeSettings, normalizeRealtimeWorkModel } from "../services/realtime_settings.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -663,6 +664,8 @@ export class CodexBridgeServer {
   public config: any = { providers: [] };
   private readonly dataDir: string;
   private readonly adminToken: string;
+  private realtimeActiveUntil = 0;
+  private realtimeWorkModelBySession = new Map<string, { model: string; expiresAt: number }>();
 
   constructor(port = 8765) {
     this.port = port;
@@ -686,6 +689,76 @@ export class CodexBridgeServer {
     fs.writeFileSync(tokenPath, `${token}\n`, { encoding: "utf-8", mode: 0o600 });
     fs.chmodSync(tokenPath, 0o600);
     return token;
+  }
+
+  private markRealtimeActive(): void {
+    this.realtimeActiveUntil = Date.now() + 15 * 60 * 1000;
+  }
+
+  private isRealtimeActive(): boolean {
+    return this.realtimeActiveUntil > Date.now();
+  }
+
+  private realtimeWorkModelSessionKey(body: any): string {
+    const metadata = body?.client_metadata || {};
+    return String(
+      metadata.session_id ||
+      metadata.thread_id ||
+      metadata.conversation_id ||
+      body?.session_id ||
+      body?.thread_id ||
+      body?.conversation_id ||
+      "__active__",
+    ).trim() || "__active__";
+  }
+
+  private resolveRealtimeWorkModel(body: any): string {
+    if (!this.isRealtimeActive()) {
+      this.realtimeWorkModelBySession.clear();
+      return "";
+    }
+
+    const now = Date.now();
+    const key = this.realtimeWorkModelSessionKey(body);
+    const pending = loadRealtimeSettings(this.dataDir).pending_work_model;
+    if (pending) {
+      const override = consumeRealtimeWorkModel(this.dataDir);
+      if (override.model) {
+        this.realtimeWorkModelBySession.set(key, {
+          model: override.model,
+          expiresAt: now + REALTIME_MODEL_OVERRIDE_TTL_MS,
+        });
+      }
+    }
+
+    let binding = this.realtimeWorkModelBySession.get(key);
+    if (binding?.expiresAt <= now) {
+      this.realtimeWorkModelBySession.delete(key);
+      binding = undefined;
+    }
+    if (!binding) binding = this.realtimeWorkModelBySession.get("__active__");
+    if (!binding) return "";
+    if (binding.expiresAt <= now) {
+      this.realtimeWorkModelBySession.delete("__active__");
+      return "";
+    }
+    return binding.model;
+  }
+
+  private availableRealtimeWorkModels(): string[] {
+    const models = new Set<string>();
+    const addCatalog = (catalogPath: string) => {
+      try {
+        const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
+        for (const model of Array.isArray(catalog?.models) ? catalog.models : []) {
+          const slug = normalizeRealtimeWorkModel(model?.slug || model?.id || model?.model);
+          if (slug) models.add(slug);
+        }
+      } catch {}
+    };
+    addCatalog(path.join(os.homedir(), ".codex", "models_catalog.json"));
+    addCatalog(path.join(os.homedir(), ".opencodex", "custom_model_catalog.json"));
+    return Array.from(models).sort((a, b) => a.localeCompare(b));
   }
 
   private acquireServerLock(): void {
@@ -1505,7 +1578,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.4", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.5", opencodex: true }));
           return;
         }
 
@@ -1519,6 +1592,7 @@ if __name__ == "__main__":
 
         // Native OpenAI Realtime / Audio / Voice transparent HTTP proxy
         if (url.pathname.startsWith("/v1/realtime") || url.pathname.startsWith("/v1/audio") || url.pathname.startsWith("/v1/voice") || url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
+          if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
           const realtimeUpstream = resolveRealtimeUpstream(req, { localAdminToken: this.adminToken });
           const targetUrl = realtimeUpstream.targetUrl;
 
@@ -1587,8 +1661,16 @@ if __name__ == "__main__":
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
           try {
             const body = await this.parseJsonBody(req);
-            console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(body), "model:", body.model);
-            const rawRequestedModel = body.model || "deepseek-v4-pro";
+            let effectiveBody = body;
+            const realtimeWorkModel = this.resolveRealtimeWorkModel(body);
+            if (realtimeWorkModel) {
+              effectiveBody = { ...body, model: realtimeWorkModel };
+              if (body.model !== realtimeWorkModel) {
+                console.log(`[OpenCodex Realtime] Applied Live work model: ${body.model || "(default)"} -> ${realtimeWorkModel}`);
+              }
+            }
+            console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
+            const rawRequestedModel = effectiveBody.model || "deepseek-v4-pro";
             const requestedModel = this.stripReasoningSuffix(rawRequestedModel);
             const providers = CredentialStore.loadProviders();
             // Subscription imports are the source of truth. A model may only
@@ -1597,7 +1679,7 @@ if __name__ == "__main__":
 
             if (!provider) {
               if (this.isNativeCatalogModel(requestedModel)) {
-                await this.proxyNativeResponses(req, body, res);
+                await this.proxyNativeResponses(req, effectiveBody, res);
                 return;
               }
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -1612,7 +1694,7 @@ if __name__ == "__main__":
             const providerUrl = rawUrl.endsWith("/chat/completions") ? rawUrl : `${rawUrl.replace(/\/$/, "")}/chat/completions`;
             const upstreamModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
 
-            await this.router.handleResponses(body, upstreamModel, apiKey, providerUrl, res, provider.name);
+            await this.router.handleResponses(effectiveBody, upstreamModel, apiKey, providerUrl, res, provider.name);
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -1632,6 +1714,37 @@ if __name__ == "__main__":
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ active }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/realtime-settings") {
+          const settings = loadRealtimeSettings(this.dataDir);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            ...settings,
+            realtime_active: this.isRealtimeActive(),
+            available_models: this.availableRealtimeWorkModels(),
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/realtime-settings") {
+          try {
+            const data = await this.parseJsonBody(req);
+            const model = normalizeRealtimeWorkModel(data?.work_model);
+            const available = this.availableRealtimeWorkModels();
+            if (model && !available.includes(model)) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: `模型 "${model}" 不在当前 Codex/网关模型目录中` }));
+              return;
+            }
+            const settings = armRealtimeWorkModel(model, this.dataDir);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ...settings, realtime_active: this.isRealtimeActive() }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
           return;
         }
 
@@ -4573,6 +4686,7 @@ if __name__ == "__main__":
       this.server.on("upgrade", (req, socket, head) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
         if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
+          if (url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
           handleWebRtcProxy(req, socket, head, { localAdminToken: this.adminToken });
           return;
         }
