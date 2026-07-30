@@ -20,6 +20,8 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(picker, /\.floating/);
   assert.doesNotMatch(statusBar, /LiveModelPicker/);
   assert.match(dashboard, /live-model-picker-enabled/);
+  assert.match(dashboard, /#view-voice \.settings-stack/);
+  assert.match(dashboard, /live-picker-setting/);
   assert.match(dashboard, /post\('\/api\/live-model-picker\/settings'/);
   assert.match(gateway, /api\/live-model-picker\/settings/);
   assert.match(app, /GPT-Live 选择执行模型/);
