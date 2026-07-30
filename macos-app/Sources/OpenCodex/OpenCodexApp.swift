@@ -37,10 +37,6 @@ struct OpenCodexApp: App {
                     await gateway.start()
                 }
         }
-        Window("GPT-Live 选择执行模型", id: "live-model-picker") {
-            LiveModelPickerView(gateway: gateway)
-        }
-        .defaultSize(width: 430, height: 245)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 Button("关于 OpenCodex") {
@@ -53,7 +49,6 @@ struct OpenCodexApp: App {
 
 struct RootView: View {
     @ObservedObject var gateway: GatewayProcess
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ZStack {
@@ -68,10 +63,6 @@ struct RootView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .onChange(of: gateway.liveModelPickerRequest?.id) { requestID in
-            guard requestID != nil else { return }
-            openWindow(id: "live-model-picker")
-        }
     }
 
     private var startupView: some View {
