@@ -725,6 +725,29 @@ export class CodexBridgeServer {
     return Array.from(models).sort((a, b) => a.localeCompare(b));
   }
 
+  private liveModelPickerSettingsPath(): string {
+    return path.join(os.homedir(), ".opencodex", "voice_settings.json");
+  }
+
+  private isLiveModelPickerEnabled(): boolean {
+    try {
+      const settings = JSON.parse(fs.readFileSync(this.liveModelPickerSettingsPath(), "utf-8"));
+      return settings?.live_model_picker_enabled === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private setLiveModelPickerEnabled(enabled: boolean): void {
+    const settingsPath = this.liveModelPickerSettingsPath();
+    let settings: any = {};
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true, mode: 0o700 });
+    settings.live_model_picker_enabled = enabled;
+    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+    try { fs.chmodSync(settingsPath, 0o600); } catch {}
+  }
+
   private async chooseLiveWorkModel(body: any): Promise<string> {
     if (!this.isRealtimeActive()) {
       this.liveModelBindings.clear();
@@ -772,10 +795,11 @@ export class CodexBridgeServer {
   private pendingLiveModelPicker(): any {
     const waiter = Array.from(this.liveModelPickerWaiters.values())
       .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (!waiter) return { pending: false, realtime_active: this.isRealtimeActive() };
+    if (!waiter) return { pending: false, realtime_active: this.isRealtimeActive(), enabled: this.isLiveModelPickerEnabled() };
     return {
       pending: true,
       realtime_active: this.isRealtimeActive(),
+      enabled: this.isLiveModelPickerEnabled(),
       request_id: waiter.requestId,
       models: waiter.models,
       created_at: waiter.createdAt,
@@ -1758,6 +1782,30 @@ if __name__ == "__main__":
         if (req.method === "GET" && url.pathname === "/api/live-model-picker/pending") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(this.pendingLiveModelPicker()));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/live-model-picker/settings") {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ enabled: this.isLiveModelPickerEnabled() }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/live-model-picker/settings") {
+          try {
+            const body = await this.parseJsonBody(req);
+            if (typeof body?.enabled !== "boolean") {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "enabled 必须是布尔值" }));
+              return;
+            }
+            this.setLiveModelPickerEnabled(body.enabled);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ enabled: body.enabled }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
           return;
         }
 
@@ -2931,6 +2979,9 @@ if __name__ == "__main__":
               vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -35.0,
               vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
               voice_llm_model: data.voice_llm_model || "",
+              live_model_picker_enabled: typeof data.live_model_picker_enabled === "boolean"
+                ? data.live_model_picker_enabled
+                : previous.live_model_picker_enabled === true,
               interaction_mode: data.interaction_mode === "push-to-talk" ? "push-to-talk" : (data.interaction_mode === "toggle" ? "toggle" : "toggle"),
               enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
               hud_theme: ["vortex", "siri"].includes(data.hud_theme) ? data.hud_theme : "vortex",
@@ -2969,6 +3020,7 @@ if __name__ == "__main__":
             vad_threshold: -35.0,
             vad_duration: 2.0,
             voice_llm_model: "",
+            live_model_picker_enabled: false,
             interaction_mode: "toggle",
             hud_theme: "vortex"
           };

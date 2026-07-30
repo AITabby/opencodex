@@ -4,6 +4,7 @@ private struct LiveModelPickerPending: Decodable {
   let pending: Bool
   let request_id: String?
   let models: [String]?
+  let enabled: Bool?
 }
 
 /// Owns the optional Live model-picker orb. This UI deliberately lives in the
@@ -24,6 +25,7 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
   private var requestID: String?
   private var currentModels: [String] = []
   private var isResolving = false
+  var onEnabledChanged: ((Bool) -> Void)?
 
   override init() {
     if let stored = UserDefaults.standard.object(forKey: Self.enabledKey) as? Bool {
@@ -35,8 +37,7 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
   }
 
   func start() {
-    guard isEnabled else { return }
-    showOrb()
+    if isEnabled { showOrb() }
     startPolling()
   }
 
@@ -60,6 +61,8 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
       pickerWindow?.orderOut(nil)
       orbWindow?.orderOut(nil)
     }
+    persistRemoteEnabled(enabled)
+    onEnabledChanged?(enabled)
   }
 
   private func showOrb() {
@@ -121,7 +124,7 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
   }
 
   @objc private func pollGateway() {
-    guard isEnabled, !pollInFlight,
+    guard !pollInFlight,
           let token = GatewayLocator.adminToken(), !token.isEmpty else { return }
 
     pollInFlight = true
@@ -143,6 +146,26 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
   }
 
   private func apply(_ payload: LiveModelPickerPending) {
+    if let remoteEnabled = payload.enabled, remoteEnabled != isEnabled {
+      isEnabled = remoteEnabled
+      UserDefaults.standard.set(remoteEnabled, forKey: Self.enabledKey)
+      if remoteEnabled {
+        showOrb()
+      } else {
+        requestID = nil
+        currentModels = []
+        pickerWindow?.orderOut(nil)
+        orbWindow?.orderOut(nil)
+      }
+      onEnabledChanged?(remoteEnabled)
+    }
+
+    guard isEnabled else {
+      requestID = nil
+      currentModels = []
+      return
+    }
+
     guard isEnabled,
           payload.pending,
           let id = payload.request_id,
@@ -165,6 +188,17 @@ final class LiveModelPickerController: NSObject, NSWindowDelegate {
     if isNewRequest {
       showPickerWindow()
     }
+  }
+
+  private func persistRemoteEnabled(_ enabled: Bool) {
+    guard let token = GatewayLocator.adminToken(), !token.isEmpty else { return }
+    var request = URLRequest(url: GatewayLocator.url(path: "api/live-model-picker/settings"))
+    request.httpMethod = "POST"
+    request.timeoutInterval = 5
+    request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try? JSONSerialization.data(withJSONObject: ["enabled": enabled])
+    URLSession.shared.dataTask(with: request).resume()
   }
 
   @objc private func orbClicked() {

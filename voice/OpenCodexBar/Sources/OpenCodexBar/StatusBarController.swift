@@ -34,6 +34,9 @@ class StatusBarController {
     updateIcon()
     try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
     buildMenu()
+    self.liveModelPickerController.onEnabledChanged = { [weak self] _ in
+      self?.updateLiveModelPickerMenuItem()
+    }
   }
 
   func setStatus(_ status: AppStatus) {
