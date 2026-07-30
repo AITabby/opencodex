@@ -121,12 +121,38 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
   {
     type: "function",
     function: {
-      name: "exec_command",
-      description: "Execute a bash shell command in the local workspace to read files or run git commands",
+      name: "spawn_agent",
+      description: "Dispatch one real Codex subagent task asynchronously. This desktop integration supports one fire-and-forget dispatch per Live task: after this tool succeeds, do not call wait_agent, list_agents, or spawn_agent again, and do not fall back to doing the delegated work yourself. Use the legacy fields task_name, message, and optional fork_turns exactly as defined here. Do not claim the subagent finished; only report that it was dispatched after this tool succeeds.",
       parameters: {
         type: "object",
         properties: {
-          cmd: { type: "string", description: "The shell command to run" }
+          task_name: { type: "string", description: "Short stable name for the subagent, for example game-builder" },
+          message: { type: "string", description: "Complete task instructions and expected deliverable for the subagent" },
+          fork_turns: { type: "string", enum: ["none", "all"], description: "Whether to include the current conversation context; use none unless context is required" }
+        },
+        required: ["task_name", "message"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "exec_command",
+      description: "Execute a shell command on the local Mac.",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: { type: "string", description: "The shell command to run" },
+          workdir: { type: "string", description: "Optional working directory; omit to use the current project directory" },
+          sandbox_permissions: {
+            type: "string",
+            enum: ["use_default", "require_escalated"],
+            description: "Permission mode for this command"
+          },
+          justification: {
+            type: "string",
+            description: "Reason associated with an elevated permission request"
+          }
         },
         required: ["cmd"]
       }
@@ -161,6 +187,8 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
     }
   }
 ];
+
+const CODEX_SUBAGENT_TOOLS = DEFAULT_WORKSPACE_TOOLS.slice(0, 1);
 
 export function convertToolsToChatTools(tools?: ResponseTool[]): ChatTool[] {
   if (!Array.isArray(tools) || tools.length === 0) return DEFAULT_WORKSPACE_TOOLS;
@@ -203,7 +231,18 @@ export function convertToolsToChatTools(tools?: ResponseTool[]): ChatTool[] {
     }
   }
 
-  return result.length > 0 ? result : DEFAULT_WORKSPACE_TOOLS;
+  if (result.length === 0) return DEFAULT_WORKSPACE_TOOLS;
+
+  // Codex Desktop may send its own workspace tool list on every continuation.
+  // Keep that list, but never drop the gateway's real subagent controls merely
+  // because the client supplied an explicit tools array.
+  const existingNames = new Set(result.map((tool) => tool.function?.name).filter(Boolean));
+  for (const tool of CODEX_SUBAGENT_TOOLS) {
+    const name = tool.function?.name;
+    if (name && !existingNames.has(name)) result.unshift(tool);
+  }
+
+  return result;
 }
 
 export function mergeConsecutiveMessages(messages: ChatMessage[]): ChatMessage[] {

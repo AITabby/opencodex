@@ -4,8 +4,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { transformResponsesToChat } from "../dist/core/transformer.js";
-import { ResponsesStreamEngine } from "../dist/core/stream_engine.js";
+import { transformResponsesToChat, convertToolsToChatTools } from "../dist/core/transformer.js";
+import { ResponsesStreamEngine, normalizeToolArguments } from "../dist/core/stream_engine.js";
 
 test("v2 transformer handles responses to chat conversion cleanly", () => {
   const reqBody = {
@@ -47,6 +47,42 @@ test("v2 transformer preserves string Responses input as a user message", () => 
   assert.equal(chat.messages.at(-1)?.role, "user");
   assert.equal(chat.messages.at(-1)?.content, "你好");
   assert.equal(chat.messages.some((message) => String(message.content).includes("Tool Contract & Permission Directive")), false);
+});
+
+test("v2 default tool contract exposes real Codex subagent controls", () => {
+  const names = convertToolsToChatTools().map((tool) => tool.function?.name);
+
+  assert.equal(names[0], "spawn_agent");
+  assert.equal(names.includes("wait_agent"), false);
+  assert.equal(names.includes("list_agents"), false);
+});
+
+test("v2 explicit desktop tools retain the subagent controls", () => {
+  const names = convertToolsToChatTools([
+    { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
+    { type: "function", function: { name: "view_file", parameters: { type: "object" } } },
+    { type: "function", function: { name: "list_dir", parameters: { type: "object" } } }
+  ]).map((tool) => tool.function?.name);
+
+  assert.deepEqual(names.slice(0, 1), ["spawn_agent"]);
+  assert.deepEqual(names.slice(1), ["exec_command", "view_file", "list_dir"]);
+});
+
+test("v2 exec command contract can request desktop-path approval", () => {
+  const execTool = convertToolsToChatTools().find((tool) => tool.function?.name === "exec_command");
+  const properties = execTool?.function?.parameters?.properties;
+
+  assert.deepEqual(properties?.sandbox_permissions?.enum, ["use_default", "require_escalated"]);
+  assert.equal(typeof properties?.justification?.description, "string");
+});
+
+test("v2 adds desktop approval fields at the protocol boundary", () => {
+  const normalized = JSON.parse(normalizeToolArguments("exec_command", JSON.stringify({
+    cmd: "cat > ~/Desktop/game.html <<'EOF'\nhello\nEOF"
+  })));
+
+  assert.equal(normalized.sandbox_permissions, "require_escalated");
+  assert.equal(typeof normalized.justification, "string");
 });
 
 test("v2 stream engine keeps third-party reasoning internal and emits text", async () => {

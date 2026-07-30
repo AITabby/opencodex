@@ -41,6 +41,7 @@ final class GatewayProcess: ObservableObject {
     @Published private(set) var liveModelPickerRequest: LiveModelPickerRequest?
 
     private var process: Process?
+    private var livePickerProcess: Process?
     private var outputPipe: Pipe?
     private var runtimeFileURL: URL?
     private var pickerPollTask: Task<Void, Never>?
@@ -96,8 +97,7 @@ final class GatewayProcess: ObservableObject {
         environment["OPENCODEX_PORT"] = String(port)
         environment["OPENCODEX_APP_MODE"] = "1"
         environment["OPENCODEX_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
-        let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("OpenCodex", isDirectory: true)
+        let applicationSupport = applicationSupportDirectory
         try? FileManager.default.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
         let runtimeFile = applicationSupport.appendingPathComponent("gateway_runtime_\(ProcessInfo.processInfo.processIdentifier).json")
         let runtimePayload: [String: Any] = ["port": port, "pid": ProcessInfo.processInfo.processIdentifier, "started_at": Date().timeIntervalSince1970]
@@ -162,7 +162,7 @@ final class GatewayProcess: ObservableObject {
         if ready {
             state = .ready
             adminToken = readAdminToken()
-            startLiveModelPickerPolling()
+            startLiveModelPicker()
         } else if child.isRunning {
             state = .failed("网关启动超时，请查看日志")
         }
@@ -174,6 +174,10 @@ final class GatewayProcess: ObservableObject {
         liveModelPickerRequest = nil
         adminToken = ""
         outputPipe?.fileHandleForReading.readabilityHandler = nil
+        if let livePickerProcess, livePickerProcess.isRunning {
+            livePickerProcess.terminate()
+        }
+        self.livePickerProcess = nil
         guard let process else { return }
         if process.isRunning {
             process.terminate()
@@ -239,10 +243,52 @@ final class GatewayProcess: ObservableObject {
         return Int.random(in: 18000...28000)
     }
 
+    private var applicationSupportDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("OpenCodex", isDirectory: true)
+    }
+
+    private var adminTokenURL: URL {
+        applicationSupportDirectory.appendingPathComponent("admin_token")
+    }
+
     private func readAdminToken() -> String {
-        guard let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return "" }
-        let tokenURL = applicationSupport.appendingPathComponent("OpenCodex/admin_token")
+        let tokenURL = adminTokenURL
         return (try? String(contentsOf: tokenURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func startLiveModelPicker() {
+        guard livePickerProcess == nil,
+              let resources = Bundle.main.resourceURL else { return }
+        let pickerURL = resources.appendingPathComponent("OpenCodexLivePicker")
+        guard FileManager.default.isExecutableFile(atPath: pickerURL.path) else {
+            appendLog("找不到独立 GPT-Live 悬浮球：\(pickerURL.path)\n")
+            return
+        }
+
+        let picker = Process()
+        picker.executableURL = pickerURL
+        picker.currentDirectoryURL = resources
+        var environment = ProcessInfo.processInfo.environment
+        environment["OPENCODEX_APP_PORT"] = String(port)
+        environment["OPENCODEX_ADMIN_TOKEN_PATH"] = adminTokenURL.path
+        environment["OPENCODEX_APP_MODE"] = "1"
+        picker.environment = environment
+        picker.standardOutput = FileHandle.nullDevice
+        picker.standardError = FileHandle.nullDevice
+        picker.terminationHandler = { [weak self] picker in
+            Task { @MainActor in
+                guard let self, self.livePickerProcess === picker else { return }
+                self.livePickerProcess = nil
+            }
+        }
+
+        do {
+            try picker.run()
+            livePickerProcess = picker
+        } catch {
+            appendLog("无法启动 GPT-Live 悬浮球：\(error.localizedDescription)\n")
+        }
     }
 
     private func startLiveModelPickerPolling() {

@@ -22,7 +22,12 @@ export function liveModelSessionKey(body: any): string {
 export function isLikelyLiveWorkRequest(body: any): boolean {
   const metadata = body?.client_metadata;
   const tools = body?.tools;
-  return Boolean(metadata && Array.isArray(tools) && tools.length > 0);
+  return Boolean(
+    metadata && (
+      (Array.isArray(tools) && tools.length > 0) ||
+      Object.prototype.hasOwnProperty.call(metadata, "x-openai-subagent")
+    )
+  );
 }
 
 export function isToolContinuation(body: any): boolean {

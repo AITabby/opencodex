@@ -13,6 +13,7 @@ ICON_SOURCE="$PACKAGE_ROOT/Resources/OpenCodex-icon-source.png"
 cd "$APP_ROOT"
 npm run build
 swift build -c release --package-path "$PACKAGE_ROOT" --product OpenCodex
+swift build -c release --package-path "$PACKAGE_ROOT" --product OpenCodexLivePicker
 BIN_ROOT="$(swift build -c release --package-path "$PACKAGE_ROOT" --show-bin-path)"
 
 NODE_BINARY="${OPENCODEX_NODE_BINARY:-$(command -v node)}"
@@ -128,6 +129,7 @@ done
 iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/OpenCodex.icns"
 
 cp "$BIN_ROOT/OpenCodex" "$APP_BUNDLE/Contents/MacOS/OpenCodex"
+cp "$BIN_ROOT/OpenCodexLivePicker" "$APP_BUNDLE/Contents/Resources/OpenCodexLivePicker"
 if [[ -d "$BIN_ROOT/OpenCodexMac_OpenCodex.bundle" ]]; then
   cp -R "$BIN_ROOT/OpenCodexMac_OpenCodex.bundle" "$APP_BUNDLE/Contents/Resources/"
 fi
@@ -143,7 +145,7 @@ rm -rf "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app"
 cp -R "$VOICE_BAR_APP" "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app"
 mkdir -p "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets"
 cp -R "$APP_ROOT/src_v2/assets/" "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets/"
-chmod +x "$APP_BUNDLE/Contents/MacOS/OpenCodex" "$APP_BUNDLE/Contents/Resources/node" \
+chmod +x "$APP_BUNDLE/Contents/MacOS/OpenCodex" "$APP_BUNDLE/Contents/Resources/OpenCodexLivePicker" "$APP_BUNDLE/Contents/Resources/node" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uv" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uvx" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/ffmpeg"

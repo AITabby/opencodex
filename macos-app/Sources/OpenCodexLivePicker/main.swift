@@ -24,13 +24,16 @@ private final class LivePickerAgent: ObservableObject {
     var onChange: (() -> Void)?
 
     private var pollTask: Task<Void, Never>?
-    private let port = 8765
+    private let port: Int
     private let token: String
 
     init() {
-        let tokenPath = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent(".opencodex/admin_token")
-        token = (try? String(contentsOf: tokenPath, encoding: .utf8))?
+        let environment = ProcessInfo.processInfo.environment
+        port = Int(environment["OPENCODEX_APP_PORT"] ?? "") ?? 8765
+        let resolvedTokenPath = environment["OPENCODEX_ADMIN_TOKEN_PATH"]
+            .map { URL(fileURLWithPath: $0) }
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".opencodex/admin_token")
+        token = (try? String(contentsOf: resolvedTokenPath, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 

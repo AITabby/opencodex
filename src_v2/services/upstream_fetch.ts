@@ -1,4 +1,4 @@
-import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
+import { Agent, fetch as undiciFetch, setGlobalDispatcher } from "undici";
 
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -35,6 +35,12 @@ export const upstreamAgent = new Agent({
   // Streaming responses have their own idle timeout in the caller.
   bodyTimeout: 0,
 });
+
+// Keep the dispatcher and fetch implementation inside the same bundled
+// undici instance. Passing an Agent through RequestInit can cross a Node
+// built-in-undici boundary under PM2 and fail before network I/O with
+// `invalid onRequestStart method`.
+setGlobalDispatcher(upstreamAgent);
 
 export type UpstreamFetchOptions = RequestInit & {
   /** Human-readable operation name for diagnostics; never includes credentials. */
@@ -148,13 +154,12 @@ export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOpt
   // onRequestStart method` before any network request is sent.
   const fetchImpl = options.fetchImpl || (undiciFetch as unknown as typeof fetch);
   const replayableBody = isReplayableBody(options.body);
-  const requestInit: RequestInit & { dispatcher?: Dispatcher } = { ...options };
+  const requestInit: RequestInit = { ...options };
   delete (requestInit as any).operation;
   delete (requestInit as any).maxAttempts;
   delete (requestInit as any).timeoutMs;
   delete (requestInit as any).retryDelayMs;
   delete (requestInit as any).fetchImpl;
-  requestInit.dispatcher = upstreamAgent;
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {

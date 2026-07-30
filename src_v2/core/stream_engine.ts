@@ -88,6 +88,37 @@ function generateHexId(prefix: string, length = 16): string {
   return `${prefix}_${randomBytes(Math.ceil(length / 2)).toString("hex").slice(0, length)}`;
 }
 
+/**
+ * The desktop client owns permission prompts.  When a provider emits a shell
+ * call that writes to a protected user folder, add the native escalation
+ * fields at the protocol boundary instead of teaching the model to ask for
+ * them in a prompt.
+ */
+export function normalizeToolArguments(name: string, rawArguments: string): string {
+  if (name !== "exec_command" || !rawArguments) return rawArguments;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawArguments);
+  } catch {
+    return rawArguments;
+  }
+  if (!parsed || typeof parsed !== "object" || typeof parsed.cmd !== "string") return rawArguments;
+  if (parsed.sandbox_permissions) return rawArguments;
+
+  const command = parsed.cmd;
+  const touchesProtectedFolder = /(?:~|\/Users\/[^\s"'`]+)\/(?:Desktop|Downloads|Pictures|Movies|Music)(?:\/|[\s"'`]|$)/i.test(command);
+  const writesFiles = /(?:^|[;&|]\s*)(?:cat|cp|mv|ditto|tee|touch|mkdir|rm|rmdir|install|python(?:3)?|node|osascript)\b/i.test(command)
+    || /(?:>>?|<<)\s*(?:~|\/Users\/)/.test(command);
+  if (!touchesProtectedFolder || !writesFiles) return rawArguments;
+
+  return JSON.stringify({
+    ...parsed,
+    sandbox_permissions: "require_escalated",
+    justification: parsed.justification || "Access a protected local folder for the user's requested operation",
+  });
+}
+
 function extractXmlAndBashToolCalls(text: string): { cleanText: string; calls: any[] } {
   let cleanText = text;
   const calls: any[] = [];
@@ -186,6 +217,7 @@ interface ToolCallState {
   output_index: number;
   added: boolean;
   closed: boolean;
+  deferArguments?: boolean;
 }
 
 interface ReasoningState {
@@ -395,6 +427,7 @@ export class ResponsesStreamEngine {
         output_index: this.nextOutputIndex++,
         added: false,
         closed: false,
+        deferArguments: (fn.name || "") === "exec_command",
       };
       this.toolCalls[index] = state;
     }
@@ -420,12 +453,14 @@ export class ResponsesStreamEngine {
 
     if (fn.arguments) {
       state.arguments += fn.arguments;
-      await emit({
-        type: "response.function_call_arguments.delta",
-        item_id: state.id,
-        output_index: state.output_index,
-        delta: fn.arguments,
-      });
+      if (!state.deferArguments) {
+        await emit({
+          type: "response.function_call_arguments.delta",
+          item_id: state.id,
+          output_index: state.output_index,
+          delta: fn.arguments,
+        });
+      }
     }
   }
 
@@ -532,6 +567,16 @@ export class ResponsesStreamEngine {
       const state = Object.values(this.toolCalls).find((candidate) => candidate.output_index === outputIndex);
       if (!state || state.closed) continue;
       state.closed = true;
+      const normalizedArguments = normalizeToolArguments(state.name, state.arguments);
+      if (state.deferArguments && normalizedArguments) {
+        await emit({
+          type: "response.function_call_arguments.delta",
+          item_id: state.id,
+          output_index: state.output_index,
+          delta: normalizedArguments,
+        });
+      }
+      state.arguments = normalizedArguments;
       await emit({
         type: "response.function_call_arguments.done",
         item_id: state.id,

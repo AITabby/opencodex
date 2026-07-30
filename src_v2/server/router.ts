@@ -148,15 +148,31 @@ export class GatewayRouter {
     const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl);
     const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(chatBody);
 
-    const targetUrl = (urlEndpoint && !providerUrl.endsWith(urlEndpoint))
-      ? `${providerUrl.replace(/\/$/, "")}${urlEndpoint}`
-      : providerUrl;
+    // Callers may provide either a provider base URL or an already selected
+    // OpenAI endpoint. Normalize both forms before an adapter chooses its
+    // protocol-specific path; otherwise Anthropic-compatible models can end
+    // up at `/chat/completions/v1/messages`.
+    const providerBaseUrl = providerUrl.replace(/\/(?:chat\/completions|messages)\/?$/i, "");
+    const adapterPath = /\/v1$/i.test(providerBaseUrl) && /^\/v1\//i.test(urlEndpoint)
+      ? urlEndpoint.slice("/v1".length)
+      : urlEndpoint;
+    const targetUrl = adapterPath
+      ? `${providerBaseUrl.replace(/\/$/, "")}${adapterPath}`
+      : /\/chat\/completions\/?$/i.test(providerUrl)
+        ? providerUrl
+        : `${providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${apiKey}`,
       ...adapterHeaders,
     };
+    // OpenCode Go's Anthropic Messages-compatible models validate the API key
+    // through x-api-key. Keep Authorization as well for providers that accept
+    // the OpenAI-compatible bearer convention.
+    if (adapter.name === "anthropic" && apiKey) {
+      headers["x-api-key"] = apiKey;
+    }
 
     // Clean V2 Antigravity Subscription Routing
     const isAntigravityModel = (
@@ -249,6 +265,13 @@ export class GatewayRouter {
       finalTargetUrl = "https://agent.api5.cursor.sh/agent.v1.AgentService/Run";
     }
 
+    console.info(
+      `[OpenCodex Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
+      `messages=${Array.isArray(finalPayloadBody?.messages) ? finalPayloadBody.messages.length : 0} ` +
+      `tools=${Array.isArray(finalPayloadBody?.tools) ? finalPayloadBody.tools.map((tool: any) => tool?.function?.name || tool?.name).filter(Boolean).join(",") || "(none)" : "(none)"} ` +
+      `continuation=${Boolean(reqBody?.input?.some?.((item: any) => item?.type === "function_call_output"))}`,
+    );
+
     pruneCursorPendingToolCalls();
     const requestedCursorToolOutput = isCursorModel ? cursorFunctionCallOutput(reqBody) : undefined;
     const pendingCursorTool = isCursorModel && cursorStateKey
@@ -277,6 +300,26 @@ export class GatewayRouter {
     };
 
     const engine = new ResponsesStreamEngine(upstreamModel, reqBody?.client_metadata?.turn_id);
+    let engineStarted = false;
+    const emitFailedResponse = async (message: string, code = "provider_request_failed"): Promise<void> => {
+      if (!engineStarted) {
+        await engine.start(writeSse);
+        engineStarted = true;
+      }
+      const now = Math.floor(Date.now() / 1000);
+      const failedResponse = {
+        id: engine.getResponseId(),
+        object: "response",
+        created_at: now,
+        completed_at: now,
+        status: "failed",
+        model: upstreamModel,
+        output: [],
+        error: { code, message },
+      };
+      await writeSse({ type: "response.failed", response: failedResponse });
+      await writeSse({ type: "response.done", response: failedResponse });
+    };
     let cursorToolResult: CursorToolResult | undefined;
     let pendingCursorToolRequest: CursorExternalToolRequest | undefined;
     const onCursorToolEvent = (event: CursorToolEvent): void => {
@@ -379,6 +422,11 @@ export class GatewayRouter {
           headers: finalHeaders,
           body: JSON.stringify(finalPayloadBody),
           signal: controller.signal,
+          // A streaming POST may have been accepted by the provider before
+          // its headers arrive. Retrying it can create a second execution of
+          // the same Live task, so the caller must decide whether to retry.
+          maxAttempts: 1,
+          timeoutMs: 120_000,
           operation: `responses:${providerName || "provider"}`,
         });
       }
@@ -435,6 +483,8 @@ export class GatewayRouter {
               headers: finalHeaders,
               body: JSON.stringify(finalPayloadBody),
               signal: controller.signal,
+              maxAttempts: 1,
+              timeoutMs: 120_000,
               operation: `responses:${providerName || "provider"}:auth-refresh`,
             });
           }
@@ -479,25 +529,18 @@ export class GatewayRouter {
         }
 
 
-        await engine.start(writeSse);
-        await writeSse({
-          type: "response.output_item.added",
-          response_id: engine.getResponseId(),
-          output_index: 0,
-          item: {
-            id: `msg_${Date.now()}`,
-            type: "message",
-            role: "assistant",
-            content: [{ type: "output_text", text: `⚠️ ${msg}` }]
-          }
-        });
-        await engine.finish(writeSse);
+        // Do not turn an upstream/provider failure into a completed assistant
+        // message. Codex and GPT-Live interpret response.completed as a
+        // successful turn and may announce that a task was dispatched even
+        // though no model response or tool call ever arrived.
+        await emitFailedResponse(msg);
         res.end();
         return;
       }
 
       res.flushHeaders();
       await engine.start(writeSse);
+      engineStarted = true;
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -742,25 +785,18 @@ export class GatewayRouter {
         ? `无法连接服务商接口${causeText}${attemptsText}：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
         : err.message;
       if (!res.headersSent) {
-        res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: detailMsg,
-          type: "upstream_unreachable",
-          retryable: Boolean(err?.retryable),
-          attempts: err?.attempts,
-          cause_code: upstreamDetails.code,
-        }));
-      } else if (!res.writableEnded) {
-        // The upstream may return HTTP 200 and report the failure in a
-        // streaming trailer (Cursor does this for Connect/protobuf errors).
-        // Headers have already been sent in that case, so surface the error
-        // as an assistant message instead of closing an empty response.
-        try {
-          await engine.processChatChunk(writeSse, {
-            choices: [{ delta: { content: `⚠️ ${detailMsg}` } }],
-          });
-          await engine.finish(writeSse);
-        } catch {}
+        res.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        });
+      }
+      if (!res.writableEnded) {
+        // A transport failure is also a failed Responses turn, regardless of
+        // whether the provider failed before headers or during its stream.
+        // Never synthesize assistant text or response.completed here.
+        await emitFailedResponse(detailMsg, "upstream_unreachable");
         res.write("data: [DONE]\n\n");
         res.end();
       }

@@ -9,6 +9,7 @@ import {
 
 test("Live picker identifies a tool-capable work handoff", () => {
   assert.equal(isLikelyLiveWorkRequest({ client_metadata: { session_id: "s1" }, tools: [{ type: "function" }] }), true);
+  assert.equal(isLikelyLiveWorkRequest({ client_metadata: { session_id: "s1", "x-openai-subagent": "1" }, tools: [] }), true);
   assert.equal(isLikelyLiveWorkRequest({ client_metadata: { session_id: "s1" }, tools: [] }), false);
   assert.equal(isLikelyLiveWorkRequest({ tools: [{ type: "function" }] }), false);
 });

@@ -20,8 +20,12 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(packageScript, /otool -L/);
   assert.match(packageScript, /@rpath\/|opt\/homebrew|usr\/local\/\(Cellar\|opt\)/);
   assert.match(packageScript, /OPENCODEX_NODE_BINARY/);
+  assert.match(packageScript, /codesign --deep --force --sign - --timestamp=none/);
+  assert.match(packageScript, /--product OpenCodexLivePicker/);
+  assert.match(packageScript, /Resources\/OpenCodexLivePicker/);
   assert.match(verifyScript, /voice-runtime\/uvx/);
   assert.match(verifyScript, /src_v2\/assets\/opencodex-logo-compact\.png/);
+  assert.match(verifyScript, /Resources\/OpenCodexLivePicker/);
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);
   assert.match(gateway, /useEnergyVAD/);
   assert.match(app, /OPENCODEX_VOICE_RUNTIME_DIR/);
@@ -63,6 +67,9 @@ test("desktop app publishes the runtime port and uses the embedded voice bar", a
   assert.match(gatewayProcess, /OPENCODEX_VOICE_BAR_PATH/);
   assert.match(gatewayProcess, /gateway_runtime_/);
   assert.match(gatewayProcess, /OPENCODEX_DATA_DIR/);
+  assert.match(gatewayProcess, /OpenCodexLivePicker/);
+  assert.match(gatewayProcess, /OPENCODEX_APP_PORT/);
+  assert.match(gatewayProcess, /OPENCODEX_ADMIN_TOKEN_PATH/);
   assert.match(info, /LSMultipleInstancesProhibited/);
 });
 

@@ -675,6 +675,7 @@ export class CodexBridgeServer {
   private readonly adminToken: string;
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
+  private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
 
   constructor(port = 8765) {
@@ -729,7 +730,19 @@ export class CodexBridgeServer {
     return path.join(os.homedir(), ".opencodex", "voice_settings.json");
   }
 
+  private liveModelPickerStatePath(): string {
+    return path.join(os.homedir(), ".opencodex", "live_model_picker.json");
+  }
+
   private isLiveModelPickerEnabled(): boolean {
+    try {
+      const state = JSON.parse(fs.readFileSync(this.liveModelPickerStatePath(), "utf-8"));
+      if (typeof state?.enabled === "boolean") return state.enabled;
+    } catch {}
+
+    // Read the legacy field once for existing installations. New writes use
+    // the dedicated Live state file so ordinary voice-settings saves cannot
+    // turn the floating ball off during a Codex restart.
     try {
       const settings = JSON.parse(fs.readFileSync(this.liveModelPickerSettingsPath(), "utf-8"));
       return settings?.live_model_picker_enabled === true;
@@ -739,27 +752,50 @@ export class CodexBridgeServer {
   }
 
   private setLiveModelPickerEnabled(enabled: boolean): void {
-    const settingsPath = this.liveModelPickerSettingsPath();
-    let settings: any = {};
-    try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
-    fs.mkdirSync(path.dirname(settingsPath), { recursive: true, mode: 0o700 });
-    settings.live_model_picker_enabled = enabled;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
-    try { fs.chmodSync(settingsPath, 0o600); } catch {}
+    const statePath = this.liveModelPickerStatePath();
+    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(statePath, JSON.stringify({ enabled }, null, 2), "utf-8");
+    try { fs.chmodSync(statePath, 0o600); } catch {}
+    if (!enabled) this.resetLiveModelPicker();
   }
 
   private async chooseLiveWorkModel(body: any): Promise<string> {
+    if (!this.isLiveModelPickerEnabled()) {
+      this.activeLiveModel = null;
+      this.liveModelBindings.clear();
+      return "";
+    }
     if (!this.isRealtimeActive()) {
+      this.activeLiveModel = null;
       this.liveModelBindings.clear();
       return "";
     }
 
     const now = Date.now();
     const sessionKey = liveModelSessionKey(body);
-    const existing = this.liveModelBindings.get(sessionKey);
-    if (existing?.expiresAt > now && isToolContinuation(body)) return existing.model;
-    if (existing) this.liveModelBindings.delete(sessionKey);
-    if (!isLikelyLiveWorkRequest(body)) return "";
+    const isLiveRequest = isLikelyLiveWorkRequest(body) || isToolContinuation(body);
+
+    // Live can send the next task without repeating the Live marker on every
+    // request. Keep using the model bound to this conversation before
+    // falling back to the request-shape heuristic below.
+    const sessionBinding = this.liveModelBindings.get(sessionKey);
+    if (sessionBinding?.expiresAt > now) {
+      sessionBinding.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
+      this.activeLiveModel = sessionBinding;
+      return sessionBinding.model;
+    }
+    if (sessionBinding) this.liveModelBindings.delete(sessionKey);
+
+    if (this.activeLiveModel?.expiresAt > now && isLiveRequest) {
+      // GPT-Live uses one floating-ball choice, so keep that choice across
+      // Live tasks even when the upstream conversation/session id changes.
+      this.activeLiveModel.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
+      this.liveModelBindings.set(sessionKey, this.activeLiveModel);
+      return this.activeLiveModel.model;
+    }
+    if (this.activeLiveModel?.expiresAt <= now) this.activeLiveModel = null;
+    this.liveModelBindings.delete(sessionKey);
+    if (!isLiveRequest) return "";
 
     const models = this.availableRealtimeWorkModels();
     if (models.length === 0) {
@@ -784,10 +820,11 @@ export class CodexBridgeServer {
     });
 
     if (selected) {
-      this.liveModelBindings.set(sessionKey, {
+      this.activeLiveModel = {
         model: selected,
         expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
-      });
+      };
+      this.liveModelBindings.set(sessionKey, this.activeLiveModel);
     }
     return selected;
   }
@@ -795,15 +832,46 @@ export class CodexBridgeServer {
   private pendingLiveModelPicker(): any {
     const waiter = Array.from(this.liveModelPickerWaiters.values())
       .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (!waiter) return { pending: false, realtime_active: this.isRealtimeActive(), enabled: this.isLiveModelPickerEnabled() };
+    if (!waiter) {
+      return {
+        pending: false,
+        realtime_active: this.isRealtimeActive(),
+        enabled: this.isLiveModelPickerEnabled(),
+        models: this.isLiveModelPickerEnabled() ? this.availableRealtimeWorkModels() : [],
+        selected_model: this.activeLiveModel?.model || "",
+      };
+    }
     return {
       pending: true,
       realtime_active: this.isRealtimeActive(),
       enabled: this.isLiveModelPickerEnabled(),
       request_id: waiter.requestId,
       models: waiter.models,
+      selected_model: this.activeLiveModel?.model || "",
       created_at: waiter.createdAt,
     };
+  }
+
+  private selectLiveModel(model: unknown): { ok: boolean; error?: string; model?: string } {
+    if (!this.isLiveModelPickerEnabled()) return { ok: false, error: "GPT-Live 模型选择未开启" };
+    const selected = normalizeRealtimeWorkModel(model);
+    const models = this.availableRealtimeWorkModels();
+    if (!selected) {
+      this.activeLiveModel = null;
+      this.liveModelBindings.clear();
+      return { ok: true, model: "" };
+    }
+    if (!models.includes(selected)) return { ok: false, error: "所选模型不在当前可用模型列表中" };
+    this.activeLiveModel = {
+      model: selected,
+      expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
+    };
+    // A model switch must update the existing Live conversation bindings;
+    // clearing them makes the next task fall back to the Desktop model.
+    for (const key of this.liveModelBindings.keys()) {
+      this.liveModelBindings.set(key, this.activeLiveModel);
+    }
+    return { ok: true, model: selected };
   }
 
   private resolveLiveModelPicker(requestId: unknown, model: unknown): { ok: boolean; error?: string; cancelled?: boolean } {
@@ -812,18 +880,37 @@ export class CodexBridgeServer {
     if (!waiter) return { ok: false, error: "模型选择请求已过期" };
     const selected = normalizeRealtimeWorkModel(model);
     if (!selected) {
-      clearTimeout(waiter.timer);
-      this.liveModelPickerWaiters.delete(id);
-      waiter.resolve("");
+      for (const pending of this.liveModelPickerWaiters.values()) {
+        clearTimeout(pending.timer);
+        pending.resolve("");
+      }
+      this.liveModelPickerWaiters.clear();
+      this.activeLiveModel = null;
+      this.liveModelBindings.clear();
       return { ok: true, cancelled: true };
     }
     if (!waiter.models.includes(selected)) {
       return { ok: false, error: "所选模型不在当前可用模型列表中" };
     }
-    clearTimeout(waiter.timer);
-    this.liveModelPickerWaiters.delete(id);
-    waiter.resolve(selected);
+    // A single Live task can issue multiple requests while the first picker
+    // is still waiting for the user. One selection must release all of those
+    // waiters together, otherwise the same task opens the picker repeatedly.
+    for (const pending of this.liveModelPickerWaiters.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve(pending.models.includes(selected) ? selected : "");
+    }
+    this.liveModelPickerWaiters.clear();
     return { ok: true };
+  }
+
+  private resetLiveModelPicker(): void {
+    for (const pending of this.liveModelPickerWaiters.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve("");
+    }
+    this.liveModelPickerWaiters.clear();
+    this.activeLiveModel = null;
+    this.liveModelBindings.clear();
   }
 
   private acquireServerLock(): void {
@@ -1042,6 +1129,35 @@ export class CodexBridgeServer {
     return String(owned.backend_model || owned.model || owned.slug || "").trim() || null;
   }
 
+  private findCatalogProtocol(rawModelName: string, provider: ProviderConfig): string {
+    const matches = this.findCatalogMatches(rawModelName);
+    const owned = matches.find((entry) => catalogModelOwner(entry));
+    const explicit = String(owned?.protocol || owned?.backend_protocol || "").trim().toLowerCase();
+    if (explicit) return explicit;
+
+    // OpenCode Go publishes some models through Anthropic Messages and the
+    // rest through OpenAI Chat Completions. The provider's single base URL is
+    // not enough to infer this, so keep the routing rule next to catalog
+    // ownership instead of sending every model to `/chat/completions`.
+    const providerId = String(provider.preset_id || provider.name || "").toLowerCase();
+    const model = String(owned?.backend_model || owned?.model || rawModelName || "").toLowerCase();
+    if (providerId === "opencode-go" || providerId === "opencode") {
+      if (/^(qwen|qwen3|minimax-m)/.test(model)) return "anthropic";
+    }
+    return "";
+  }
+
+  private normalizeProviderModel(rawModelName: string, provider: ProviderConfig): string {
+    const model = String(rawModelName || "").trim();
+    const providerId = String(provider.preset_id || provider.name || "").toLowerCase();
+    if (providerId === "opencode-go" || providerId === "opencode") {
+      // The Codex catalog/UI may namespace imported models (`opencode/...` or
+      // `opencode-go/...`), while OpenCode's API expects the bare model ID.
+      return model.replace(/^opencode(?:-go)?\//i, "");
+    }
+    return model;
+  }
+
 
   private isNativeCatalogModel(rawModelName: string): boolean {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
@@ -1072,6 +1188,8 @@ export class CodexBridgeServer {
         method: "POST",
         headers: forwardHeaders,
         body: JSON.stringify(body),
+        maxAttempts: 1,
+        timeoutMs: 120_000,
         operation: "native-responses",
       });
       const responseHeaders: Record<string, string> = {};
@@ -1678,6 +1796,11 @@ if __name__ == "__main__":
                 "accept-encoding": "identity",
               },
               body: upstreamBody,
+              // Replaying a native Live signaling POST can create duplicate
+              // sessions or duplicate task handoffs. A single failure must be
+              // returned to the client for it to decide what to do next.
+              maxAttempts: 1,
+              timeoutMs: 120_000,
               operation: realtimeUpstream.nativeSession ? "realtime-native-http" : "realtime-api-http",
             });
 
@@ -1753,10 +1876,13 @@ if __name__ == "__main__":
 
             const apiKey = CredentialStore.resolveApiKey(provider);
             const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
-            const providerUrl = rawUrl.endsWith("/chat/completions") ? rawUrl : `${rawUrl.replace(/\/$/, "")}/chat/completions`;
-            const upstreamModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
+            const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
+            const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
+            const protocol = effectiveBody.protocol || this.findCatalogProtocol(requestedModel, provider);
+            const routingBody = protocol ? { ...effectiveBody, protocol } : effectiveBody;
+            const providerUrl = rawUrl;
 
-            await this.router.handleResponses(effectiveBody, upstreamModel, apiKey, providerUrl, res, provider.name);
+            await this.router.handleResponses(routingBody, upstreamModel, apiKey, providerUrl, res, provider.name);
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -1819,6 +1945,26 @@ if __name__ == "__main__":
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
           }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/live-model-picker/select") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const result = this.selectLiveModel(body?.model);
+            res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/live-model-picker/reset") {
+          this.resetLiveModelPicker();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, reset: true }));
           return;
         }
 
@@ -2979,9 +3125,9 @@ if __name__ == "__main__":
               vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -35.0,
               vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
               voice_llm_model: data.voice_llm_model || "",
-              live_model_picker_enabled: typeof data.live_model_picker_enabled === "boolean"
-                ? data.live_model_picker_enabled
-                : previous.live_model_picker_enabled === true,
+              // GPT-Live has its own persisted state. Do not let a generic
+              // voice-settings save overwrite the floating-ball toggle.
+              live_model_picker_enabled: this.isLiveModelPickerEnabled(),
               interaction_mode: data.interaction_mode === "push-to-talk" ? "push-to-talk" : (data.interaction_mode === "toggle" ? "toggle" : "toggle"),
               enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
               hud_theme: ["vortex", "siri"].includes(data.hud_theme) ? data.hud_theme : "vortex",
@@ -3027,6 +3173,7 @@ if __name__ == "__main__":
           if (fs.existsSync(settingsPath)) {
             try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsPath, "utf-8")) }; } catch {}
           }
+          settings.live_model_picker_enabled = this.isLiveModelPickerEnabled();
           
           let available_models: string[] = [];
           try {
