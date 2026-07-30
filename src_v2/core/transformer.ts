@@ -53,6 +53,19 @@ function stripInternalCodexEnvelopes(content: string): string {
   return clean.trim();
 }
 
+export function annotateCustomModelIdentity(instructions: string, upstreamModel: string): string {
+  const model = String(upstreamModel || "unknown").replace(/[\r\n"]/g, "").trim() || "unknown";
+  const rewritten = instructions.replace(
+    /\bbased on GPT-5\b/gi,
+    `running through the configured upstream model "${model}"`
+  );
+  const routingNotice = [
+    `OpenCodex routing notice: the active upstream model for this request is "${model}".`,
+    "If asked which model is serving the request, report this upstream model name; do not infer it from the Codex persona text."
+  ].join(" ");
+  return rewritten.trim() ? `${routingNotice}\n\n${rewritten.trim()}` : routingNotice;
+}
+
 export function responsesInputToChatMessages(input?: ResponseInputItem[]): ChatMessage[] {
   if (!Array.isArray(input) || input.length === 0) return [];
 
@@ -235,6 +248,7 @@ export function transformResponsesToChat(
   const tools = convertToolsToChatTools(body.tools);
 
   let systemPrompt = body.instructions ? stripInternalCodexEnvelopes(body.instructions) : "";
+  systemPrompt = annotateCustomModelIdentity(systemPrompt, upstreamModel);
 
   if (systemPrompt.trim()) {
     messages.push({

@@ -42,3 +42,13 @@ test("dashboard refreshes subscription status after every model deletion path", 
   assert.match(text, /post\('\/api\/models\/delete',\{ids:ids\}\);await syncDashboardState\(\)/);
   assert.match(text, /post\('\/api\/providers\/delete',\{name:name\}\);await syncDashboardState\(\)/);
 });
+
+test("application settings expose secure proxy configuration and connectivity testing", async () => {
+  const text = await source();
+  for (const marker of ["proxy-mode", "proxy-http", "proxy-https", "proxy-no-proxy", "save-proxy", "test-proxy"]) {
+    assert.match(text, new RegExp(`id=\\"${marker}\\"`));
+  }
+  assert.match(text, /\/api\/network\/proxy\/test/);
+  assert.match(text, /保存并立即生效/);
+  assert.doesNotMatch(text, /proxy-password/);
+});

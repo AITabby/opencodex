@@ -6,6 +6,7 @@ import { GoogleGeminiAdapter } from "../adapters/google.js";
 import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
+import { describeNetworkError } from "../services/network.js";
 
 
 
@@ -724,11 +725,12 @@ export class GatewayRouter {
       }
     } catch (err: any) {
       clearTimeout(timeoutId);
-      console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, err.stack || err.message);
+      const networkError = describeNetworkError(err);
+      console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, networkError);
       const detailMsg = isCursorModel && /outdated|deprecated|upgrade/i.test(String(err.message || ""))
         ? "Cursor 上游已拒绝当前客户端协议：本机 Cursor 版本已被判定为过旧。请先从 Cursor 官网更新/重新下载 Cursor（设置会保留），再重试；这不是免费套餐限制。"
         : err.message === "fetch failed"
-        ? `无法连接服务商接口 (${finalTargetUrl})：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
+        ? `无法连接服务商接口 (${finalTargetUrl})：${networkError}`
         : err.message;
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
