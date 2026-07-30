@@ -8,7 +8,6 @@ import Darwin
 class AppDelegate: NSObject, NSApplicationDelegate {
   static weak var shared: AppDelegate?
   var statusBar: StatusBarController!
-  var liveModelPickerController: LiveModelPickerController!
   private var voiceManager: VoiceManager!
   private let replyFile = "/tmp/voice_reply.txt"
   private let logFile = "/tmp/ocb_debug.log"
@@ -197,13 +196,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     ensurePythonScripts()
     setupMainMenu()
-    liveModelPickerController = LiveModelPickerController()
-    liveModelPickerController.start()
     
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
       guard let self = self else { return }
       let apiClient = APIClient()
-      self.statusBar = StatusBarController(apiClient: apiClient, liveModelPickerController: self.liveModelPickerController)
+      self.statusBar = StatusBarController(apiClient: apiClient)
       
       // By default, do not start listening on launch. Wait for manual activation.
       AppDelegate.shared?.log("[App] Ready. Waiting for activation.")

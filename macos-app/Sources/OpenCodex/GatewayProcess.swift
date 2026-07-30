@@ -1,6 +1,20 @@
 import Foundation
 import AppKit
 
+struct LiveModelPickerRequest: Identifiable, Equatable {
+    let id: String
+    let models: [String]
+    let createdAt: Date
+}
+
+private struct LiveModelPickerResponse: Decodable {
+    let pending: Bool
+    let enabled: Bool?
+    let request_id: String?
+    let models: [String]?
+    let created_at: Double?
+}
+
 @MainActor
 final class GatewayProcess: ObservableObject {
     enum State: Equatable {
@@ -24,10 +38,13 @@ final class GatewayProcess: ObservableObject {
     @Published private(set) var state: State = .idle
     @Published private(set) var port: Int = 0
     @Published private(set) var logTail = ""
+    @Published private(set) var liveModelPickerRequest: LiveModelPickerRequest?
 
     private var process: Process?
     private var outputPipe: Pipe?
     private var runtimeFileURL: URL?
+    private var pickerPollTask: Task<Void, Never>?
+    private var adminToken = ""
 
     init() {
         NotificationCenter.default.addObserver(
@@ -144,12 +161,18 @@ final class GatewayProcess: ObservableObject {
         let ready = await waitForHealth()
         if ready {
             state = .ready
+            adminToken = readAdminToken()
+            startLiveModelPickerPolling()
         } else if child.isRunning {
             state = .failed("网关启动超时，请查看日志")
         }
     }
 
     func stop() {
+        pickerPollTask?.cancel()
+        pickerPollTask = nil
+        liveModelPickerRequest = nil
+        adminToken = ""
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         guard let process else { return }
         if process.isRunning {
@@ -171,8 +194,42 @@ final class GatewayProcess: ObservableObject {
         Task { await start() }
     }
 
+    func resolveLiveModel(request: LiveModelPickerRequest, model: String) async throws {
+        let response = try await sendLiveModelResolution(request: request, model: model)
+        guard response else { throw URLError(.badServerResponse) }
+        liveModelPickerRequest = nil
+    }
+
+    func cancelLiveModel(request: LiveModelPickerRequest) async throws {
+        let response = try await sendLiveModelResolution(request: request, model: "")
+        guard response else { throw URLError(.badServerResponse) }
+        liveModelPickerRequest = nil
+    }
+
     private func appendLog(_ text: String) {
         logTail = String((logTail + text).suffix(6000))
+    }
+
+    private func sendLiveModelResolution(request: LiveModelPickerRequest, model: String) async throws -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/resolve") else {
+            throw URLError(.badURL)
+        }
+        var requestURL = URLRequest(url: url)
+        requestURL.httpMethod = "POST"
+        requestURL.timeoutInterval = 10
+        requestURL.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        requestURL.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        requestURL.httpBody = try JSONSerialization.data(withJSONObject: [
+            "request_id": request.id,
+            "model": model,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: requestURL)
+        guard let httpResponse = response as? HTTPURLResponse else { return false }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "模型选择请求已过期"
+            throw NSError(domain: "OpenCodexLivePicker", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
+        }
+        return true
     }
 
     private func choosePort() async -> Int {
@@ -180,6 +237,50 @@ final class GatewayProcess: ObservableObject {
             return value
         }
         return Int.random(in: 18000...28000)
+    }
+
+    private func readAdminToken() -> String {
+        guard let applicationSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return "" }
+        let tokenURL = applicationSupport.appendingPathComponent("OpenCodex/admin_token")
+        return (try? String(contentsOf: tokenURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func startLiveModelPickerPolling() {
+        pickerPollTask?.cancel()
+        pickerPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                await self?.pollLiveModelPicker()
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    private func pollLiveModelPicker() async {
+        guard state == .ready, port > 0, !adminToken.isEmpty,
+              let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/pending") else { return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2
+        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return }
+            let payload = try JSONDecoder().decode(LiveModelPickerResponse.self, from: data)
+            guard payload.enabled == true, payload.pending,
+                  let requestID = payload.request_id,
+                  let models = payload.models,
+                  !models.isEmpty else {
+                liveModelPickerRequest = nil
+                return
+            }
+            let createdAt = Date(timeIntervalSince1970: payload.created_at ?? Date().timeIntervalSince1970)
+            let next = LiveModelPickerRequest(id: requestID, models: models, createdAt: createdAt)
+            if liveModelPickerRequest?.id != next.id {
+                liveModelPickerRequest = next
+            }
+        } catch {
+            // Independent Live UI is best-effort. The gateway's bounded waiter
+            // falls back to the desktop-selected model if it is unavailable.
+        }
     }
 
     private func waitForHealth() async -> Bool {

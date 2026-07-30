@@ -13,15 +13,12 @@ class StatusBarController {
   private let statusItem: NSStatusItem
   private let popover: NSPopover
   private let apiClient: APIClient
-  private let liveModelPickerController: LiveModelPickerController
-  private var liveModelPickerItem: NSMenuItem!
   private(set) var currentStatus: AppStatus = .idle
   private var animationTimer: Timer?
   private var frameIndex = 0
 
-  init(apiClient: APIClient, liveModelPickerController: LiveModelPickerController) {
+  init(apiClient: APIClient) {
     self.apiClient = apiClient
-    self.liveModelPickerController = liveModelPickerController
     statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     popover = NSPopover()
 
@@ -34,9 +31,6 @@ class StatusBarController {
     updateIcon()
     try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
     buildMenu()
-    self.liveModelPickerController.onEnabledChanged = { [weak self] _ in
-      self?.updateLiveModelPickerMenuItem()
-    }
   }
 
   func setStatus(_ status: AppStatus) {
@@ -141,17 +135,6 @@ class StatusBarController {
 
     menu.addItem(NSMenuItem.separator())
 
-    liveModelPickerItem = NSMenuItem(
-      title: "GPT-Live 模型选择悬浮球",
-      action: #selector(toggleLiveModelPicker),
-      keyEquivalent: ""
-    )
-    liveModelPickerItem.target = self
-    menu.addItem(liveModelPickerItem)
-    updateLiveModelPickerMenuItem()
-
-    menu.addItem(NSMenuItem.separator())
-
     let restartItem = NSMenuItem(title: "Restart Codex", action: #selector(restartCodex), keyEquivalent: "r")
     restartItem.target = self
     menu.addItem(restartItem)
@@ -169,19 +152,6 @@ class StatusBarController {
 
   @objc private func toggleVoice() {
     AppDelegate.shared?.toggleVoiceInput()
-  }
-
-  @objc private func toggleLiveModelPicker() {
-    liveModelPickerController.toggle()
-    updateLiveModelPickerMenuItem()
-  }
-
-  private func updateLiveModelPickerMenuItem() {
-    guard liveModelPickerItem != nil else { return }
-    liveModelPickerItem.state = liveModelPickerController.isEnabled ? .on : .off
-    liveModelPickerItem.title = liveModelPickerController.isEnabled
-      ? "关闭 GPT-Live 模型选择悬浮球"
-      : "开启 GPT-Live 模型选择悬浮球"
   }
 
   @objc private func startNewConversation() {
