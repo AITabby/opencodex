@@ -58,3 +58,15 @@ test("native GPT models pass through the Codex backend when the gateway is enabl
   assert.match(source, /proxyNativeResponses/);
   assert.match(source, /chatgpt\.com\/backend-api\/codex\/responses/);
 });
+
+test("native restore remains durable across later gateway starts", async () => {
+  const source = await gateway();
+  const managedBlock = source.match(/if \(managedConfig\.includes\("opencodex managed"\)\) \{([\s\S]*?)\n    \}/)?.[1] || "";
+  assert.match(managedBlock, /restoreConfiguredProviderModels/);
+  assert.match(managedBlock, /preserveOfficialModels/);
+  const beforeManagedBlock = source.slice(
+    source.indexOf("const before = JSON.stringify(catalog.models)"),
+    source.indexOf('if (managedConfig.includes("opencodex managed"))')
+  );
+  assert.doesNotMatch(beforeManagedBlock, /restoreConfiguredProviderModels/);
+});

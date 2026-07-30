@@ -1,13 +1,43 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import {
+  deriveProviderNamespace,
+  migrateProviderCatalogOwner,
+  preserveOfficialModels,
+  restoreConfiguredProviderModels,
+  resolveOpenAiChatCompletionsUrl,
+  resolveOpenAiModelsUrl,
+  upsertProviderCatalogModel
+} from "../dist/server/gateway.js";
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {
   assert.equal(deriveProviderNamespace("custom", "https://api.deepseek.com/v1"), "deepseek");
   assert.equal(deriveProviderNamespace("custom", "https://api.xiaomimimo.com/v1"), "xiaomi");
   assert.equal(deriveProviderNamespace("custom", "https://llm.acme-lab.net/v1"), "acme-lab");
   assert.equal(deriveProviderNamespace("my-gateway", "https://api.example.com/v1"), "my-gateway");
+});
+
+test("OpenAI-compatible root URLs receive the standard v1 route", () => {
+  assert.equal(
+    resolveOpenAiChatCompletionsUrl("http://127.0.0.1:8317/"),
+    "http://127.0.0.1:8317/v1/chat/completions"
+  );
+  assert.equal(
+    resolveOpenAiModelsUrl("http://127.0.0.1:8317/"),
+    "http://127.0.0.1:8317/v1/models"
+  );
+});
+
+test("OpenAI-compatible versioned and full endpoint URLs are preserved", () => {
+  assert.equal(
+    resolveOpenAiChatCompletionsUrl("https://api.example.com/openai/v1"),
+    "https://api.example.com/openai/v1/chat/completions"
+  );
+  assert.equal(
+    resolveOpenAiChatCompletionsUrl("https://api.example.com/v1/chat/completions"),
+    "https://api.example.com/v1/chat/completions"
+  );
 });
 
 test("renaming a custom provider migrates its catalog namespace", () => {
@@ -75,6 +105,20 @@ test("provider-owned models are namespaced even without a collision", () => {
   assert.equal(catalog.models[0].slug, "deepseek/deepseek-chat");
   assert.equal(catalog.models[0].backend_model, "deepseek-chat");
   assert.equal(catalog.models[0].display_name, "deepseek/deepseek-chat");
+});
+
+test("configured provider models are restored after the desktop rewrites the catalog", () => {
+  const catalog = { models: [{ slug: "gpt-5.5", model: "gpt-5.5" }] };
+
+  restoreConfiguredProviderModels(catalog, [{
+    name: "127-0-0",
+    baseUrl: "http://127.0.0.1:8317/",
+    models: ["gemini-3.6-flash-high"]
+  }]);
+
+  const restored = catalog.models.find((model) => model.backend_provider === "127-0-0");
+  assert.equal(restored?.slug, "127-0-0/gemini-3.6-flash-high");
+  assert.equal(restored?.backend_model, "gemini-3.6-flash-high");
 });
 
 test("legacy provider-owned entries migrate to the provider namespace", () => {

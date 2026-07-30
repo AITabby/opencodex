@@ -20,6 +20,15 @@ import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { handleWebRtcProxy } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
+import {
+  configureNetworkDispatcher,
+  describeNetworkError,
+  readNetworkProxyConfig,
+  resolveNetworkProxy,
+  saveNetworkProxyConfig,
+  testNetworkProxy,
+} from "../services/network.js";
+import { applyCodexChatGptAuthHeaders, readCodexChatGptAuth } from "../services/codex_auth.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -283,6 +292,33 @@ function providerUrlFingerprint(baseUrl: string): string {
   }
 }
 
+export function resolveOpenAiChatCompletionsUrl(baseUrl: string): string {
+  const raw = String(baseUrl || "").trim();
+  if (!raw) return "";
+
+  try {
+    const url = new URL(raw);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (/\/chat\/completions$/i.test(pathname)) {
+      url.pathname = pathname;
+    } else if (!pathname || pathname === "/") {
+      url.pathname = "/v1/chat/completions";
+    } else {
+      url.pathname = `${pathname}/chat/completions`;
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    const clean = raw.replace(/\/+$/, "");
+    if (/\/chat\/completions$/i.test(clean)) return clean;
+    return `${clean}${clean ? "" : "/v1"}/chat/completions`;
+  }
+}
+
+export function resolveOpenAiModelsUrl(baseUrl: string): string {
+  const chatUrl = resolveOpenAiChatCompletionsUrl(baseUrl);
+  return chatUrl.replace(/\/chat\/completions$/i, "/models");
+}
+
 function stableShortHash(value: string): string {
   let hash = 2166136261;
   for (const char of value) {
@@ -436,6 +472,21 @@ export function upsertProviderCatalogModel(
   entry.backend_model = backend;
   entry.display_name = providerDisplayName(owner, catalogSlug);
   catalog.models.push(entry);
+}
+
+export function restoreConfiguredProviderModels(catalog: any, providers: ProviderConfig[]): void {
+  if (!catalog || typeof catalog !== "object") return;
+  if (!Array.isArray(catalog.models)) catalog.models = [];
+
+  for (const provider of Array.isArray(providers) ? providers : []) {
+    const providerName = String(provider?.name || provider?.preset_id || "").trim();
+    if (!providerName || !Array.isArray(provider?.models)) continue;
+    for (const model of provider.models) {
+      const backendModel = String(model || "").trim();
+      if (!backendModel) continue;
+      upsertProviderCatalogModel(catalog, backendModel, backendModel, backendModel, providerName);
+    }
+  }
 }
 
 export function preserveOfficialModels(catalog: any): void {
@@ -876,9 +927,14 @@ export class CodexBridgeServer {
     forwardHeaders["host"] = "chatgpt.com";
 
     try {
+      const codexAuth = readCodexChatGptAuth();
+      if (!codexAuth) {
+        throw new Error("Codex ChatGPT login token is unavailable; sign in to Codex again");
+      }
+      const authenticatedHeaders = applyCodexChatGptAuthHeaders(forwardHeaders, codexAuth);
       const upstreamRes = await fetch(targetUrl, {
         method: "POST",
-        headers: forwardHeaders,
+        headers: authenticatedHeaders,
         body: JSON.stringify(body)
       });
       const responseHeaders: Record<string, string> = {};
@@ -892,10 +948,11 @@ export class CodexBridgeServer {
       }
       res.end();
     } catch (err: any) {
-      console.error(`[CodexBridge V2] Native Responses proxy error: ${err.message}`);
+      const networkError = describeNetworkError(err);
+      console.error(`[CodexBridge V2] Native Responses proxy error: ${networkError}`);
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: networkError }));
       }
     }
   }
@@ -1387,29 +1444,33 @@ if __name__ == "__main__":
     const configPath = path.join(os.homedir(), ".codex", "config.toml");
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
-    // Native mode deliberately leaves the imported catalog untouched. In
-    // managed mode, always repair the catalog first so native Codex models
-    // cannot disappear just because a third-party entry was deleted.
+    // Reconcile configured models only while OpenCodex is managing Codex.
+    // "Restore native" intentionally leaves provider credentials in Keychain
+    // but clears the model catalog, so a later helper start must not re-enable
+    // or repopulate third-party models.
+    const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    let catalog: any = { models: [] };
+    if (fs.existsSync(catalogPath)) {
+      try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
+    }
+    if (!Array.isArray(catalog.models)) catalog.models = [];
+    const before = JSON.stringify(catalog.models);
     if (managedConfig.includes("opencodex managed")) {
-      const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
-      let catalog: any = { models: [] };
-      if (fs.existsSync(catalogPath)) {
-        try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
-      }
-      if (!Array.isArray(catalog.models)) catalog.models = [];
-      const before = JSON.stringify(catalog.models);
+      restoreConfiguredProviderModels(catalog, this.config.providers);
+      // In managed mode, also restore the native model entries so switching
+      // between native and custom models remains possible.
       preserveOfficialModels(catalog);
+    }
 
-      if (before !== JSON.stringify(catalog.models)) {
-        try {
-          fs.mkdirSync(path.dirname(catalogPath), { recursive: true, mode: 0o700 });
-          fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), { encoding: "utf-8", mode: 0o600 });
-          try { fs.chmodSync(catalogPath, 0o600); } catch {}
-        } catch (err: any) {
-          // A read-only test/container home must not prevent the gateway from
-          // starting. The next writable start will persist the repair.
-          console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
-        }
+    if (before !== JSON.stringify(catalog.models)) {
+      try {
+        fs.mkdirSync(path.dirname(catalogPath), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), { encoding: "utf-8", mode: 0o600 });
+        try { fs.chmodSync(catalogPath, 0o600); } catch {}
+      } catch (err: any) {
+        // A read-only test/container home must not prevent the gateway from
+        // starting. The next writable start will persist the repair.
+        console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
       }
     }
     return new Promise(async (resolve, reject) => {
@@ -1523,7 +1584,7 @@ if __name__ == "__main__":
 
             const apiKey = CredentialStore.resolveApiKey(provider);
             const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
-            const providerUrl = rawUrl.endsWith("/chat/completions") ? rawUrl : `${rawUrl.replace(/\/$/, "")}/chat/completions`;
+            const providerUrl = resolveOpenAiChatCompletionsUrl(rawUrl);
             const upstreamModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
 
             await this.router.handleResponses(body, upstreamModel, apiKey, providerUrl, res, provider.name);
@@ -1546,6 +1607,41 @@ if __name__ == "__main__":
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ active }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/network/proxy") {
+          const config = readNetworkProxyConfig();
+          const resolved = resolveNetworkProxy(config);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ config, resolved }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/network/proxy") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const config = saveNetworkProxyConfig(body);
+            const resolved = configureNetworkDispatcher();
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "success", config, resolved }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err?.message || "代理设置保存失败" }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/network/proxy/test") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const result = await testNetworkProxy(body);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result));
+          } catch (err: any) {
+            res.writeHead(502, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: describeNetworkError(err) }));
+          }
           return;
         }
 
@@ -1993,8 +2089,7 @@ if __name__ == "__main__":
               return;
             }
 
-            const cleanUrl = baseUrl.replace(/\/$/, "");
-            const testTargetUrl = cleanUrl.endsWith("/models") ? cleanUrl : `${cleanUrl}/models`;
+            const testTargetUrl = resolveOpenAiModelsUrl(baseUrl);
 
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 6000);
@@ -2011,6 +2106,11 @@ if __name__ == "__main__":
 
               if (testRes.status === 401 || testRes.status === 403) {
                 finishTest("failed", `接口可连通，但 API Key 无效或未授权 (HTTP ${testRes.status})`);
+                return;
+              }
+
+              if (!testRes.ok) {
+                finishTest("failed", `接口路径不可用 (HTTP ${testRes.status}): ${testTargetUrl}`);
                 return;
               }
 

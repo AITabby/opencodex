@@ -2,7 +2,22 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { ResponsesStreamEngine, ThinkTagFilter } from "../dist/core/stream_engine.js";
-import { responsesInputToChatMessages, transformResponsesToChat } from "../dist/core/transformer.js";
+import {
+  annotateCustomModelIdentity,
+  responsesInputToChatMessages,
+  transformResponsesToChat
+} from "../dist/core/transformer.js";
+
+test("V2 transformer reports the configured upstream model instead of the Codex persona model", () => {
+  const instructions = annotateCustomModelIdentity(
+    "You are Codex, an agent based on GPT-5.",
+    "gemini-3.6-flash-high"
+  );
+
+  assert.match(instructions, /active upstream model.*gemini-3\.6-flash-high/i);
+  assert.match(instructions, /running through the configured upstream model "gemini-3\.6-flash-high"/i);
+  assert.doesNotMatch(instructions, /based on GPT-5/i);
+});
 
 test("V2 transformer strips Codex-only envelopes while preserving the user request", () => {
   const result = transformResponsesToChat({
@@ -14,7 +29,7 @@ test("V2 transformer strips Codex-only envelopes while preserving the user reque
     stream: true
   }, "test-model", "session-1");
   assert.equal(result.messages[0].role, "system");
-  assert.match(result.messages[0].content, /^You are helpful\./);
+  assert.match(result.messages[0].content, /You are helpful\.$/);
   assert.equal(result.messages[1].content, "请继续处理");
 });
 
