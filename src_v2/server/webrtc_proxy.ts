@@ -25,6 +25,7 @@ export type RealtimeUpstream = {
   targetHost: string;
   targetPath: string;
   nativeSession: boolean;
+  nativeLiveCall: boolean;
   headers: Record<string, string>;
 };
 
@@ -63,6 +64,14 @@ function nativeBackendPath(pathname: string): string {
   return `/backend-api/${subPath}`;
 }
 
+function isLiveCallPath(pathname: string): boolean {
+  return pathname === "/v1/live";
+}
+
+function isLiveSidebandPath(pathname: string): boolean {
+  return pathname.startsWith("/v1/live/");
+}
+
 function isNativeChatGptRequest(req: http.IncomingMessage, pathname: string): boolean {
   return Boolean(
     headerValue(req, "chatgpt-account-id")
@@ -93,17 +102,75 @@ function copyRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOpt
 
 export function resolveRealtimeUpstream(req: http.IncomingMessage, options: RealtimeProxyOptions = {}): RealtimeUpstream {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-  const nativeSession = isNativeChatGptRequest(req, url.pathname);
-  const targetHost = nativeSession ? "chatgpt.com" : "api.openai.com";
-  const targetPath = nativeSession ? nativeBackendPath(url.pathname) : url.pathname;
-  const targetUrl = `https://${targetHost}${targetPath}${url.search}`;
+  const incomingAuthorization = headerValue(req, "authorization");
+  const nativeAccessToken = options.nativeAccessToken || readNativeAccessToken();
+  const localBearer = isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
+  const nativeLiveCall = isLiveCallPath(url.pathname)
+    && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
+  const nativeLiveSideband = isLiveSidebandPath(url.pathname)
+    && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
+  const nativeSession = isNativeChatGptRequest(req, url.pathname) || nativeLiveCall || nativeLiveSideband;
+  const targetHost = nativeLiveSideband ? "api.openai.com" : (nativeSession ? "chatgpt.com" : "api.openai.com");
+  const targetPath = nativeLiveCall
+    ? "/backend-api/codex/realtime/calls"
+    : (nativeSession && !nativeLiveSideband ? nativeBackendPath(url.pathname) : url.pathname);
+  const targetSearch = nativeLiveCall
+    ? `${url.search ? `${url.search}&` : "?"}intent=quicksilver&architecture=avas`
+    : url.search;
+  const targetUrl = `https://${targetHost}${targetPath}${targetSearch}`;
   return {
     targetUrl,
     targetHost,
     targetPath,
     nativeSession,
+    nativeLiveCall,
     headers: copyRequestHeaders(req, options, nativeSession),
   };
+}
+
+/**
+ * Codex's API-shaped Frameless Realtime client sends `/v1/live` as a
+ * multipart request. ChatGPT-authenticated Codex uses the backend's JSON
+ * `{sdp, session}` shape instead. Normalize only that native create-call
+ * request; ordinary OpenAI API Realtime traffic remains untouched.
+ */
+export function normalizeNativeLiveCallBody(rawBody: Buffer, contentType: string): Buffer {
+  const boundaryMatch = /boundary=(?:"([^"]+)"|([^;\s]+))/i.exec(contentType || "");
+  if (!boundaryMatch) {
+    throw new Error("native /v1/live request is missing a multipart boundary");
+  }
+  const boundary = boundaryMatch[1] || boundaryMatch[2];
+  const marker = `--${boundary}`;
+  const parts = rawBody.toString("utf8").split(marker);
+  let sdp = "";
+  let session: unknown;
+  for (const rawPart of parts) {
+    const part = rawPart.replace(/^\r?\n/, "");
+    if (!part.trim() || part.trim() === "--") continue;
+    const separator = part.indexOf("\r\n\r\n");
+    const alternateSeparator = part.indexOf("\n\n");
+    const splitAt = separator >= 0 ? separator : alternateSeparator;
+    if (splitAt < 0) continue;
+    const headers = part.slice(0, splitAt).toLowerCase();
+    let value = part.slice(splitAt + (separator >= 0 ? 4 : 2));
+    // The CRLF immediately before the next multipart boundary is framing,
+    // while any preceding CRLF belongs to the SDP itself.
+    if (value.endsWith("\r\n")) value = value.slice(0, -2);
+    else if (value.endsWith("\n")) value = value.slice(0, -1);
+    const name = /name="([^"]+)"/i.exec(headers)?.[1];
+    if (name === "sdp") sdp = value;
+    if (name === "session") {
+      try {
+        session = JSON.parse(value);
+      } catch {
+        throw new Error("native /v1/live session part is not valid JSON");
+      }
+    }
+  }
+  if (!sdp || !session || typeof session !== "object") {
+    throw new Error("native /v1/live multipart body must contain sdp and session parts");
+  }
+  return Buffer.from(JSON.stringify({ sdp, session }), "utf8");
 }
 
 export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: Buffer, options: RealtimeProxyOptions = {}): void {
