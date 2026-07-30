@@ -148,4 +148,12 @@ chmod +x "$APP_BUNDLE/Contents/MacOS/OpenCodex" "$APP_BUNDLE/Contents/Resources/
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uvx" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/ffmpeg"
 
+# Swift build products may carry an ad-hoc signature before packaging. Once
+# resources are copied into the bundle that old signature is incomplete, and
+# Gatekeeper can report the downloaded app as damaged instead of showing the
+# normal unsigned-app override. Re-sign the complete bundle ad-hoc for local
+# distribution; a Developer ID signature, when configured, replaces this in
+# package-dmg.sh.
+codesign --deep --force --sign - --timestamp=none "$APP_BUNDLE"
+
 print "Created $APP_BUNDLE"
