@@ -254,6 +254,7 @@ export function deriveProviderNamespace(requestedName: string, baseUrl: string):
   const knownHosts: Array<[string, string]> = [
     ["deepseek.com", "deepseek"],
     ["x.ai", "xai"],
+    ["xiaomimimo.com", "xiaomi"],
     ["openrouter.ai", "openrouter"],
     ["minimaxi.com", "minimax"],
     ["moonshot.cn", "kimi"],
@@ -344,6 +345,52 @@ function scopedCatalogSlug(providerName: string, rawSlug: string, usedSlugs: Set
     candidate = `${base}-${suffix++}`;
   }
   return candidate;
+}
+
+export function migrateProviderCatalogOwner(catalog: any, previousProviderName: string, nextProviderName: string): void {
+  if (!catalog || !Array.isArray(catalog.models)) return;
+  const previous = normalizeNamespace(previousProviderName);
+  const next = normalizeNamespace(nextProviderName);
+  if (!previous || !next || previous === next) return;
+
+  const migrated: any[] = [];
+  for (const model of catalog.models) {
+    if (catalogModelOwner(model) !== previous) {
+      migrated.push(model);
+      continue;
+    }
+
+    const currentSlug = catalogModelSlug(model);
+    const rawSlug = currentSlug.toLowerCase().startsWith(`${previous}/`)
+      ? currentSlug.slice(previous.length + 1)
+      : String(model?.backend_model || currentSlug).trim();
+    if (!rawSlug) continue;
+
+    const backendModel = String(model?.backend_model || rawSlug).trim();
+    const duplicate = migrated.find((entry: any) =>
+      catalogModelOwner(entry) === next
+      && String(entry?.backend_model || "").trim().toLowerCase() === backendModel.toLowerCase()
+    );
+    if (duplicate) continue;
+
+    const usedSlugs = new Set<string>(migrated
+      .map((entry: any) => catalogModelSlug(entry).toLowerCase())
+      .filter(Boolean));
+    const canonical = namespaceModelSlug(next, rawSlug);
+    const slug = usedSlugs.has(canonical.toLowerCase())
+      ? scopedCatalogSlug(next, rawSlug, usedSlugs)
+      : canonical;
+    migrated.push({
+      ...model,
+      slug,
+      model: slug,
+      backend_provider: next,
+      backend_model: backendModel,
+      display_name: providerDisplayName(next, slug)
+    });
+  }
+
+  catalog.models = migrated;
 }
 
 export function upsertProviderCatalogModel(
@@ -1617,23 +1664,29 @@ if __name__ == "__main__":
             let providers = CredentialStore.loadProviders();
             let provider = providers.find((p: any) => p.name === requestedProviderName)
               || providers.find((p: any) => p.preset_id === presetId);
-            let providerName = provider?.preset_id === "custom" && provider.name && provider.name !== "custom"
-              ? normalizeNamespace(provider.name)
-              : deriveProviderNamespace(provider?.preset_id || requestedProviderName, baseUrl);
+            const previousProviderName = normalizeNamespace(provider?.name || "");
+            const providerName = deriveProviderNamespace(
+              presetId === "custom" ? "custom" : (provider?.preset_id || requestedProviderName),
+              baseUrl
+            );
+            let resolvedProviderName = providerName;
             if (!provider) {
-              const conflict = providers.find((p: any) => normalizeNamespace(p.name) === providerName);
+              const conflict = providers.find((p: any) => normalizeNamespace(p.name) === resolvedProviderName);
               if (conflict && providerUrlFingerprint((conflict as any).baseUrl || (conflict as any).base_url) !== providerUrlFingerprint(baseUrl)) {
-                providerName = `${providerName}-${stableShortHash(providerUrlFingerprint(baseUrl))}`;
+                resolvedProviderName = `${resolvedProviderName}-${stableShortHash(providerUrlFingerprint(baseUrl))}`;
               }
-            } else if (provider.name === "custom") {
-              provider.name = providerName;
+            } else if (provider.preset_id === "custom" && previousProviderName !== resolvedProviderName) {
+              const conflict = providers.find((p: any) => p !== provider && normalizeNamespace(p.name) === resolvedProviderName);
+              if (conflict && providerUrlFingerprint((conflict as any).baseUrl || (conflict as any).base_url) !== providerUrlFingerprint(baseUrl)) {
+                resolvedProviderName = `${resolvedProviderName}-${stableShortHash(providerUrlFingerprint(baseUrl))}`;
+              }
             }
             if (!provider) {
-              provider = { name: providerName, preset_id: presetId, baseUrl, models: selectedModels };
+              provider = { name: resolvedProviderName, preset_id: presetId, baseUrl, models: selectedModels };
               providers.push(provider);
             } else {
               provider.baseUrl = baseUrl || provider.baseUrl;
-              provider.name = providerName;
+              provider.name = resolvedProviderName;
               provider.preset_id = presetId;
               // The dashboard sends the complete current list. Replace the
               // stored list so removals and edits are reflected on reopen.
@@ -1646,7 +1699,7 @@ if __name__ == "__main__":
             delete provider.last_test_message;
 
             if (apiKey) {
-              CredentialStore.setApiKey(providerName, apiKey);
+              CredentialStore.setApiKey(resolvedProviderName, apiKey);
             }
             CredentialStore.saveProviders(providers);
 
@@ -1660,6 +1713,7 @@ if __name__ == "__main__":
                 try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
               }
               if (!Array.isArray(catalog.models)) catalog.models = [];
+              migrateProviderCatalogOwner(catalog, previousProviderName, resolvedProviderName);
               preserveOfficialModels(catalog);
 
               const desiredSlugs = new Set<string>();
@@ -1672,7 +1726,7 @@ if __name__ == "__main__":
                 }
               }
               catalog.models = catalog.models.filter((entry: any) => {
-                if (catalogModelOwner(entry) !== providerName) return true;
+                if (catalogModelOwner(entry) !== resolvedProviderName) return true;
                 return ![entry.slug, entry.model, entry.backend_model]
                   .filter(Boolean)
                   .some((value: any) => desiredSlugs.has(String(value).trim().toLowerCase()));
@@ -1690,7 +1744,7 @@ if __name__ == "__main__":
                   slug = parts[0].trim();
                   backendModel = parts[1].trim();
                 }
-                upsertProviderCatalogModel(catalog, slug, backendModel, slug, providerName);
+                upsertProviderCatalogModel(catalog, slug, backendModel, slug, resolvedProviderName);
               }
 
               preserveOfficialModels(catalog);

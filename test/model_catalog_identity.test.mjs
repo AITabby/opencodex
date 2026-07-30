@@ -1,12 +1,33 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { deriveProviderNamespace, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import { deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {
   assert.equal(deriveProviderNamespace("custom", "https://api.deepseek.com/v1"), "deepseek");
+  assert.equal(deriveProviderNamespace("custom", "https://api.xiaomimimo.com/v1"), "xiaomi");
   assert.equal(deriveProviderNamespace("custom", "https://llm.acme-lab.net/v1"), "acme-lab");
   assert.equal(deriveProviderNamespace("my-gateway", "https://api.example.com/v1"), "my-gateway");
+});
+
+test("renaming a custom provider migrates its catalog namespace", () => {
+  const catalog = {
+    models: [{
+      slug: "test/mimo-2.5",
+      model: "test/mimo-2.5",
+      backend_model: "mimo-2.5",
+      backend_provider: "test",
+      display_name: "test/mimo-2.5"
+    }]
+  };
+
+  migrateProviderCatalogOwner(catalog, "test", "xiaomi");
+
+  assert.equal(catalog.models[0].slug, "xiaomi/mimo-2.5");
+  assert.equal(catalog.models[0].model, "xiaomi/mimo-2.5");
+  assert.equal(catalog.models[0].backend_provider, "xiaomi");
+  assert.equal(catalog.models[0].backend_model, "mimo-2.5");
+  assert.equal(catalog.models[0].display_name, "xiaomi/mimo-2.5");
 });
 
 test("third-party model with an official slug gets a provider namespace", () => {
