@@ -26,6 +26,20 @@ import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWo
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
 
+export function buildManagedCodexConfig(
+  content: string,
+  port: number,
+  adminToken: string,
+  catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
+): string {
+  const preserved = content
+    .replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "")
+    .trim();
+  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed >>>\n`;
+  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
+  return `${managedTop}\n${preserved}\n${managedProvider}`;
+}
+
 function isSyntheticToolTrace(value: unknown): boolean {
   if (typeof value !== "string") return false;
   const text = value.trim();
@@ -1718,6 +1732,16 @@ if __name__ == "__main__":
     // managed mode, always repair the catalog first so native Codex models
     // cannot disappear just because a third-party entry was deleted.
     if (managedConfig.includes("opencodex managed")) {
+      try {
+        const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
+        if (synchronizedConfig !== managedConfig) {
+          fs.writeFileSync(configPath, synchronizedConfig, "utf-8");
+          console.log(`[OpenCodex Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
+        }
+        CatalogSyncService.syncCustomModelsToCodexCache();
+      } catch (err: any) {
+        console.warn(`[OpenCodex Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
+      }
       const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
       let catalog: any = { models: [] };
       if (fs.existsSync(catalogPath)) {
@@ -4194,13 +4218,7 @@ if __name__ == "__main__":
 
             if (hasModels && fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              content = content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
-
-              const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${this.port}/v1"\n# <<< opencodex managed <<<\n`;
-
-              const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${this.port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${this.adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed <<<\n`;
-
-              fs.writeFileSync(configPath, managedTop + "\n" + content + "\n" + managedProvider, "utf-8");
+              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
               CatalogSyncService.syncCustomModelsToCodexCache();
               console.log("[OpenCodex Gateway] Applied gateway proxy and custom model catalog to config.toml before restart.");
             }
