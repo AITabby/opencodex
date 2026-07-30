@@ -5,6 +5,7 @@ import { AdapterFactory } from "../adapters/factory.js";
 import { GoogleGeminiAdapter } from "../adapters/google.js";
 import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
+import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 
 
@@ -264,7 +265,6 @@ export class GatewayRouter {
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
     res.setHeader("X-Accel-Buffering", "no");
-    res.flushHeaders();
     res.socket?.setNoDelay(true);
 
     const controller = new AbortController();
@@ -374,11 +374,12 @@ export class GatewayRouter {
           );
         })();
       } else {
-        response = await fetch(finalTargetUrl, {
+        response = await fetchUpstream(finalTargetUrl, {
           method: "POST",
           headers: finalHeaders,
           body: JSON.stringify(finalPayloadBody),
           signal: controller.signal,
+          operation: `responses:${providerName || "provider"}`,
         });
       }
 
@@ -429,11 +430,12 @@ export class GatewayRouter {
               finalHeaders["anthropic-client-platform"] = "DESKTOP_APP";
               finalHeaders["anthropic-client-version"] = getClaudeDesktopVersion();
             }
-            response = await fetch(finalTargetUrl, {
+            response = await fetchUpstream(finalTargetUrl, {
               method: "POST",
               headers: finalHeaders,
               body: JSON.stringify(finalPayloadBody),
               signal: controller.signal,
+              operation: `responses:${providerName || "provider"}:auth-refresh`,
             });
           }
         }
@@ -442,6 +444,7 @@ export class GatewayRouter {
       clearTimeout(timeoutId);
 
       if (!response.ok || !response.body) {
+        res.flushHeaders();
         const errText = firstAuthErrorText && (response.status === 401 || response.status === 403)
           ? firstAuthErrorText
           : await response.text();
@@ -493,6 +496,7 @@ export class GatewayRouter {
         return;
       }
 
+      res.flushHeaders();
       await engine.start(writeSse);
 
       const reader = response.body.getReader();
@@ -724,15 +728,28 @@ export class GatewayRouter {
       }
     } catch (err: any) {
       clearTimeout(timeoutId);
-      console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, err.stack || err.message);
+      const upstreamDetails = upstreamErrorDetails(err);
+      console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, {
+        stack: err.stack,
+        ...upstreamDetails,
+        attempts: err?.attempts,
+      });
+      const attemptsText = Number.isFinite(err?.attempts) ? `（已尝试 ${err.attempts} 次）` : "";
+      const causeText = upstreamDetails.code ? ` [${upstreamDetails.code}]` : "";
       const detailMsg = isCursorModel && /outdated|deprecated|upgrade/i.test(String(err.message || ""))
         ? "Cursor 上游已拒绝当前客户端协议：本机 Cursor 版本已被判定为过旧。请先从 Cursor 官网更新/重新下载 Cursor（设置会保留），再重试；这不是免费套餐限制。"
         : err.message === "fetch failed"
-        ? `无法连接服务商接口 (${finalTargetUrl})：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
+        ? `无法连接服务商接口${causeText}${attemptsText}：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
         : err.message;
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: detailMsg }));
+        res.end(JSON.stringify({
+          error: detailMsg,
+          type: "upstream_unreachable",
+          retryable: Boolean(err?.retryable),
+          attempts: err?.attempts,
+          cause_code: upstreamDetails.code,
+        }));
       } else if (!res.writableEnded) {
         // The upstream may return HTTP 200 and report the failure in a
         // streaming trailer (Cursor does this for Connect/protobuf errors).

@@ -20,6 +20,7 @@ import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { handleWebRtcProxy } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
+import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -654,6 +655,9 @@ function repairNativeRollouts(): number {
 export class CodexBridgeServer {
   private port: number;
   private server: http.Server | null = null;
+  private serverLockFd: number | null = null;
+  private serverLockPath = "";
+  private gatewayRestartInProgress = false;
   private router = new GatewayRouter();
   private claudeModelFetchError = "";
   public config: any = { providers: [] };
@@ -682,6 +686,56 @@ export class CodexBridgeServer {
     fs.writeFileSync(tokenPath, `${token}\n`, { encoding: "utf-8", mode: 0o600 });
     fs.chmodSync(tokenPath, 0o600);
     return token;
+  }
+
+  private acquireServerLock(): void {
+    const lockPath = path.join(this.dataDir, `gateway-${this.port}.lock`);
+    fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+    try {
+      const fd = fs.openSync(lockPath, "wx", 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, port: this.port, started_at: Date.now() }));
+      this.serverLockFd = fd;
+      this.serverLockPath = lockPath;
+      return;
+    } catch (error: any) {
+      if (error?.code !== "EEXIST") throw error;
+    }
+
+    let ownerPid: number | undefined;
+    try {
+      const owner = JSON.parse(fs.readFileSync(lockPath, "utf-8"));
+      if (Number.isInteger(owner?.pid)) ownerPid = owner.pid;
+    } catch {}
+
+    if (ownerPid === process.pid) {
+      throw new Error(`Gateway port ${this.port} is already owned by this process`);
+    }
+    if (ownerPid) {
+      try {
+        process.kill(ownerPid, 0);
+        throw new Error(`Gateway port ${this.port} is already owned by PID ${ownerPid}`);
+      } catch (error: any) {
+        if (error?.message?.includes("already owned")) throw error;
+        // The recorded owner is gone; remove only this stale lock and retry.
+      }
+    }
+
+    try { fs.unlinkSync(lockPath); } catch {}
+    const fd = fs.openSync(lockPath, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, port: this.port, started_at: Date.now() }));
+    this.serverLockFd = fd;
+    this.serverLockPath = lockPath;
+  }
+
+  private releaseServerLock(): void {
+    if (this.serverLockFd !== null) {
+      try { fs.closeSync(this.serverLockFd); } catch {}
+      this.serverLockFd = null;
+    }
+    if (this.serverLockPath) {
+      try { fs.unlinkSync(this.serverLockPath); } catch {}
+      this.serverLockPath = "";
+    }
   }
 
   private isAdminAuthorized(req: http.IncomingMessage): boolean {
@@ -876,10 +930,11 @@ export class CodexBridgeServer {
     forwardHeaders["host"] = "chatgpt.com";
 
     try {
-      const upstreamRes = await fetch(targetUrl, {
+      const upstreamRes = await fetchUpstream(targetUrl, {
         method: "POST",
         headers: forwardHeaders,
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        operation: "native-responses",
       });
       const responseHeaders: Record<string, string> = {};
       upstreamRes.headers.forEach((value, key) => {
@@ -892,10 +947,20 @@ export class CodexBridgeServer {
       }
       res.end();
     } catch (err: any) {
-      console.error(`[CodexBridge V2] Native Responses proxy error: ${err.message}`);
+      const details = upstreamErrorDetails(err);
+      console.error(`[CodexBridge V2] Native Responses proxy error:`, {
+        ...details,
+        attempts: err?.attempts,
+      });
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({
+          error: err.message,
+          type: "upstream_unreachable",
+          retryable: Boolean(err?.retryable),
+          attempts: err?.attempts,
+          cause_code: details.code,
+        }));
       }
     }
   }
@@ -1383,7 +1448,13 @@ if __name__ == "__main__":
     if (overridePort && typeof overridePort === "number") {
       this.port = overridePort;
     }
-    this.ensurePythonScripts();
+    this.acquireServerLock();
+    try {
+      this.ensurePythonScripts();
+    } catch (error) {
+      this.releaseServerLock();
+      throw error;
+    }
     const configPath = path.join(os.homedir(), ".codex", "config.toml");
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
@@ -1460,10 +1531,11 @@ if __name__ == "__main__":
 
           try {
             const rawBody = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await this.parseRawBuffer(req) : undefined;
-            const upstreamRes = await fetch(targetUrl, {
+            const upstreamRes = await fetchUpstream(targetUrl, {
               method: req.method,
               headers: forwardHeaders,
               body: rawBody ? new Uint8Array(rawBody) : undefined,
+              operation: "realtime-http",
             });
 
             const respHeaders: Record<string, string> = {};
@@ -1480,10 +1552,20 @@ if __name__ == "__main__":
             }
             res.end();
           } catch (err: any) {
-            console.error(`[CodexBridge V2] Realtime HTTP proxy error: ${err.message}`);
+            const details = upstreamErrorDetails(err);
+            console.error(`[CodexBridge V2] Realtime HTTP proxy error:`, {
+              ...details,
+              attempts: err?.attempts,
+            });
             if (!res.headersSent) {
               res.writeHead(502, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: err.message }));
+              res.end(JSON.stringify({
+                error: err.message,
+                type: "upstream_unreachable",
+                retryable: Boolean(err?.retryable),
+                attempts: err?.attempts,
+                cause_code: details.code,
+              }));
             }
           }
           return;
@@ -3750,6 +3832,12 @@ if __name__ == "__main__":
         }
 
         if (req.method === "POST" && url.pathname === "/api/restart-codex") {
+          if (this.gatewayRestartInProgress) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Gateway restart already in progress", retryable: true }));
+            return;
+          }
+          this.gatewayRestartInProgress = true;
           try {
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
@@ -3781,10 +3869,13 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", message: "桌面端与网关服务正在重新启动..." }));
 
             setTimeout(() => {
-              try { execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"], { stdio: "ignore" }); } catch {}
+              try { execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"], { stdio: "ignore" }); } catch {
+                this.gatewayRestartInProgress = false;
+              }
             }, 300);
             return;
           } catch (err: any) {
+            this.gatewayRestartInProgress = false;
             console.error("[OpenCodex Gateway] Restart error:", err?.message);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -4496,6 +4587,7 @@ if __name__ == "__main__":
 
       this.server.on("error", (err) => {
         console.error(`[CodexBridge V2] Server error: ${err.message}`);
+        this.releaseServerLock();
         reject(err);
       });
 
@@ -4837,9 +4929,13 @@ if __name__ == "__main__":
   public stop(): Promise<void> {
     return new Promise((resolve) => {
       if (this.server) {
-        this.server.close(() => resolve());
+        this.server.close(() => {
+          this.releaseServerLock();
+          void closeUpstreamDispatcher().finally(resolve);
+        });
       } else {
-        resolve();
+        this.releaseServerLock();
+        void closeUpstreamDispatcher().finally(resolve);
       }
     });
   }
