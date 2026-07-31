@@ -49,22 +49,15 @@ enum GatewayLocator {
   }
 
   static var webSocketURL: URL {
-    URL(string: "ws://127.0.0.1:\(runtimePort ?? fallbackPort)")!
+    URL(string: "ws://127.0.0.1:\(runtimePort ?? fallbackPort)/ws/voice")!
   }
 
   static func url(path: String) -> URL {
     httpBaseURL.appendingPathComponent(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
   }
 
-  static func adminToken() -> String? {
-    for directory in dataDirectories {
-      let path = directory.appendingPathComponent("admin_token")
-      if let token = try? String(contentsOf: path, encoding: .utf8) {
-        let trimmed = token.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed }
-      }
-    }
-    return nil
+  static func voiceToken() -> String? {
+    CapabilityTokenKeychain.token(for: "voice")
   }
 
   static func settingsData() -> Data? {

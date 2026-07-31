@@ -1,7 +1,7 @@
 import Foundation
 
-func addOpenCodexAdminToken(to request: inout URLRequest) {
-  guard let token = GatewayLocator.adminToken(),
+func addOpenCodexVoiceToken(to request: inout URLRequest) {
+  guard let token = GatewayLocator.voiceToken(),
     !token.isEmpty else {
     return
   }
@@ -28,7 +28,7 @@ class APIClient: NSObject {
     var req = URLRequest(url: GatewayLocator.url(path: "api/voice"))
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    addOpenCodexAdminToken(to: &req)
+    addOpenCodexVoiceToken(to: &req)
     req.httpBody = try? JSONSerialization.data(withJSONObject: ["text": text])
 
     URLSession.shared.dataTask(with: req) { _, response, _ in
@@ -38,10 +38,4 @@ class APIClient: NSObject {
     }.resume()
   }
 
-  func restartCodex() {
-    var req = URLRequest(url: GatewayLocator.url(path: "api/restart-codex"))
-    req.httpMethod = "POST"
-    addOpenCodexAdminToken(to: &req)
-    URLSession.shared.dataTask(with: req).resume()
-  }
 }

@@ -14,7 +14,7 @@ test("native ChatGPT Realtime requests keep the global gateway but use the nativ
       authorization: "Bearer gateway-token",
       origin: "app://-",
     }),
-    { localAdminToken: "gateway-token", nativeAccessToken: "native-token" },
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
   );
 
   assert.equal(upstream.nativeSession, true);
@@ -30,7 +30,7 @@ test("API Realtime requests remain on api.openai.com and preserve a real API bea
       host: "127.0.0.1:8765",
       authorization: "Bearer sk-test-key",
     }),
-    { localAdminToken: "gateway-token", nativeAccessToken: "native-token" },
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
   );
 
   assert.equal(upstream.nativeSession, false);
@@ -44,10 +44,43 @@ test("the local gateway bearer is never forwarded as an upstream Realtime creden
       host: "127.0.0.1:8765",
       authorization: "Bearer gateway-token",
     }),
-    { localAdminToken: "gateway-token" },
+    { localGatewayTokens: ["gateway-token"] },
   );
 
   assert.equal(upstream.headers.authorization, undefined);
+});
+
+test("missing and placeholder bearers never unlock the native Codex token", () => {
+  for (const authorization of [undefined, "Bearer dummy-token", "Bearer opencodex-placeholder"]) {
+    const headers = { host: "127.0.0.1:8765" };
+    if (authorization) headers.authorization = authorization;
+    const upstream = resolveRealtimeUpstream(
+      request("/v1/live", headers),
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
+    );
+
+    assert.equal(upstream.nativeSession, false, authorization);
+    assert.equal(upstream.targetUrl, "https://api.openai.com/v1/live", authorization);
+    assert.notEqual(upstream.headers.authorization, "Bearer native-token", authorization);
+  }
+});
+
+test("local gateway-only headers and cookies are stripped before upstream proxying", () => {
+  const upstream = resolveRealtimeUpstream(
+    request("/backend-api/codex/realtime", {
+      host: "127.0.0.1:8765",
+      authorization: "Bearer gateway-token",
+      cookie: "opencodex_admin=gateway-token",
+      "proxy-authorization": "Basic local-proxy-secret",
+      "x-opencodex-token": "gateway-token",
+    }),
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
+  );
+
+  assert.equal(upstream.headers.authorization, "Bearer native-token");
+  assert.equal(upstream.headers.cookie, undefined);
+  assert.equal(upstream.headers["proxy-authorization"], undefined);
+  assert.equal(upstream.headers["x-opencodex-token"], undefined);
 });
 
 test("an already native backend path is not double-prefixed", () => {
@@ -69,7 +102,7 @@ test("gateway bearer native Live call uses the ChatGPT backend call shape", () =
       authorization: "Bearer gateway-token",
       "content-type": "multipart/form-data; boundary=codex-realtime-call-boundary",
     }),
-    { localAdminToken: "gateway-token", nativeAccessToken: "native-token" },
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
   );
 
   assert.equal(upstream.nativeSession, true);
@@ -87,7 +120,7 @@ test("native Live sideband stays on the API WebSocket path", () => {
       host: "127.0.0.1:8765",
       authorization: "Bearer gateway-token",
     }),
-    { localAdminToken: "gateway-token", nativeAccessToken: "native-token" },
+    { localGatewayTokens: ["gateway-token"], nativeAccessToken: "native-token" },
   );
 
   assert.equal(upstream.nativeSession, true);

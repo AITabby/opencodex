@@ -126,11 +126,27 @@ npm run build:all
 npm start
 ```
 
+`npm run build:all` 会自动识别当前平台。macOS 会同时构建网关和
+OpenCodexBar（需要 Swift 工具链）；Windows / Linux 会构建可独立运行的
+网关，并跳过仅支持 macOS 的语音伴侣。
+
 启动后访问：
 
 ```text
 http://localhost:8765/dashboard
 ```
+
+#### 本地安全与能力令牌
+
+源码版网关将本地权限拆成四类令牌：管理、模型网关、语音和移动端。
+Windows 使用当前用户 DPAPI 加密保存，macOS 使用登录钥匙串；旧版
+`admin_token` 会在新安全存储写入并回读成功后迁移并删除。令牌状态、轮换
+和移动端配对入口位于 Dashboard 的“应用与安全”。
+
+Linux 不会回退到明文令牌文件。启动前必须通过进程环境提供四个互不相同、
+长度至少 32 字符的值：`OPENCODEX_ADMIN_TOKEN`、
+`OPENCODEX_GATEWAY_TOKEN`、`OPENCODEX_VOICE_TOKEN` 和
+`OPENCODEX_MOBILE_TOKEN`。
 
 ### 项目状态
 
@@ -204,11 +220,28 @@ npm run build:all
 npm start
 ```
 
+`npm run build:all` detects the current platform. On macOS it builds both the
+gateway and OpenCodexBar (a Swift toolchain is required). On Windows and Linux
+it builds the standalone gateway and skips the macOS-only voice companion.
+
 Then open:
 
 ```text
 http://localhost:8765/dashboard
 ```
+
+#### Local security and capability tokens
+
+The source gateway separates local access into admin, model-gateway, voice,
+and mobile capabilities. Windows stores them with current-user DPAPI and
+macOS uses the login Keychain. A legacy `admin_token` file is removed only
+after the secure store has been written and verified. Token status, rotation,
+and mobile pairing are available under **App & Security** in the Dashboard.
+
+Linux does not fall back to plaintext token files. Before startup, provide
+four distinct values of at least 32 characters through
+`OPENCODEX_ADMIN_TOKEN`, `OPENCODEX_GATEWAY_TOKEN`,
+`OPENCODEX_VOICE_TOKEN`, and `OPENCODEX_MOBILE_TOKEN`.
 
 ### Project status
 

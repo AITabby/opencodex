@@ -32,8 +32,8 @@ test("session detail filters compact tool traces masquerading as user text", asy
 test("subscription imports require live provider models and explicit ownership", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");
-  assert.match(source, /return \[\];\s*\n  }\n\n  private async fetchGrokModelsDynamic/);
-  assert.match(source, /return \[\];\s*\n  }\n\n  public async start/);
+  assert.match(source, /return \[\];\s*\r?\n  }\r?\n\r?\n  private async fetchGrokModelsDynamic/);
+  assert.match(source, /return \[\];\s*\r?\n  }\r?\n\r?\n  public async start/);
   assert.match(source, /hasCatalogModelsForProvider\(catalogModels, "antigravity"\)/);
   assert.match(source, /hasCatalogModelsForProvider\(catalogModels, "grok"\)/);
   assert.match(source, /catalog\.models = catalog\.models\.filter\(\(m: any\) => m\.backend_provider !== "antigravity"\)/);

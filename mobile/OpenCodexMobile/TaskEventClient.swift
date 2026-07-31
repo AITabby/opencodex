@@ -12,7 +12,7 @@ final class TaskEventClient: ObservableObject {
     private var lastSequence = 0
     private var activeTaskIDs = Set<String>()
     private var gatewayURL: URL?
-    private var adminToken = ""
+    private var mobileToken = ""
     private let streamSession: URLSession
     private let onEvent: (CodexTaskEvent) async -> Void
     private let onNoActiveTasks: () async -> Void
@@ -32,13 +32,13 @@ final class TaskEventClient: ObservableObject {
         self.onNoActiveTasks = onNoActiveTasks
     }
 
-    func start(baseURL: URL, adminToken: String) {
+    func start(baseURL: URL, mobileToken: String) {
         stop()
         gatewayURL = baseURL
-        self.adminToken = adminToken
+        self.mobileToken = mobileToken
         streamTask = Task { [weak self] in
             guard let self else { return }
-            await self.run(baseURL: baseURL, adminToken: adminToken)
+            await self.run(baseURL: baseURL, mobileToken: mobileToken)
         }
     }
 
@@ -51,7 +51,7 @@ final class TaskEventClient: ObservableObject {
         reconnecting = false
     }
 
-    private func run(baseURL: URL, adminToken: String) async {
+    private func run(baseURL: URL, mobileToken: String) async {
         var retryDelay: UInt64 = 1
 
         while !Task.isCancelled {
@@ -64,7 +64,7 @@ final class TaskEventClient: ObservableObject {
             ]
             requestURL = components?.url ?? requestURL
             var request = URLRequest(url: requestURL, timeoutInterval: 24 * 60 * 60)
-            request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+            request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
             request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
 
             do {
@@ -123,7 +123,7 @@ final class TaskEventClient: ObservableObject {
     }
 
     private func startActiveReconciliation() {
-        guard reconciliationTask == nil, let gatewayURL, !adminToken.isEmpty else { return }
+        guard reconciliationTask == nil, let gatewayURL, !mobileToken.isEmpty else { return }
         reconciliationTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -132,7 +132,7 @@ final class TaskEventClient: ObservableObject {
                 do {
                     let activeEvents = try await self.fetchActiveSnapshot(
                         baseURL: gatewayURL,
-                        adminToken: self.adminToken
+                        mobileToken: self.mobileToken
                     )
                     // SSE gives us lifecycle transitions quickly, while this
                     // authoritative snapshot often carries the later token
@@ -161,7 +161,7 @@ final class TaskEventClient: ObservableObject {
         }
     }
 
-    private func fetchActiveSnapshot(baseURL: URL, adminToken: String) async throws -> [CodexTaskEvent] {
+    private func fetchActiveSnapshot(baseURL: URL, mobileToken: String) async throws -> [CodexTaskEvent] {
         var requestURL = baseURL
         requestURL.appendPathComponent("api/task-events")
         var components = URLComponents(url: requestURL, resolvingAgainstBaseURL: false)
@@ -172,7 +172,7 @@ final class TaskEventClient: ObservableObject {
         ]
         requestURL = components?.url ?? requestURL
         var request = URLRequest(url: requestURL, timeoutInterval: 20)
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await streamSession.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard statusCode == 200 else { throw TaskEventClientError.http(statusCode) }

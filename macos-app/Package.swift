@@ -11,8 +11,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "OpenCodex",
+            dependencies: ["OpenCodexSecurity"],
             resources: [.process("Resources")]
         ),
-        .executableTarget(name: "OpenCodexLivePicker")
+        .executableTarget(name: "OpenCodexLivePicker", dependencies: ["OpenCodexSecurity"]),
+        .target(name: "OpenCodexSecurity")
     ]
 )

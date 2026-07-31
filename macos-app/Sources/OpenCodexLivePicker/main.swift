@@ -1,5 +1,6 @@
 import AppKit
 import CoreImage
+import OpenCodexSecurity
 import SwiftUI
 
 private struct LivePickerRequest: Equatable {
@@ -25,16 +26,14 @@ private final class LivePickerAgent: ObservableObject {
 
     private var pollTask: Task<Void, Never>?
     private let port: Int
-    private let token: String
+    private var token: String
+    private var tokenLoadedAt: Date
 
     init() {
         let environment = ProcessInfo.processInfo.environment
         port = Int(environment["OPENCODEX_APP_PORT"] ?? "") ?? 8765
-        let resolvedTokenPath = environment["OPENCODEX_ADMIN_TOKEN_PATH"]
-            .map { URL(fileURLWithPath: $0) }
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(".opencodex/admin_token")
-        token = (try? String(contentsOf: resolvedTokenPath, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        token = CapabilityTokenKeychain.token(for: "gateway") ?? ""
+        tokenLoadedAt = Date()
     }
 
     func start() {
@@ -71,6 +70,7 @@ private final class LivePickerAgent: ObservableObject {
     }
 
     private func poll() async {
+        refreshTokenIfNeeded()
         guard !token.isEmpty,
               let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/pending") else { return }
         var request = URLRequest(url: url)
@@ -116,6 +116,7 @@ private final class LivePickerAgent: ObservableObject {
     }
 
     private func send(requestID: String, model: String) async throws -> Bool {
+        refreshTokenIfNeeded()
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/resolve") else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -131,6 +132,7 @@ private final class LivePickerAgent: ObservableObject {
     }
 
     private func sendSelection(model: String) async throws -> Bool {
+        refreshTokenIfNeeded()
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/select") else { return false }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -142,16 +144,10 @@ private final class LivePickerAgent: ObservableObject {
         return (response as? HTTPURLResponse)?.statusCode == 200
     }
 
-    private func sendSettings(enabled: Bool) async throws -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/settings") else { return false }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 10
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["enabled": enabled])
-        let (_, response) = try await URLSession.shared.data(for: request)
-        return (response as? HTTPURLResponse)?.statusCode == 200
+    private func refreshTokenIfNeeded() {
+        guard Date().timeIntervalSince(tokenLoadedAt) >= 30 else { return }
+        token = CapabilityTokenKeychain.token(for: "gateway") ?? ""
+        tokenLoadedAt = Date()
     }
 }
 

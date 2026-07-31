@@ -4,12 +4,10 @@
  */
 
 import http from "node:http";
-import net from "node:net";
-import tls from "node:tls";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { GatewayRouter } from "./router.js";
 import { CredentialStore } from "../services/credential_store.js";
@@ -18,7 +16,22 @@ import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_s
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
-import { handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
+import { handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccessToken, resolveRealtimeUpstream } from "./webrtc_proxy.js";
+import {
+  classifyWebSocketPath,
+  isAllowedGatewayHost,
+  isAllowedGatewayOrigin,
+  isProtectedGatewayPath,
+  isRealtimeProxyPath,
+  requiredCapabilitiesForHttp,
+  requiredCapabilitiesForWebSocket,
+} from "./security_boundary.js";
+import {
+  CapabilityTokenStore,
+  GATEWAY_CAPABILITIES,
+  type CapabilityTokens,
+  type GatewayCapability,
+} from "./capability_tokens.js";
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
@@ -29,14 +42,14 @@ const MASKED_CREDENTIAL = "••••••••";
 export function buildManagedCodexConfig(
   content: string,
   port: number,
-  adminToken: string,
+  gatewayToken: string,
   catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
 ): string {
   const preserved = content
     .replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "")
     .trim();
   const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed >>>\n`;
-  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
+  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${gatewayToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
 
@@ -686,7 +699,9 @@ export class CodexBridgeServer {
   private claudeModelFetchError = "";
   public config: any = { providers: [] };
   private readonly dataDir: string;
-  private readonly adminToken: string;
+  private readonly tokenStore: CapabilityTokenStore;
+  private capabilityTokens: CapabilityTokens;
+  private previousCapabilityTokens = new Map<GatewayCapability, { token: string; expiresAt: number }>();
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
@@ -695,25 +710,9 @@ export class CodexBridgeServer {
   constructor(port = 8765) {
     this.port = port;
     this.dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex");
-    this.adminToken = this.loadOrCreateAdminToken();
+    this.tokenStore = new CapabilityTokenStore(this.dataDir);
+    this.capabilityTokens = this.tokenStore.snapshot();
     this.config.providers = CredentialStore.loadProviders();
-  }
-
-  private loadOrCreateAdminToken(): string {
-    fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
-    const tokenPath = path.join(this.dataDir, "admin_token");
-    try {
-      const existing = fs.readFileSync(tokenPath, "utf-8").trim();
-      if (existing.length >= 32) {
-        fs.chmodSync(tokenPath, 0o600);
-        return existing;
-      }
-    } catch {}
-
-    const token = randomBytes(32).toString("hex");
-    fs.writeFileSync(tokenPath, `${token}\n`, { encoding: "utf-8", mode: 0o600 });
-    fs.chmodSync(tokenPath, 0o600);
-    return token;
   }
 
   private markRealtimeActive(): void {
@@ -977,10 +976,15 @@ export class CodexBridgeServer {
     }
   }
 
-  private isAdminAuthorized(req: http.IncomingMessage): boolean {
+  private requestCredentialCandidates(req: http.IncomingMessage): string[] {
+    const candidates: string[] = [];
+    const localTokenHeader = req.headers["x-opencodex-token"];
+    const localToken = Array.isArray(localTokenHeader) ? localTokenHeader[0] || "" : localTokenHeader || "";
+    if (localToken.trim()) candidates.push(localToken.trim());
+
     const authorization = typeof req.headers.authorization === "string" ? req.headers.authorization : "";
     const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() || "";
-    if (credentialsMatch(bearer, this.adminToken)) return true;
+    if (bearer) candidates.push(bearer);
 
     const cookieHeader = typeof req.headers.cookie === "string" ? req.headers.cookie : "";
     const cookieToken = cookieHeader
@@ -988,22 +992,60 @@ export class CodexBridgeServer {
       .map((part) => part.trim())
       .find((part) => part.startsWith("opencodex_admin="))
       ?.slice("opencodex_admin=".length) || "";
-    return credentialsMatch(cookieToken, this.adminToken);
+    if (cookieToken) candidates.push(cookieToken);
+    return candidates;
   }
 
-  private requireAdmin(req: http.IncomingMessage, res: http.ServerResponse): boolean {
-    if (this.isAdminAuthorized(req)) return true;
+  private acceptedTokensForCapability(capability: GatewayCapability): string[] {
+    const accepted = [this.capabilityTokens[capability]];
+    const previous = this.previousCapabilityTokens.get(capability);
+    if (previous && previous.expiresAt > Date.now()) {
+      accepted.push(previous.token);
+    } else if (previous) {
+      this.previousCapabilityTokens.delete(capability);
+    }
+    return accepted;
+  }
+
+  private isCapabilityAuthorized(req: http.IncomingMessage, capabilities: GatewayCapability[]): boolean {
+    if (capabilities.length === 0) return false;
+    const candidates = this.requestCredentialCandidates(req);
+    for (const capability of capabilities) {
+      for (const acceptedToken of this.acceptedTokensForCapability(capability)) {
+        if (candidates.some((candidate) => credentialsMatch(candidate, acceptedToken))) return true;
+      }
+    }
+    return false;
+  }
+
+  private requireCapabilities(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    capabilities: GatewayCapability[],
+  ): boolean {
+    if (this.isCapabilityAuthorized(req, capabilities)) return true;
     res.writeHead(401, {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
-      "WWW-Authenticate": "Bearer"
+      "WWW-Authenticate": `Bearer realm="OpenCodex", scope="${capabilities.join(" ")}"`,
     });
-    res.end(JSON.stringify({ error: "OpenCodex admin authentication required" }));
+    res.end(JSON.stringify({
+      error: "OpenCodex capability authentication required",
+      required_capabilities: capabilities,
+    }));
     return false;
   }
 
   private issueAdminCookie(res: http.ServerResponse): void {
-    res.setHeader("Set-Cookie", `opencodex_admin=${this.adminToken}; HttpOnly; SameSite=Strict; Path=/`);
+    res.setHeader("Set-Cookie", `opencodex_admin=${this.capabilityTokens.admin}; HttpOnly; SameSite=Strict; Path=/`);
+  }
+
+  private rotateCapabilityToken(capability: GatewayCapability): { token: string; graceExpiresAt: number } {
+    const { token, previousToken } = this.tokenStore.rotate(capability);
+    const graceExpiresAt = Date.now() + 5 * 60 * 1000;
+    this.previousCapabilityTokens.set(capability, { token: previousToken, expiresAt: graceExpiresAt });
+    this.capabilityTokens = this.tokenStore.snapshot();
+    return { token, graceExpiresAt };
   }
 
   private parseRawBuffer(req: http.IncomingMessage): Promise<Buffer> {
@@ -1188,7 +1230,31 @@ export class CodexBridgeServer {
 
   private async proxyNativeResponses(req: http.IncomingMessage, body: any, res: http.ServerResponse): Promise<void> {
     const targetUrl = "https://chatgpt.com/backend-api/codex/responses";
-    const skipHeaders = new Set(["host", "content-length", "transfer-encoding", "connection", "accept-encoding", "content-encoding"]);
+    const nativeAccessToken = readNativeAccessToken();
+    if (!nativeAccessToken) {
+      res.writeHead(401, {
+        "Content-Type": "application/json",
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify({
+        error: "Native Codex authentication is unavailable",
+        type: "native_auth_unavailable",
+      }));
+      return;
+    }
+
+    const skipHeaders = new Set([
+      "host",
+      "content-length",
+      "transfer-encoding",
+      "connection",
+      "accept-encoding",
+      "content-encoding",
+      "authorization",
+      "cookie",
+      "proxy-authorization",
+      "x-opencodex-token",
+    ]);
     const forwardHeaders: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
       if (skipHeaders.has(key.toLowerCase())) continue;
@@ -1196,6 +1262,7 @@ export class CodexBridgeServer {
       else if (Array.isArray(value)) forwardHeaders[key] = value.join(", ");
     }
     forwardHeaders["host"] = "chatgpt.com";
+    forwardHeaders["authorization"] = `Bearer ${nativeAccessToken}`;
 
     try {
       const upstreamRes = await fetchUpstream(targetUrl, {
@@ -1733,7 +1800,7 @@ if __name__ == "__main__":
     // cannot disappear just because a third-party entry was deleted.
     if (managedConfig.includes("opencodex managed")) {
       try {
-        const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
+        const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.capabilityTokens.gateway);
         if (synchronizedConfig !== managedConfig) {
           fs.writeFileSync(configPath, synchronizedConfig, "utf-8");
           console.log(`[OpenCodex Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
@@ -1765,14 +1832,35 @@ if __name__ == "__main__":
     }
     return new Promise(async (resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
-        const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader("Referrer-Policy", "no-referrer");
+        res.setHeader("X-Frame-Options", "DENY");
+        res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+
+        if (!isAllowedGatewayHost(req.headers.host, this.port)) {
+          res.writeHead(421, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "Untrusted gateway Host header" }));
+          return;
+        }
+
+        const originHeader = req.headers.origin;
+        const origin = Array.isArray(originHeader) ? originHeader[0] : originHeader;
+        if (!isAllowedGatewayOrigin(origin, this.port)) {
+          res.writeHead(403, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ error: "Untrusted gateway Origin header" }));
+          return;
+        }
+
+        const url = new URL(req.url || "/", `http://127.0.0.1:${this.port}`);
 
         // Handle WebSocket Upgrade HTTP requests with 426 Upgrade Required (triggers codex-rs HTTP fallback)
         if (req.headers.upgrade?.toLowerCase() === "websocket" || (req.headers.connection || "").toLowerCase().includes("upgrade")) {
-          if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.startsWith("/v1/live/")) {
-            // Handled by server.on("upgrade") for transparent proxying to api.openai.com
-            return;
-          }
           res.writeHead(426, {
             "Content-Type": "application/json",
             "Sec-WebSocket-Version": "13",
@@ -1793,14 +1881,17 @@ if __name__ == "__main__":
         // HttpOnly admin cookie. Native voice/mobile clients use the same
         // token through Authorization: Bearer. Keep every local-data and
         // process-control API behind that boundary.
-        if (url.pathname.startsWith("/api/") && !this.requireAdmin(req, res)) {
-          return;
+        if (isProtectedGatewayPath(url.pathname)) {
+          const requiredCapabilities = requiredCapabilitiesForHttp(req.method, url.pathname);
+          if (!this.requireCapabilities(req, res, requiredCapabilities)) return;
         }
 
         // Native OpenAI Realtime / Audio / Voice transparent HTTP proxy
-        if (url.pathname.startsWith("/v1/realtime") || url.pathname.startsWith("/v1/audio") || url.pathname.startsWith("/v1/voice") || url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
+        if (isRealtimeProxyPath(url.pathname)) {
           if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
-          const realtimeUpstream = resolveRealtimeUpstream(req, { localAdminToken: this.adminToken });
+          const realtimeUpstream = resolveRealtimeUpstream(req, {
+            localGatewayTokens: this.acceptedTokensForCapability("gateway"),
+          });
           const targetUrl = realtimeUpstream.targetUrl;
 
           try {
@@ -1866,6 +1957,106 @@ if __name__ == "__main__":
           this.issueAdminCookie(res);
           res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
           res.end(getDashboardHtml());
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/security/capability-tokens") {
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({
+            storage: this.tokenStore.storageDescription,
+            capabilities: Object.fromEntries(GATEWAY_CAPABILITIES.map((capability) => [capability, {
+              environment_managed: this.tokenStore.isManagedByEnvironment(capability),
+              previous_token_grace_active: (this.previousCapabilityTokens.get(capability)?.expiresAt || 0) > Date.now(),
+            }])),
+          }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/security/mobile-token") {
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({
+            capability: "mobile",
+            token: this.capabilityTokens.mobile,
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/security/capability-tokens/rotate") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const capability = String(body?.capability || "") as GatewayCapability;
+            if (!GATEWAY_CAPABILITIES.includes(capability)) {
+              throw new Error("capability must be one of: admin, gateway, voice, mobile");
+            }
+
+            const { token, graceExpiresAt } = this.rotateCapabilityToken(capability);
+            let managedConfigUpdated = false;
+            let warning = "";
+            if (capability === "gateway") {
+              try {
+                const configPath = path.join(os.homedir(), ".codex", "config.toml");
+                const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : "";
+                if (content.includes("opencodex managed")) {
+                  const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+                  fs.writeFileSync(
+                    configPath,
+                    buildManagedCodexConfig(content, this.port, this.capabilityTokens.gateway, catalogPath),
+                    "utf-8",
+                  );
+                  managedConfigUpdated = true;
+                }
+              } catch (error: any) {
+                warning = `Gateway token rotated, but managed Codex config could not be updated: ${error?.message || error}`;
+              }
+            }
+            if (capability === "admin") this.issueAdminCookie(res);
+            res.writeHead(200, {
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+            });
+            res.end(JSON.stringify({
+              capability,
+              ...(capability === "mobile" ? { token } : {}),
+              previous_token_valid_until: new Date(graceExpiresAt).toISOString(),
+              managed_config_updated: managedConfigUpdated,
+              ...(warning ? { warning } : {}),
+            }));
+          } catch (error: any) {
+            if (!res.headersSent) {
+              res.writeHead(400, {
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+              });
+              res.end(JSON.stringify({ error: error?.message || String(error) }));
+            }
+          }
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/v1/models") {
+          const seen = new Set<string>();
+          const data = this.readImportedModelCatalog().flatMap((entry: any) => {
+            const id = String(entry?.slug || entry?.id || entry?.model || "").trim();
+            if (!id || seen.has(id)) return [];
+            seen.add(id);
+            return [{
+              id,
+              object: "model",
+              created: 0,
+              owned_by: catalogModelOwner(entry) || "openai",
+            }];
+          });
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          });
+          res.end(JSON.stringify({ object: "list", data }));
           return;
         }
 
@@ -4218,7 +4409,7 @@ if __name__ == "__main__":
 
             if (hasModels && fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
+              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.capabilityTokens.gateway, catalogPath), "utf-8");
               CatalogSyncService.syncCustomModelsToCodexCache();
               console.log("[OpenCodex Gateway] Applied gateway proxy and custom model catalog to config.toml before restart.");
             }
@@ -4879,71 +5070,87 @@ if __name__ == "__main__":
         });
       });
 
-      const proxyWebSocketToOpenAI = (req: http.IncomingMessage, socket: any, head: Buffer) => {
-        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-        const targetHost = "api.openai.com";
-        const targetPort = 443;
-
-        console.log(`[CodexBridge V2] Proxying Realtime WebSocket to wss://${targetHost}${url.pathname}${url.search}`);
-
-        const targetSocket = tls.connect(targetPort, targetHost, { servername: targetHost }, () => {
-          let reqLines = `${req.method} ${url.pathname}${url.search} HTTP/1.1\r\n`;
-          reqLines += `Host: ${targetHost}\r\n`;
-
-          for (const [key, value] of Object.entries(req.headers)) {
-            const k = key.toLowerCase();
-            if (k === "host") continue;
-            if (k === "origin") {
-              reqLines += `Origin: https://chatgpt.com\r\n`;
-              continue;
-            }
-            if (Array.isArray(value)) {
-              for (const v of value) {
-                reqLines += `${key}: ${v}\r\n`;
-              }
-            } else if (value) {
-              reqLines += `${key}: ${value}\r\n`;
-            }
-          }
-          reqLines += "\r\n";
-
-          targetSocket.write(reqLines);
-          if (head && head.length > 0) {
-            targetSocket.write(head);
-          }
-
-          socket.pipe(targetSocket);
-          targetSocket.pipe(socket);
-        });
-
-        targetSocket.on("error", (err) => {
-          console.error(`[CodexBridge V2] Realtime WebSocket proxy error: ${err.message}`);
+      const rejectWebSocketUpgrade = (
+        socket: any,
+        statusCode: number,
+        statusText: string,
+        message: string,
+        extraHeaders: Record<string, string> = {},
+      ) => {
+        const payload = JSON.stringify({ error: { message } });
+        const headers = {
+          "Content-Type": "application/json",
+          "Content-Length": String(Buffer.byteLength(payload)),
+          "Cache-Control": "no-store",
+          "Connection": "close",
+          ...extraHeaders,
+        };
+        const serializedHeaders = Object.entries(headers)
+          .map(([key, value]) => `${key}: ${value}\r\n`)
+          .join("");
+        try {
+          socket.write(`HTTP/1.1 ${statusCode} ${statusText}\r\n${serializedHeaders}\r\n${payload}`);
+        } finally {
           socket.destroy();
-        });
-
-        socket.on("error", () => {
-          targetSocket.destroy();
-        });
+        }
       };
 
       this.server.on("upgrade", (req, socket, head) => {
-        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-        if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
-          if (url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
-          handleWebRtcProxy(req, socket, head, { localAdminToken: this.adminToken });
+        if (!isAllowedGatewayHost(req.headers.host, this.port)) {
+          rejectWebSocketUpgrade(socket, 421, "Misdirected Request", "Untrusted gateway Host header");
           return;
         }
 
-        if (url.pathname.includes("responses")) {
-          socket.write("HTTP/1.1 426 Upgrade Required\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"error\":{\"message\":\"Responses WebSocket transport is disabled; use HTTP\",\"type\":\"upgrade_required\"}}");
-          socket.destroy();
+        const originHeader = req.headers.origin;
+        const origin = Array.isArray(originHeader) ? originHeader[0] : originHeader;
+        if (!isAllowedGatewayOrigin(origin, this.port)) {
+          rejectWebSocketUpgrade(socket, 403, "Forbidden", "Untrusted gateway Origin header");
           return;
         }
 
-        // Handle voice bar & companion WebSockets
-        wss.handleUpgrade(req, socket, head, (ws) => {
-          wss.emit("connection", ws, req);
-        });
+        const url = new URL(req.url || "/", `http://127.0.0.1:${this.port}`);
+        const route = classifyWebSocketPath(url.pathname);
+        const requiredCapabilities = requiredCapabilitiesForWebSocket(route);
+        if (!this.isCapabilityAuthorized(req, requiredCapabilities)) {
+          rejectWebSocketUpgrade(
+            socket,
+            401,
+            "Unauthorized",
+            "OpenCodex capability authentication required",
+            { "WWW-Authenticate": `Bearer realm="OpenCodex", scope="${requiredCapabilities.join(" ")}"` },
+          );
+          return;
+        }
+
+        if (route === "realtime") {
+          if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) {
+            this.markRealtimeActive();
+          }
+          handleWebRtcProxy(req, socket, head, {
+            localGatewayTokens: this.acceptedTokensForCapability("gateway"),
+          });
+          return;
+        }
+
+        if (route === "responses") {
+          rejectWebSocketUpgrade(
+            socket,
+            426,
+            "Upgrade Required",
+            "Responses WebSocket transport is disabled; use HTTP",
+            { "Sec-WebSocket-Version": "13" },
+          );
+          return;
+        }
+
+        if (route === "voice") {
+          wss.handleUpgrade(req, socket, head, (ws) => {
+            wss.emit("connection", ws, req);
+          });
+          return;
+        }
+
+        rejectWebSocketUpgrade(socket, 404, "Not Found", "Unknown WebSocket endpoint");
       });
 
       this.server.on("error", (err) => {
@@ -5290,10 +5497,13 @@ if __name__ == "__main__":
   public stop(): Promise<void> {
     return new Promise((resolve) => {
       if (this.server) {
-        this.server.close(() => {
+        const server = this.server;
+        this.server = null;
+        server.close(() => {
           this.releaseServerLock();
           void closeUpstreamDispatcher().finally(resolve);
         });
+        server.closeIdleConnections();
       } else {
         this.releaseServerLock();
         void closeUpstreamDispatcher().finally(resolve);

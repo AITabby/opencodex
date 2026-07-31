@@ -36,15 +36,24 @@ test("macOS packaging carries the complete voice runtime", async () => {
 });
 
 test("repository build includes the bundled OpenCodexBar source", async () => {
-  const [packageJson, buildAll, packageScript] = await Promise.all([
+  const [packageJson, build, buildAll, buildAllShell, packageScript] = await Promise.all([
     read("package.json"),
+    read("scripts/build.mjs"),
+    read("scripts/build-all.mjs"),
     read("scripts/build-all.sh"),
     read("macos-app/scripts/package-app.sh")
   ]);
-  assert.equal(JSON.parse(packageJson).scripts["build:all"], "./scripts/build-all.sh");
-  assert.match(buildAll, /npm run build/);
-  assert.match(buildAll, /voice\/OpenCodexBar/);
-  assert.match(buildAll, /swift build -c release/);
+  const scripts = JSON.parse(packageJson).scripts;
+  assert.equal(scripts.build, "node ./scripts/build.mjs");
+  assert.equal(scripts["build:all"], "node ./scripts/build-all.mjs");
+  assert.match(build, /rmSync/);
+  assert.match(build, /typescript.*bin.*tsc/s);
+  assert.match(buildAll, /process\.platform === "darwin"/);
+  assert.match(buildAll, /build-all\.sh/);
+  assert.match(buildAll, /build\.mjs/);
+  assert.match(buildAllShell, /npm run build/);
+  assert.match(buildAllShell, /voice\/OpenCodexBar/);
+  assert.match(buildAllShell, /swift build -c release/);
   assert.match(packageScript, /VOICE_BAR_SOURCE=.*voice\/OpenCodexBar/);
 });
 
@@ -70,7 +79,8 @@ test("desktop app publishes the runtime port and uses the embedded voice bar", a
   assert.match(gatewayProcess, /OPENCODEX_DATA_DIR/);
   assert.match(gatewayProcess, /OpenCodexLivePicker/);
   assert.match(gatewayProcess, /OPENCODEX_APP_PORT/);
-  assert.match(gatewayProcess, /OPENCODEX_ADMIN_TOKEN_PATH/);
+  assert.match(gatewayProcess, /CapabilityTokenKeychain\.token\(for: "gateway"\)/);
+  assert.doesNotMatch(gatewayProcess, /admin_token|OPENCODEX_ADMIN_TOKEN_PATH/);
   assert.match(gateway, /buildManagedCodexConfig/);
   assert.match(gateway, /Synchronized managed Codex config to port/);
   assert.match(info, /LSMultipleInstancesProhibited/);

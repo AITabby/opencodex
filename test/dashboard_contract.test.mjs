@@ -36,6 +36,23 @@ test("dashboard uses the gateway admin cookie without embedding credentials", as
   assert.match(text, /api\('\/api\/providers'\)/);
 });
 
+test("dashboard exposes explicit capability rotation and mobile pairing controls", async () => {
+  const text = await source();
+  for (const marker of [
+    "capability-token-storage",
+    "copy-mobile-token",
+    "data-token-rotate=\"admin\"",
+    "data-token-rotate=\"gateway\"",
+    "data-token-rotate=\"voice\"",
+    "data-token-rotate=\"mobile\"",
+    "/api/security/capability-tokens/rotate",
+    "/api/security/mobile-token",
+  ]) {
+    assert.match(text, new RegExp(marker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+  assert.match(text, /旧令牌仅保留 5 分钟兼容期/);
+});
+
 test("dashboard refreshes subscription status after every model deletion path", async () => {
   const text = await source();
   assert.match(text, /post\('\/api\/models\/delete',\{id:id\}\);await syncDashboardState\(\)/);

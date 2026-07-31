@@ -14,8 +14,8 @@ import { URL } from "node:url";
 const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 
 export type RealtimeProxyOptions = {
-  /** The bearer token installed in Codex config for the local gateway. */
-  localAdminToken?: string;
+  /** Current and grace-period bearer tokens accepted by the local gateway. */
+  localGatewayTokens?: string[];
   /** Test-only override; production reads the native Codex access token. */
   nativeAccessToken?: string;
 };
@@ -35,7 +35,7 @@ function headerValue(req: http.IncomingMessage, name: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function readNativeAccessToken(): string {
+export function readNativeAccessToken(): string {
   try {
     const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
     return typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
@@ -48,11 +48,9 @@ function bearerValue(value: string): string {
   return value.replace(/^Bearer\s+/i, "").trim();
 }
 
-function isLocalOrPlaceholderBearer(value: string, localAdminToken?: string): boolean {
+function isLocalGatewayBearer(value: string, localGatewayTokens: string[] = []): boolean {
   const token = bearerValue(value);
-  if (!token) return true;
-  if (localAdminToken && token === localAdminToken) return true;
-  return /dummy|opencodex/i.test(token);
+  return Boolean(token && localGatewayTokens.some((candidate) => candidate === token));
 }
 
 function nativeBackendPath(pathname: string): string {
@@ -85,6 +83,7 @@ function copyRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOpt
     const lowerKey = key.toLowerCase();
     if (lowerKey === "host" || lowerKey === "connection" || lowerKey === "upgrade") continue;
     if (lowerKey === "content-length" || lowerKey === "transfer-encoding") continue;
+    if (lowerKey === "cookie" || lowerKey === "proxy-authorization" || lowerKey === "x-opencodex-token") continue;
     if (lowerKey.startsWith("sec-websocket-")) continue;
     if (Array.isArray(value)) headers[key] = value.join(", ");
     else if (typeof value === "string") headers[key] = value;
@@ -92,19 +91,19 @@ function copyRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOpt
 
   const incomingAuthorization = headerValue(req, "authorization");
   const nativeToken = options.nativeAccessToken || readNativeAccessToken();
-  if (nativeSession && nativeToken && isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken)) {
+  if (nativeSession && nativeToken && isLocalGatewayBearer(incomingAuthorization, options.localGatewayTokens)) {
     headers.authorization = `Bearer ${nativeToken}`;
-  } else if (isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken)) {
+  } else if (isLocalGatewayBearer(incomingAuthorization, options.localGatewayTokens)) {
     delete headers.authorization;
   }
   return headers;
 }
 
 export function resolveRealtimeUpstream(req: http.IncomingMessage, options: RealtimeProxyOptions = {}): RealtimeUpstream {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(req.url || "/", "http://127.0.0.1");
   const incomingAuthorization = headerValue(req, "authorization");
   const nativeAccessToken = options.nativeAccessToken || readNativeAccessToken();
-  const localBearer = isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
+  const localBearer = isLocalGatewayBearer(incomingAuthorization, options.localGatewayTokens);
   const nativeLiveCall = isLiveCallPath(url.pathname)
     && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
   const nativeLiveSideband = isLiveSidebandPath(url.pathname)
@@ -183,7 +182,7 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
     servername: upstream.targetHost,
     rejectUnauthorized: true,
   }, () => {
-    let reqLines = `${req.method} ${upstream.targetPath}${new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).search} HTTP/1.1\r\n`;
+    let reqLines = `${req.method} ${upstream.targetPath}${new URL(req.url || "/", "http://127.0.0.1").search} HTTP/1.1\r\n`;
     reqLines += `Host: ${upstream.targetHost}\r\n`;
     reqLines += "Connection: Upgrade\r\nUpgrade: websocket\r\n";
     for (const [key, value] of Object.entries(upstream.headers)) {

@@ -135,7 +135,7 @@ class StatusBarController {
 
     menu.addItem(NSMenuItem.separator())
 
-    let restartItem = NSMenuItem(title: "Restart Codex", action: #selector(restartCodex), keyEquivalent: "r")
+    let restartItem = NSMenuItem(title: "Open Dashboard to Restart Codex", action: #selector(openDashboard), keyEquivalent: "r")
     restartItem.target = self
     menu.addItem(restartItem)
 
@@ -156,10 +156,6 @@ class StatusBarController {
 
   @objc private func startNewConversation() {
     AppDelegate.shared?.startNewConversation()
-  }
-
-  @objc private func restartCodex() {
-    apiClient.restartCodex()
   }
 
   @objc private func quit() {

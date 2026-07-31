@@ -26,8 +26,14 @@ class WebSocketManager: NSObject {
       self.task?.cancel(with: .goingAway, reason: nil)
       
       let url = GatewayLocator.webSocketURL
+      guard let voiceToken = GatewayLocator.voiceToken() else {
+        AppDelegate.shared?.log("[WS Err] OpenCodex voice token is unavailable")
+        return
+      }
+      var request = URLRequest(url: url)
+      request.setValue("Bearer \(voiceToken)", forHTTPHeaderField: "Authorization")
       let session = URLSession(configuration: .default)
-      let t = session.webSocketTask(with: url)
+      let t = session.webSocketTask(with: request)
       self.task = t
       t.resume()
       self.isConnected = true

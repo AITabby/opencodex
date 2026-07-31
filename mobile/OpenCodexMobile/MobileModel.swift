@@ -6,7 +6,7 @@ import UIKit
 @MainActor
 final class MobileModel: ObservableObject {
     @Published var gatewayURL: String
-    @Published var adminToken: String
+    @Published var mobileToken: String
     @Published var relayURL: String
     @Published var relayChannel: String
     @Published var relayToken: String
@@ -46,7 +46,8 @@ final class MobileModel: ObservableObject {
 
     init() {
         gatewayURL = KeychainStore.string(for: "gateway-url") ?? "http://127.0.0.1:8765/"
-        adminToken = KeychainStore.string(for: "gateway-admin-token") ?? ""
+        mobileToken = KeychainStore.string(for: "gateway-mobile-token") ?? ""
+        KeychainStore.remove("gateway-admin-token")
         relayURL = KeychainStore.string(for: "relay-url") ?? "wss://relay.example.com/v1/relay"
         relayChannel = KeychainStore.string(for: "relay-channel") ?? ""
         relayToken = KeychainStore.string(for: "relay-token") ?? ""
@@ -65,7 +66,7 @@ final class MobileModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.connectRelay()
             }
-        } else if !adminToken.isEmpty {
+        } else if !mobileToken.isEmpty {
             // A saved same-Wi-Fi gateway is a user choice, not a transient
             // screen action. Restore it after launch so the companion does
             // not require a manual reconnect every time it opens.
@@ -88,19 +89,19 @@ final class MobileModel: ObservableObject {
 
     func connect() {
         let normalizedGatewayURL = gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let normalizedAdminToken = adminToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedMobileToken = mobileToken.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let baseURL = URL(string: normalizedGatewayURL) else {
             isConnecting = false
             connectionError = "网关地址格式不正确"
             return
         }
-        guard !normalizedAdminToken.isEmpty else {
+        guard !normalizedMobileToken.isEmpty else {
             isConnecting = false
             connectionError = "请先填写管理令牌"
             return
         }
         gatewayURL = normalizedGatewayURL
-        adminToken = normalizedAdminToken
+        mobileToken = normalizedMobileToken
         usingRelay = false
         persistConnectionSecrets()
         relayClient?.stop()
@@ -138,14 +139,14 @@ final class MobileModel: ObservableObject {
                 // can read the error, edit the address, and retry immediately.
                 self.isConnecting = !connected && error == nil && reconnecting
                 if connected {
-                    self.startSessionSynchronization(baseURL: baseURL, adminToken: normalizedAdminToken)
+                    self.startSessionSynchronization(baseURL: baseURL, mobileToken: normalizedMobileToken)
                 } else {
                     // Keep the last successful chat snapshot visible while
                     // the event client automatically reconnects.
                     self.stopSessionSynchronization(preservingVisibleState: reconnecting)
                 }
             }
-        newClient.start(baseURL: baseURL, adminToken: normalizedAdminToken)
+        newClient.start(baseURL: baseURL, mobileToken: normalizedMobileToken)
         objectWillChange.send()
     }
 
@@ -383,7 +384,7 @@ final class MobileModel: ObservableObject {
                     sessionID: selectedSessionID,
                     modelID: modelID,
                     baseURL: configuration.baseURL,
-                    adminToken: configuration.adminToken
+                    mobileToken: configuration.mobileToken
                 )
             } else {
                 throw RelayRequestError.disconnected
@@ -412,8 +413,8 @@ final class MobileModel: ObservableObject {
                     await self.refreshRelaySessionIndex()
                     await self.refreshSentConversationOverRelay()
                 } else if let configuration {
-                    await self.refreshSessionIndex(baseURL: configuration.baseURL, adminToken: configuration.adminToken)
-                    await self.refreshSentConversation(baseURL: configuration.baseURL, adminToken: configuration.adminToken)
+                    await self.refreshSessionIndex(baseURL: configuration.baseURL, mobileToken: configuration.mobileToken)
+                    await self.refreshSentConversation(baseURL: configuration.baseURL, mobileToken: configuration.mobileToken)
                 }
             }
             return true
@@ -438,14 +439,15 @@ final class MobileModel: ObservableObject {
         Task { @MainActor [weak self] in
             await self?.refreshSessionIndex(
                 baseURL: configuration.baseURL,
-                adminToken: configuration.adminToken
+                mobileToken: configuration.mobileToken
             )
         }
     }
 
     private func persistConnectionSecrets() {
         KeychainStore.set(gatewayURL, for: "gateway-url")
-        KeychainStore.set(adminToken, for: "gateway-admin-token")
+        KeychainStore.set(mobileToken, for: "gateway-mobile-token")
+        KeychainStore.remove("gateway-admin-token")
         KeychainStore.set(relayURL, for: "relay-url")
         KeychainStore.set(relayChannel, for: "relay-channel")
         KeychainStore.set(relayToken, for: "relay-token")
@@ -518,18 +520,18 @@ final class MobileModel: ObservableObject {
         }
     }
 
-    private var sessionConfiguration: (baseURL: URL, adminToken: String)? {
+    private var sessionConfiguration: (baseURL: URL, mobileToken: String)? {
         guard !usingRelay,
               connected,
               let baseURL = URL(string: gatewayURL),
-              !adminToken.isEmpty else {
+              !mobileToken.isEmpty else {
             return nil
         }
-        return (baseURL, adminToken)
+        return (baseURL, mobileToken)
     }
 
-    private func startSessionSynchronization(baseURL: URL, adminToken: String) {
-        let key = "\(baseURL.absoluteString)|\(adminToken)"
+    private func startSessionSynchronization(baseURL: URL, mobileToken: String) {
+        let key = "\(baseURL.absoluteString)|\(mobileToken)"
         // Connection-state publishers can emit several `connected` values.
         // One successful initial index load is enough for a given gateway;
         // subsequent work is scoped to the selected session.
@@ -538,9 +540,9 @@ final class MobileModel: ObservableObject {
         sessionSyncKey = key
         isSessionSyncing = true
         initialSessionLoadTask = Task { @MainActor [weak self] in
-            await self?.refreshAvailableModels(baseURL: baseURL, adminToken: adminToken)
+            await self?.refreshAvailableModels(baseURL: baseURL, mobileToken: mobileToken)
             guard !Task.isCancelled else { return }
-            await self?.refreshSessionIndex(baseURL: baseURL, adminToken: adminToken)
+            await self?.refreshSessionIndex(baseURL: baseURL, mobileToken: mobileToken)
             guard !Task.isCancelled else { return }
             self?.initialSessionLoadTask = nil
         }
@@ -575,10 +577,10 @@ final class MobileModel: ObservableObject {
         }
     }
 
-    private func refreshSessionIndex(baseURL: URL, adminToken: String) async {
+    private func refreshSessionIndex(baseURL: URL, mobileToken: String) async {
         isSessionSyncing = true
         do {
-            let fetchedSessions = try await fetchSessions(baseURL: baseURL, adminToken: adminToken)
+            let fetchedSessions = try await fetchSessions(baseURL: baseURL, mobileToken: mobileToken)
             guard !Task.isCancelled else { return }
             sessions = fetchedSessions
             hasCompletedInitialSessionSync = true
@@ -603,11 +605,11 @@ final class MobileModel: ObservableObject {
         }
     }
 
-    private func refreshAvailableModels(baseURL: URL, adminToken: String) async {
+    private func refreshAvailableModels(baseURL: URL, mobileToken: String) async {
         isLoadingModels = true
         defer { isLoadingModels = false }
         do {
-            let fetchedModels = try await fetchAvailableModels(baseURL: baseURL, adminToken: adminToken)
+            let fetchedModels = try await fetchAvailableModels(baseURL: baseURL, mobileToken: mobileToken)
             guard !Task.isCancelled else { return }
             availableModels = fetchedModels
             if !fetchedModels.contains(where: { $0.id == selectedModelID }) {
@@ -680,7 +682,7 @@ final class MobileModel: ObservableObject {
             return
         }
         guard let configuration = sessionConfiguration else { return }
-        await refreshSelectedSession(baseURL: configuration.baseURL, adminToken: configuration.adminToken)
+        await refreshSelectedSession(baseURL: configuration.baseURL, mobileToken: configuration.mobileToken)
     }
 
     private func refreshSelectedSessionOverRelay() async {
@@ -717,7 +719,7 @@ final class MobileModel: ObservableObject {
         }
     }
 
-    private func refreshSelectedSession(baseURL: URL, adminToken: String) async {
+    private func refreshSelectedSession(baseURL: URL, mobileToken: String) async {
         guard let requestedSessionID = selectedSessionID else {
             isSelectedSessionLoading = false
             if !chatMessages.isEmpty {
@@ -730,7 +732,7 @@ final class MobileModel: ObservableObject {
             let messages = try await fetchSessionMessages(
                 sessionID: requestedSessionID,
                 baseURL: baseURL,
-                adminToken: adminToken
+                mobileToken: mobileToken
             )
             // A previous polling request may complete after the user chose a
             // different row. Never let that stale payload overwrite the new
@@ -753,13 +755,13 @@ final class MobileModel: ObservableObject {
     /// The app-server returns once it has accepted `turn/start`; its rollout
     /// file can appear a moment later.  Retry a small, bounded number of times
     /// while preserving the local pending bubble rather than polling forever.
-    private func refreshSentConversation(baseURL: URL, adminToken: String) async {
+    private func refreshSentConversation(baseURL: URL, mobileToken: String) async {
         for delay in [UInt64.zero, 450_000_000, 1_200_000_000] {
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
             }
             guard !Task.isCancelled else { return }
-            await refreshSelectedSession(baseURL: baseURL, adminToken: adminToken)
+            await refreshSelectedSession(baseURL: baseURL, mobileToken: mobileToken)
             if pendingMobileMessages.isEmpty { return }
         }
     }
@@ -784,22 +786,22 @@ final class MobileModel: ObservableObject {
         return serverMessages + pendingMobileMessages
     }
 
-    nonisolated private func fetchSessions(baseURL: URL, adminToken: String) async throws -> [GatewaySession] {
+    nonisolated private func fetchSessions(baseURL: URL, mobileToken: String) async throws -> [GatewaySession] {
         var requestURL = baseURL
         requestURL.appendPathComponent("api/sessions")
         var request = URLRequest(url: requestURL)
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard statusCode == 200 else { throw GatewaySessionError.http(statusCode) }
         return try JSONDecoder().decode([GatewaySession].self, from: data)
     }
 
-    nonisolated private func fetchAvailableModels(baseURL: URL, adminToken: String) async throws -> [GatewayModelOption] {
+    nonisolated private func fetchAvailableModels(baseURL: URL, mobileToken: String) async throws -> [GatewayModelOption] {
         var requestURL = baseURL
         requestURL.appendPathComponent("v1/models")
         var request = URLRequest(url: requestURL)
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard statusCode == 200 else { throw GatewaySessionError.http(statusCode) }
@@ -807,14 +809,14 @@ final class MobileModel: ObservableObject {
             .filter { !$0.id.isEmpty && $0.id != "opencodex/cu" }
     }
 
-    nonisolated private func fetchSessionMessages(sessionID: String, baseURL: URL, adminToken: String) async throws -> [GatewayChatMessage] {
+    nonisolated private func fetchSessionMessages(sessionID: String, baseURL: URL, mobileToken: String) async throws -> [GatewayChatMessage] {
         var requestURL = baseURL
         requestURL.appendPathComponent("api/sessions/detail")
         var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
         request.httpBody = try JSONSerialization.data(withJSONObject: ["id": sessionID])
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard statusCode == 200 else { throw GatewaySessionError.http(statusCode) }
@@ -833,7 +835,7 @@ final class MobileModel: ObservableObject {
         sessionID: String?,
         modelID: String,
         baseURL: URL,
-        adminToken: String
+        mobileToken: String
     ) async throws -> GatewayMobileMessageResponse {
         var requestURL = baseURL
         requestURL.appendPathComponent("api/mobile/messages")
@@ -846,7 +848,7 @@ final class MobileModel: ObservableObject {
         request.timeoutInterval = 70
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(mobileToken)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
         guard statusCode == 202 else {

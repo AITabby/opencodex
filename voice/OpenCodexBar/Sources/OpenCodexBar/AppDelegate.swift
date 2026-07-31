@@ -762,7 +762,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     var request = URLRequest(url: GatewayLocator.url(path: "api/voice/ask"))
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    addOpenCodexAdminToken(to: &request)
+    addOpenCodexVoiceToken(to: &request)
     
     let bodyObj: [String: Any] = [
       "prompt": prompt,
@@ -1274,7 +1274,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     request.httpMethod = "POST"
     request.httpBody = jsonData
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    addOpenCodexAdminToken(to: &request)
+    addOpenCodexVoiceToken(to: &request)
     
     let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       if let error = error {

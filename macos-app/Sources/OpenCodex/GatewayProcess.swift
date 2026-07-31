@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import OpenCodexSecurity
 
 struct LiveModelPickerRequest: Identifiable, Equatable {
     let id: String
@@ -45,7 +46,8 @@ final class GatewayProcess: ObservableObject {
     private var outputPipe: Pipe?
     private var runtimeFileURL: URL?
     private var pickerPollTask: Task<Void, Never>?
-    private var adminToken = ""
+    private var gatewayToken = ""
+    private var gatewayTokenLoadedAt = Date.distantPast
 
     init() {
         NotificationCenter.default.addObserver(
@@ -161,7 +163,8 @@ final class GatewayProcess: ObservableObject {
         let ready = await waitForHealth()
         if ready {
             state = .ready
-            adminToken = readAdminToken()
+            gatewayToken = CapabilityTokenKeychain.token(for: "gateway") ?? ""
+            gatewayTokenLoadedAt = Date()
             startLiveModelPicker()
         } else if child.isRunning {
             state = .failed("网关启动超时，请查看日志")
@@ -172,7 +175,8 @@ final class GatewayProcess: ObservableObject {
         pickerPollTask?.cancel()
         pickerPollTask = nil
         liveModelPickerRequest = nil
-        adminToken = ""
+        gatewayToken = ""
+        gatewayTokenLoadedAt = .distantPast
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         if let livePickerProcess, livePickerProcess.isRunning {
             livePickerProcess.terminate()
@@ -215,6 +219,7 @@ final class GatewayProcess: ObservableObject {
     }
 
     private func sendLiveModelResolution(request: LiveModelPickerRequest, model: String) async throws -> Bool {
+        refreshGatewayTokenIfNeeded()
         guard let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/resolve") else {
             throw URLError(.badURL)
         }
@@ -222,7 +227,7 @@ final class GatewayProcess: ObservableObject {
         requestURL.httpMethod = "POST"
         requestURL.timeoutInterval = 10
         requestURL.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        requestURL.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        requestURL.setValue("Bearer \(gatewayToken)", forHTTPHeaderField: "Authorization")
         requestURL.httpBody = try JSONSerialization.data(withJSONObject: [
             "request_id": request.id,
             "model": model,
@@ -248,13 +253,10 @@ final class GatewayProcess: ObservableObject {
             .appendingPathComponent("OpenCodex", isDirectory: true)
     }
 
-    private var adminTokenURL: URL {
-        applicationSupportDirectory.appendingPathComponent("admin_token")
-    }
-
-    private func readAdminToken() -> String {
-        let tokenURL = adminTokenURL
-        return (try? String(contentsOf: tokenURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    private func refreshGatewayTokenIfNeeded() {
+        guard Date().timeIntervalSince(gatewayTokenLoadedAt) >= 30 else { return }
+        gatewayToken = CapabilityTokenKeychain.token(for: "gateway") ?? ""
+        gatewayTokenLoadedAt = Date()
     }
 
     private func startLiveModelPicker() {
@@ -271,7 +273,6 @@ final class GatewayProcess: ObservableObject {
         picker.currentDirectoryURL = resources
         var environment = ProcessInfo.processInfo.environment
         environment["OPENCODEX_APP_PORT"] = String(port)
-        environment["OPENCODEX_ADMIN_TOKEN_PATH"] = adminTokenURL.path
         environment["OPENCODEX_APP_MODE"] = "1"
         picker.environment = environment
         picker.standardOutput = FileHandle.nullDevice
@@ -302,11 +303,12 @@ final class GatewayProcess: ObservableObject {
     }
 
     private func pollLiveModelPicker() async {
-        guard state == .ready, port > 0, !adminToken.isEmpty,
+        refreshGatewayTokenIfNeeded()
+        guard state == .ready, port > 0, !gatewayToken.isEmpty,
               let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/pending") else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 2
-        request.setValue("Bearer \(adminToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(gatewayToken)", forHTTPHeaderField: "Authorization")
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return }

@@ -860,7 +860,7 @@ private struct SettingsPage: View {
                     TextField("Mac 网关地址", text: $model.gatewayURL)
                         .textInputAutocapitalization(.never)
                         .keyboardType(.URL)
-                    SecureField("测试访问令牌", text: $model.adminToken)
+                    SecureField("移动端配对令牌", text: $model.mobileToken)
                     if model.isConnecting {
                         Button("取消当前连接", role: .cancel) {
                             model.cancelConnectionAttempt()
@@ -869,7 +869,7 @@ private struct SettingsPage: View {
                     Button(model.isConnecting ? "用当前地址重新连接" : "连接 Mac 网关") {
                         model.connect()
                     }
-                    .disabled(model.gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.adminToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(model.gatewayURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || model.mobileToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
                 Section("宠物与提醒") {
