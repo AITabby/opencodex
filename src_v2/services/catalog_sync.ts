@@ -11,6 +11,8 @@ import { execFileSync } from "node:child_process";
 import { ProviderConfig } from "../core/types.js";
 import { CredentialStore } from "./credential_store.js";
 
+import { stripManagedCodexConfig } from "../server/gateway.js";
+
 const DEFAULT_REASONING_PRESETS = [
   { effort: "low", description: "Minimal reasoning for simple tasks" },
   { effort: "medium", description: "Balances speed and reasoning depth" },
@@ -117,7 +119,7 @@ export class CatalogSyncService {
       const configPath = path.join(os.homedir(), ".codex", "config.toml");
       if (!fs.existsSync(configPath)) return [];
       const backup = fs.readFileSync(configPath, "utf-8");
-      const tempContent = backup.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "");
+      const tempContent = stripManagedCodexConfig(backup);
       fs.writeFileSync(configPath, tempContent, "utf-8");
       try {
         const raw = execFileSync("/Applications/ChatGPT.app/Contents/Resources/codex", ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();

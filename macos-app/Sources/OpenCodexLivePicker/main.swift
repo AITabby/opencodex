@@ -227,14 +227,17 @@ private final class LiveOrbAnimationView: NSView {
                 let blue = cloudWeight(u, v, 4.3, 1.17)
                 let violet = cloudWeight(u, v, 6.4, 0.69)
                 let total = cyan + pink + blue + violet
-                let alpha = clamp(0.16 + total * 0.19)
+                // Keep the fluid soft-edged, but give the colors enough density
+                // to remain vivid over bright and dark desktop backgrounds.
+                let alpha = clamp(0.21 + total * 0.23)
                 let red = (pink * 1.0 + blue * 0.16 + violet * 0.52) / max(total, 0.001)
                 let green = (cyan * 0.95 + blue * 0.42 + violet * 0.30 + pink * 0.12) / max(total, 0.001)
                 let blueChannel = (cyan * 0.90 + pink * 0.72 + blue * 1.0 + violet * 1.0) / max(total, 0.001)
                 let index = (y * textureWidth + x) * 4
-                pixels[index] = UInt8(clamp(red * alpha) * 255)
-                pixels[index + 1] = UInt8(clamp(green * alpha) * 255)
-                pixels[index + 2] = UInt8(clamp(blueChannel * alpha) * 255)
+                let brightness = 1.10
+                pixels[index] = UInt8(clamp(red * alpha * brightness) * 255)
+                pixels[index + 1] = UInt8(clamp(green * alpha * brightness) * 255)
+                pixels[index + 2] = UInt8(clamp(blueChannel * alpha * brightness) * 255)
                 pixels[index + 3] = UInt8(alpha * 255)
             }
         }

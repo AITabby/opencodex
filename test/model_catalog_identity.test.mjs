@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import { buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, stripManagedCodexConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 
 test("managed Codex config follows the current gateway port across restarts", () => {
-  const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nbase_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n`;
+  const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed >>>\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nbase_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n`;
   const next = buildManagedCodexConfig(existing, 19753, "test-admin-token", "/Users/test/.opencodex/custom_model_catalog.json");
 
   assert.match(next, /openai_base_url = "http:\/\/127\.0\.0\.1:19753\/v1"/);
@@ -13,6 +13,17 @@ test("managed Codex config follows the current gateway port across restarts", ()
   assert.doesNotMatch(next, /18421/);
   assert.match(next, /model = "gpt-5\.5"/);
   assert.equal((next.match(/# >>> opencodex managed >>>/g) || []).length, 2);
+});
+
+test("managed Codex config strips corrupted duplicate blocks and orphaned keys idempotently", () => {
+  const corrupted = `# >>> opencodex managed >>>\nmodel_catalog_json = "/path/1"\nopenai_base_url = "http://127.0.0.1:8765/v1"\n# <<< opencodex managed >>>\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/path/1"\nopenai_base_url = "http://127.0.0.1:8765/v1"\n# <<< opencodex managed >>>\n\nmodel = "gpt-5.5"\nmodel_catalog_json = "/path/2"\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\n# <<< opencodex managed >>>\n\n[model_providers.opencodex]\nname = "OpenCodex"\n`;
+  const firstPass = buildManagedCodexConfig(corrupted, 8765, "token-1");
+  const secondPass = buildManagedCodexConfig(firstPass, 8765, "token-1");
+
+  assert.equal((firstPass.match(/# >>> opencodex managed >>>/g) || []).length, 2);
+  assert.equal((firstPass.match(/model_catalog_json/g) || []).length, 1);
+  assert.equal((firstPass.match(/\[model_providers\.opencodex\]/g) || []).length, 1);
+  assert.equal(firstPass, secondPass);
 });
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {

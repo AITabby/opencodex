@@ -26,15 +26,22 @@ import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWo
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
 
+export function stripManagedCodexConfig(content: string): string {
+  let cleaned = content || "";
+  cleaned = cleaned.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed (?:>>>|<<<)\r?\n?/gi, "");
+  cleaned = cleaned.replace(/^\s*model_catalog_json\s*=.*$\r?\n?/gm, "");
+  cleaned = cleaned.replace(/^\s*openai_base_url\s*=.*$\r?\n?/gm, "");
+  cleaned = cleaned.replace(/^\s*\[model_providers\.opencodex\][\s\S]*?(?=\n\s*\[|\n\s*# >>>|$)/gm, "");
+  return cleaned.trim();
+}
+
 export function buildManagedCodexConfig(
   content: string,
   port: number,
   adminToken: string,
   catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
 ): string {
-  const preserved = content
-    .replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "")
-    .trim();
+  const preserved = stripManagedCodexConfig(content);
   const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed >>>\n`;
   const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
@@ -2197,10 +2204,7 @@ if __name__ == "__main__":
               const configPath = path.join(os.homedir(), ".codex", "config.toml");
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
-                if (!content.includes("opencodex managed")) {
-                  const managedBlock = `\n# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\n# <<< opencodex managed <<<\n`;
-                  fs.writeFileSync(configPath, content + managedBlock, "utf-8");
-                }
+                fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
               }
             }
 
@@ -2331,10 +2335,7 @@ if __name__ == "__main__":
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              if (!content.includes("opencodex managed")) {
-                const managedBlock = `\n# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\n# <<< opencodex managed <<<\n`;
-                fs.writeFileSync(configPath, content + managedBlock, "utf-8");
-              }
+              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
             }
 
             recordSubscriptionImport(this.dataDir, String(cli));
@@ -4587,7 +4588,7 @@ if __name__ == "__main__":
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              content = content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
+              content = stripManagedCodexConfig(content);
               content = content.replace(/^model\s*=\s*".*?"/m, 'model = "gpt-5.5"');
               fs.writeFileSync(configPath, content + "\n", "utf-8");
             }
