@@ -10,6 +10,7 @@ enum AppStatus {
 }
 
 class StatusBarController {
+  private let statusFile = PrivateRuntimeStorage.shared.fixedFile("voice-status.txt")
   private let statusItem: NSStatusItem
   private let popover: NSPopover
   private let apiClient: APIClient
@@ -29,7 +30,7 @@ class StatusBarController {
     }
 
     updateIcon()
-    try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+    try? PrivateRuntimeStorage.shared.write("idle", to: statusFile)
     buildMenu()
   }
 
@@ -46,7 +47,7 @@ class StatusBarController {
     case .error: statusStr = "error"
     case .offline: statusStr = "offline"
     }
-    try? statusStr.write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+    try? PrivateRuntimeStorage.shared.write(statusStr, to: statusFile)
 
     if status == .loading || status == .listening || status == .sending {
       startAnimation()

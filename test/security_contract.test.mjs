@@ -25,6 +25,8 @@ test("gateway is loopback-only and enforces route capabilities", async () => {
   assert.match(source, /timingSafeEqual/);
   assert.doesNotMatch(source, /server\.listen\(this\.port, "0\.0\.0\.0"/);
   assert.doesNotMatch(source, /url\.pathname\.includes\("voice"\)/);
+  assert.match(source, /OPENCODEX_CODEX_CONFIG_PATH/);
+  assert.doesNotMatch(source, /const configPath = path\.join\(os\.homedir\(\), "\.codex", "config\.toml"\)/);
 });
 
 test("voice WebSocket uses its dedicated authenticated endpoint", async () => {
@@ -64,17 +66,23 @@ test("local gateway credentials are isolated from native upstream credentials", 
 
 test("provider and voice APIs never return plaintext credentials", async () => {
   const [source, store] = await Promise.all([gateway(), credentials()]);
-  assert.match(source, /const \{ api_key: _apiKey/);
+  assert.match(source, /const\s*\{\s*api_key: _apiKey/);
   assert.match(source, /api_key_configured/);
   assert.match(source, /maskVoiceSettings/);
   assert.match(store, /OpenCodex Provider Credential/);
+  assert.match(store, /ProtectedData\]::Protect/);
+  assert.match(store, /DataProtectionScope\]::CurrentUser/);
+  assert.match(store, /dpapi-current-user/);
   assert.match(store, /delete provider\.api_key/);
   assert.match(store, /posixPermissions|chmodSync/);
+  assert.doesNotMatch(store, /provider credentials require macOS Keychain/);
 });
 
 test("voice and session shell calls pass user input as arguments", async () => {
   const source = await gateway();
-  assert.match(source, /execFileSync\(resolveRuntimeBinary\("uvx"\), edgeArgs/);
+  assert.match(source, /execFileSync\(resolveRuntimeBinary\("uvx"\), \["--from", VOICE_RUNTIME_PACKAGES\.edgeTts, \.\.\.edgeArgs\]/);
+  assert.match(source, /spawn\(uvxPath, \["--with", VOICE_RUNTIME_PACKAGES\.whisper, "python3", transcribeScript, filePath, localModel\]/);
+  assert.match(source, /spawn\(uvxPath, \["--with", VOICE_RUNTIME_PACKAGES\.sileroVad, "python3", scriptPath\]/);
   assert.match(source, /execFileSync\(resolveRuntimeBinary\("say"\), \["-o", tmpAiff, text\]/);
   assert.match(source, /execFileSync\("sqlite3", \[dbPath, sql\]/);
   assert.doesNotMatch(source, /execSync\(`uvx edge-tts/);

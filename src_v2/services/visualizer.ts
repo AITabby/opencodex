@@ -5,19 +5,14 @@
  * Cyberpunk rotating scanner halo, and live audio-reactive amplitude sync via real Web Audio API mic input.
  */
 
-export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: string = "vortex"): string {
+export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: string = "vortex", cspNonce = ""): string {
   return `<!DOCTYPE html>
 <html lang="zh-CN" ${isHudModeStatic ? 'class="hud-mode"' : ''}>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>OpenCodex Voice Visualizer Playground</title>
-  <!-- Google Fonts Outfit & JetBrains Mono -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@300;400;700&display=swap" rel="stylesheet">
-  
-  <style>
+  <style nonce="${cspNonce}">
     :root {
       --bg-gradient: linear-gradient(135deg, #070416 0%, #0d0926 50%, #04020a 100%);
       --glass-bg: rgba(255, 255, 255, 0.02);
@@ -43,7 +38,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     }
     
     body {
-      font-family: 'Outfit', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
       background: var(--bg-gradient);
       color: var(--color-text);
       min-height: 100vh;
@@ -137,7 +132,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
       color: var(--color-text-muted);
       text-transform: uppercase;
       letter-spacing: 1.5px;
-      font-family: 'JetBrains Mono', monospace;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
     }
     .back-btn {
       background: rgba(255, 255, 255, 0.04);
@@ -636,7 +631,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
         <div class="mic-pulse-indicator" id="mic-led"></div>
         <div class="mic-status-text" id="mic-text">未接入真实麦克风（使用模拟幅值演示）</div>
       </div>
-      <button class="action-btn action-btn-primary" id="btn-connect-mic" onclick="toggleMicrophone()" style="flex:0;min-width:180px;">
+      <button class="action-btn action-btn-primary" id="btn-connect-mic" style="flex:0;min-width:180px;">
         <svg style="width:1rem;height:1rem;" fill="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
           <path d="M12 2a3 3 0 00-3 3v7a3 3 0 006 0V5a3 3 0 00-3-3zM4.3 11a1 1 0 100 2 7.7 7.7 0 0014.7 0 1 1 0 100-2 9.7 9.7 0 01-14.7 0zm6.7 8v2a1 1 0 102 0v-2a1 1 0 10-2 0z"/>
         </svg>
@@ -662,9 +657,9 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           基于 HTML5 Canvas 构建的 60fps 三色平滑正弦声波。支持流体算法插值，线条的振幅和速度会随着实际输入音频分贝实时平滑波动。
         </div>
         <div class="card-actions">
-          <button class="action-btn active" id="btn-siri-sim" onclick="setSiriMode('simulate')">模拟说话中</button>
-          <button class="action-btn" id="btn-siri-quiet" onclick="setSiriMode('quiet')">模拟静音</button>
-          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-siri" onclick="applyTheme('siri')" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
+          <button class="action-btn active" id="btn-siri-sim">模拟说话中</button>
+          <button class="action-btn" id="btn-siri-quiet">模拟静音</button>
+          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-siri" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
         </div>
       </div>
 
@@ -695,9 +690,9 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
           一个融合了频段均衡器（Equalizer Bars）与高维运动环境粒子流（Environment Particles）的动效。连入真实麦克风后能直观地看到环境粒子流在您的音浪中呼啸！
         </div>
         <div class="card-actions">
-          <button class="action-btn active" id="btn-eq-sim" onclick="setEqMode('simulate')">模拟高频波动</button>
-          <button class="action-btn" id="btn-eq-quiet" onclick="setEqMode('quiet')">模拟平静</button>
-          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-vortex" onclick="applyTheme('vortex')" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
+          <button class="action-btn active" id="btn-eq-sim">模拟高频波动</button>
+          <button class="action-btn" id="btn-eq-quiet">模拟平静</button>
+          <button class="action-btn action-btn-primary apply-theme-btn" id="btn-apply-vortex" style="margin-left:auto;background:var(--color-primary);color:#fff;border-radius:6px;font-weight:600;padding:0.4rem 0.8rem;transition:all 0.3s;border:none;cursor:pointer;">应用此主题</button>
         </div>
       </div>
 
@@ -705,7 +700,7 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
 
   </div>
 
-  <script>
+  <script nonce="${cspNonce}">
     // Audio State
     let audioContext = null;
     let analyser = null;
@@ -1353,6 +1348,14 @@ export function getVisualizerHtml(isHudModeStatic: boolean = false, hudTheme: st
     if (!isHudMode) {
       checkActiveTheme();
     }
+
+    document.getElementById('btn-connect-mic')?.addEventListener('click', toggleMicrophone);
+    document.getElementById('btn-siri-sim')?.addEventListener('click', () => setSiriMode('simulate'));
+    document.getElementById('btn-siri-quiet')?.addEventListener('click', () => setSiriMode('quiet'));
+    document.getElementById('btn-apply-siri')?.addEventListener('click', () => applyTheme('siri'));
+    document.getElementById('btn-eq-sim')?.addEventListener('click', () => setEqMode('simulate'));
+    document.getElementById('btn-eq-quiet')?.addEventListener('click', () => setEqMode('quiet'));
+    document.getElementById('btn-apply-vortex')?.addEventListener('click', () => applyTheme('vortex'));
 
     // Run animation on load
     animate();

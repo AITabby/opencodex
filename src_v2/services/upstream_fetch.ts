@@ -1,4 +1,5 @@
 import { Agent, fetch as undiciFetch, setGlobalDispatcher } from "undici";
+import { redactSensitiveText, safeErrorMessage } from "../server/privacy.js";
 
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -93,11 +94,11 @@ export function upstreamErrorDetails(error: unknown): {
   const raw = error as any;
   const cause = errorCause(error);
   return {
-    message: String(raw?.message || cause?.message || error || "unknown error"),
+    message: safeErrorMessage(raw?.message || cause?.message || error || "unknown error"),
     code: typeof cause?.code === "string" ? cause.code : undefined,
     syscall: typeof cause?.syscall === "string" ? cause.syscall : undefined,
     hostname: typeof cause?.hostname === "string" ? cause.hostname : undefined,
-    cause: typeof cause?.message === "string" && cause !== raw ? cause.message : undefined,
+    cause: typeof cause?.message === "string" && cause !== raw ? safeErrorMessage(cause.message) : undefined,
   };
 }
 
@@ -144,7 +145,7 @@ function sleep(ms: number): Promise<void> {
 export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOptions = {}): Promise<Response> {
   const target = new URL(rawTarget).toString();
   const displayTarget = safeTarget(target);
-  const operation = options.operation || "upstream request";
+  const operation = redactSensitiveText(options.operation || "upstream request", 120);
   const maxAttempts = Math.max(1, Math.min(3, Math.floor(options.maxAttempts ?? DEFAULT_ATTEMPTS)));
   const timeoutMs = Math.max(1_000, options.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
   const retryDelayMs = Math.max(0, options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS);

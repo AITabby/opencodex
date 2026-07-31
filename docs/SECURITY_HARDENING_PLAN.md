@@ -2,8 +2,7 @@
 
 Date: 2026-07-31
 
-Status: P0 and P1 implemented in the current working tree on 2026-07-31. P2
-remains planned work.
+Status: P0, P1, and P2 implemented in the current working tree on 2026-07-31.
 
 P0 verification evidence:
 
@@ -48,6 +47,31 @@ P1 verification evidence:
 - A default-profile runtime smoke test returned `200` for health and
   Dashboard, then stopped cleanly with no listener on port `8765` and no
   remaining gateway lock file.
+
+P2 verification evidence:
+
+- `npm run build:all` passed on Windows. The TypeScript gateway compiled and
+  the macOS-only OpenCodexBar build was skipped as designed.
+- `npm test` passed 95/95, including 10 P2-specific privacy and
+  defense-in-depth tests.
+- `npm audit --omit=dev --audit-level=low` reported 0 known production
+  dependency vulnerabilities.
+- An isolated built-gateway probe verified nonce-matched CSP headers,
+  `nosniff`, no-referrer, frame denial, route-specific `413` handling, and
+  deletion of the exact private runtime directory after shutdown.
+- Tests prove request decompression fails closed above the route limit,
+  concurrency and per-minute ceilings release correctly, and failed gateway
+  startup also removes its private runtime directory.
+- Dashboard and visualizer HTML contain no remote icon or font dependencies.
+  Imported remote session images remain inert until the user clicks the load
+  control; the resulting request uses a no-referrer policy.
+- Voice helper scripts and audio use random per-process directories and UUID
+  filenames. Node creates `0700` directories and `0600` files on POSIX;
+  OpenCodexBar applies the same permissions and cleans the directory on exit.
+- Runtime Python package requirements are pinned to
+  [`edge-tts==7.2.8`](https://pypi.org/project/edge-tts/),
+  [`openai-whisper==20250625`](https://pypi.org/project/openai-whisper/), and
+  [`silero-vad==6.2.1`](https://pypi.org/project/silero-vad/).
 
 Remaining acceptance: the macOS Keychain and Swift source changes still need
 a macOS build plus a physical voice capture/STT/model-output regression. The
@@ -168,7 +192,7 @@ must never be used as upstream credentials.
 Windows secrets must use Credential Manager or DPAPI. macOS continues to use
 Keychain. No platform may silently fall back to plaintext credentials.
 
-## P2 - privacy and defense in depth
+## P2 - privacy and defense in depth (implemented)
 
 - Remove raw tool arguments, voice text, prompt content, and upstream bodies
   from persistent logs.
@@ -183,6 +207,27 @@ Keychain. No platform may silently fall back to plaintext credentials.
 - Do not load remote images from imported sessions without explicit user
   action.
 - Add route-specific size, concurrency, and rate limits.
+
+### P2 route budgets
+
+| Route family | Body limit | Requests/minute | Concurrent |
+| --- | ---: | ---: | ---: |
+| Session import | 36 MiB | 6 | 1 |
+| Voice STT | 16 MiB | 30 | 2 |
+| Voice TTS | 512 KiB | 90 | 3 |
+| Voice prompt injection | 256 KiB | 60 | 2 |
+| Provider connectivity test | 1 MiB | 20 | 2 |
+| Mobile message | 512 KiB | 60 | 4 |
+| Responses / Realtime HTTP | 24 MiB | 120 | 8 |
+| Other administrator writes | 2 MiB | 90 | 8 |
+
+WebSocket upgrades have separate budgets: voice allows 30 upgrades per minute
+and 2 concurrent connections; Realtime allows 60 and 8; Responses attempts
+allow 30 and 4 before the transport-specific response is returned.
+
+Authentication runs before protected-route budget accounting, so an
+unauthenticated local process cannot consume the legitimate client's rate or
+concurrency allowance.
 
 ## P0 regression requirements
 
@@ -214,3 +259,7 @@ P0 is source-complete only when:
 The OpenCodexBar change additionally requires a macOS Swift build and a real
 voice capture/STT/model-output regression. Windows source verification cannot
 substitute for that macOS acceptance layer.
+
+P2 does not change that platform boundary: the Node gateway is source- and
+runtime-verified on Windows, while the new Swift private-runtime behavior still
+requires the macOS build and physical voice regression above.

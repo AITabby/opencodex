@@ -7,12 +7,12 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { GatewayRouter } from "./router.js";
 import { CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
-import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_sync.js";
+import { CatalogSyncService, applyProviderModelMetadata, buildFullCatalogEntry } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
@@ -35,9 +35,59 @@ import {
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
+import { PrivateRuntimeDirectory, VOICE_RUNTIME_PACKAGES } from "./private_runtime.js";
+import { LocalRequestGuard, requestPolicyForHttp, requestPolicyForWebSocket } from "./request_limits.js";
+import { redactLogLine, safeErrorMessage } from "./privacy.js";
+import {
+  DEEPSEEK_API_BASE_URL,
+  DEEPSEEK_RESPONSES_MODELS,
+  effectiveDeepSeekBaseUrl,
+  isDeepSeekProvider,
+  isDeepSeekResponsesModel,
+  selectDeepSeekResponsesModels,
+} from "../providers/deepseek.js";
+import { probeDeepSeekResponsesModels } from "./native_responses.js";
 
-const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
+
+// Matches opencodex managed blocks written by any version, including legacy
+// blocks whose closer was mistakenly written as "# <<< opencodex managed >>>".
+const MANAGED_CONFIG_BLOCK_RE = /# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed [<>]{3}\r?\n?/gi;
+
+export function buildContentSecurityPolicy(nonce: string): string {
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    `script-src 'nonce-${nonce}'`,
+    "script-src-attr 'none'",
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self'",
+    "connect-src 'self'",
+    "media-src 'self' data: blob:",
+    "img-src 'self' data: https: http:",
+    "worker-src 'none'",
+  ].join("; ");
+}
+
+function tomlBasicString(value: string): string {
+  return JSON.stringify(value);
+}
+
+function codexConfigPath(): string {
+  const override = process.env.OPENCODEX_CODEX_CONFIG_PATH?.trim();
+  return override ? path.resolve(override) : path.join(os.homedir(), ".codex", "config.toml");
+}
+
+export function ensureManagedCatalogConfig(content: string, catalogPath: string): string {
+  if (content.includes("opencodex managed")) return content;
+  const managedBlock = `# >>> opencodex managed >>>\nmodel_catalog_json = ${tomlBasicString(catalogPath)}\n# <<< opencodex managed <<<\n`;
+  // Root-level TOML keys must be written before the first table. Appending the
+  // block would place model_catalog_json inside whichever table ends the file.
+  return `${managedBlock}\n${content.trimStart()}`;
+}
 
 export function buildManagedCodexConfig(
   content: string,
@@ -46,10 +96,11 @@ export function buildManagedCodexConfig(
   catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
 ): string {
   const preserved = content
-    .replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "")
+    .replace(MANAGED_CONFIG_BLOCK_RE, "")
     .trim();
-  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed >>>\n`;
-  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${gatewayToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
+  catalogPath = JSON.stringify(catalogPath).slice(1, -1);
+  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed <<<\n`;
+  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${gatewayToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed <<<\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
 
@@ -461,6 +512,7 @@ export function upsertProviderCatalogModel(
     owned.model = canonicalSlug;
     owned.backend_model = backend;
     owned.display_name = providerDisplayName(owner, canonicalSlug);
+    applyProviderModelMetadata(owned, owner, backend);
     return;
   }
 
@@ -470,7 +522,7 @@ export function upsertProviderCatalogModel(
   const catalogSlug = usedSlugs.has(canonicalSlug.toLowerCase())
     ? scopedCatalogSlug(owner, slug, usedSlugs)
     : canonicalSlug;
-  const entry = buildFullCatalogEntry(catalogSlug, owner);
+  const entry = buildFullCatalogEntry(catalogSlug, owner, undefined, backend);
   entry.backend_model = backend;
   entry.display_name = providerDisplayName(owner, catalogSlug);
   catalog.models.push(entry);
@@ -511,14 +563,14 @@ export function preserveOfficialModels(catalog: any): void {
       ? scopedCatalogSlug(owner, rawSlug, usedSlugs)
       : canonical;
     const backendModel = String(model.backend_model || rawSlug).trim();
-    const moved = {
+    const moved = applyProviderModelMetadata({
       ...model,
       slug: alias,
       model: alias,
       backend_provider: owner,
       backend_model: backendModel,
       display_name: providerDisplayName(owner, alias)
-    };
+    }, owner, backendModel);
     usedSlugs.add(alias.toLowerCase());
     thirdParty.push(moved);
   }
@@ -608,13 +660,6 @@ function readLogTail(filePath: string, maxBytes = 256 * 1024): string[] {
   }
 }
 
-function redactLogLine(line: string): string {
-  return line
-    .replace(/(authorization\s*:\s*bearer\s+)[^\s,]+/gi, "$1[REDACTED]")
-    .replace(/(api[_-]?key\s*[=:]\s*)[^\s,]+/gi, "$1[REDACTED]")
-    .replace(/(sk-[A-Za-z0-9_-]{12,}|gsk_[A-Za-z0-9_-]{12,})/g, "[REDACTED]");
-}
-
 function isGatewayReasoningItem(record: any): boolean {
   const payload = record?.type === "response_item" ? record.payload : record;
   if (!payload || payload.type !== "reasoning") return false;
@@ -679,7 +724,7 @@ function repairNativeRollouts(): number {
       fs.writeFileSync(rolloutPath, `${sanitized.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf-8");
       repaired++;
     } catch (error: any) {
-      console.error(`[OpenCodex V2] Could not repair native rollout ${rolloutPath}: ${error.message}`);
+      console.error(`[OpenCodex V2] Could not repair native rollout id=${path.basename(rolloutPath)}: ${safeErrorMessage(error)}`);
     }
   }
 
@@ -700,18 +745,22 @@ export class CodexBridgeServer {
   public config: any = { providers: [] };
   private readonly dataDir: string;
   private readonly tokenStore: CapabilityTokenStore;
+  private readonly runtimeFiles: PrivateRuntimeDirectory;
+  private readonly requestGuard = new LocalRequestGuard();
   private capabilityTokens: CapabilityTokens;
   private previousCapabilityTokens = new Map<GatewayCapability, { token: string; expiresAt: number }>();
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
+  private stopping = false;
 
   constructor(port = 8765) {
     this.port = port;
     this.dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex");
     this.tokenStore = new CapabilityTokenStore(this.dataDir);
     this.capabilityTokens = this.tokenStore.snapshot();
+    this.runtimeFiles = new PrivateRuntimeDirectory("opencodex-gateway");
     this.config.providers = CredentialStore.loadProviders();
   }
 
@@ -1052,27 +1101,37 @@ export class CodexBridgeServer {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
-      const MAX_BYTES = MAX_REQUEST_BYTES;
+      let settled = false;
+      const pathname = new URL(req.url || "/", `http://127.0.0.1:${this.port}`).pathname;
+      const maxBytes = requestPolicyForHttp(req.method, pathname).bodyLimitBytes;
       req.on("data", (chunk: Buffer) => {
+        if (settled) return;
         bytes += chunk.length;
-        if (bytes > MAX_BYTES) {
-          req.destroy();
+        if (bytes > maxBytes) {
+          settled = true;
           reject(new Error("Request body exceeds limit"));
           return;
         }
         chunks.push(chunk);
       });
       req.on("end", () => {
+        if (settled) return;
         const rawBuffer = Buffer.concat(chunks);
         const contentEncoding = req.headers["content-encoding"] as string | null;
         try {
-          const decompressed = RequestDecompressor.decompressBody(rawBuffer, contentEncoding);
+          const decompressed = RequestDecompressor.decompressBody(rawBuffer, contentEncoding, maxBytes);
+          settled = true;
           resolve(decompressed);
-        } catch {
-          resolve(rawBuffer);
+        } catch (error) {
+          settled = true;
+          reject(error);
         }
       });
-      req.on("error", reject);
+      req.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
     });
   }
 
@@ -1080,28 +1139,38 @@ export class CodexBridgeServer {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
-      const MAX_BYTES = MAX_REQUEST_BYTES;
+      let settled = false;
+      const pathname = new URL(req.url || "/", `http://127.0.0.1:${this.port}`).pathname;
+      const maxBytes = requestPolicyForHttp(req.method, pathname).bodyLimitBytes;
       req.on("data", (chunk: Buffer) => {
+        if (settled) return;
         bytes += chunk.length;
-        if (bytes > MAX_BYTES) {
-          req.destroy();
+        if (bytes > maxBytes) {
+          settled = true;
           reject(new Error("Request body exceeds limit"));
           return;
         }
         chunks.push(chunk);
       });
       req.on("end", () => {
+        if (settled) return;
         try {
           const rawBuffer = Buffer.concat(chunks);
           const contentEncoding = req.headers["content-encoding"] as string | null;
-          const decompressed = RequestDecompressor.decompressBody(rawBuffer, contentEncoding);
+          const decompressed = RequestDecompressor.decompressBody(rawBuffer, contentEncoding, maxBytes);
           const str = decompressed.toString("utf-8");
+          settled = true;
           resolve(str ? JSON.parse(str) : {});
-        } catch (err) {
-          reject(new Error("Invalid JSON body"));
+        } catch (error: any) {
+          settled = true;
+          reject(new Error(error?.message?.includes("limit") ? error.message : "Invalid JSON body"));
         }
       });
-      req.on("error", reject);
+      req.on("error", (error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
     });
   }
 
@@ -1188,15 +1257,23 @@ export class CodexBridgeServer {
   private findCatalogProtocol(rawModelName: string, provider: ProviderConfig): string {
     const matches = this.findCatalogMatches(rawModelName);
     const owned = matches.find((entry) => catalogModelOwner(entry));
-    const explicit = String(owned?.protocol || owned?.backend_protocol || "").trim().toLowerCase();
+    const providerId = String(provider.preset_id || provider.name || "").toLowerCase();
+    const model = String(owned?.backend_model || owned?.model || rawModelName || "").toLowerCase();
+
+    // Both current DeepSeek V4 models are deliberately pinned to the native
+    // Responses route. This rule also repairs older catalog entries that were
+    // imported before backend_protocol metadata existed.
+    if (isDeepSeekProvider(provider.name, provider.preset_id) && isDeepSeekResponsesModel(model)) {
+      return "responses";
+    }
+
+    const explicit = String(owned?.protocol || owned?.backend_protocol || provider.protocol || "").trim().toLowerCase();
     if (explicit) return explicit;
 
     // OpenCode Go publishes some models through Anthropic Messages and the
     // rest through OpenAI Chat Completions. The provider's single base URL is
     // not enough to infer this, so keep the routing rule next to catalog
     // ownership instead of sending every model to `/chat/completions`.
-    const providerId = String(provider.preset_id || provider.name || "").toLowerCase();
-    const model = String(owned?.backend_model || owned?.model || rawModelName || "").toLowerCase();
     if (providerId === "opencode-go" || providerId === "opencode") {
       if (/^(qwen|qwen3|minimax-m)/.test(model)) return "anthropic";
     }
@@ -1292,7 +1369,7 @@ export class CodexBridgeServer {
       if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
-          error: err.message,
+          error: safeErrorMessage(err),
           type: "upstream_unreachable",
           retryable: Boolean(err?.retryable),
           attempts: err?.attempts,
@@ -1480,23 +1557,23 @@ def main():
         except Exception as e:
             print(json.dumps({"error": str(e)}), flush=True)
 
-if __name__ == "__main__":
+    if __name__ == "__main__":
     main()`;
 
     try {
-      fs.writeFileSync("/tmp/ocb_minimax_tts.py", minimaxScript, "utf-8");
-      fs.writeFileSync("/tmp/ocb_transcribe.py", transcribeScript, "utf-8");
-      fs.writeFileSync("/tmp/ocb_silero_vad_daemon.py", sileroVadScript, "utf-8");
-      console.log("[OpenCodex] Written helper python scripts to /tmp successfully.");
+      this.runtimeFiles.writePrivateFile(this.runtimeFiles.fixedFile("ocb_minimax_tts.py"), minimaxScript);
+      this.runtimeFiles.writePrivateFile(this.runtimeFiles.fixedFile("ocb_transcribe.py"), transcribeScript);
+      this.runtimeFiles.writePrivateFile(this.runtimeFiles.fixedFile("ocb_silero_vad_daemon.py"), sileroVadScript);
+      console.log("[OpenCodex] Prepared private per-run voice helpers.");
     } catch (err: any) {
-      console.error("[OpenCodex] Failed to write helper python scripts: " + err.message);
+      console.error("[OpenCodex] Failed to prepare private voice helpers: " + safeErrorMessage(err));
     }
   }
 
   private vadProcess: any = null;
   private vadStdoutBuffer: string = "";
   private vadCallbackQueue: ((value: any) => void)[] = [];
-  private readonly useEnergyVAD = process.env.OPENCODEX_VOICE_ENERGY_VAD === "1" || Boolean(process.env.OPENCODEX_VOICE_RUNTIME_DIR);
+  private useEnergyVAD = process.env.OPENCODEX_VOICE_ENERGY_VAD === "1" || Boolean(process.env.OPENCODEX_VOICE_RUNTIME_DIR);
   private currentSystemUtterance: string = "";
   private voiceSessionThreadIds = new Map<string, string>();
   // Native voice responses are observed through one shared CDP connection.
@@ -1513,10 +1590,11 @@ if __name__ == "__main__":
   private startVADDaemon() {
     if (this.vadProcess) return;
 
-    const scriptPath = "/tmp/ocb_silero_vad_daemon.py";
-    console.error(`[OpenCodex VAD] Starting persistent VAD daemon from: ${scriptPath}`);
+    const scriptPath = this.runtimeFiles.fixedFile("ocb_silero_vad_daemon.py");
+    const uvxPath = resolveRuntimeBinary("uvx");
+    console.error("[OpenCodex VAD] Starting pinned private VAD runtime.");
 
-    this.vadProcess = spawn("python3", [scriptPath]);
+    this.vadProcess = spawn(uvxPath, ["--with", VOICE_RUNTIME_PACKAGES.sileroVad, "python3", scriptPath]);
     this.vadStdoutBuffer = "";
     this.vadCallbackQueue = [];
 
@@ -1542,13 +1620,20 @@ if __name__ == "__main__":
           const cb = this.vadCallbackQueue.shift();
           if (cb) cb(res);
         } catch (e: any) {
-          console.error(`[OpenCodex VAD Daemon Parse Error] ${e.message} for line: ${trimmed}`);
+          console.error(`[OpenCodex VAD Daemon Parse Error] ${safeErrorMessage(e)}`);
         }
       }
     });
 
     this.vadProcess.stderr.on("data", (data: Buffer) => {
-      console.error(`[OpenCodex VAD Daemon Stderr] ${data.toString().trim()}`);
+      console.error(`[OpenCodex VAD Daemon Stderr] ${safeErrorMessage(data.toString())}`);
+    });
+
+    this.vadProcess.on("error", (error: Error) => {
+      console.error(`[OpenCodex VAD] Pinned runtime unavailable; energy VAD remains active: ${safeErrorMessage(error)}`);
+      this.useEnergyVAD = true;
+      this.vadProcess = null;
+      this.vadCallbackQueue.splice(0).forEach((callback) => callback({ error: "VAD runtime unavailable" }));
     });
 
     this.vadProcess.on("close", (code: number) => {
@@ -1658,7 +1743,7 @@ if __name__ == "__main__":
       this.antigravityModelFetchError = "Antigravity 实时模型目录返回成功，但没有可用模型";
     } catch (err: any) {
       this.antigravityModelFetchError = `Antigravity 模型目录请求异常：${err?.message || "未知错误"}`;
-      console.error("[OpenCodex] Dynamic Antigravity model fetch failed:", err?.message);
+      console.error(`[OpenCodex] Dynamic Antigravity model fetch failed: ${safeErrorMessage(err)}`);
     }
 
     // Do not manufacture subscription models when the live catalog request
@@ -1704,7 +1789,7 @@ if __name__ == "__main__":
         }
       }
     } catch (err: any) {
-      console.error("[OpenCodex] Dynamic Grok model fetch failed:", err?.message);
+      console.error(`[OpenCodex] Dynamic Grok model fetch failed: ${safeErrorMessage(err)}`);
     }
     return [];
   }
@@ -1757,7 +1842,7 @@ if __name__ == "__main__":
             : `Claude 模型目录请求失败（HTTP ${res.status}）`;
       }
     } catch (err: any) {
-      console.error("[OpenCodex] Dynamic Claude model fetch failed:", err?.message);
+      console.error(`[OpenCodex] Dynamic Claude model fetch failed: ${safeErrorMessage(err)}`);
       this.claudeModelFetchError = "Claude 模型目录请求异常，请稍后重试";
     }
     return [];
@@ -1775,7 +1860,7 @@ if __name__ == "__main__":
       result = await fetchCursorModels(token, getCursorClientVersion(), AbortSignal.timeout(15000));
       return result;
     } catch (err: any) {
-      console.error("[OpenCodex] Dynamic Cursor model fetch failed:", err?.message);
+      console.error(`[OpenCodex] Dynamic Cursor model fetch failed: ${safeErrorMessage(err)}`);
     }
     return [];
   }
@@ -1785,14 +1870,20 @@ if __name__ == "__main__":
     if (overridePort && typeof overridePort === "number") {
       this.port = overridePort;
     }
-    this.acquireServerLock();
+    try {
+      this.acquireServerLock();
+    } catch (error) {
+      this.runtimeFiles.cleanup();
+      throw error;
+    }
     try {
       this.ensurePythonScripts();
     } catch (error) {
       this.releaseServerLock();
+      this.runtimeFiles.cleanup();
       throw error;
     }
-    const configPath = path.join(os.homedir(), ".codex", "config.toml");
+    const configPath = codexConfigPath();
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
     // Native mode deliberately leaves the imported catalog untouched. In
@@ -1807,7 +1898,7 @@ if __name__ == "__main__":
         }
         CatalogSyncService.syncCustomModelsToCodexCache();
       } catch (err: any) {
-        console.warn(`[OpenCodex Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
+        console.warn(`[OpenCodex Gateway] Could not synchronize managed Codex config: ${safeErrorMessage(err)}`);
       }
       const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
       let catalog: any = { models: [] };
@@ -1826,16 +1917,20 @@ if __name__ == "__main__":
         } catch (err: any) {
           // A read-only test/container home must not prevent the gateway from
           // starting. The next writable start will persist the repair.
-          console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
+          console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${safeErrorMessage(err)}`);
         }
       }
     }
     return new Promise(async (resolve, reject) => {
+      let listening = false;
       this.server = http.createServer(async (req, res) => {
+        const cspNonce = randomBytes(18).toString("base64");
         res.setHeader("X-Content-Type-Options", "nosniff");
         res.setHeader("Referrer-Policy", "no-referrer");
         res.setHeader("X-Frame-Options", "DENY");
-        res.setHeader("Content-Security-Policy", "frame-ancestors 'none'");
+        res.setHeader("Content-Security-Policy", buildContentSecurityPolicy(cspNonce));
+        res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
+        res.setHeader("Permissions-Policy", "camera=(), geolocation=(), microphone=(self)");
 
         if (!isAllowedGatewayHost(req.headers.host, this.port)) {
           res.writeHead(421, {
@@ -1870,20 +1965,56 @@ if __name__ == "__main__":
           return;
         }
 
+        // Authenticate sensitive namespaces before accounting them against
+        // route budgets. An unauthenticated local process must not be able to
+        // exhaust the legitimate client's rate or concurrency allowance.
+        if (isProtectedGatewayPath(url.pathname)) {
+          const requiredCapabilities = requiredCapabilitiesForHttp(req.method, url.pathname);
+          if (!this.requireCapabilities(req, res, requiredCapabilities)) return;
+        }
+
+        const requestPolicy = requestPolicyForHttp(req.method, url.pathname);
+        const contentLengthHeader = req.headers["content-length"];
+        const contentLengthText = Array.isArray(contentLengthHeader) ? "invalid" : contentLengthHeader;
+        if (contentLengthText !== undefined) {
+          const contentLength = Number(contentLengthText);
+          if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
+            res.writeHead(400, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ error: "Invalid Content-Length" }));
+            return;
+          }
+          if (contentLength > requestPolicy.bodyLimitBytes) {
+            res.writeHead(413, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({
+              error: "Request body exceeds the route limit",
+              max_bytes: requestPolicy.bodyLimitBytes,
+            }));
+            return;
+          }
+        }
+
+        const guardDecision = this.requestGuard.acquire(requestPolicy);
+        if (!guardDecision.allowed) {
+          res.writeHead(429, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            "Retry-After": String(guardDecision.retryAfterSeconds),
+          });
+          res.end(JSON.stringify({
+            error: guardDecision.reason === "concurrency"
+              ? "Too many concurrent requests for this route"
+              : "Local route rate limit exceeded",
+          }));
+          return;
+        }
+        res.once("finish", guardDecision.release);
+        res.once("close", guardDecision.release);
+
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.5", opencodex: true }));
           return;
-        }
-
-        // The dashboard and the bundled visualizer establish a same-origin,
-        // HttpOnly admin cookie. Native voice/mobile clients use the same
-        // token through Authorization: Bearer. Keep every local-data and
-        // process-control API behind that boundary.
-        if (isProtectedGatewayPath(url.pathname)) {
-          const requiredCapabilities = requiredCapabilitiesForHttp(req.method, url.pathname);
-          if (!this.requireCapabilities(req, res, requiredCapabilities)) return;
         }
 
         // Native OpenAI Realtime / Audio / Voice transparent HTTP proxy
@@ -1941,7 +2072,7 @@ if __name__ == "__main__":
             if (!res.headersSent) {
               res.writeHead(502, { "Content-Type": "application/json" });
               res.end(JSON.stringify({
-                error: err.message,
+                error: safeErrorMessage(err),
                 type: "upstream_unreachable",
                 retryable: Boolean(err?.retryable),
                 attempts: err?.attempts,
@@ -1955,8 +2086,11 @@ if __name__ == "__main__":
         if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/dashboard")) {
           const { getDashboardHtml } = await import("../services/dashboard.js");
           this.issueAdminCookie(res);
-          res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-          res.end(getDashboardHtml());
+          res.writeHead(200, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+          });
+          res.end(getDashboardHtml(cspNonce));
           return;
         }
 
@@ -2000,7 +2134,7 @@ if __name__ == "__main__":
             let warning = "";
             if (capability === "gateway") {
               try {
-                const configPath = path.join(os.homedir(), ".codex", "config.toml");
+                const configPath = codexConfigPath();
                 const content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : "";
                 if (content.includes("opencodex managed")) {
                   const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
@@ -2033,7 +2167,7 @@ if __name__ == "__main__":
                 "Content-Type": "application/json",
                 "Cache-Control": "no-store",
               });
-              res.end(JSON.stringify({ error: error?.message || String(error) }));
+              res.end(JSON.stringify({ error: safeErrorMessage(error) }));
             }
           }
           return;
@@ -2069,7 +2203,7 @@ if __name__ == "__main__":
             if (liveWorkModel && body.model !== liveWorkModel) {
               console.log(`[OpenCodex Realtime] Applied selected Live work model: ${body.model || "(default)"} -> ${liveWorkModel}`);
             }
-            console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
+            console.log(`[CodexBridge V2] Responses request accepted model=${String(effectiveBody.model || "default")} fields=${Object.keys(effectiveBody).length}`);
             const rawRequestedModel = effectiveBody.model || "deepseek-v4-pro";
             const requestedModel = this.stripReasoningSuffix(rawRequestedModel);
             const providers = CredentialStore.loadProviders();
@@ -2090,18 +2224,21 @@ if __name__ == "__main__":
             }
 
             const apiKey = CredentialStore.resolveApiKey(provider);
-            const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
+            const configuredUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
             const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
             const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
-            const protocol = effectiveBody.protocol || this.findCatalogProtocol(requestedModel, provider);
+            const catalogProtocol = this.findCatalogProtocol(requestedModel, provider);
+            const protocol = catalogProtocol || effectiveBody.protocol;
             const routingBody = protocol ? { ...effectiveBody, protocol } : effectiveBody;
-            const providerUrl = rawUrl;
+            const providerUrl = protocol === "responses"
+              ? effectiveDeepSeekBaseUrl(provider.name, provider.preset_id, configuredUrl)
+              : configuredUrl;
 
             await this.router.handleResponses(routingBody, upstreamModel, apiKey, providerUrl, res, provider.name);
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: err.message }));
+              res.end(JSON.stringify({ error: safeErrorMessage(err) }));
             }
           }
           return;
@@ -2109,7 +2246,7 @@ if __name__ == "__main__":
 
         // 3. Dashboard REST API Routes
         if (req.method === "GET" && url.pathname === "/api/gateway/status") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let active = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -2145,7 +2282,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ enabled: body.enabled }));
           } catch (err: any) {
             res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2158,7 +2295,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify(result));
           } catch (err: any) {
             res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2171,7 +2308,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify(result));
           } catch (err: any) {
             res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2185,7 +2322,14 @@ if __name__ == "__main__":
 
         if (req.method === "GET" && url.pathname === "/api/providers/presets") {
           const presets = [
-            { id: "deepseek", label: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com/v1", iconSlug: "deepseek", models: [{ id: "deepseek-chat" }, { id: "deepseek-reasoner" }] },
+            {
+              id: "deepseek",
+              label: "DeepSeek",
+              defaultBaseUrl: DEEPSEEK_API_BASE_URL,
+              protocol: "responses",
+              iconSlug: "deepseek",
+              models: DEEPSEEK_RESPONSES_MODELS.map((id) => ({ id })),
+            },
             { id: "qwen", label: "通义千问 (Qwen)", defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", iconSlug: "qwen", models: [{ id: "qwen-max" }, { id: "qwen-plus" }] },
             { id: "minimax", label: "MiniMax", defaultBaseUrl: "https://api.minimaxi.com/v1", iconSlug: "minimax", models: [{ id: "minimax-m3" }] },
             { id: "kimi", label: "Kimi (Moonshot)", defaultBaseUrl: "https://api.moonshot.cn/v1", iconSlug: "kimi", models: [{ id: "moonshot-v1-8k" }] },
@@ -2201,7 +2345,7 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/providers") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let isGatewayActive = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -2259,7 +2403,13 @@ if __name__ == "__main__":
 
             const status = hasActiveModel || hasApiKey ? "configured" : "not_configured";
 
-            const { api_key: _apiKey, api_key_env: _apiKeyEnv, refresh_token: _refreshToken, ...safeProvider } = p;
+            const {
+              api_key: _apiKey,
+              api_key_env: _apiKeyEnv,
+              refresh_token: _refreshToken,
+              credential_ref: _credentialReference,
+              ...safeProvider
+            } = p;
             return {
               ...safeProvider,
               models: effectiveModels,
@@ -2267,7 +2417,9 @@ if __name__ == "__main__":
               api_key_configured: hasApiKey,
               status,
               test_status: p.last_test_status || "untested",
-              credential_storage: hasApiKey ? (p.credential_ref ? "keychain" : "local-secure-store") : "none",
+              credential_storage: hasApiKey
+                ? (p.credential_ref ? CredentialStore.credentialStorage(p.credential_ref) : (p.api_key_env ? "environment" : "legacy"))
+                : "none",
               active_models: effectiveModels.map((m: string) => {
                 const raw = String(m);
                 const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
@@ -2291,7 +2443,14 @@ if __name__ == "__main__":
             const body = await this.parseJsonBody(req);
             const requestedProviderName = String(body.name || body.preset_id || "custom").trim().toLowerCase();
             const presetId = String(body.preset_id || requestedProviderName).trim().toLowerCase();
-            const baseUrl = String(body.base_url || "").trim();
+            const requestedBaseUrl = String(body.base_url || "").trim();
+            const baseUrl = effectiveDeepSeekBaseUrl(requestedProviderName, presetId, requestedBaseUrl);
+            const requestedProtocol = String(body.protocol || "").trim().toLowerCase();
+            const providerProtocol: ProviderConfig["protocol"] = isDeepSeekProvider(requestedProviderName, presetId)
+              ? "responses"
+              : (["responses", "openai", "anthropic", "google", "gemini"].includes(requestedProtocol)
+                ? requestedProtocol as ProviderConfig["protocol"]
+                : undefined);
             const apiKey = String(body.api_key || "").trim();
             const selectedModels: string[] = Array.isArray(body.selected_models) ? body.selected_models : [];
 
@@ -2316,12 +2475,20 @@ if __name__ == "__main__":
               }
             }
             if (!provider) {
-              provider = { name: resolvedProviderName, preset_id: presetId, baseUrl, models: selectedModels };
+              provider = {
+                name: resolvedProviderName,
+                preset_id: presetId,
+                baseUrl,
+                models: selectedModels,
+                ...(providerProtocol ? { protocol: providerProtocol } : {}),
+              };
               providers.push(provider);
             } else {
               provider.baseUrl = baseUrl || provider.baseUrl;
               provider.name = resolvedProviderName;
               provider.preset_id = presetId;
+              if (providerProtocol) provider.protocol = providerProtocol;
+              else delete provider.protocol;
               // The dashboard sends the complete current list. Replace the
               // stored list so removals and edits are reflected on reopen.
               provider.models = Array.from(new Set(selectedModels));
@@ -2333,7 +2500,7 @@ if __name__ == "__main__":
             delete provider.last_test_message;
 
             if (apiKey) {
-              CredentialStore.setApiKey(resolvedProviderName, apiKey);
+              CredentialStore.setApiKey(provider, apiKey);
             }
             CredentialStore.saveProviders(providers);
 
@@ -2385,12 +2552,11 @@ if __name__ == "__main__":
               fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
               // Ensure opencodex managed block is enabled in config.toml
-              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              const configPath = codexConfigPath();
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
                 if (!content.includes("opencodex managed")) {
-                  const managedBlock = `\n# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\n# <<< opencodex managed <<<\n`;
-                  fs.writeFileSync(configPath, content + managedBlock, "utf-8");
+                  fs.writeFileSync(configPath, ensureManagedCatalogConfig(content, catalogPath), "utf-8");
                 }
               }
             }
@@ -2399,13 +2565,13 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", provider }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
 
         if (req.method === "GET" && url.pathname === "/api/cli-bridge/status") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let isGatewayActive = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -2519,12 +2685,11 @@ if __name__ == "__main__":
             fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
             // Also ensure opencodex block is enabled in config.toml
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
               if (!content.includes("opencodex managed")) {
-                const managedBlock = `\n# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\n# <<< opencodex managed <<<\n`;
-                fs.writeFileSync(configPath, content + managedBlock, "utf-8");
+                fs.writeFileSync(configPath, ensureManagedCatalogConfig(content, catalogPath), "utf-8");
               }
             }
 
@@ -2534,7 +2699,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", cli }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2556,8 +2721,9 @@ if __name__ == "__main__":
               res.end(JSON.stringify({ status, message }));
             };
 
+            let found: ProviderConfig | undefined;
             try {
-              const found = CredentialStore.loadProviders().find((p: any) => p.name === providerName || p.preset_id === providerName);
+              found = CredentialStore.loadProviders().find((p: any) => p.name === providerName || p.preset_id === providerName);
               if (found) {
                 baseUrl = baseUrl || (found as any).baseUrl || (found as any).base_url;
                 apiKey = apiKey || CredentialStore.resolveApiKey(found);
@@ -2621,6 +2787,42 @@ if __name__ == "__main__":
               return;
             }
 
+            if (providerName === "deepseek") {
+              if (!apiKey) {
+                finishTest("failed", "未配置 DeepSeek API Key");
+                return;
+              }
+              const catalogModels = this.readImportedModelCatalog()
+                .filter((entry: any) => catalogModelOwner(entry) === normalizeNamespace(found?.name || providerName))
+                .map((entry: any) => entry?.backend_model || entry?.model || entry?.slug);
+              const modelsToProbe = selectDeepSeekResponsesModels([
+                ...((found?.models || []) as string[]),
+                ...catalogModels,
+              ]);
+              if (modelsToProbe.length === 0) {
+                finishTest("failed", "未找到已启用的 DeepSeek V4 模型，请先保存模型后再测试");
+                return;
+              }
+              const probes = await probeDeepSeekResponsesModels(
+                apiKey,
+                modelsToProbe,
+                DEEPSEEK_API_BASE_URL,
+              );
+              const failed = probes.filter((probe) => !probe.ok);
+              if (failed.length === 0) {
+                finishTest(
+                  "connected",
+                  `DeepSeek 原生 Responses 已验证：${probes.map((probe) => probe.model).join("、")}`,
+                );
+              } else {
+                finishTest(
+                  "failed",
+                  failed.map((probe) => `${probe.model}: ${probe.message}${probe.status ? ` (HTTP ${probe.status})` : ""}`).join("；"),
+                );
+              }
+              return;
+            }
+
 
             if (!baseUrl) {
               finishTest("failed", "未配置 Endpoint / Base URL");
@@ -2659,7 +2861,7 @@ if __name__ == "__main__":
             }
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "failed", message: err.message }));
+            res.end(JSON.stringify({ status: "failed", message: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2944,7 +3146,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "injected", reply: "" }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -2976,7 +3178,7 @@ if __name__ == "__main__":
             }
 
             const engine = settings.tts_engine || "edge-tts";
-            const apiKey = settings.tts_api_key || CredentialStore.readKeychainSecret("OpenCodex Voice Credential", settings.tts_credential_ref) || "";
+            const apiKey = settings.tts_api_key || CredentialStore.readSecureSecret("OpenCodex Voice Credential", settings.tts_credential_ref) || "";
             const baseUrl = settings.tts_base_url || "https://api.openai.com/v1";
             const model = settings.tts_model || "tts-1";
             const voice = settings.tts_voice || "zh-CN-XiaoxiaoNeural";
@@ -3039,10 +3241,11 @@ if __name__ == "__main__":
                   }
                   if (chunks.length > 0) audioBuf = Buffer.concat(chunks);
                 } else {
-                  console.error(`[Doubao TTS Err ${apiRes.status}] ${await apiRes.text()}`);
+                  const upstreamBody = await apiRes.text();
+                  console.error(`[Doubao TTS Err ${apiRes.status}] upstream_body_bytes=${Buffer.byteLength(upstreamBody)}`);
                 }
               } catch (e: any) {
-                console.error(`[Doubao TTS Exception] ${e.message}`);
+                console.error(`[Doubao TTS Exception] ${safeErrorMessage(e)}`);
               }
             } else if (engine === "openai-compatible" || engine === "openai") {
               try {
@@ -3060,8 +3263,8 @@ if __name__ == "__main__":
                 }
               } catch {}
             } else if (engine === "edge-tts") {
+              const tmpMp3 = this.runtimeFiles.uniqueFile("tts-edge", "mp3");
               try {
-                const tmpMp3 = path.join(os.tmpdir(), `tts-edge-${Date.now()}.mp3`);
                 const speed = typeof settings.tts_speed === "number" ? settings.tts_speed : 1.2;
                 const edgeArgs = ["edge-tts", "--voice", voice, "--text", text, "--write-media", tmpMp3];
                 if (speed !== 1.0) {
@@ -3069,12 +3272,14 @@ if __name__ == "__main__":
                   const rateStr = pct >= 0 ? `+${pct}%` : `${pct}%`;
                   edgeArgs.push("--rate", rateStr);
                 }
-                cp.execFileSync(resolveRuntimeBinary("uvx"), edgeArgs, { stdio: "ignore" });
+                cp.execFileSync(resolveRuntimeBinary("uvx"), ["--from", VOICE_RUNTIME_PACKAGES.edgeTts, ...edgeArgs], { stdio: "ignore" });
                 if (fs.existsSync(tmpMp3)) {
+                  fs.chmodSync(tmpMp3, 0o600);
                   audioBuf = fs.readFileSync(tmpMp3);
-                  try { fs.unlinkSync(tmpMp3); } catch {}
                 }
-              } catch {}
+              } catch {} finally {
+                this.runtimeFiles.removeFile(tmpMp3);
+              }
             } else if (engine === "minimax") {
               try {
                 const { WebSocket: WsClient } = await import("ws");
@@ -3142,14 +3347,16 @@ if __name__ == "__main__":
 
             // Reliable Native Fallback if Cloud/Edge TTS didn't produce audio
             if (!audioBuf || audioBuf.length === 0) {
-              const tmpAiff = path.join(os.tmpdir(), `tts-say-${Date.now()}.aiff`);
+              const tmpAiff = this.runtimeFiles.uniqueFile("tts-say", "aiff");
               try {
                 cp.execFileSync(resolveRuntimeBinary("say"), ["-o", tmpAiff, text], { stdio: "ignore" });
                 if (fs.existsSync(tmpAiff)) {
+                  fs.chmodSync(tmpAiff, 0o600);
                   audioBuf = fs.readFileSync(tmpAiff);
-                  try { fs.unlinkSync(tmpAiff); } catch {}
                 }
-              } catch {}
+              } catch {} finally {
+                this.runtimeFiles.removeFile(tmpAiff);
+              }
             }
 
             if (audioBuf && audioBuf.length > 0) {
@@ -3161,25 +3368,14 @@ if __name__ == "__main__":
             }
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
 
         if (req.method === "POST" && url.pathname === "/api/voice/stt") {
           try {
-            const chunks: Buffer[] = [];
-            let bytes = 0;
-            req.on("data", (chunk: Buffer) => {
-              bytes += chunk.length;
-              if (bytes > MAX_REQUEST_BYTES) {
-                req.destroy();
-                return;
-              }
-              chunks.push(chunk);
-            });
-            await new Promise<void>((resolve) => req.on("end", resolve));
-            const rawBody = Buffer.concat(chunks);
+            const rawBody = await this.parseRawBuffer(req);
 
             const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
             let settings: any = {
@@ -3192,8 +3388,8 @@ if __name__ == "__main__":
               try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsPath, "utf-8")) }; } catch {}
             }
 
-            const audioPath = path.join(os.tmpdir(), `opencodex-stt-${randomUUID()}.wav`);
-            fs.writeFileSync(audioPath, rawBody);
+            const audioPath = this.runtimeFiles.uniqueFile("voice-stt", "wav");
+            this.runtimeFiles.writePrivateFile(audioPath, rawBody);
 
             const engine = settings.stt_engine || "local-whisper";
             try {
@@ -3211,11 +3407,12 @@ if __name__ == "__main__":
                 });
               }
             } finally {
-              try { fs.unlinkSync(audioPath); } catch {}
+              this.runtimeFiles.removeFile(audioPath);
             }
           } catch (err: any) {
-            res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message, text: "" }));
+            const tooLarge = String(err?.message || "").includes("exceeds limit");
+            res.writeHead(tooLarge ? 413 : 500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: safeErrorMessage(err), text: "" }));
           }
           return;
         }
@@ -3278,7 +3475,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", method: "swift-run", codex_restarted: true, cdp_ready: cdpReady, voice_ready: voiceReady }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -3298,16 +3495,8 @@ if __name__ == "__main__":
             const sttAccount = "voice:stt";
             const ttsAccount = "voice:tts";
             const voiceCredentialService = "OpenCodex Voice Credential";
-            const sttCredentialRef = data.clear_stt_api_key
-              ? ""
-              : (incomingSttKey && incomingSttKey !== MASKED_CREDENTIAL
-                ? `keychain:${voiceCredentialService}:${sttAccount}`
-                : (previous.stt_credential_ref || ""));
-            const ttsCredentialRef = data.clear_tts_api_key
-              ? ""
-              : (incomingTtsKey && incomingTtsKey !== MASKED_CREDENTIAL
-                ? `keychain:${voiceCredentialService}:${ttsAccount}`
-                : (previous.tts_credential_ref || ""));
+            let sttCredentialRef = data.clear_stt_api_key ? "" : (previous.stt_credential_ref || "");
+            let ttsCredentialRef = data.clear_tts_api_key ? "" : (previous.tts_credential_ref || "");
 
             // Existing installations may still have plaintext voice keys. Migrate
             // them once, then never write them back to voice_settings.json.
@@ -3317,10 +3506,10 @@ if __name__ == "__main__":
             const ttsSecret = data.clear_tts_api_key
               ? ""
               : (incomingTtsKey && incomingTtsKey !== MASKED_CREDENTIAL ? incomingTtsKey : (previous.tts_api_key || ""));
-            if (sttSecret) CredentialStore.writeKeychainSecret(voiceCredentialService, sttAccount, sttSecret);
-            if (ttsSecret) CredentialStore.writeKeychainSecret(voiceCredentialService, ttsAccount, ttsSecret);
-            if (data.clear_stt_api_key) CredentialStore.deleteKeychainSecret(voiceCredentialService, sttAccount);
-            if (data.clear_tts_api_key) CredentialStore.deleteKeychainSecret(voiceCredentialService, ttsAccount);
+            if (sttSecret) sttCredentialRef = CredentialStore.writeSecureSecret(voiceCredentialService, sttAccount, sttSecret);
+            if (ttsSecret) ttsCredentialRef = CredentialStore.writeSecureSecret(voiceCredentialService, ttsAccount, ttsSecret);
+            if (data.clear_stt_api_key) CredentialStore.deleteSecureSecret(voiceCredentialService, previous.stt_credential_ref);
+            if (data.clear_tts_api_key) CredentialStore.deleteSecureSecret(voiceCredentialService, previous.tts_credential_ref);
 
             const settings = {
               stt_engine: data.stt_engine || "local-whisper",
@@ -3356,7 +3545,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", settings: maskVoiceSettings(settings) }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -3581,7 +3770,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ metadata: { id }, messages }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4383,7 +4572,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", message: "Agent 会话已写入 Codex 会话库", id: sessionId, rollout_path: targetFilePath, imported_line_count: importedLines.length, registered: true, restarted: false }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4397,7 +4586,7 @@ if __name__ == "__main__":
           this.gatewayRestartInProgress = true;
           try {
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
 
             let hasModels = false;
             if (fs.existsSync(catalogPath)) {
@@ -4427,7 +4616,7 @@ if __name__ == "__main__":
             return;
           } catch (err: any) {
             this.gatewayRestartInProgress = false;
-            console.error("[OpenCodex Gateway] Restart error:", err?.message);
+            console.error(`[OpenCodex Gateway] Restart error: ${safeErrorMessage(err)}`);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "success", message: "桌面端与网关服务正在重新启动..." }));
@@ -4465,8 +4654,11 @@ if __name__ == "__main__":
               } catch {}
             }
             this.issueAdminCookie(res);
-            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-            res.end(getVisualizerHtml(isHud, hudTheme));
+            res.writeHead(200, {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            });
+            res.end(getVisualizerHtml(isHud, hudTheme, cspNonce));
           } catch (e: any) {
             res.writeHead(500, { "Content-Type": "text/plain" });
             res.end(`Visualizer Error: ${e.message}`);
@@ -4575,7 +4767,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", deleted: ids }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4586,8 +4778,16 @@ if __name__ == "__main__":
             const body = await this.parseJsonBody(req);
             const providerName = body.name || body.id;
             let providers = CredentialStore.loadProviders();
+            const removedProviders = providers.filter((p: any) => p.name === providerName || p.id === providerName);
             providers = providers.filter((p: any) => p.name !== providerName && p.id !== providerName);
             CredentialStore.saveProviders(providers);
+            for (const removedProvider of removedProviders) {
+              try {
+                CredentialStore.deleteProviderSecret(removedProvider);
+              } catch (error: any) {
+                console.error(`[OpenCodex] Could not delete provider credential: ${safeErrorMessage(error)}`);
+              }
+            }
 
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
             if (fs.existsSync(catalogPath)) {
@@ -4607,7 +4807,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", deleted: providerName }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4683,7 +4883,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", deleted: id, files: deletedFiles, deleted_count: deletedFiles.length }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4769,16 +4969,16 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", id: sessionId, restarted: false }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
         if (req.method === "POST" && url.pathname === "/api/reset") {
           try {
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              content = content.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "").trim();
+              content = content.replace(MANAGED_CONFIG_BLOCK_RE, "").trim();
               content = content.replace(/^model\s*=\s*".*?"/m, 'model = "gpt-5.5"');
               fs.writeFileSync(configPath, content + "\n", "utf-8");
             }
@@ -4798,7 +4998,7 @@ if __name__ == "__main__":
             res.end(JSON.stringify({ status: "success", gateway_active: false }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
+            res.end(JSON.stringify({ error: safeErrorMessage(err) }));
           }
           return;
         }
@@ -4855,12 +5055,12 @@ if __name__ == "__main__":
               isEcho = true;
             }
             if (isEcho) {
-              console.error(`[Semantic AEC] Ignored echo text: "${trimmed}"`);
+              console.error(`[Semantic AEC] Ignored probable echo content_length=${trimmed.length}`);
               audioBuffer = Buffer.alloc(0);
               lastVADCheckedLength = 0;
               return;
             }
-            console.error(`[Semantic AEC] Interruption detected! User said: "${trimmed}" while system was saying: "${this.currentSystemUtterance}"`);
+            console.error(`[Semantic AEC] Interruption detected user_content_length=${trimmed.length} system_content_length=${this.currentSystemUtterance.length}`);
             this.currentSystemUtterance = "";
             triggerSpeechEnd(trimmed);
             return;
@@ -5002,22 +5202,24 @@ if __name__ == "__main__":
                     };
 
                     const wavBuffer = pcmToWav(currentBuffer, 16000, 1, 16);
-                    const tmpWavPath = `/tmp/ws_chunk_${Date.now()}.wav`;
-                    fs.writeFileSync(tmpWavPath, wavBuffer);
+                    const tmpWavPath = this.runtimeFiles.uniqueFile("voice-chunk", "wav");
+                    this.runtimeFiles.writePrivateFile(tmpWavPath, wavBuffer);
 
                     let text = "";
-                    const isAPI = settings.stt_engine === "openai-compatible" || settings.stt_engine === "groq" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
-                    if (isAPI) {
-                      text = await this.transcribeAudioAPI(tmpWavPath, settings);
-                    } else {
-                      text = await new Promise<string>((resolve) => {
-                        this.transcribeAudioLocal(tmpWavPath, settings, (resText) => {
-                          resolve(resText || "");
+                    try {
+                      const isAPI = settings.stt_engine === "openai-compatible" || settings.stt_engine === "groq" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
+                      if (isAPI) {
+                        text = await this.transcribeAudioAPI(tmpWavPath, settings);
+                      } else {
+                        text = await new Promise<string>((resolve) => {
+                          this.transcribeAudioLocal(tmpWavPath, settings, (resText) => {
+                            resolve(resText || "");
+                          });
                         });
-                      });
+                      }
+                    } finally {
+                      this.runtimeFiles.removeFile(tmpWavPath);
                     }
-
-                    try { fs.unlinkSync(tmpWavPath); } catch {}
 
                     if (text && text.trim().length > 0) {
                       ws.send(JSON.stringify({
@@ -5028,7 +5230,7 @@ if __name__ == "__main__":
                       await checkSemanticVAD(text);
                     }
                   } catch (err: any) {
-                    console.error(`[WebSocket STT Chunk Error] ${err.message}`);
+                    console.error(`[WebSocket STT Chunk Error] ${safeErrorMessage(err)}`);
                   } finally {
                     isProcessingChunk = false;
                   }
@@ -5058,7 +5260,7 @@ if __name__ == "__main__":
               }
             }
           } catch (err: any) {
-            console.error(`[WebSocket message err] ${err.message}`);
+            console.error(`[WebSocket message err] ${safeErrorMessage(err)}`);
           }
         });
 
@@ -5122,6 +5324,22 @@ if __name__ == "__main__":
           return;
         }
 
+        const websocketPolicy = requestPolicyForWebSocket(route);
+        const websocketGuard = this.requestGuard.acquire(websocketPolicy);
+        if (!websocketGuard.allowed) {
+          rejectWebSocketUpgrade(
+            socket,
+            429,
+            "Too Many Requests",
+            websocketGuard.reason === "concurrency"
+              ? "Too many concurrent WebSocket connections for this route"
+              : "WebSocket connection rate limit exceeded",
+            { "Retry-After": String(websocketGuard.retryAfterSeconds) },
+          );
+          return;
+        }
+        socket.once("close", websocketGuard.release);
+
         if (route === "realtime") {
           if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) {
             this.markRealtimeActive();
@@ -5154,12 +5372,14 @@ if __name__ == "__main__":
       });
 
       this.server.on("error", (err) => {
-        console.error(`[CodexBridge V2] Server error: ${err.message}`);
+        console.error(`[CodexBridge V2] Server error: ${safeErrorMessage(err)}`);
         this.releaseServerLock();
+        if (!listening) this.runtimeFiles.cleanup();
         reject(err);
       });
 
       this.server.listen(this.port, "127.0.0.1", () => {
+        listening = true;
         console.log(`[CodexBridge V2] Server listening on http://127.0.0.1:${this.port}`);
         resolve();
       });
@@ -5169,7 +5389,7 @@ if __name__ == "__main__":
   private async transcribeAudioAPI(filePath: string, settings: any): Promise<string> {
     let apiKey = settings.stt_api_key || "";
     if (!apiKey && settings.stt_credential_ref) {
-      apiKey = CredentialStore.readKeychainSecret("OpenCodex Voice Credential", settings.stt_credential_ref) || "";
+      apiKey = CredentialStore.readSecureSecret("OpenCodex Voice Credential", settings.stt_credential_ref) || "";
     }
     const baseUrl = settings.stt_base_url || "https://api.openai.com/v1";
     const model = settings.stt_model || "whisper-1";
@@ -5179,7 +5399,7 @@ if __name__ == "__main__":
       : `${baseUrl.replace(/\/$/, "")}/audio/transcriptions`;
 
     const audioData = fs.readFileSync(filePath);
-    const boundary = `----WebKitFormBoundary${Math.random().toString(36).substring(2)}`;
+    const boundary = `----OpenCodexBoundary${randomBytes(18).toString("hex")}`;
     let payload = Buffer.alloc(0);
 
     const appendField = (name: string, value: string) => {
@@ -5213,8 +5433,8 @@ if __name__ == "__main__":
     });
 
     if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`STT API returned status ${response.status}: ${errText}`);
+      await response.arrayBuffer().catch(() => new ArrayBuffer(0));
+      throw new Error(`STT API returned status ${response.status}`);
     }
 
     const resJson: any = await response.json();
@@ -5222,11 +5442,10 @@ if __name__ == "__main__":
   }
 
   private transcribeAudioLocal(filePath: string, settings: any, cb: (text: string | null) => void) {
-    const pythonCmd = resolveRuntimeBinary("python3");
     const localModel = typeof settings?.stt_model === "string" && settings.stt_model.trim()
       ? settings.stt_model.trim()
       : "base";
-    const args = ["/tmp/ocb_transcribe.py", filePath, localModel];
+    const transcribeScript = this.runtimeFiles.fixedFile("ocb_transcribe.py");
     const uvxPath = resolveRuntimeBinary("uvx");
 
     const env = {
@@ -5234,27 +5453,29 @@ if __name__ == "__main__":
       PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${os.homedir()}/Library/Python/3.9/bin:${os.homedir()}/.local/bin:${process.env.PATH || ""}`
     };
 
-    const child = uvxPath !== "uvx" || fs.existsSync(uvxPath)
-      ? spawn(uvxPath, ["--with", "openai-whisper", "python3", "/tmp/ocb_transcribe.py", filePath, localModel], { env })
-      : spawn(pythonCmd, args, { env });
+    const child = spawn(uvxPath, ["--with", VOICE_RUNTIME_PACKAGES.whisper, "python3", transcribeScript, filePath, localModel], { env });
 
     let output = "";
-    let errorOutput = "";
-
+    let finished = false;
+    const finish = (value: string | null) => {
+      if (finished) return;
+      finished = true;
+      cb(value);
+    };
     child.stdout.on("data", (chunk: Buffer) => {
       output += chunk.toString();
     });
 
-    child.stderr.on("data", (chunk: Buffer) => {
-      errorOutput += chunk.toString();
-    });
+    child.stderr.resume();
+
+    child.on("error", () => finish(null));
 
     child.on("close", (code: number) => {
       if (code === 0) {
         const text = output.trim();
-        cb(text);
+        finish(text);
       } else {
-        cb(null);
+        finish(null);
       }
     });
   }
@@ -5374,7 +5595,7 @@ if __name__ == "__main__":
     });
 
     this.mcpProcess.stderr.on("data", (chunk: Buffer) => {
-      console.error(`[OpenCodex MCP STDERR] ${chunk.toString().trim().split("\n")[0]}`);
+      console.error(`[OpenCodex MCP STDERR] output_bytes=${chunk.length}`);
     });
 
     this.mcpProcess.on("close", (code: number) => {
@@ -5384,7 +5605,7 @@ if __name__ == "__main__":
         req.reject(new Error("MCP process closed"));
       }
       this.mcpRequests.clear();
-      setTimeout(() => this.initCodexMcp(), 2000);
+      if (!this.stopping) setTimeout(() => this.initCodexMcp(), 2000);
     });
 
     setTimeout(() => {
@@ -5459,23 +5680,25 @@ if __name__ == "__main__":
       };
 
       const wavBuffer = pcmToWav(pcmBuffer, 16000, 1, 16);
-      const tmpWavPath = `/tmp/ws_stt_${Date.now()}.wav`;
-      fs.writeFileSync(tmpWavPath, wavBuffer);
+      const tmpWavPath = this.runtimeFiles.uniqueFile("voice-final", "wav");
+      this.runtimeFiles.writePrivateFile(tmpWavPath, wavBuffer);
 
       let text = "";
-      const isAPI = settings.stt_engine === "openai-compatible" || settings.stt_engine === "groq" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
+      try {
+        const isAPI = settings.stt_engine === "openai-compatible" || settings.stt_engine === "groq" || (settings.stt_api_key && settings.stt_api_key.startsWith("gsk_")) || settings.stt_base_url.includes("groq");
 
-      if (isAPI) {
-        text = await this.transcribeAudioAPI(tmpWavPath, settings);
-      } else {
-        text = await new Promise<string>((resolve) => {
-          this.transcribeAudioLocal(tmpWavPath, settings, (resText) => {
-            resolve(resText || "");
+        if (isAPI) {
+          text = await this.transcribeAudioAPI(tmpWavPath, settings);
+        } else {
+          text = await new Promise<string>((resolve) => {
+            this.transcribeAudioLocal(tmpWavPath, settings, (resText) => {
+              resolve(resText || "");
+            });
           });
-        });
+        }
+      } finally {
+        this.runtimeFiles.removeFile(tmpWavPath);
       }
-
-      try { fs.unlinkSync(tmpWavPath); } catch {}
 
       const cleanText = text.replace(/^[。！？\.\s]+|[。！？\.\s]+$/g, '');
       if (cleanText.length === 0 || text.includes('......') || text.includes('。。。') || text.includes('李宗盛') || text.includes('明镜') || text.includes('字幕由') || (text.length < fallbackText.length - 3 && fallbackText.length > 0)) {
@@ -5496,17 +5719,34 @@ if __name__ == "__main__":
 
   public stop(): Promise<void> {
     return new Promise((resolve) => {
+      this.stopping = true;
+      if (this.nativeVoiceObserverTimer) {
+        clearTimeout(this.nativeVoiceObserverTimer);
+        this.nativeVoiceObserverTimer = null;
+      }
+      try { this.nativeVoiceObserverWs?.close(); } catch {}
+      this.nativeVoiceObserverWs = null;
+      try { this.vadProcess?.kill(); } catch {}
+      this.vadProcess = null;
+      try { this.mcpProcess?.kill(); } catch {}
+      this.mcpProcess = null;
+
+      const finishStop = () => {
+        this.releaseServerLock();
+        try {
+          this.runtimeFiles.cleanup();
+        } catch (error) {
+          console.error(`[OpenCodex] Private runtime cleanup failed: ${safeErrorMessage(error)}`);
+        }
+        void closeUpstreamDispatcher().finally(resolve);
+      };
       if (this.server) {
         const server = this.server;
         this.server = null;
-        server.close(() => {
-          this.releaseServerLock();
-          void closeUpstreamDispatcher().finally(resolve);
-        });
+        server.close(finishStop);
         server.closeIdleConnections();
       } else {
-        this.releaseServerLock();
-        void closeUpstreamDispatcher().finally(resolve);
+        finishStop();
       }
     });
   }

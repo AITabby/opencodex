@@ -7,6 +7,8 @@ import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
+import { redactSensitiveText, safeDiagnosticTarget, safeErrorMessage } from "./privacy.js";
+import { proxyNativeResponses } from "./native_responses.js";
 
 
 
@@ -131,6 +133,10 @@ function rememberCursorSession(
 }
 
 export class GatewayRouter {
+  constructor(
+    private readonly nativeResponsesProxy: typeof proxyNativeResponses = proxyNativeResponses,
+  ) {}
+
   public async handleResponses(
     reqBody: any,
     upstreamModel: string,
@@ -139,6 +145,18 @@ export class GatewayRouter {
     res: http.ServerResponse,
     providerName = ""
   ): Promise<void> {
+    if (String(reqBody?.protocol || "").toLowerCase() === "responses") {
+      await this.nativeResponsesProxy({
+        reqBody,
+        upstreamModel,
+        apiKey,
+        providerUrl,
+        providerName,
+        res,
+      });
+      return;
+    }
+
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
@@ -323,8 +341,8 @@ export class GatewayRouter {
     let cursorToolResult: CursorToolResult | undefined;
     let pendingCursorToolRequest: CursorExternalToolRequest | undefined;
     const onCursorToolEvent = (event: CursorToolEvent): void => {
-      const args = event.arguments ? ` args=${event.arguments.replace(/\s+/g, " ").slice(0, 500)}` : "";
-      console.log(`[OpenCodex Cursor] tool-${event.phase} transport=${event.transport} name=${event.name} id=${event.id}${event.execId ? ` exec_id=${event.execId}` : ""}${event.exitCode !== undefined ? ` exit=${event.exitCode}` : ""}${args}`);
+      const argumentBytes = event.arguments ? Buffer.byteLength(event.arguments) : 0;
+      console.log(`[OpenCodex Cursor] tool-${event.phase} transport=${event.transport} name=${event.name} id=${event.id}${event.execId ? ` exec_id=${event.execId}` : ""}${event.exitCode !== undefined ? ` exit=${event.exitCode}` : ""} argument_bytes=${argumentBytes}`);
     };
     const onExternalCursorToolRequest = (request: CursorExternalToolRequest): void => {
       if (cursorStateKey) {
@@ -334,7 +352,7 @@ export class GatewayRouter {
       } else if (!pendingCursorToolRequest) {
         pendingCursorToolRequest = request;
       }
-      console.log(`[OpenCodex Cursor] external-tool-pending transport=${request.transport} name=${request.name} id=${request.id}${request.execId ? ` exec_id=${request.execId}` : ""} args=${request.arguments.replace(/\s+/g, " ").slice(0, 500)}`);
+      console.log(`[OpenCodex Cursor] external-tool-pending transport=${request.transport} name=${request.name} id=${request.id}${request.execId ? ` exec_id=${request.execId}` : ""} argument_bytes=${Buffer.byteLength(request.arguments)}`);
     };
 
     try {
@@ -498,7 +516,7 @@ export class GatewayRouter {
         const errText = firstAuthErrorText && (response.status === 401 || response.status === 403)
           ? firstAuthErrorText
           : await response.text();
-        console.error(`[CodexBridge V2] Upstream error (${response.status}) for ${finalTargetUrl}: ${errText}`);
+        console.error(`[CodexBridge V2] Upstream error status=${response.status} target=${safeDiagnosticTarget(finalTargetUrl)} body_bytes=${Buffer.byteLength(errText)}`);
         let msg = `Upstream API Error (${response.status})`;
         try {
           const parsed = JSON.parse(errText);
@@ -731,7 +749,7 @@ export class GatewayRouter {
         try {
           readResult = await readWithTimeout(600000);
         } catch (readErr: any) {
-          console.warn(`[CodexBridge V2] ${readErr.message}; closing stream cleanly.`);
+          console.warn(`[CodexBridge V2] ${safeErrorMessage(readErr)}; closing stream cleanly.`);
           break;
         }
 
@@ -772,9 +790,11 @@ export class GatewayRouter {
     } catch (err: any) {
       clearTimeout(timeoutId);
       const upstreamDetails = upstreamErrorDetails(err);
-      console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, {
-        stack: err.stack,
-        ...upstreamDetails,
+      console.error(`[CodexBridge V2] Stream error target=${safeDiagnosticTarget(finalTargetUrl)}`, {
+        message: safeErrorMessage(err),
+        code: upstreamDetails.code,
+        syscall: upstreamDetails.syscall,
+        hostname: upstreamDetails.hostname,
         attempts: err?.attempts,
       });
       const attemptsText = Number.isFinite(err?.attempts) ? `（已尝试 ${err.attempts} 次）` : "";
@@ -783,7 +803,7 @@ export class GatewayRouter {
         ? "Cursor 上游已拒绝当前客户端协议：本机 Cursor 版本已被判定为过旧。请先从 Cursor 官网更新/重新下载 Cursor（设置会保留），再重试；这不是免费套餐限制。"
         : err.message === "fetch failed"
         ? `无法连接服务商接口${causeText}${attemptsText}：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
-        : err.message;
+        : redactSensitiveText(err.message, 500);
       if (!res.headersSent) {
         res.writeHead(200, {
           "Content-Type": "text/event-stream",

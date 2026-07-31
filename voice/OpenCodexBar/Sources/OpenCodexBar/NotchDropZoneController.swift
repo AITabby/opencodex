@@ -44,13 +44,13 @@ class DropZoneView: NSView {
         
         // 2. Dragged image data (TIFF/PNG from screenshots, web, etc.)
         if let imgData = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
-            let tempURL = URL(fileURLWithPath: "/tmp/dropped_file.png")
+            let tempURL = PrivateRuntimeStorage.shared.uniqueFile("dropped-image", withExtension: "png")
             if let image = NSImage(data: imgData) {
                 if let tiffData = image.tiffRepresentation,
                    let bitmap = NSBitmapImageRep(data: tiffData),
                    let pngData = bitmap.representation(using: .png, properties: [:]) {
                     do {
-                        try pngData.write(to: tempURL)
+                        try PrivateRuntimeStorage.shared.write(pngData, to: tempURL)
                         onPerformDrop?([tempURL])
                         return true
                     } catch {
@@ -62,9 +62,9 @@ class DropZoneView: NSView {
         
         // 3. Plain text / Strings
         if let string = pasteboard.string(forType: .string) {
-            let tempURL = URL(fileURLWithPath: "/tmp/dropped_file.txt")
+            let tempURL = PrivateRuntimeStorage.shared.uniqueFile("dropped-text", withExtension: "txt")
             do {
-                try string.write(to: tempURL, atomically: true, encoding: .utf8)
+                try PrivateRuntimeStorage.shared.write(string, to: tempURL)
                 onPerformDrop?([tempURL])
                 return true
             } catch {

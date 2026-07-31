@@ -25,7 +25,7 @@ Before starting, we will reset your `config.toml` to a standard state (removing 
     const path = require("path");
     const tomlPath = path.join(process.env.HOME, ".codex", "config.toml");
     let content = fs.readFileSync(tomlPath, "utf-8");
-    content = content.replace(/# >>> opencodex managed >>>[\\s\\S]*?# <<< opencodex managed <<<\\n?/gi, "");
+    content = content.replace(/# >>> opencodex managed >>>[\\s\\S]*?# <<< opencodex managed [<>]{3}\\r?\\n?/gi, "");
     fs.writeFileSync(tomlPath, content.trim() + "\\n", "utf-8");
     console.log("✔ ~/.codex/config.toml successfully restored to Native/Fresh State!");
     '
@@ -118,7 +118,7 @@ Finally, test Codex Desktop's visual features using the text-only DeepSeek model
     const path = require("path");
     const tomlPath = path.join(process.env.HOME, ".codex", "config.toml");
     let content = fs.readFileSync(tomlPath, "utf-8");
-    content = content.replace(/# >>> opencodex managed >>>[\\s\\S]*?# <<< opencodex managed <<<\\n?/gi, "");
+    content = content.replace(/# >>> opencodex managed >>>[\\s\\S]*?# <<< opencodex managed [<>]{3}\\r?\\n?/gi, "");
     fs.writeFileSync(tomlPath, content.trim() + "\\n", "utf-8");
     console.log("✔ ~/.codex/config.toml 成功还原为原生干净状态！");
     '

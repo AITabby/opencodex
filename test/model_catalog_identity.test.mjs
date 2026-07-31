@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import { buildManagedCodexConfig, deriveProviderNamespace, ensureManagedCatalogConfig, migrateProviderCatalogOwner, preserveOfficialModels, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 
 test("managed Codex config follows the current gateway port across restarts", () => {
   const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nbase_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n`;
@@ -13,6 +13,29 @@ test("managed Codex config follows the current gateway port across restarts", ()
   assert.doesNotMatch(next, /18421/);
   assert.match(next, /model = "gpt-5\.5"/);
   assert.equal((next.match(/# >>> opencodex managed >>>/g) || []).length, 2);
+});
+
+test("managed Codex config strips legacy blocks closed with >>>", () => {
+  const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed >>>\n`;
+  const next = buildManagedCodexConfig(existing, 19753, "test-gateway-token", "/Users/test/.opencodex/custom_model_catalog.json");
+
+  assert.equal((next.match(/# >>> opencodex managed >>>/g) || []).length, 2);
+  assert.equal((next.match(/model_catalog_json/g) || []).length, 1);
+  assert.doesNotMatch(next, /18421/);
+});
+
+test("managed Codex config escapes Windows paths and keeps catalog settings at the TOML root", () => {
+  const windowsCatalogPath = String.raw`C:\Users\freed\.opencodex\custom_model_catalog.json`;
+  const encodedPath = JSON.stringify(windowsCatalogPath);
+  const existing = `[shell_environment_policy.set]\nBROWSER_USE_AVAILABLE_BACKENDS = "chrome"\n`;
+
+  const catalogOnly = ensureManagedCatalogConfig(existing, windowsCatalogPath);
+  assert.equal(catalogOnly.startsWith("# >>> opencodex managed >>>"), true);
+  assert.equal(catalogOnly.includes(`model_catalog_json = ${encodedPath}`), true);
+  assert.ok(catalogOnly.indexOf("model_catalog_json") < catalogOnly.indexOf("[shell_environment_policy.set]"));
+
+  const fullConfig = buildManagedCodexConfig(existing, 19753, "test-gateway-token", windowsCatalogPath);
+  assert.equal(fullConfig.includes(`model_catalog_json = ${encodedPath}`), true);
 });
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {

@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
 import { URL } from "node:url";
+import { safeDiagnosticTarget, safeErrorMessage } from "./privacy.js";
 
 const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 
@@ -174,7 +175,7 @@ export function normalizeNativeLiveCallBody(rawBody: Buffer, contentType: string
 
 export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: Buffer, options: RealtimeProxyOptions = {}): void {
   const upstream = resolveRealtimeUpstream(req, options);
-  console.log(`[OpenCodex WebRTC Proxy] Proxying ${upstream.nativeSession ? "native ChatGPT" : "API"} WebSocket signal to wss://${upstream.targetHost}${upstream.targetPath}`);
+  console.log(`[OpenCodex WebRTC Proxy] Proxying ${upstream.nativeSession ? "native ChatGPT" : "API"} WebSocket signal to ${safeDiagnosticTarget(`wss://${upstream.targetHost}${upstream.targetPath}`)}`);
 
   const targetSocket = tls.connect({
     host: upstream.targetHost,
@@ -209,7 +210,7 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
   });
 
   targetSocket.on("error", (err) => {
-    console.error(`[OpenCodex WebRTC Proxy Error] ${err.message}`);
+    console.error(`[OpenCodex WebRTC Proxy Error] ${safeErrorMessage(err)}`);
     try { socket.destroy(); } catch {}
   });
   targetSocket.on("close", () => {

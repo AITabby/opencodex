@@ -10,6 +10,8 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { ProviderConfig } from "../core/types.js";
 import { CredentialStore } from "./credential_store.js";
+import { safeErrorMessage } from "../server/privacy.js";
+import { isDeepSeekProvider, isDeepSeekResponsesModel } from "../providers/deepseek.js";
 
 const DEFAULT_REASONING_PRESETS = [
   { effort: "low", description: "Minimal reasoning for simple tasks" },
@@ -32,12 +34,53 @@ export function getActualContextWindow(modelSlug: string, apiContextWindow?: num
   return 200000;
 }
 
-export function buildFullCatalogEntry(modelSlug: string, providerName: string, apiContextWindow?: number): any {
-  const actualContext = getActualContextWindow(modelSlug, apiContextWindow);
+export function applyProviderModelMetadata(entry: any, providerName: string, backendModel: string): any {
+  if (!entry || !isDeepSeekProvider(providerName) || !isDeepSeekResponsesModel(backendModel)) return entry;
+
+  Object.assign(entry, {
+    backend_protocol: "responses",
+    description: `deepseek: ${backendModel} (1,048,576 context; native Responses API)`,
+    context_window: 1048576,
+    max_context_window: 1048576,
+    auto_compact_token_limit: null,
+    truncation_policy: { mode: "tokens", limit: 10000 },
+    default_reasoning_level: "high",
+    supported_reasoning_levels: [
+      { effort: "low", description: "Fast responses with lighter reasoning" },
+      { effort: "high", description: "Extra reasoning depth for complex work" },
+      { effort: "max", description: "Maximum reasoning depth for the hardest work" },
+    ],
+    default_reasoning_summary: "none",
+    reasoning_summary_format: "experimental",
+    supports_reasoning_summaries: true,
+    default_verbosity: "low",
+    support_verbosity: true,
+    apply_patch_tool_type: "freeform",
+    web_search_tool_type: "text",
+    supports_search_tool: true,
+    experimental_supported_tools: [],
+    input_modalities: ["text"],
+    supports_image_detail_original: false,
+    minimal_client_version: "0.144.0",
+    prefer_websockets: false,
+    supports_computer_use: false,
+    supports_mcp: false,
+    vision_bridge_enabled: false,
+  });
+  return entry;
+}
+
+export function buildFullCatalogEntry(
+  modelSlug: string,
+  providerName: string,
+  apiContextWindow?: number,
+  backendModel = modelSlug,
+): any {
+  const actualContext = getActualContextWindow(backendModel, apiContextWindow);
   const compactLimit = Math.floor(actualContext * 0.8);
   const truncLimit = Math.floor(actualContext * 0.2);
 
-  return {
+  const entry = {
     slug: modelSlug,
     model: modelSlug,
     display_name: modelSlug,
@@ -77,6 +120,7 @@ export function buildFullCatalogEntry(modelSlug: string, providerName: string, a
     supports_mcp: true,
     vision_bridge_enabled: true,
   };
+  return applyProviderModelMetadata(entry, providerName, backendModel);
 }
 
 export class CatalogSyncService {
@@ -117,7 +161,7 @@ export class CatalogSyncService {
       const configPath = path.join(os.homedir(), ".codex", "config.toml");
       if (!fs.existsSync(configPath)) return [];
       const backup = fs.readFileSync(configPath, "utf-8");
-      const tempContent = backup.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed <<<\n?/gi, "");
+      const tempContent = backup.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed [<>]{3}\r?\n?/gi, "");
       fs.writeFileSync(configPath, tempContent, "utf-8");
       try {
         const raw = execFileSync("/Applications/ChatGPT.app/Contents/Resources/codex", ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
@@ -201,7 +245,7 @@ export class CatalogSyncService {
       const updatedCatalog = { models: catalogModels };
       fs.writeFileSync(CatalogSyncService.catalogPath, JSON.stringify(updatedCatalog, null, 2), "utf-8");
     } catch (err: any) {
-      console.error(`[CatalogSyncService] Could not sync catalog: ${err.message}`);
+      console.error(`[CatalogSyncService] Could not sync catalog: ${safeErrorMessage(err)}`);
     }
   }
 }

@@ -147,10 +147,12 @@ export interface ChatCompletionRequestBody {
 export interface ProviderConfig {
   name: string;
   type?: string;
+  protocol?: "responses" | "openai" | "anthropic" | "google" | "gemini";
   preset_id?: string;
   baseUrl: string;
   api_key_env?: string;
   api_key?: string;
+  credential_ref?: string;
   models?: string[];
   headers?: Record<string, string>;
   /** Connection testing is explicit; configuration alone must not imply success. */
@@ -165,6 +167,8 @@ export interface CatalogModelEntry {
   display_name?: string;
   backend_model?: string;
   backend_provider?: string;
+  backend_protocol?: "responses" | "openai" | "anthropic" | "google" | "gemini";
+  protocol?: "responses" | "openai" | "anthropic" | "google" | "gemini";
   provider?: string;
   description?: string;
   context_window?: number;

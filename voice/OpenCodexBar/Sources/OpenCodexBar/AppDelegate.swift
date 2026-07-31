@@ -9,8 +9,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   static weak var shared: AppDelegate?
   var statusBar: StatusBarController!
   private var voiceManager: VoiceManager!
-  private let replyFile = "/tmp/voice_reply.txt"
-  private let logFile = "/tmp/ocb_debug.log"
+  private let logFile = PrivateRuntimeStorage.shared.fixedFile("voice-debug.log")
+  private let voiceStatusFile = PrivateRuntimeStorage.shared.fixedFile("voice-status.txt")
   var sessionId: String?
   private var lastQueryTime: Date?
   var hudWindowController: HUDWindowController?
@@ -55,17 +55,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
   private var pressedInteractionMode = "toggle"
 
   func log(_ m: String) {
-    if let h = FileHandle(forWritingAtPath: logFile) {
-      h.seekToEndOfFile()
-      h.write((m + "\n").data(using: .utf8)!)
-      h.closeFile()
+    let contentPrefixes = [
+      "[WS Chunk]", "[WS Done]", "[STT]", "[STT Interrupted]",
+      "[Drop STT]", "[Go]", "[Stream Chunk]", "[Stream TTS]",
+      "[Live Mode] Captured", "[Notch] Perform drop", "[Ask] Sending",
+      "[TTS] Synthesizing", "[TTS] HUD", "[TTS] Bypassed",
+      "[VM STT]", "[VM] Server requested stop recording early",
+      "[HUD JS Result]", "[AX JS Result]"
+    ]
+    var safe = m
+    if let marker = contentPrefixes.first(where: { m.hasPrefix($0) }) {
+      safe = "\(marker) content=[REDACTED] bytes=\(m.lengthOfBytes(using: .utf8))"
+    } else {
+      let redactions = [
+        ("(?i)([\"'](?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)[\"']\\s*:\\s*[\"'])(?:bearer\\s+)?[^\"']*([\"'])", "$1[REDACTED]$2"),
+        ("(?i)((?:authorization|cookie|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password)\\s*[=:]\\s*)(?:bearer\\s+)?[^\\s,;]+", "$1[REDACTED]"),
+        ("\\b(?:sk-[A-Za-z0-9_-]{12,}|gsk_[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{20,})\\b", "[REDACTED]"),
+        ("(?i)(HTTP\\s+\\d{3}:).+$", "$1 [REDACTED_BODY]")
+      ]
+      for (pattern, replacement) in redactions {
+        safe = safe.replacingOccurrences(
+          of: pattern,
+          with: replacement,
+          options: .regularExpression
+        )
+      }
     }
+    PrivateRuntimeStorage.shared.appendLine(String(safe.prefix(1000)), to: logFile)
   }
 
   func applicationDidFinishLaunching(_ n: Notification) {
     AppDelegate.shared = self
-    try? "".write(toFile: replyFile, atomically: true, encoding: .utf8)
-    try? "".write(toFile: logFile, atomically: true, encoding: .utf8)
+    try? PrivateRuntimeStorage.shared.write("", to: logFile)
     
     // Request accessibility permission on startup
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -242,6 +263,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
     if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }
     if let hotKey = carbonHotKeyRef { UnregisterEventHotKey(hotKey) }
+    PrivateRuntimeStorage.shared.cleanup()
   }
 
   private func setupMainMenu() {
@@ -606,8 +628,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     statusBar.setStatus(.sending)
     hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
-    try? text.write(toFile: "/tmp/voice_cmd.txt", atomically: true, encoding: .utf8)
-
     // Reset streaming state before asking
     self.streamResponseText = ""
     self.streamCurrentSentence = ""
@@ -635,11 +655,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return
       }
 
-      let finalReply = s.extractFinalCodexResponse(reply) ?? ""
-      let c = s.clean(finalReply)
-      s.log("[LLM Done] Output text written to file. Speaking final summary.")
-      try? c.write(toFile: s.replyFile, atomically: true, encoding: .utf8)
-
+      s.log("[LLM Done] Output received. Preparing the final summary.")
       // Scan full reply for tool executions to be robust
       let lines = reply.components(separatedBy: .newlines)
       for line in lines {
@@ -1021,7 +1037,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     
     if let expected = expectedSentenceCount, nextPlayIndex >= expected {
       log("[PlayQ] done: nextPlayIndex=\(nextPlayIndex) >= expected=\(expected)")
-      try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      try? PrivateRuntimeStorage.shared.write("idle", to: voiceStatusFile)
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
         self.statusBar.setStatus(.idle)
@@ -1046,7 +1062,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     let activeSeq = self.currentQuerySequence
     guard !playQueue.isEmpty else {
       isPlayingQueue = false
-      try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      try? PrivateRuntimeStorage.shared.write("idle", to: voiceStatusFile)
       DispatchQueue.main.async { [weak self] in
         guard let self = self, self.currentQuerySequence == activeSeq else { return }
         self.statusBar.setStatus(.idle)
@@ -1069,31 +1085,32 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     }
     let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
     let ext = isWav ? "wav" : "mp3"
-    let chunkFile = "/tmp/ocb_tts_chunk_\(playChunkIndex).\(ext)"
+    let chunkURL = PrivateRuntimeStorage.shared.uniqueFile("tts-chunk-\(playChunkIndex)", withExtension: ext)
     playChunkIndex += 1
     
     // Start interruption monitoring when TTS audio starts playing!
     voiceManager.startInterruptionMonitoring()
     
-    let rawFile = "/tmp/ocb_tts_chunk_\(playChunkIndex)_raw.\(ext)"
+    let rawURL = PrivateRuntimeStorage.shared.uniqueFile("tts-chunk-raw-\(playChunkIndex)", withExtension: ext)
     do {
-      try data.write(to: URL(fileURLWithPath: rawFile))
+      try PrivateRuntimeStorage.shared.write(data, to: rawURL)
       let settings = VoiceSettings.load()
       let volumeVal = settings.tts_volume ?? 1.5
       if volumeVal != 1.0 {
-        let success = amplifyAudioFile(inputPath: rawFile, outputPath: chunkFile, volume: volumeVal)
+        let success = amplifyAudioFile(inputPath: rawURL.path, outputPath: chunkURL.path, volume: volumeVal)
         if !success {
-          try? FileManager.default.removeItem(atPath: chunkFile)
-          try? FileManager.default.copyItem(atPath: rawFile, toPath: chunkFile)
+          PrivateRuntimeStorage.shared.remove(chunkURL)
+          try FileManager.default.copyItem(at: rawURL, to: chunkURL)
         }
       } else {
-        try? FileManager.default.removeItem(atPath: chunkFile)
-        try? FileManager.default.copyItem(atPath: rawFile, toPath: chunkFile)
+        PrivateRuntimeStorage.shared.remove(chunkURL)
+        try FileManager.default.copyItem(at: rawURL, to: chunkURL)
       }
-      try? FileManager.default.removeItem(atPath: rawFile)
+      try PrivateRuntimeStorage.shared.makePrivate(chunkURL)
+      PrivateRuntimeStorage.shared.remove(rawURL)
       
       // Update speaking status for VAD sync
-      try? "speaking".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      try? PrivateRuntimeStorage.shared.write("speaking", to: voiceStatusFile)
       
       DispatchQueue.main.async { [weak self] in
         guard let self = self, self.currentQuerySequence == activeSeq else { return }
@@ -1115,9 +1132,9 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
         let settings = VoiceSettings.load()
         let volumeVal = settings.tts_volume ?? 1.5
-        p.arguments = ["-v", String(volumeVal), chunkFile]
+        p.arguments = ["-v", String(volumeVal), chunkURL.path]
         p.terminationHandler = { [weak self] _ in
-          try? FileManager.default.removeItem(atPath: chunkFile)
+          PrivateRuntimeStorage.shared.remove(chunkURL)
           self?.streamingQueue.async {
             guard let s = self, s.currentQuerySequence == activeSeq else { return }
             s.currentPlayProcess = nil
@@ -1129,6 +1146,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         do {
           try p.run()
         } catch {
+          PrivateRuntimeStorage.shared.remove(chunkURL)
           s.log("[Play Queue Err] \(error.localizedDescription)")
           s.streamingQueue.async { [weak self] in
             guard let s = self, s.currentQuerySequence == activeSeq else { return }
@@ -1139,6 +1157,8 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         }
       }
     } catch {
+      PrivateRuntimeStorage.shared.remove(rawURL)
+      PrivateRuntimeStorage.shared.remove(chunkURL)
       log("[Play Queue Write Err] \(error.localizedDescription)")
       streamingQueue.async { [weak self] in
         guard let self = self, self.currentQuerySequence == activeSeq else { return }
@@ -1302,26 +1322,27 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     let activeSeq = self.currentQuerySequence
     let isWav = data.count >= 4 && data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 // "RIFF"
     let ext = isWav ? "wav" : "mp3"
-    let rawUrl = "/tmp/ocb_tts_raw.\(ext)"
-    let audioUrl = "/tmp/ocb_tts.\(ext)"
+    let rawURL = PrivateRuntimeStorage.shared.uniqueFile("tts-full-raw", withExtension: ext)
+    let audioURL = PrivateRuntimeStorage.shared.uniqueFile("tts-full", withExtension: ext)
     do {
-      try data.write(to: URL(fileURLWithPath: rawUrl))
+      try PrivateRuntimeStorage.shared.write(data, to: rawURL)
       let settings = VoiceSettings.load()
       let volumeVal = settings.tts_volume ?? 1.5
       if volumeVal != 1.0 {
-        let success = amplifyAudioFile(inputPath: rawUrl, outputPath: audioUrl, volume: volumeVal)
+        let success = amplifyAudioFile(inputPath: rawURL.path, outputPath: audioURL.path, volume: volumeVal)
         if !success {
-          try? FileManager.default.removeItem(atPath: audioUrl)
-          try? FileManager.default.copyItem(atPath: rawUrl, toPath: audioUrl)
+          PrivateRuntimeStorage.shared.remove(audioURL)
+          try FileManager.default.copyItem(at: rawURL, to: audioURL)
         }
       } else {
-        try? FileManager.default.removeItem(atPath: audioUrl)
-        try? FileManager.default.copyItem(atPath: rawUrl, toPath: audioUrl)
+        PrivateRuntimeStorage.shared.remove(audioURL)
+        try FileManager.default.copyItem(at: rawURL, to: audioURL)
       }
-      try? FileManager.default.removeItem(atPath: rawUrl)
+      try PrivateRuntimeStorage.shared.makePrivate(audioURL)
+      PrivateRuntimeStorage.shared.remove(rawURL)
       
       // Update speaking status for VAD sync
-      try? "speaking".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+      try? PrivateRuntimeStorage.shared.write("speaking", to: voiceStatusFile)
       
       DispatchQueue.main.async { [weak self] in
         guard let s = self, s.currentQuerySequence == activeSeq else { return }
@@ -1341,12 +1362,13 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         playTask.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
         let settings = VoiceSettings.load()
         let volumeVal = settings.tts_volume ?? 1.5
-        playTask.arguments = ["-v", String(volumeVal), audioUrl]
+        playTask.arguments = ["-v", String(volumeVal), audioURL.path]
         try? playTask.run()
         playTask.waitUntilExit()
+        PrivateRuntimeStorage.shared.remove(audioURL)
         
         s.log("[TTS] Finished playing full audio")
-        try? "idle".write(toFile: "/tmp/ocb_status.txt", atomically: true, encoding: .utf8)
+        try? PrivateRuntimeStorage.shared.write("idle", to: s.voiceStatusFile)
         s.voiceManager.stopInterruptionMonitoring()
         
         DispatchQueue.main.async {
@@ -1356,6 +1378,8 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
         }
       }
     } catch {
+      PrivateRuntimeStorage.shared.remove(rawURL)
+      PrivateRuntimeStorage.shared.remove(audioURL)
       self.log("[TTS Err] Failed to write/play audio: \(error.localizedDescription)")
       DispatchQueue.main.async { [weak self] in
         guard let s = self, s.currentQuerySequence == activeSeq else { return }
@@ -1724,9 +1748,11 @@ if __name__ == "__main__":
     main()
 """
 
-    try? minimax.write(toFile: "/tmp/ocb_minimax_tts.py", atomically: true, encoding: .utf8)
-    try? openai.write(toFile: "/tmp/ocb_openai_tts.py", atomically: true, encoding: .utf8)
-    log("[App] Written helper python scripts to /tmp")
+    let minimaxURL = PrivateRuntimeStorage.shared.fixedFile("minimax-tts.py")
+    let openAIURL = PrivateRuntimeStorage.shared.fixedFile("openai-tts.py")
+    try? PrivateRuntimeStorage.shared.write(minimax, to: minimaxURL)
+    try? PrivateRuntimeStorage.shared.write(openai, to: openAIURL)
+    log("[App] Prepared private helper scripts.")
   }
 
   private var pausedMediaApps: String = ""
@@ -2097,12 +2123,19 @@ if __name__ == "__main__":
     }
     
     let ext = url.pathExtension.lowercased()
-    let filePath = "/tmp/dropped_file.\(ext)"
-    let destURL = URL(fileURLWithPath: filePath)
-    try? FileManager.default.removeItem(at: destURL)
-    try? FileManager.default.copyItem(at: url, to: destURL)
+    let destURL = PrivateRuntimeStorage.shared.uniqueFile("dropped-file", withExtension: ext)
+    if let previousPath = currentDroppedFilePath {
+      PrivateRuntimeStorage.shared.remove(URL(fileURLWithPath: previousPath))
+    }
+    do {
+      try FileManager.default.copyItem(at: url, to: destURL)
+      try PrivateRuntimeStorage.shared.makePrivate(destURL)
+    } catch {
+      log("[Notch Err] Could not stage dropped file: \(error.localizedDescription)")
+      return
+    }
     
-    self.currentDroppedFilePath = filePath
+    self.currentDroppedFilePath = destURL.path
     self.isWaitingForDropCommand = true
     self.didPlayDropPrompt = false
     
