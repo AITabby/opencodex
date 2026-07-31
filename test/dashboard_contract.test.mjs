@@ -55,6 +55,16 @@ test("dashboard exposes the per-model Chat or Responses protocol choice", async 
   assert.match(text, /readProviderModelRows/);
 });
 
+test("dashboard exposes a persistent Chinese-English language switch", async () => {
+  const text = await source();
+  assert.match(text, /id="language-toggle"/);
+  assert.match(text, /opencodex\.language/);
+  assert.match(text, /OpenCodex Control Center/);
+  assert.match(text, /setLanguage/);
+  assert.match(text, /MutationObserver/);
+  assert.match(text, /closest\('\.session-item,\.session-message,\.log-row/);
+});
+
 test("dashboard refreshes subscription status after every model deletion path", async () => {
   const text = await source();
   assert.match(text, /post\('\/api\/models\/delete',\{id:id\}\);await syncDashboardState\(\)/);
