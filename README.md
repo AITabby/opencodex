@@ -7,8 +7,8 @@
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-win-x64.exe"><img src="https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat-square&logo=windows" alt="Windows 10/11"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe"><img src="https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat-square&logo=windows" alt="Windows 10/11"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
 
@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-arm64.dmg">⬇️ 下载 OpenCodex v1.0.4</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg">⬇️ 下载 OpenCodex v1.0.5（macOS）</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-win-x64.exe">🪟 下载 Windows 版</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe">🪟 下载 Windows v1.0.3</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.4">查看 Release</a>
+  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.5">查看 Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
@@ -34,7 +34,7 @@
   <a href="./assets/demo.mp4">▶️ 查看应用演示视频</a>
 </p>
 
-> macOS Apple Silicon arm64 · Windows 10/11 · v1.0.4 · 当前 macOS DMG 未经过 Apple 签名
+> macOS Apple Silicon arm64 v1.0.5 · Windows 10/11 v1.0.3 · 当前 macOS DMG 未经过 Apple 签名
 
 > ✅ 当前 Release 的 DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 
@@ -49,6 +49,8 @@ OpenCodex 是一个运行在本机的 Codex Desktop 控制中心，提供 macOS 
 - 接入 API Key、OpenAI Compatible 接口和本机订阅
 - 管理第三方模型，并让它们出现在 Codex Desktop 的模型菜单中
 - 使用语音助手、会话管理和本地 Agent 工具
+- GPT-Live 实时沟通后，可将任务交给任意已接入的可用第三方模型执行
+- 通过 GPT-Live 悬浮球随时切换执行模型，根据模型能力自由安排任务
 - 让模型路由、语音和本地 Agent 能力在一个应用里协同工作
 
 ### 核心能力
@@ -57,6 +59,7 @@ OpenCodex 是一个运行在本机的 Codex Desktop 控制中心，提供 macOS 
 | --- | --- |
 | 🌐 网关 | 管理服务商、API Key、模型和本机订阅，按需启用第三方模型 |
 | 🎙️ 语音 | 配置语音识别、语音合成和全局语音栏 |
+| 🤖 GPT-Live | 实时沟通后选择任意已接入的第三方模型执行任务，并支持随时切换 |
 | 💬 会话 | 查看本地 Codex 会话，扫描和导入其他 Agent 的完整上下文 |
 | 🛡️ 原生保护 | 官方 Codex 模型和原生登录路径保持独立 |
 
@@ -75,6 +78,7 @@ Codex Desktop
 OpenCodex App
   ├── 本地网关：第三方模型与服务商管理
   ├── 语音栏：STT / TTS / 全局语音交互
+  ├── GPT-Live：实时沟通与执行模型选择
   └── 会话中心：扫描、查看、导入 Agent 会话
 ```
 
@@ -84,6 +88,8 @@ OpenCodex App
 - 本机订阅登录态检测、导入、刷新和实时模型验证
 - 服务商模型命名空间，避免不同厂商出现同名模型冲突
 - 模型添加、测试、删除和订阅状态实时同步
+- GPT-Live 实时语音沟通后，将任务交给任意已接入的可用第三方模型执行
+- GPT-Live 悬浮球支持随时切换执行模型，按模型特点灵活安排任务
 - 本地会话浏览、Agent 会话扫描与上下文导入
 - 实时网关日志与一键重启/还原原生 Codex
 
@@ -92,7 +98,7 @@ OpenCodex App
 #### 普通用户
 
 1. 确保已经安装 Codex Desktop。
-2. 下载 [OpenCodex-1.0.4-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-arm64.dmg)。
+2. 下载 [OpenCodex-1.0.5-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg)。
 3. 将 OpenCodex 拖入 `Applications` 并打开。
 4. 在应用内管理网关、语音和会话功能。
 
@@ -103,7 +109,7 @@ DMG 版本已经包含网关所需的独立运行时，普通用户无需在终�
 #### Windows 10/11
 
 1. 确保已经安装 Codex Desktop。
-2. 下载 [OpenCodex-1.0.4-win-x64.exe](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-win-x64.exe)。
+2. 下载 [OpenCodex-1.0.3-win-x64.exe](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe)。
 3. 运行安装程序并打开 OpenCodex。
 
 Windows 安装包已经包含本地网关和桌面应用窗口。Windows 用户不需要额外安装 Node.js 或 .NET SDK，也不需要通过终端启动网关。
@@ -128,7 +134,7 @@ http://localhost:8765/dashboard
 
 ### 项目状态
 
-当前发布版本为 `v1.0.4`，提供 macOS Apple Silicon 和 Windows 10/11 安装包。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
+当前 macOS 发布版本为 `v1.0.5`，Windows 发布版本为 `v1.0.3`。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
 
 ---
 
@@ -146,6 +152,7 @@ It works alongside Codex Desktop instead of replacing it. Native Codex models an
 | --- | --- |
 | 🌐 Gateway | Manage providers, API keys, subscriptions, and third-party models |
 | 🎙️ Voice | Configure speech recognition, speech synthesis, and the global voice bar |
+| 🤖 GPT-Live | Choose any available connected third-party model to execute tasks after a live conversation, and switch models at any time |
 | 💬 Sessions | Browse local Codex sessions and import external agent context |
 | 🛡️ Native protection | Keep native Codex models and native login isolated |
 
@@ -161,13 +168,15 @@ Official Codex models stay on their native route. Only models explicitly added b
 - Local subscription detection, import, refresh, and live model validation
 - Provider-scoped model names to avoid cross-provider naming conflicts
 - Real-time synchronization for adding, testing, deleting, and importing models
+- GPT-Live can hand tasks from a live conversation to any available connected third-party model
+- The GPT-Live floating orb lets you switch the execution model at any time based on each model's strengths
 - Local session browser and external agent conversation import
 - Live gateway logs and one-click restart or native reset
 
 ### Installation
 
 1. Install Codex Desktop on macOS.
-2. Download the [OpenCodex v1.0.4 Apple Silicon DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-arm64.dmg).
+2. Download the [OpenCodex v1.0.5 Apple Silicon DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg).
 3. Drag OpenCodex into `Applications` and launch it.
 4. Manage providers, voice, sessions, and third-party models from the app.
 
@@ -178,7 +187,7 @@ The current DMG is unsigned. If macOS blocks the first launch, allow it from **S
 #### Windows 10/11
 
 1. Install Codex Desktop.
-2. Download the [OpenCodex v1.0.4 Windows installer](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-win-x64.exe).
+2. Download the [OpenCodex v1.0.3 Windows installer](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe).
 3. Run the installer and launch OpenCodex.
 
 The Windows installer includes the local gateway and native app window. Windows users do not need Node.js or the .NET SDK, and do not need to start the gateway from a terminal.
@@ -203,12 +212,12 @@ http://localhost:8765/dashboard
 
 ### Project status
 
-The current release is `v1.0.4` for macOS Apple Silicon and Windows 10/11. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
+The current macOS release is `v1.0.5`, while Windows remains at `v1.0.3`. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
 
 ### Links
 
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.0.4](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-arm64.dmg)
-- [Download OpenCodex v1.0.4 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.4/OpenCodex-1.0.4-win-x64.exe)
+- [Download OpenCodex v1.0.5 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg)
+- [Download OpenCodex v1.0.3 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)
