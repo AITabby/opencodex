@@ -78,6 +78,11 @@ export function buildFullCatalogEntry(modelSlug: string, providerName: string, a
     supports_computer_use: true,
     supports_mcp: true,
     vision_bridge_enabled: true,
+    // Third-party chat models can delegate image generation to the native
+    // Codex Responses image tool. This capability is independent from
+    // the model's own vision input capability.
+    supports_image_generation: true,
+    image_generation_mode: "native_responses",
   };
 }
 

@@ -6,6 +6,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { transformResponsesToChat, convertToolsToChatTools } from "../dist/core/transformer.js";
 import { ResponsesStreamEngine, normalizeToolArguments } from "../dist/core/stream_engine.js";
+import {
+  DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL,
+  NATIVE_IMAGE_TOOL_NAME,
+  buildNativeCodexImageRequestBody,
+  extractImageGenerationContext,
+  parseImageGenerationArguments,
+} from "../dist/services/native_image_bridge.js";
 
 test("v2 transformer handles responses to chat conversion cleanly", () => {
   const reqBody = {
@@ -66,6 +73,42 @@ test("v2 explicit desktop tools retain the subagent controls", () => {
 
   assert.deepEqual(names.slice(0, 1), ["spawn_agent"]);
   assert.deepEqual(names.slice(1), ["exec_command", "view_file", "list_dir"]);
+});
+
+test("v2 converts Responses image_generation into a gateway-owned native Codex function", () => {
+  const tools = convertToolsToChatTools([{ type: "image_generation" }]);
+  const imageTool = tools.find((tool) => tool.function?.name === NATIVE_IMAGE_TOOL_NAME);
+
+  assert.ok(imageTool);
+  assert.equal(imageTool.function.parameters.required[0], "prompt");
+  assert.equal(tools.some((tool) => tool.function?.name === "spawn_agent"), true);
+});
+
+test("native Codex image bridge keeps generation independent from the chat model's vision flag", () => {
+  const context = extractImageGenerationContext({
+    input: [{
+      type: "message",
+      role: "user",
+      content: [
+        { type: "input_text", text: "把这张图改成海报" },
+        { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+      ],
+    }],
+  });
+  assert.equal(context.text, "把这张图改成海报");
+  assert.deepEqual(context.images, [{ url: "data:image/png;base64,AAAA" }]);
+  assert.equal(DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL, "gpt-5.6");
+  assert.equal(parseImageGenerationArguments('{"prompt":"画一只猫"}').prompt, "画一只猫");
+  const nativeRequest = buildNativeCodexImageRequestBody(
+    { prompt: "画一只猫", size: "1024x1024", quality: "medium" },
+    context,
+    DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL,
+  );
+  assert.equal(nativeRequest.tools[0].type, "image_generation");
+  assert.equal(nativeRequest.tools[0].action, "auto");
+  assert.equal(nativeRequest.tools[0].partial_images, 0);
+  assert.equal(nativeRequest.tools[0].size, "1024x1024");
+  assert.equal(nativeRequest.input[0].content[1].type, "input_image");
 });
 
 test("v2 exec command contract can request desktop-path approval", () => {
@@ -129,4 +172,33 @@ test("v2 tool-only responses do not announce an empty message before the tool ca
   const responseDoneIndex = events.findIndex((event) => event.type === "response.done");
   assert.ok(completedToolIndex >= 0);
   assert.ok(completedToolIndex < responseDoneIndex);
+});
+
+test("v2 executes internal image calls without leaking them as client function calls", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("mock-coder", "image-turn");
+  const emit = async (event) => events.push(event);
+
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: {
+      tool_calls: [{
+        index: 0,
+        id: "call-image",
+        function: { name: NATIVE_IMAGE_TOOL_NAME, arguments: '{"prompt":"一只猫"}' },
+      }],
+    } }],
+  });
+
+  assert.equal(engine.getInternalImageToolCalls()[0].arguments, '{"prompt":"一只猫"}');
+  assert.equal(events.some((event) => event.item?.type === "function_call"), false);
+
+  await engine.emitImageGeneration(emit, { result: "AAAA" });
+  await engine.finish(emit);
+
+  assert.equal(events.some((event) => event.item?.type === "image_generation_call"), true);
+  assert.equal(events.some((event) => event.type === "response.image_generation_call.partial_image"), false);
+  assert.equal(events.find((event) => event.type === "response.output_item.done")?.item?.result, "AAAA");
+  assert.equal(events.find((event) => event.type === "response.completed")?.response?.output?.[0]?.type, "image_generation_call");
+  assert.equal(events.some((event) => event.item?.type === "message"), false);
 });

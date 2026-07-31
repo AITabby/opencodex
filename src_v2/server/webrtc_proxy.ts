@@ -35,7 +35,7 @@ function headerValue(req: http.IncomingMessage, name: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function readNativeAccessToken(): string {
+export function readNativeAccessToken(): string {
   try {
     const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
     return typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
@@ -48,7 +48,7 @@ function bearerValue(value: string): string {
   return value.replace(/^Bearer\s+/i, "").trim();
 }
 
-function isLocalOrPlaceholderBearer(value: string, localAdminToken?: string): boolean {
+export function isLocalOrPlaceholderBearer(value: string, localAdminToken?: string): boolean {
   const token = bearerValue(value);
   if (!token) return true;
   if (localAdminToken && token === localAdminToken) return true;
@@ -79,12 +79,15 @@ function isNativeChatGptRequest(req: http.IncomingMessage, pathname: string): bo
   );
 }
 
-function copyRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOptions, nativeSession: boolean): Record<string, string> {
+export function copyNativeRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOptions = {}, nativeSession = true): Record<string, string> {
   const headers: Record<string, string> = {};
   for (const [key, value] of Object.entries(req.headers)) {
     const lowerKey = key.toLowerCase();
     if (lowerKey === "host" || lowerKey === "connection" || lowerKey === "upgrade") continue;
-    if (lowerKey === "content-length" || lowerKey === "transfer-encoding") continue;
+    // The gateway decodes request bodies before replaying them upstream. Do
+    // not forward the original content-encoding or the upstream will try to
+    // decompress an already-decoded JSON body and answer with a generic 400.
+    if (lowerKey === "content-length" || lowerKey === "transfer-encoding" || lowerKey === "content-encoding") continue;
     if (lowerKey.startsWith("sec-websocket-")) continue;
     if (Array.isArray(value)) headers[key] = value.join(", ");
     else if (typeof value === "string") headers[key] = value;
@@ -124,7 +127,7 @@ export function resolveRealtimeUpstream(req: http.IncomingMessage, options: Real
     targetPath,
     nativeSession,
     nativeLiveCall,
-    headers: copyRequestHeaders(req, options, nativeSession),
+    headers: copyNativeRequestHeaders(req, options, nativeSession),
   };
 }
 

@@ -70,6 +70,15 @@ private final class LivePickerAgent: ObservableObject {
         onChange?()
     }
 
+    func disable() async {
+        guard (try? await sendSettings(enabled: false)) == true else { return }
+        enabled = false
+        request = nil
+        selectedModel = ""
+        availableModels = []
+        onChange?()
+    }
+
     private func poll() async {
         guard !token.isEmpty,
               let url = URL(string: "http://127.0.0.1:\(port)/api/live-model-picker/pending") else { return }
@@ -167,6 +176,7 @@ private final class LiveCardHostingView: NSHostingView<LiveCardView> {
 @MainActor
 private final class LiveOrbAnimationView: NSView {
     let onOpen: () -> Void
+    let onContextMenu: (NSEvent) -> Void
     let onDragStart: () -> Void
     let onDrag: (CGSize) -> Void
     let onDragEnd: () -> Void
@@ -177,8 +187,9 @@ private final class LiveOrbAnimationView: NSView {
     private let blurContext = CIContext(options: nil)
     private let noiseGenerator = CIFilter(name: "CIRandomGenerator")!
 
-    init(onOpen: @escaping () -> Void, onDragStart: @escaping () -> Void, onDrag: @escaping (CGSize) -> Void, onDragEnd: @escaping () -> Void) {
+    init(onOpen: @escaping () -> Void, onContextMenu: @escaping (NSEvent) -> Void, onDragStart: @escaping () -> Void, onDrag: @escaping (CGSize) -> Void, onDragEnd: @escaping () -> Void) {
         self.onOpen = onOpen
+        self.onContextMenu = onContextMenu
         self.onDragStart = onDragStart
         self.onDrag = onDrag
         self.onDragEnd = onDragEnd
@@ -286,6 +297,10 @@ private final class LiveOrbAnimationView: NSView {
         onDragEnd()
         moved = false
     }
+
+    override func rightMouseDown(with event: NSEvent) {
+        onContextMenu(event)
+    }
 }
 
 @MainActor
@@ -356,7 +371,7 @@ private final class LiveOrbHaloView: NSView {
 
 @MainActor
 private final class LiveOrbView: NSView {
-    init(onOpen: @escaping () -> Void, onDragStart: @escaping () -> Void, onDrag: @escaping (CGSize) -> Void, onDragEnd: @escaping () -> Void) {
+    init(onOpen: @escaping () -> Void, onContextMenu: @escaping (NSEvent) -> Void, onDragStart: @escaping () -> Void, onDrag: @escaping (CGSize) -> Void, onDragEnd: @escaping () -> Void) {
         super.init(frame: NSRect(x: 0, y: 0, width: 66, height: 66))
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
@@ -374,6 +389,7 @@ private final class LiveOrbView: NSView {
 
         let animationView = LiveOrbAnimationView(
             onOpen: onOpen,
+            onContextMenu: onContextMenu,
             onDragStart: onDragStart,
             onDrag: onDrag,
             onDragEnd: onDragEnd
@@ -471,11 +487,34 @@ private struct LiveCardView: View {
     }
 }
 
+private struct LiveContextMenuView: View {
+    let onClose: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: onClose) {
+            Text("关闭 GPT-Live 悬浮球")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(hovering ? Color.white.opacity(0.12) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .onHover { hovering = $0 }
+        .padding(7)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(.white.opacity(0.22)))
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     let agent = LivePickerAgent()
     private var orbPanel: LivePickerPanel!
     private var cardPanel: LivePickerPanel!
+    private var contextPanel: LivePickerPanel!
     private var orbOrigin = CGPoint.zero
     private var dragOrigin = CGPoint.zero
     private var cardManuallyShown = false
@@ -498,8 +537,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func createPanels() {
         orbPanel = makePanel(size: NSSize(width: 66, height: 66))
         cardPanel = makePanel(size: NSSize(width: 380, height: 320))
+        contextPanel = makePanel(size: NSSize(width: 280, height: 72))
         orbPanel.contentView = LiveOrbView(
             onOpen: { [weak self] in self?.toggleCard() },
+            onContextMenu: { [weak self] event in self?.showContextMenu(event: event) },
             onDragStart: { [weak self] in self?.beginDrag() },
             onDrag: { [weak self] translation in self?.drag(translation) },
             onDragEnd: { [weak self] in self?.endDrag() }
@@ -520,9 +561,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         cardHostingView.layer?.cornerRadius = 18
         cardHostingView.layer?.masksToBounds = true
         cardPanel.contentView = cardHostingView
+        let contextHostingView = NSHostingView(rootView: LiveContextMenuView(
+            onClose: { [weak self] in self?.disableLivePicker() }
+        ))
+        contextHostingView.wantsLayer = true
+        contextHostingView.layer?.backgroundColor = NSColor.clear.cgColor
+        contextHostingView.layer?.isOpaque = false
+        contextHostingView.layer?.cornerRadius = 18
+        contextHostingView.layer?.masksToBounds = true
+        contextPanel.contentView = contextHostingView
         positionOrb(initial: true)
         orbPanel.orderFrontRegardless()
         cardPanel.orderOut(nil)
+        contextPanel.orderOut(nil)
         agent.onChange = { [weak self] in self?.refreshPanels() }
     }
 
@@ -560,6 +611,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleCard() {
+        closeContextMenu()
         if cardPanel.isVisible {
             closeCard()
         } else {
@@ -572,12 +624,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         cardPanel.orderOut(nil)
     }
 
+    private func showContextMenu(event _: NSEvent) {
+        closeCard()
+        positionContextMenu()
+        contextPanel.makeKeyAndOrderFront(nil)
+    }
+
+    private func closeContextMenu() {
+        contextPanel.orderOut(nil)
+    }
+
+    @objc private func disableLivePicker() {
+        closeContextMenu()
+        Task { await agent.disable() }
+    }
+
     private func installDismissMonitors() {
         let dismissIfOutside: (NSEvent) -> Void = { [weak self] event in
-            guard let self, self.cardPanel.isVisible else { return }
+            guard let self, self.cardPanel.isVisible || self.contextPanel.isVisible else { return }
             let point = NSEvent.mouseLocation
-            if !self.cardPanel.frame.contains(point) && !self.orbPanel.frame.contains(point) {
+            if !self.cardPanel.frame.contains(point) && !self.contextPanel.frame.contains(point) && !self.orbPanel.frame.contains(point) {
                 self.closeCard()
+                self.closeContextMenu()
             }
         }
         globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown]) { event in
@@ -623,9 +691,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         orbPanel.setFrameOrigin(orbOrigin)
         if cardPanel.isVisible { positionCard() }
+        if contextPanel.isVisible { positionContextMenu() }
     }
 
     private func endDrag() {}
+
+    private func positionContextMenu() {
+        let center = NSPoint(x: orbPanel.frame.midX, y: orbPanel.frame.midY)
+        let screen = NSScreen.screens.first(where: { $0.visibleFrame.contains(center) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSScreen.screens[0].visibleFrame
+        let size = contextPanel.frame.size
+        let x = min(max(screen.minX + 10, orbPanel.frame.midX - size.width / 2), screen.maxX - size.width - 10)
+        var y = orbPanel.frame.maxY + 10
+        if y + size.height > screen.maxY { y = orbPanel.frame.minY - size.height - 10 }
+        contextPanel.setFrameOrigin(CGPoint(x: x, y: y))
+    }
 }
 
 @main

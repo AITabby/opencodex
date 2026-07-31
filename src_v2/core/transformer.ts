@@ -12,6 +12,7 @@ import {
   ResponseTool,
 } from "./types.js";
 import { AdapterFactory } from "../adapters/factory.js";
+import { buildNativeImageTool, NATIVE_IMAGE_TOOL_NAME, isImageGenerationTool } from "../services/native_image_bridge.js";
 
 const THINK_TAG_REGEX = /<think>[\s\S]*?<\/think>/gi;
 
@@ -198,7 +199,9 @@ export function convertToolsToChatTools(tools?: ResponseTool[]): ChatTool[] {
     if (typeof rawTool !== "object" || rawTool === null) continue;
     const tool = rawTool as any;
 
-    if (tool.type === "function" && tool.function) {
+    if (isImageGenerationTool(tool)) {
+      result.push(buildNativeImageTool());
+    } else if (tool.type === "function" && tool.function) {
       result.push({
         type: "function",
         function: tool.function,
@@ -313,6 +316,13 @@ export function transformResponsesToChat(
   if (body.temperature !== undefined) chatBody.temperature = body.temperature;
   if (body.top_p !== undefined) chatBody.top_p = body.top_p;
   if (body.max_output_tokens !== undefined) chatBody.max_tokens = body.max_output_tokens;
+  const requestedToolChoice = (body as any).tool_choice;
+  if (requestedToolChoice === "image_generation" || requestedToolChoice?.type === "image_generation") {
+    chatBody.tool_choice = {
+      type: "function",
+      function: { name: NATIVE_IMAGE_TOOL_NAME },
+    };
+  }
 
   return chatBody;
 }

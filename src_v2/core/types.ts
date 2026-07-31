@@ -9,6 +9,16 @@
 
 export type ResponseItemType = "message" | "function_call" | "function_call_output" | "reasoning";
 
+export interface ResponseImageContentPart {
+  type: "input_image" | "output_image";
+  image_url?: string;
+  file_id?: string;
+  detail?: "auto" | "low" | "high" | "original";
+  annotations?: any[];
+}
+
+export type ResponseContentPart = ResponseTextContentPart | ResponseImageContentPart | Record<string, any>;
+
 export interface ResponseTextContentPart {
   type: "input_text" | "output_text";
   text: string;
@@ -19,7 +29,7 @@ export interface ResponseMessageItem {
   id?: string;
   type?: "message";
   role: "developer" | "system" | "user" | "assistant";
-  content?: string | ResponseTextContentPart[];
+  content?: string | ResponseContentPart[];
   phase?: "commentary" | "final_answer";
   internal_chat_message_metadata_passthrough?: Record<string, any>;
 }
@@ -78,6 +88,14 @@ export type ResponseTool =
       tools?: ResponseToolFunction[];
     }
   | {
+      type: "image_generation";
+      model?: string;
+      quality?: string;
+      size?: string;
+      background?: string;
+      partial_images?: number;
+    }
+  | {
       name: string;
       description?: string;
       parameters?: Record<string, any>;
@@ -88,6 +106,7 @@ export interface ResponsesRequestBody {
   instructions?: string;
   input?: ResponseInputItem[];
   tools?: ResponseTool[];
+  tool_choice?: any;
   stream?: boolean;
   temperature?: number;
   top_p?: number;
@@ -170,5 +189,7 @@ export interface CatalogModelEntry {
   context_window?: number;
   max_context_window?: number;
   vision_bridge_enabled?: boolean;
+  supports_image_generation?: boolean;
+  image_generation_mode?: "native_responses" | "none";
   supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
 }

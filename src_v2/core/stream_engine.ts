@@ -12,6 +12,7 @@
  */
 
 import { randomBytes } from "crypto";
+import { NATIVE_IMAGE_TOOL_NAME } from "../services/native_image_bridge.js";
 
 export class ThinkTagFilter {
   private isThinking = false;
@@ -227,6 +228,14 @@ interface ReasoningState {
   closed: boolean;
 }
 
+interface ImageGenerationState {
+  id: string;
+  output_index: number;
+  result: string;
+  revised_prompt?: string;
+  closed: boolean;
+}
+
 export class ResponsesStreamEngine {
   private responseId: string;
   private model: string;
@@ -239,6 +248,8 @@ export class ResponsesStreamEngine {
   private messageClosed = false;
 
   private toolCalls: Record<number, ToolCallState> = {};
+  private internalImageToolCalls: Record<number, ToolCallState> = {};
+  private imageGenerations: ImageGenerationState[] = [];
   private reasoningState: ReasoningState | null = null;
 
   private thinkFilter = new ThinkTagFilter();
@@ -257,6 +268,16 @@ export class ResponsesStreamEngine {
 
   public getMessageText(): string {
     return this.messageText;
+  }
+
+  /** Internal gateway tool calls are deliberately never emitted as client tools. */
+  public getInternalImageToolCalls(): Array<{ id: string; call_id: string; name: string; arguments: string }> {
+    return Object.values(this.internalImageToolCalls).map((state) => ({
+      id: state.id,
+      call_id: state.call_id,
+      name: state.name,
+      arguments: state.arguments,
+    }));
   }
 
   private wrap(writeSse: (payload: any) => Promise<void>) {
@@ -407,7 +428,9 @@ export class ResponsesStreamEngine {
   private async emitToolDelta(writeSse: (payload: any) => Promise<void>, call: any): Promise<void> {
     const index = Number(call.index || 0);
     const fn = call.function || {};
-    let state = this.toolCalls[index];
+    const isInternalImageCall = fn.name === NATIVE_IMAGE_TOOL_NAME || Boolean(this.internalImageToolCalls[index]);
+    const toolStore = isInternalImageCall ? this.internalImageToolCalls : this.toolCalls;
+    let state = toolStore[index];
 
     if (!state) {
       // Responses separates the persisted function-call item id (`fc_*`)
@@ -424,15 +447,20 @@ export class ResponsesStreamEngine {
         call_id: callId,
         name: fn.name || "",
         arguments: "",
-        output_index: this.nextOutputIndex++,
-        added: false,
+        output_index: isInternalImageCall ? -1 : this.nextOutputIndex++,
+        added: isInternalImageCall,
         closed: false,
-        deferArguments: (fn.name || "") === "exec_command",
+        deferArguments: !isInternalImageCall && (fn.name || "") === "exec_command",
       };
-      this.toolCalls[index] = state;
+      toolStore[index] = state;
     }
 
     if (fn.name && !state.name) state.name = fn.name;
+
+    if (isInternalImageCall) {
+      if (fn.arguments) state.arguments += fn.arguments;
+      return;
+    }
 
     const emit = this.wrap(writeSse);
     if (!state.added) {
@@ -464,10 +492,61 @@ export class ResponsesStreamEngine {
     }
   }
 
+  /**
+   * Add a completed image result as a native Responses image_generation_call
+   * output item. The base64 result is emitted only after the bridge succeeds.
+   */
+  public async emitImageGeneration(
+    writeSse: (payload: any) => Promise<void>,
+    image: { result: string; revised_prompt?: string; partial_images?: string[] },
+  ): Promise<void> {
+    if (!image.result) return;
+    const emit = this.wrap(writeSse);
+    const state: ImageGenerationState = {
+      id: generateHexId("ig", 24),
+      output_index: this.nextOutputIndex++,
+      result: image.result,
+      ...(image.revised_prompt ? { revised_prompt: image.revised_prompt } : {}),
+      closed: false,
+    };
+    this.imageGenerations.push(state);
+
+    await emit({
+      type: "response.output_item.added",
+      output_index: state.output_index,
+      item: {
+        id: state.id,
+        type: "image_generation_call",
+        status: "in_progress",
+        ...(state.revised_prompt ? { revised_prompt: state.revised_prompt } : {}),
+      },
+    });
+
+    const partials = Array.isArray(image.partial_images) && image.partial_images.length > 0
+      ? image.partial_images
+      : [];
+    for (let index = 0; index < partials.length; index += 1) {
+      const partial = partials[index];
+      if (!partial) continue;
+      await emit({
+        type: "response.image_generation_call.partial_image",
+        item_id: state.id,
+        output_index: state.output_index,
+        partial_image_index: index,
+        partial_image_b64: partial,
+      });
+    }
+  }
+
   public async processChatChunk(writeSse: (payload: any) => Promise<void>, chunk: any): Promise<void> {
     const emit = this.wrap(writeSse);
-    const choice = (chunk.choices || [{}])[0];
-    const delta = choice.delta || {};
+    // OpenAI-compatible providers may send an informational chunk with an
+    // empty `choices` array before the first token or at stream completion.
+    // Treat it as a no-op instead of dereferencing an absent choice and
+    // aborting the whole Live/tool continuation.
+    const choices = Array.isArray(chunk?.choices) ? chunk.choices : [];
+    const choice = choices[0] && typeof choices[0] === "object" ? choices[0] : {};
+    const delta = choice.delta && typeof choice.delta === "object" ? choice.delta : {};
 
     const reasoning = delta.reasoning_content || delta.reasoning || choice.message?.reasoning_content;
     if (reasoning) {
@@ -512,11 +591,12 @@ export class ResponsesStreamEngine {
     await this.closeReasoning(emit);
 
     const hasTools = Object.keys(this.toolCalls).length > 0;
+    const hasImages = this.imageGenerations.length > 0;
     if (flushedText && !this.messageClosed) {
       await this.emitTextDelta(emit, flushedText);
     }
 
-    if (!hasTools && (!this.messageText || this.messageText.trim().length === 0)) {
+    if (!hasTools && !hasImages && (!this.messageText || this.messageText.trim().length === 0)) {
       if (!this.messageOpened) {
         await this.openMessage(emit);
       }
@@ -528,6 +608,9 @@ export class ResponsesStreamEngine {
     const outputIndexes: number[] = [];
     if (this.messageOpened && !this.messageClosed) outputIndexes.push(this.messageIndex!);
     for (const state of Object.values(this.toolCalls)) {
+      if (!state.closed) outputIndexes.push(state.output_index);
+    }
+    for (const state of this.imageGenerations) {
       if (!state.closed) outputIndexes.push(state.output_index);
     }
     outputIndexes.sort((a, b) => a - b);
@@ -565,39 +648,86 @@ export class ResponsesStreamEngine {
       }
 
       const state = Object.values(this.toolCalls).find((candidate) => candidate.output_index === outputIndex);
-      if (!state || state.closed) continue;
-      state.closed = true;
-      const normalizedArguments = normalizeToolArguments(state.name, state.arguments);
-      if (state.deferArguments && normalizedArguments) {
+      if (state && !state.closed) {
+        state.closed = true;
+        const normalizedArguments = normalizeToolArguments(state.name, state.arguments);
+        if (state.deferArguments && normalizedArguments) {
+          await emit({
+            type: "response.function_call_arguments.delta",
+            item_id: state.id,
+            output_index: state.output_index,
+            delta: normalizedArguments,
+          });
+        }
+        state.arguments = normalizedArguments;
         await emit({
-          type: "response.function_call_arguments.delta",
+          type: "response.function_call_arguments.done",
           item_id: state.id,
           output_index: state.output_index,
-          delta: normalizedArguments,
+          arguments: state.arguments,
         });
+        await emit({
+          type: "response.output_item.done",
+          output_index: state.output_index,
+          item: {
+            id: state.id,
+            type: "function_call",
+            status: "completed",
+            call_id: state.call_id,
+            name: state.name,
+            arguments: state.arguments,
+          },
+        });
+        continue;
       }
-      state.arguments = normalizedArguments;
-      await emit({
-        type: "response.function_call_arguments.done",
-        item_id: state.id,
-        output_index: state.output_index,
-        arguments: state.arguments,
-      });
+
+      const image = this.imageGenerations.find((candidate) => candidate.output_index === outputIndex);
+      if (!image || image.closed) continue;
+      image.closed = true;
       await emit({
         type: "response.output_item.done",
-        output_index: state.output_index,
+        output_index: image.output_index,
         item: {
-          id: state.id,
-          type: "function_call",
+          id: image.id,
+          type: "image_generation_call",
           status: "completed",
-          call_id: state.call_id,
-          name: state.name,
-          arguments: state.arguments,
+          ...(image.revised_prompt ? { revised_prompt: image.revised_prompt } : {}),
+          result: image.result,
         },
       });
     }
 
     const now = Math.floor(Date.now() / 1000);
+    const output: any[] = [];
+    if (this.messageOpened) {
+      output.push({
+        id: this.messageItemId,
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        phase: hasTools ? "commentary" : "final_answer",
+        content: [{ type: "output_text", text: this.messageText, annotations: [] }],
+      });
+    }
+    for (const state of Object.values(this.toolCalls)) {
+      output.push({
+        id: state.id,
+        type: "function_call",
+        status: "completed",
+        call_id: state.call_id,
+        name: state.name,
+        arguments: state.arguments,
+      });
+    }
+    for (const image of this.imageGenerations) {
+      output.push({
+        id: image.id,
+        type: "image_generation_call",
+        status: "completed",
+        ...(image.revised_prompt ? { revised_prompt: image.revised_prompt } : {}),
+        result: image.result,
+      });
+    }
     await emit({
       type: "response.completed",
       response: {
@@ -607,7 +737,7 @@ export class ResponsesStreamEngine {
         completed_at: now,
         status: "completed",
         model: this.model,
-        output: [],
+        output,
       },
     });
 
@@ -620,7 +750,7 @@ export class ResponsesStreamEngine {
         completed_at: now,
         status: "completed",
         model: this.model,
-        output: [],
+        output,
       },
     });
 

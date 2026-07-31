@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "../dist/server/webrtc_proxy.js";
+import { copyNativeRequestHeaders, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "../dist/server/webrtc_proxy.js";
 
 function request(url, headers = {}) {
   return { url, headers };
@@ -48,6 +48,19 @@ test("the local gateway bearer is never forwarded as an upstream Realtime creden
   );
 
   assert.equal(upstream.headers.authorization, undefined);
+});
+
+test("decoded request bodies do not retain the original content-encoding header", () => {
+  const headers = copyNativeRequestHeaders(request("/v1/responses", {
+    host: "127.0.0.1:8765",
+    authorization: "Bearer gateway-token",
+    "content-type": "application/json",
+    "content-encoding": "zstd",
+  }), { localAdminToken: "gateway-token", nativeAccessToken: "native-token" }, true);
+
+  assert.equal(headers["content-encoding"], undefined);
+  assert.equal(headers.authorization, "Bearer native-token");
+  assert.equal(headers["content-type"], "application/json");
 });
 
 test("an already native backend path is not double-prefixed", () => {

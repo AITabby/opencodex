@@ -35,7 +35,7 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(gateway, /Do not let a generic/);
   assert.match(gateway, /this\.resetLiveModelPicker\(\)/);
   assert.match(gateway, /if \(!this\.isLiveModelPickerEnabled\(\)\) return/);
-  assert.doesNotMatch(floatingPicker, /rightMouseDown/);
+  assert.match(floatingPicker, /rightMouseDown/);
   assert.doesNotMatch(floatingPicker, /取消当前模型/);
   assert.doesNotMatch(dashboard, /oncontextmenu/);
   assert.match(floatingPicker, /onOpen: \{ \[weak self\] in self\?\.toggleCard\(\) \}/);

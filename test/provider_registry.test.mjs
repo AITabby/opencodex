@@ -45,11 +45,28 @@ test("V2 stream emits indexed text output and a completed lifecycle", async () =
   assert.ok(events.some((event) => event.type === "response.completed"));
 });
 
+test("V2 stream ignores provider chunks with an empty choices array", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("test-model", "turn-empty-choice");
+  const write = async (event) => events.push(event);
+  await engine.start(write);
+  await engine.processChatChunk(write, { id: "provider-info", choices: [] });
+  await engine.processChatChunk(write, { choices: [{ delta: { content: "after-gap" } }] });
+  await engine.finish(write);
+  assert.ok(events.some((event) => event.type === "response.output_text.delta" && event.delta === "after-gap"));
+  assert.ok(events.some((event) => event.type === "response.completed"));
+});
+
 test("V2 source contains no request debug persistence or Computer Use re-enablement", async () => {
-  const [source, catalog] = await Promise.all([
+  const [source, catalog, router] = await Promise.all([
     readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8"),
-    readFile(new URL("../src_v2/services/catalog_sync.ts", import.meta.url), "utf8")
+    readFile(new URL("../src_v2/services/catalog_sync.ts", import.meta.url), "utf8"),
+    readFile(new URL("../src_v2/server/router.ts", import.meta.url), "utf8")
   ]);
   assert.doesNotMatch(source, /responses_request_debug|debug_req\.json/);
   assert.match(catalog, /experimental_supported_tools/);
+  assert.match(catalog, /image_generation_mode: "native_responses"/);
+  assert.match(source, /proxyNativeResponses/);
+  assert.match(router, /上游流在完成事件前结束/);
+  assert.match(router, /generateNativeCodexImage/);
 });

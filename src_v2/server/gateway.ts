@@ -18,10 +18,10 @@ import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_s
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
-import { handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
+import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
-import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
+import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -338,6 +338,34 @@ function providerDisplayName(providerName: string, rawSlug: string): string {
     ? slug.slice(owner.length + 1)
     : slug;
   return `${owner}/${unscoped || "model"}`;
+}
+
+function runtimeProviderCatalogEntries(): any[] {
+  const entries: any[] = [];
+  for (const provider of CredentialStore.loadProviders()) {
+    const owner = normalizeNamespace(String(provider?.name || provider?.preset_id || ""));
+    if (!owner || !Array.isArray(provider?.models)) continue;
+    for (const configuredModel of provider.models) {
+      const value = String(configuredModel || "").trim();
+      if (!value) continue;
+      const separator = value.includes("=") ? "=" : (value.includes("->") ? "->" : "");
+      const parts = separator ? value.split(separator) : [value];
+      const rawSlug = String(parts[0] || "").trim();
+      const backendModel = String(parts[1] || rawSlug).trim();
+      if (!rawSlug || !backendModel) continue;
+      const slug = namespaceModelSlug(owner, rawSlug);
+      entries.push({
+        slug,
+        model: slug,
+        display_name: providerDisplayName(owner, slug),
+        backend_provider: owner,
+        backend_model: backendModel,
+        supports_image_generation: true,
+        image_generation_mode: "native_responses",
+      });
+    }
+  }
+  return entries;
 }
 
 function isOfficialCachedModel(model: any): boolean {
@@ -698,6 +726,7 @@ export class CodexBridgeServer {
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
+  private livePickerOverlayProcess: ReturnType<typeof spawn> | null = null;
 
   constructor(port = 8765) {
     this.port = port;
@@ -747,6 +776,17 @@ export class CodexBridgeServer {
     return Array.from(models).sort((a, b) => a.localeCompare(b));
   }
 
+  private liveModelIntentCandidates(): string[] {
+    const models = new Set(this.availableRealtimeWorkModels());
+    // Keep provider-only models out of the native picker list, but allow
+    // Live speech to address a model that is already configured locally.
+    for (const model of runtimeProviderCatalogEntries()) {
+      const slug = normalizeRealtimeWorkModel(model.slug);
+      if (slug) models.add(slug);
+    }
+    return Array.from(models).sort((a, b) => a.localeCompare(b));
+  }
+
   private liveModelPickerSettingsPath(): string {
     return path.join(os.homedir(), ".opencodex", "voice_settings.json");
   }
@@ -777,7 +817,56 @@ export class CodexBridgeServer {
     fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(statePath, JSON.stringify({ enabled }, null, 2), "utf-8");
     try { fs.chmodSync(statePath, 0o600); } catch {}
-    if (!enabled) this.resetLiveModelPicker();
+    if (!enabled) {
+      this.resetLiveModelPicker();
+      this.stopLivePickerOverlay();
+    } else {
+      this.startLivePickerOverlay();
+    }
+  }
+
+  private livePickerOverlayExecutable(): string {
+    const configured = String(process.env.OPENCODEX_LIVE_PICKER_PATH || "").trim();
+    const candidates = [
+      configured,
+      path.join(process.cwd(), "macos-app", ".build", "out", "Products", "Release", "OpenCodexLivePicker"),
+      path.join(process.cwd(), "macos-app", ".build", "arm64-apple-macosx", "release", "OpenCodexLivePicker"),
+    ].filter(Boolean);
+    return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+  }
+
+  private startLivePickerOverlay(): void {
+    if (process.platform !== "darwin" || this.livePickerOverlayProcess || !this.isLiveModelPickerEnabled()) return;
+    const executable = this.livePickerOverlayExecutable();
+    if (!executable) {
+      console.warn("[OpenCodex Realtime] Native Live picker overlay is unavailable; keeping the web fallback available.");
+      return;
+    }
+    const child = spawn(executable, [], {
+      cwd: path.dirname(executable),
+      env: {
+        ...process.env,
+        OPENCODEX_APP_PORT: String(this.port),
+        OPENCODEX_ADMIN_TOKEN_PATH: path.join(this.dataDir, "admin_token"),
+        OPENCODEX_APP_MODE: "1",
+      },
+      stdio: "ignore",
+    });
+    this.livePickerOverlayProcess = child;
+    child.once("error", (error) => {
+      console.warn(`[OpenCodex Realtime] Could not start native Live picker overlay: ${error.message}`);
+      if (this.livePickerOverlayProcess === child) this.livePickerOverlayProcess = null;
+    });
+    child.once("exit", () => {
+      if (this.livePickerOverlayProcess === child) this.livePickerOverlayProcess = null;
+    });
+    console.log(`[OpenCodex Realtime] Native Live picker overlay started for port ${this.port}`);
+  }
+
+  private stopLivePickerOverlay(): void {
+    const child = this.livePickerOverlayProcess;
+    this.livePickerOverlayProcess = null;
+    if (child && !child.killed) child.kill();
   }
 
   private async chooseLiveWorkModel(body: any): Promise<string> {
@@ -795,10 +884,26 @@ export class CodexBridgeServer {
     const now = Date.now();
     const sessionKey = liveModelSessionKey(body);
     const isLiveRequest = isLikelyLiveWorkRequest(body) || isToolContinuation(body);
+    const isLiveSessionRequest = isLiveRequest || isLikelyLiveModelIntentRequest(body, this.isRealtimeActive());
 
+    // A spoken model choice is exactly the same state change as clicking a
+    // model in the floating-ball picker. The voice turn itself stays native;
+    // the binding is used by the next real work handoff.
+    if (isLiveSessionRequest) {
+      const requestedModel = extractLiveModelIntent(body, this.liveModelIntentCandidates());
+      if (requestedModel) {
+        const selected = this.bindLiveModel(requestedModel);
+        this.resolvePendingLiveModelSelection(selected, true);
+        console.log(`[OpenCodex Realtime] Voice model selection updated: ${selected}${isLiveRequest ? " (current work handoff)" : " (next work handoff)"}`);
+        return isLiveRequest ? selected : "";
+      }
+    }
+
+    // If speech mentioned a model that is not present in the catalog, do not
+    // clear the current choice. This is the same as leaving the manual
+    // picker untouched: the previous choice remains the fallback.
     // Live can send the next task without repeating the Live marker on every
-    // request. Keep using the model bound to this conversation before
-    // falling back to the request-shape heuristic below.
+    // request, so keep using the bound model before opening a new picker.
     const sessionBinding = this.liveModelBindings.get(sessionKey);
     if (sessionBinding?.expiresAt > now) {
       sessionBinding.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
@@ -846,8 +951,21 @@ export class CodexBridgeServer {
         expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
       };
       this.liveModelBindings.set(sessionKey, this.activeLiveModel);
+      return selected;
     }
-    return selected;
+
+    // Do not leave the Live request waiting forever when the user ignores the
+    // floating ball. The incoming model is the desktop's current/default
+    // model, so use it as the deterministic timeout fallback and remember it
+    // for the following Live task.
+    const fallbackModel = normalizeRealtimeWorkModel(body?.model);
+    if (fallbackModel) {
+      this.bindLiveModel(fallbackModel);
+      console.warn(`[OpenCodex Realtime] Live picker timed out; using incoming default model: ${fallbackModel}`);
+      return fallbackModel;
+    }
+    console.warn("[OpenCodex Realtime] Live picker timed out; no incoming default model was available");
+    return "";
   }
 
   private pendingLiveModelPicker(): any {
@@ -858,6 +976,7 @@ export class CodexBridgeServer {
         pending: false,
         realtime_active: this.isRealtimeActive(),
         enabled: this.isLiveModelPickerEnabled(),
+        native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
         models: this.isLiveModelPickerEnabled() ? this.availableRealtimeWorkModels() : [],
         selected_model: this.activeLiveModel?.model || "",
       };
@@ -866,6 +985,7 @@ export class CodexBridgeServer {
       pending: true,
       realtime_active: this.isRealtimeActive(),
       enabled: this.isLiveModelPickerEnabled(),
+      native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
       request_id: waiter.requestId,
       models: waiter.models,
       selected_model: this.activeLiveModel?.model || "",
@@ -883,6 +1003,11 @@ export class CodexBridgeServer {
       return { ok: true, model: "" };
     }
     if (!models.includes(selected)) return { ok: false, error: "所选模型不在当前可用模型列表中" };
+    this.bindLiveModel(selected);
+    return { ok: true, model: selected };
+  }
+
+  private bindLiveModel(selected: string): string {
     this.activeLiveModel = {
       model: selected,
       expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
@@ -892,7 +1017,7 @@ export class CodexBridgeServer {
     for (const key of this.liveModelBindings.keys()) {
       this.liveModelBindings.set(key, this.activeLiveModel);
     }
-    return { ok: true, model: selected };
+    return selected;
   }
 
   private resolveLiveModelPicker(requestId: unknown, model: unknown): { ok: boolean; error?: string; cancelled?: boolean } {
@@ -913,15 +1038,19 @@ export class CodexBridgeServer {
     if (!waiter.models.includes(selected)) {
       return { ok: false, error: "所选模型不在当前可用模型列表中" };
     }
+    this.resolvePendingLiveModelSelection(selected);
+    return { ok: true };
+  }
+
+  private resolvePendingLiveModelSelection(selected: string, allowOutsidePicker = false): void {
     // A single Live task can issue multiple requests while the first picker
     // is still waiting for the user. One selection must release all of those
     // waiters together, otherwise the same task opens the picker repeatedly.
     for (const pending of this.liveModelPickerWaiters.values()) {
       clearTimeout(pending.timer);
-      pending.resolve(pending.models.includes(selected) ? selected : "");
+      pending.resolve(allowOutsidePicker || pending.models.includes(selected) ? selected : "");
     }
     this.liveModelPickerWaiters.clear();
-    return { ok: true };
   }
 
   private resetLiveModelPicker(): void {
@@ -1097,6 +1226,10 @@ export class CodexBridgeServer {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
     if (!requested) return [];
     const catalog = this.readImportedModelCatalog();
+    const knownSlugs = new Set(catalog.map((entry: any) => catalogModelSlug(entry).toLowerCase()).filter(Boolean));
+    for (const entry of runtimeProviderCatalogEntries()) {
+      if (!knownSlugs.has(catalogModelSlug(entry).toLowerCase())) catalog.push(entry);
+    }
     const identityCandidates = (entry: any): string[] => [
       entry.slug, entry.model, entry.id
     ].filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -1184,24 +1317,23 @@ export class CodexBridgeServer {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
     if (!requested) return false;
     const catalog = this.readImportedModelCatalog();
-    return catalog.some((entry: any) => {
+    const importedNative = catalog.some((entry: any) => {
       const owner = catalogModelOwner(entry);
       if (owner) return false;
       return [entry.slug, entry.model, entry.id]
         .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
         .some((value) => value.trim().toLowerCase() === requested);
     });
+    if (importedNative) return true;
+    // Official models are allowed to bypass the provider catalog even when a
+    // stale custom catalog file has not been written yet. Never classify an
+    // owner-scoped third-party model as native here.
+    return readOfficialModelMap().has(requested);
   }
 
   private async proxyNativeResponses(req: http.IncomingMessage, body: any, res: http.ServerResponse): Promise<void> {
     const targetUrl = "https://chatgpt.com/backend-api/codex/responses";
-    const skipHeaders = new Set(["host", "content-length", "transfer-encoding", "connection", "accept-encoding", "content-encoding"]);
-    const forwardHeaders: Record<string, string> = {};
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (skipHeaders.has(key.toLowerCase())) continue;
-      if (typeof value === "string") forwardHeaders[key] = value;
-      else if (Array.isArray(value)) forwardHeaders[key] = value.join(", ");
-    }
+    const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
     forwardHeaders["host"] = "chatgpt.com";
 
     try {
@@ -1210,7 +1342,7 @@ export class CodexBridgeServer {
         headers: forwardHeaders,
         body: JSON.stringify(body),
         maxAttempts: 1,
-        timeoutMs: 120_000,
+        timeoutMs: 600_000,
         operation: "native-responses",
       });
       const responseHeaders: Record<string, string> = {};
@@ -1891,10 +2023,14 @@ if __name__ == "__main__":
             const providers = CredentialStore.loadProviders();
             // Subscription imports are the source of truth. A model may only
             // use the provider recorded beside it in the imported catalog.
-            const provider = this.findCatalogProvider(requestedModel, providers);
+            // Official ownerless GPT models must win before any third-party
+            // backend alias is considered; otherwise a custom provider that
+            // happens to expose the same raw slug could steal native routing.
+            const nativeModel = this.isNativeCatalogModel(requestedModel);
+            const provider = nativeModel ? null : this.findCatalogProvider(requestedModel, providers);
 
             if (!provider) {
-              if (this.isNativeCatalogModel(requestedModel)) {
+              if (nativeModel) {
                 await this.proxyNativeResponses(req, effectiveBody, res);
                 return;
               }
@@ -1913,7 +2049,8 @@ if __name__ == "__main__":
             const routingBody = protocol ? { ...effectiveBody, protocol } : effectiveBody;
             const providerUrl = rawUrl;
 
-            await this.router.handleResponses(routingBody, upstreamModel, apiKey, providerUrl, res, provider.name);
+            const nativeImageHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
+            await this.router.handleResponses(routingBody, upstreamModel, apiKey, providerUrl, res, provider.name, nativeImageHeaders);
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -4955,6 +5092,7 @@ if __name__ == "__main__":
 
       this.server.listen(this.port, "127.0.0.1", () => {
         console.log(`[CodexBridge V2] Server listening on http://127.0.0.1:${this.port}`);
+        this.startLivePickerOverlay();
         resolve();
       });
     });
@@ -5290,6 +5428,7 @@ if __name__ == "__main__":
 
   public stop(): Promise<void> {
     return new Promise((resolve) => {
+      this.stopLivePickerOverlay();
       if (this.server) {
         this.server.close(() => {
           this.releaseServerLock();

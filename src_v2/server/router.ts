@@ -6,6 +6,7 @@ import { GoogleGeminiAdapter } from "../adapters/google.js";
 import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
+import { extractImageGenerationContext, generateNativeCodexImage, parseImageGenerationArguments } from "../services/native_image_bridge.js";
 import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 
 
@@ -35,6 +36,19 @@ const cursorPendingToolCalls = new Map<string, CursorPendingToolCall>();
 // by the old request closure and silently discarded.
 const cursorExternalToolQueues = new Map<string, CursorExternalToolRequest[]>();
 const CURSOR_PENDING_TOOL_TTL_MS = 10 * 60 * 1000;
+
+function providerChunkSignalsCompletion(chunk: any): boolean {
+  if (!chunk || typeof chunk !== "object") return false;
+  if (chunk.type === "message_stop" || chunk.type === "response.completed" || chunk.type === "response.done") return true;
+  const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+  if (choices.some((choice: any) => choice && choice.finish_reason)) return true;
+  const candidates = Array.isArray(chunk.candidates)
+    ? chunk.candidates
+    : Array.isArray(chunk.response?.candidates)
+      ? chunk.response.candidates
+      : [];
+  return candidates.some((candidate: any) => Boolean(candidate?.finishReason || candidate?.finish_reason));
+}
 
 function cursorHistoryKey(body: any): string {
   return String(
@@ -137,11 +151,13 @@ export class GatewayRouter {
     apiKey: string,
     providerUrl: string,
     res: http.ServerResponse,
-    providerName = ""
+    providerName = "",
+    nativeImageHeaders: Record<string, string> = {},
   ): Promise<void> {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
+    const imageGenerationContext = extractImageGenerationContext(reqBody);
     const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId);
     chatBody.stream = true;
 
@@ -547,13 +563,19 @@ export class GatewayRouter {
       let buffer = "";
 
       const readWithTimeout = (timeoutMs = 600000): Promise<ReadableStreamReadResult<Uint8Array>> => {
-        return Promise.race([
-          reader.read(),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error("Stream read timeout (600s)")), timeoutMs)
-          ),
-        ]);
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`Stream read timeout (${Math.round(timeoutMs / 1000)}s)`)), timeoutMs);
+          reader.read().then((result) => {
+            clearTimeout(timer);
+            resolve(result);
+          }, (error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+        });
       };
+
+      let providerStreamCompleted = false;
 
       if (isCursorModel) {
         let binaryBuffer = new Uint8Array(0);
@@ -726,41 +748,71 @@ export class GatewayRouter {
           cursorExternalToolQueues.delete(cursorStateKey);
         }
         if (!pendingCursorToolRequest) rememberCursorSession(cursorHistoryId, cursorMessages, engine.getMessageText());
-      } else while (true) {
-        let readResult: ReadableStreamReadResult<Uint8Array>;
-        try {
-          readResult = await readWithTimeout(600000);
-        } catch (readErr: any) {
-          console.warn(`[CodexBridge V2] ${readErr.message}; closing stream cleanly.`);
-          break;
+      } else {
+        const processSseLine = async (line: string): Promise<void> => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) return;
+          const dataStr = trimmed.slice("data:".length).trim();
+          if (!dataStr) return;
+          if (dataStr === "[DONE]") {
+            providerStreamCompleted = true;
+            return;
+          }
+
+          let chunk: any;
+          try {
+            chunk = JSON.parse(dataStr);
+          } catch {
+            // SSE comments and provider keep-alives are harmless, but a
+            // stream without a terminal event is not allowed to become a
+            // synthetic response.completed.
+            return;
+          }
+          if (providerChunkSignalsCompletion(chunk)) providerStreamCompleted = true;
+          if (activeAdapter.processStreamChunk) {
+            const normalizedChunks = activeAdapter.processStreamChunk(chunk);
+            for (const nc of normalizedChunks) {
+              await engine.processChatChunk(writeSse, nc);
+            }
+          } else {
+            await engine.processChatChunk(writeSse, chunk);
+          }
+        };
+
+        while (!providerStreamCompleted) {
+          const readResult = await readWithTimeout(600000);
+          const { done, value } = readResult;
+          if (done) {
+            buffer += decoder.decode();
+            if (buffer.trim()) {
+              const finalLines = buffer.split("\n");
+              buffer = "";
+              for (const line of finalLines) await processSseLine(line);
+            }
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+          for (const line of lines) await processSseLine(line);
         }
 
-        const { done, value } = readResult;
-        if (done) break;
+        if (!providerStreamCompleted) {
+          throw new Error("上游流在完成事件前结束，已拒绝伪造 response.completed");
+        }
+      }
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data: ")) {
-            const dataStr = trimmed.slice(6);
-            if (dataStr === "[DONE]") continue;
-            try {
-              const chunk = JSON.parse(dataStr);
-              if (activeAdapter.processStreamChunk) {
-                const normalizedChunks = activeAdapter.processStreamChunk(chunk);
-                for (const nc of normalizedChunks) {
-                  await engine.processChatChunk(writeSse, nc);
-                }
-              } else {
-                await engine.processChatChunk(writeSse, chunk);
-              }
-            } catch {
-              // Ignore parse errors on individual chunk lines
-            }
-          }
+      const internalImageCalls = engine.getInternalImageToolCalls();
+      for (const call of internalImageCalls) {
+        const imageArgs = parseImageGenerationArguments(call.arguments, imageGenerationContext.text);
+        const images = await generateNativeCodexImage(imageArgs, imageGenerationContext, nativeImageHeaders);
+        for (const image of images) {
+          await engine.emitImageGeneration(writeSse, {
+            result: image.data,
+            revised_prompt: image.revisedPrompt,
+            partial_images: image.partialImages,
+          });
         }
       }
 
@@ -771,6 +823,7 @@ export class GatewayRouter {
       }
     } catch (err: any) {
       clearTimeout(timeoutId);
+      controller.abort();
       const upstreamDetails = upstreamErrorDetails(err);
       console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, {
         stack: err.stack,
