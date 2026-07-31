@@ -20,11 +20,52 @@ import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
+import { isNativeResponsesReasoningId, sanitizeNativeResponsesBody } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
+type ModelProtocol = "chat" | "responses";
+
+function normalizeModelProtocol(value: unknown): ModelProtocol {
+  return String(value || "").trim().toLowerCase() === "responses" ? "responses" : "chat";
+}
+
+function splitConfiguredModel(value: unknown): { slug: string; backendModel: string } {
+  const raw = String(value || "").trim();
+  const separator = raw.includes("=") ? "=" : (raw.includes("->") ? "->" : "");
+  if (!separator) return { slug: raw, backendModel: raw };
+  const parts = raw.split(separator);
+  return {
+    slug: String(parts[0] || "").trim(),
+    backendModel: String(parts.slice(1).join(separator) || parts[0] || "").trim(),
+  };
+}
+
+function protocolForConfiguredModel(
+  configuredModel: unknown,
+  protocols: Record<string, unknown> | undefined,
+  fallback: unknown = "chat",
+): ModelProtocol {
+  const raw = String(configuredModel || "").trim();
+  const { slug, backendModel } = splitConfiguredModel(raw);
+  const map = protocols || {};
+  return normalizeModelProtocol(map[raw] ?? map[slug] ?? map[backendModel] ?? fallback);
+}
+
+function buildModelProtocolMap(
+  models: string[],
+  protocols: Record<string, unknown> | undefined,
+  fallback: unknown = "chat",
+): Record<string, ModelProtocol> {
+  const result: Record<string, ModelProtocol> = {};
+  for (const model of models) {
+    const { slug } = splitConfiguredModel(model);
+    if (slug) result[slug] = protocolForConfiguredModel(model, protocols, fallback);
+  }
+  return result;
+}
 
 export function stripManagedCodexConfig(content: string): string {
   let cleaned = content || "";
@@ -354,12 +395,15 @@ function runtimeProviderCatalogEntries(): any[] {
       const backendModel = String(parts[1] || rawSlug).trim();
       if (!rawSlug || !backendModel) continue;
       const slug = namespaceModelSlug(owner, rawSlug);
+      const protocol = protocolForConfiguredModel(configuredModel, provider.model_protocols);
       entries.push({
         slug,
         model: slug,
         display_name: providerDisplayName(owner, slug),
         backend_provider: owner,
         backend_model: backendModel,
+        protocol,
+        backend_protocol: protocol,
         supports_image_generation: true,
         image_generation_mode: "native_responses",
       });
@@ -458,7 +502,8 @@ export function upsertProviderCatalogModel(
   rawSlug: string,
   backendModel: string,
   displayName: string,
-  providerName: string
+  providerName: string,
+  protocol: ModelProtocol = "chat",
 ): void {
   if (!catalog || typeof catalog !== "object") return;
   if (!Array.isArray(catalog.models)) catalog.models = [];
@@ -466,6 +511,7 @@ export function upsertProviderCatalogModel(
   const slug = String(rawSlug || "").trim();
   const backend = String(backendModel || slug).trim();
   const owner = normalizeNamespace(providerName);
+  const normalizedProtocol = normalizeModelProtocol(protocol);
   if (!slug || !backend || !owner) return;
   const canonicalSlug = namespaceModelSlug(owner, slug);
 
@@ -483,6 +529,8 @@ export function upsertProviderCatalogModel(
     owned.model = canonicalSlug;
     owned.backend_model = backend;
     owned.display_name = providerDisplayName(owner, canonicalSlug);
+    owned.protocol = normalizedProtocol;
+    owned.backend_protocol = normalizedProtocol;
     return;
   }
 
@@ -492,7 +540,7 @@ export function upsertProviderCatalogModel(
   const catalogSlug = usedSlugs.has(canonicalSlug.toLowerCase())
     ? scopedCatalogSlug(owner, slug, usedSlugs)
     : canonicalSlug;
-  const entry = buildFullCatalogEntry(catalogSlug, owner);
+  const entry = buildFullCatalogEntry(catalogSlug, owner, undefined, normalizedProtocol);
   entry.backend_model = backend;
   entry.display_name = providerDisplayName(owner, catalogSlug);
   catalog.models.push(entry);
@@ -649,6 +697,13 @@ function isGatewayReasoningItem(record: any): boolean {
   return legacyGatewayId || v2GatewayId || importedThinking;
 }
 
+function isForeignResponsesReasoningItem(record: any): boolean {
+  const payload = record?.type === "response_item" ? record.payload : record;
+  if (!payload || payload.type !== "reasoning") return false;
+  const id = typeof payload.id === "string" ? payload.id : "";
+  return Boolean(id) && !isNativeResponsesReasoningId(id);
+}
+
 function normalizeStoredFunctionCallId(record: any): boolean {
   const payload = record?.type === "response_item" ? record.payload : record;
   if (!payload || payload.type !== "function_call" || typeof payload.id !== "string") return false;
@@ -689,7 +744,7 @@ function repairNativeRollouts(): number {
     }
 
     const sanitized = records.filter((record) => {
-      if (isGatewayReasoningItem(record)) {
+      if (isGatewayReasoningItem(record) || isForeignResponsesReasoningItem(record)) {
         changed = true;
         return false;
       }
@@ -1924,7 +1979,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.5", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.6", opencodex: true }));
           return;
         }
 
@@ -2031,7 +2086,11 @@ if __name__ == "__main__":
 
             if (!provider) {
               if (nativeModel) {
-                await this.proxyNativeResponses(req, effectiveBody, res);
+                const cleaned = sanitizeNativeResponsesBody(effectiveBody);
+                if (cleaned.removedReasoningItems || cleaned.removedPreviousResponseId) {
+                  console.warn(`[OpenCodex Native] Removed incompatible third-party history: reasoning=${cleaned.removedReasoningItems}, previous_response_id=${cleaned.removedPreviousResponseId}`);
+                }
+                await this.proxyNativeResponses(req, cleaned.body, res);
                 return;
               }
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -2138,7 +2197,7 @@ if __name__ == "__main__":
 
         if (req.method === "GET" && url.pathname === "/api/providers/presets") {
           const presets = [
-            { id: "deepseek", label: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com/v1", iconSlug: "deepseek", models: [{ id: "deepseek-chat" }, { id: "deepseek-reasoner" }] },
+            { id: "deepseek", label: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com/", iconSlug: "deepseek", models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }] },
             { id: "qwen", label: "通义千问 (Qwen)", defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", iconSlug: "qwen", models: [{ id: "qwen-max" }, { id: "qwen-plus" }] },
             { id: "minimax", label: "MiniMax", defaultBaseUrl: "https://api.minimaxi.com/v1", iconSlug: "minimax", models: [{ id: "minimax-m3" }] },
             { id: "kimi", label: "Kimi (Moonshot)", defaultBaseUrl: "https://api.moonshot.cn/v1", iconSlug: "kimi", models: [{ id: "moonshot-v1-8k" }] },
@@ -2228,7 +2287,11 @@ if __name__ == "__main__":
                   catalogModelOwner(cm) === normalizeNamespace(p.name)
                   && [cm.slug, cm.id, cm.display_name, cm.backend_model].filter(Boolean).some((value: any) => String(value) === alias)
                 );
-                return { id: catalogModel?.slug || alias, enabled: true };
+                return {
+                  id: catalogModel?.slug || alias,
+                  enabled: true,
+                  protocol: catalogModel?.protocol || catalogModel?.backend_protocol || protocolForConfiguredModel(raw, p.model_protocols),
+                };
               })
             };
           });
@@ -2247,6 +2310,11 @@ if __name__ == "__main__":
             const baseUrl = String(body.base_url || "").trim();
             const apiKey = String(body.api_key || "").trim();
             const selectedModels: string[] = Array.isArray(body.selected_models) ? body.selected_models : [];
+            const selectedModelProtocols = buildModelProtocolMap(
+              selectedModels,
+              body.model_protocols && typeof body.model_protocols === "object" ? body.model_protocols : undefined,
+              body.model_protocol,
+            );
 
             let providers = CredentialStore.loadProviders();
             let provider = providers.find((p: any) => p.name === requestedProviderName)
@@ -2269,7 +2337,13 @@ if __name__ == "__main__":
               }
             }
             if (!provider) {
-              provider = { name: resolvedProviderName, preset_id: presetId, baseUrl, models: selectedModels };
+              provider = {
+                name: resolvedProviderName,
+                preset_id: presetId,
+                baseUrl,
+                models: selectedModels,
+                model_protocols: selectedModelProtocols,
+              };
               providers.push(provider);
             } else {
               provider.baseUrl = baseUrl || provider.baseUrl;
@@ -2278,6 +2352,7 @@ if __name__ == "__main__":
               // The dashboard sends the complete current list. Replace the
               // stored list so removals and edits are reflected on reopen.
               provider.models = Array.from(new Set(selectedModels));
+              provider.model_protocols = selectedModelProtocols;
             }
 
             // Saving or changing configuration invalidates the previous connectivity result.
@@ -2320,18 +2395,15 @@ if __name__ == "__main__":
               });
 
               for (const modelStr of selectedModels) {
-                let slug = modelStr;
-                let backendModel = modelStr;
-                if (modelStr.includes("=")) {
-                  const parts = modelStr.split("=");
-                  slug = parts[0].trim();
-                  backendModel = parts[1].trim();
-                } else if (modelStr.includes("->")) {
-                  const parts = modelStr.split("->");
-                  slug = parts[0].trim();
-                  backendModel = parts[1].trim();
-                }
-                upsertProviderCatalogModel(catalog, slug, backendModel, slug, resolvedProviderName);
+                const { slug, backendModel } = splitConfiguredModel(modelStr);
+                upsertProviderCatalogModel(
+                  catalog,
+                  slug,
+                  backendModel,
+                  slug,
+                  resolvedProviderName,
+                  selectedModelProtocols[slug] || "chat",
+                );
               }
 
               preserveOfficialModels(catalog);
@@ -2482,6 +2554,81 @@ if __name__ == "__main__":
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/providers/test-model") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const presetId = String(body.preset_id || body.name || "").trim().toLowerCase();
+            const modelInput = String(body.model || "").trim();
+            const model = modelInput.includes("=")
+              ? modelInput.split("=").slice(1).join("=").trim()
+              : modelInput.includes("->")
+                ? modelInput.split("->").slice(1).join("->").trim()
+                : modelInput;
+            const protocol = body.protocol === "responses" ? "responses" : "chat";
+            let baseUrl = String(body.base_url || body.baseUrl || "").trim();
+            let apiKey = String(body.api_key || body.apiKey || "").trim();
+
+            try {
+              const found = CredentialStore.loadProviders().find((p: any) => p.name === presetId || p.preset_id === presetId);
+              if (found) {
+                baseUrl = baseUrl || String((found as any).baseUrl || (found as any).base_url || "");
+                apiKey = apiKey || String(CredentialStore.resolveApiKey(found) || "");
+              }
+            } catch {}
+
+            if (!presetId || !model || !baseUrl) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "failed", message: "缺少服务商、Endpoint 或模型名称" }));
+              return;
+            }
+            if (!apiKey || apiKey === "grok-cli-auto" || apiKey === "antigravity-cli-auto") {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "failed", message: "未找到 API Key，请先填写或保存 API Key" }));
+              return;
+            }
+
+            const providerBaseUrl = baseUrl
+              .replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "")
+              .replace(/\/$/, "");
+            const targetUrl = `${providerBaseUrl}/${protocol === "responses" ? "responses" : "chat/completions"}`;
+            const testBody = protocol === "responses"
+              ? { model, input: "Reply with OK.", stream: false, store: false, max_output_tokens: 16 }
+              : { model, messages: [{ role: "user", content: "Reply with OK." }], stream: false, max_tokens: 16 };
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 20_000);
+
+            try {
+              const testRes = await fetch(targetUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+                body: JSON.stringify(testBody),
+                signal: controller.signal
+              });
+              const responseText = await testRes.text();
+              clearTimeout(timer);
+              if (!testRes.ok) {
+                const detail = responseText.replace(/\s+/g, " ").trim().slice(0, 600);
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ status: "failed", message: `${protocol === "responses" ? "Responses" : "Chat"} 测试失败 (HTTP ${testRes.status})${detail ? `：${detail}` : ""}` }));
+                return;
+              }
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "connected", message: `${protocol === "responses" ? "Responses" : "Chat"} 测试成功，模型已返回响应` }));
+              return;
+            } catch (netErr: any) {
+              clearTimeout(timer);
+              const message = netErr?.name === "AbortError" ? "模型测试超时 (20s)" : (netErr?.message || "模型测试网络失败");
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ status: "failed", message: `模型测试失败：${message}` }));
+              return;
+            }
+          } catch (err: any) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "failed", message: err.message }));
           }
           return;
         }
@@ -4497,6 +4644,12 @@ if __name__ == "__main__":
               });
               if (nextModels.length !== (provider.models || []).length) {
                 provider.models = nextModels;
+                const nextProtocols: Record<string, ModelProtocol> = {};
+                for (const model of nextModels) {
+                  const { slug } = splitConfiguredModel(model);
+                  if (slug) nextProtocols[slug] = protocolForConfiguredModel(model, provider.model_protocols);
+                }
+                provider.model_protocols = nextProtocols;
                 providersChanged = true;
               }
             }

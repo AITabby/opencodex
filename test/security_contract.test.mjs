@@ -58,3 +58,15 @@ test("native GPT models pass through the Codex backend when the gateway is enabl
   assert.match(source, /proxyNativeResponses/);
   assert.match(source, /chatgpt\.com\/backend-api\/codex\/responses/);
 });
+
+test("third-party native Responses routing is explicit and can fall back to Chat", async () => {
+  const [source, router] = await Promise.all([
+    gateway(),
+    readFile(new URL("../src_v2/server/router.ts", import.meta.url), "utf8")
+  ]);
+  assert.match(source, /protocol/);
+  assert.match(router, /proxyThirdPartyResponses/);
+  assert.match(router, /Responses unsupported by/);
+  assert.match(router, /protocol: \"chat\"/);
+  assert.match(router, /native-third-party-responses/);
+});

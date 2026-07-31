@@ -8,6 +8,7 @@ import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthServic
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { extractImageGenerationContext, generateNativeCodexImage, parseImageGenerationArguments } from "../services/native_image_bridge.js";
 import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
+import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 
 
 
@@ -36,6 +37,174 @@ const cursorPendingToolCalls = new Map<string, CursorPendingToolCall>();
 // by the old request closure and silently discarded.
 const cursorExternalToolQueues = new Map<string, CursorExternalToolRequest[]>();
 const CURSOR_PENDING_TOOL_TTL_MS = 10 * 60 * 1000;
+
+function responsesEndpointForProvider(providerUrl: string): string {
+  const base = String(providerUrl || "").replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "").replace(/\/$/, "");
+  return `${base}/responses`;
+}
+
+function isResponsesUnsupported(status: number, body: string): boolean {
+  if (status === 404 || status === 405) return true;
+  if (status !== 415) return false;
+  return /response|protocol|endpoint|unsupported|not supported|not found/i.test(body);
+}
+
+function sanitizeThirdPartyResponsesPayload(payload: any, blockedReasoningIds: Set<string>): any | null {
+  if (!payload || typeof payload !== "object") return payload;
+
+  const item = payload.item;
+  if (item?.type === "reasoning") {
+    const id = typeof item.id === "string" ? item.id : "";
+    if (!isNativeResponsesReasoningId(id)) {
+      if (id) blockedReasoningIds.add(id);
+      return null;
+    }
+  }
+
+  const itemId = typeof payload.item_id === "string" ? payload.item_id : "";
+  if (itemId && blockedReasoningIds.has(itemId)) return null;
+  if (itemId && /reasoning/i.test(String(payload.type || "")) && !isNativeResponsesReasoningId(itemId)) {
+    blockedReasoningIds.add(itemId);
+    return null;
+  }
+
+  if (payload.response && Array.isArray(payload.response.output)) {
+    const output = payload.response.output.filter((outputItem: any) => {
+      if (outputItem?.type !== "reasoning") return true;
+      const id = typeof outputItem.id === "string" ? outputItem.id : "";
+      if (isNativeResponsesReasoningId(id)) return true;
+      if (id) blockedReasoningIds.add(id);
+      return false;
+    });
+    payload = { ...payload, response: { ...payload.response, output } };
+  }
+
+  return payload;
+}
+
+function sanitizeThirdPartySseEvent(event: string, blockedReasoningIds: Set<string>): string | null {
+  const lines = event.split(/\r?\n/);
+  const dataIndexes: number[] = [];
+  const dataLines: string[] = [];
+  lines.forEach((line, index) => {
+    if (line.startsWith("data:")) {
+      dataIndexes.push(index);
+      dataLines.push(line.slice(5).trimStart());
+    }
+  });
+  if (dataLines.length === 0) return `${event}\n\n`;
+  const raw = dataLines.join("\n");
+  if (raw === "[DONE]") return `${event}\n\n`;
+
+  let payload: any;
+  try { payload = JSON.parse(raw); } catch { return `${event}\n\n`; }
+  const sanitized = sanitizeThirdPartyResponsesPayload(payload, blockedReasoningIds);
+  if (sanitized === null) return null;
+  const output = JSON.stringify(sanitized);
+  const rewritten = lines.map((line, index) => {
+    if (!dataIndexes.includes(index)) return line;
+    return `data: ${output}`;
+  });
+  return `${rewritten.join("\n")}\n\n`;
+}
+
+async function pipeFilteredThirdPartyResponses(body: AsyncIterable<Uint8Array>, res: http.ServerResponse): Promise<void> {
+  const decoder = new TextDecoder();
+  const blockedReasoningIds = new Set<string>();
+  let buffer = "";
+  const flush = (final = false) => {
+    const chunks = buffer.split(/\r?\n\r?\n/);
+    buffer = final ? "" : (chunks.pop() || "");
+    for (const chunk of chunks) {
+      if (!chunk.trim()) continue;
+      const sanitized = sanitizeThirdPartySseEvent(chunk, blockedReasoningIds);
+      if (sanitized) res.write(sanitized);
+    }
+  };
+
+  for await (const chunk of body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    flush();
+  }
+  buffer += decoder.decode();
+  flush(true);
+}
+
+async function proxyThirdPartyResponses(
+  reqBody: any,
+  upstreamModel: string,
+  apiKey: string,
+  providerUrl: string,
+  res: http.ServerResponse,
+): Promise<"handled" | "fallback"> {
+  const targetUrl = responsesEndpointForProvider(providerUrl);
+  const upstreamBody = { ...reqBody, model: upstreamModel };
+  delete upstreamBody.protocol;
+
+  try {
+    const upstreamRes = await fetchUpstream(targetUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(upstreamBody),
+      maxAttempts: 1,
+      timeoutMs: 120_000,
+      operation: "native-third-party-responses",
+    });
+
+    if (!upstreamRes.ok || !upstreamRes.body) {
+      const errorText = await upstreamRes.text();
+      if (isResponsesUnsupported(upstreamRes.status, errorText)) {
+        console.warn(`[OpenCodex Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
+        return "fallback";
+      }
+      const responseHeaders: Record<string, string> = { "Content-Type": "application/json" };
+      res.writeHead(upstreamRes.status, responseHeaders);
+      res.end(errorText || JSON.stringify({ error: `Upstream API Error (${upstreamRes.status})` }));
+      return "handled";
+    }
+
+    const responseHeaders: Record<string, string> = {};
+    upstreamRes.headers.forEach((value, key) => {
+      if (key.toLowerCase() !== "content-length") responseHeaders[key] = value;
+    });
+    res.writeHead(upstreamRes.status, responseHeaders);
+    const contentType = upstreamRes.headers.get("content-type") || "";
+    if (contentType.toLowerCase().includes("text/event-stream")) {
+      // @ts-ignore Node's fetch body is an async iterable at runtime.
+      await pipeFilteredThirdPartyResponses(upstreamRes.body, res);
+    } else {
+      const raw = await upstreamRes.text();
+      try {
+        const blockedReasoningIds = new Set<string>();
+        const payload = sanitizeThirdPartyResponsesPayload(JSON.parse(raw), blockedReasoningIds);
+        res.end(payload === null ? "{}" : JSON.stringify(payload));
+        return;
+      } catch {
+        res.end(raw);
+        return;
+      }
+    }
+    res.end();
+    return "handled";
+  } catch (err: any) {
+    const details = upstreamErrorDetails(err);
+    console.error(`[CodexBridge V2] Native third-party Responses proxy error:`, {
+      ...details,
+      attempts: err?.attempts,
+    });
+    res.writeHead(502, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      error: err.message,
+      type: "upstream_unreachable",
+      retryable: Boolean(err?.retryable),
+      cause_code: details.code,
+    }));
+    return "handled";
+  }
+}
 
 function providerChunkSignalsCompletion(chunk: any): boolean {
   if (!chunk || typeof chunk !== "object") return false;
@@ -157,6 +326,14 @@ export class GatewayRouter {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
+    if (String(reqBody?.protocol || "").toLowerCase() === "responses") {
+      const nativeResult = await proxyThirdPartyResponses(reqBody, upstreamModel, apiKey, providerUrl, res);
+      if (nativeResult === "handled") return;
+      // The native request was rejected before execution because the endpoint
+      // does not expose Responses. Honor the configured preference by making
+      // the one explicit Responses -> Chat fallback and continue normally.
+      reqBody = { ...reqBody, protocol: "chat" };
+    }
     const imageGenerationContext = extractImageGenerationContext(reqBody);
     const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId);
     chatBody.stream = true;

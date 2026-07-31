@@ -1,7 +1,18 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { buildFullCatalogEntry } from "../dist/services/catalog_sync.js";
 import { buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, stripManagedCodexConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+
+test("catalog entries preserve the selected upstream protocol", () => {
+  const responses = buildFullCatalogEntry("opencode/deepseek-v4-flash", "opencode", undefined, "responses");
+  const chat = buildFullCatalogEntry("deepseek-chat", "deepseek", undefined, "chat");
+
+  assert.equal(responses.protocol, "responses");
+  assert.equal(responses.backend_protocol, "responses");
+  assert.equal(chat.protocol, "chat");
+  assert.equal(chat.backend_protocol, "chat");
+});
 
 test("managed Codex config follows the current gateway port across restarts", () => {
   const existing = `model = "gpt-5.5"\n\n# >>> opencodex managed >>>\nmodel_catalog_json = "/Users/test/.opencodex/custom_model_catalog.json"\nopenai_base_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed >>>\n\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nbase_url = "http://127.0.0.1:18421/v1"\n# <<< opencodex managed <<<\n`;
@@ -98,6 +109,15 @@ test("provider-owned models are namespaced even without a collision", () => {
   assert.equal(catalog.models[0].slug, "deepseek/deepseek-chat");
   assert.equal(catalog.models[0].backend_model, "deepseek-chat");
   assert.equal(catalog.models[0].display_name, "deepseek/deepseek-chat");
+});
+
+test("upserting a model records native Responses preference", () => {
+  const catalog = { models: [] };
+
+  upsertProviderCatalogModel(catalog, "deepseek-v4-flash", "deepseek-v4-flash", "DeepSeek V4 Flash", "opencode-go", "responses");
+
+  assert.equal(catalog.models[0].protocol, "responses");
+  assert.equal(catalog.models[0].backend_protocol, "responses");
 });
 
 test("legacy provider-owned entries migrate to the provider namespace", () => {

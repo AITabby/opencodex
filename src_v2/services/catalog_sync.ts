@@ -34,7 +34,12 @@ export function getActualContextWindow(modelSlug: string, apiContextWindow?: num
   return 200000;
 }
 
-export function buildFullCatalogEntry(modelSlug: string, providerName: string, apiContextWindow?: number): any {
+export function buildFullCatalogEntry(
+  modelSlug: string,
+  providerName: string,
+  apiContextWindow?: number,
+  protocol: "chat" | "responses" = "chat",
+): any {
   const actualContext = getActualContextWindow(modelSlug, apiContextWindow);
   const compactLimit = Math.floor(actualContext * 0.8);
   const truncLimit = Math.floor(actualContext * 0.2);
@@ -45,6 +50,8 @@ export function buildFullCatalogEntry(modelSlug: string, providerName: string, a
     display_name: modelSlug,
     backend_model: modelSlug,
     backend_provider: providerName,
+    protocol,
+    backend_protocol: protocol,
     provider: "opencodex",
     model_provider: "opencodex",
     description: `${providerName}: ${modelSlug} (${actualContext.toLocaleString()} context)`,
@@ -187,7 +194,8 @@ export class CatalogSyncService {
 
         for (const modelSlug of liveModels) {
           const lower = modelSlug.toLowerCase();
-          const full = buildFullCatalogEntry(modelSlug, p.name);
+          const protocol = (p as any).model_protocols?.[modelSlug] === "responses" ? "responses" : "chat";
+          const full = buildFullCatalogEntry(modelSlug, p.name, undefined, protocol);
           modelsMap.set(lower, full);
         }
       }

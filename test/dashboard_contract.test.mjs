@@ -36,6 +36,25 @@ test("dashboard uses the gateway admin cookie without embedding credentials", as
   assert.match(text, /api\('\/api\/providers'\)/);
 });
 
+test("dashboard exposes the per-model Chat or Responses protocol choice", async () => {
+  const text = await source();
+  assert.match(text, /provider-model-rows/);
+  assert.match(text, /provider-model-row/);
+  assert.match(text, /add-provider-model/);
+  assert.match(text, /provider-remove-model/);
+  assert.match(text, /多个模型用逗号分隔/);
+  assert.match(text, /children\.length>=2/);
+  assert.match(text, /value="chat"/);
+  assert.match(text, /value="responses"/);
+  assert.match(text, /provider-test-model/);
+  assert.match(text, /testProviderModelRow/);
+  assert.match(text, /\/api\/providers\/test-model/);
+  assert.match(text, /<option value="chat"[^>]*>Chat<\/option>/);
+  assert.match(text, /<option value="responses"[^>]*>Responses<\/option>/);
+  assert.match(text, /model_protocols/);
+  assert.match(text, /readProviderModelRows/);
+});
+
 test("dashboard refreshes subscription status after every model deletion path", async () => {
   const text = await source();
   assert.match(text, /post\('\/api\/models\/delete',\{id:id\}\);await syncDashboardState\(\)/);

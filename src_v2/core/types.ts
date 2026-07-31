@@ -171,6 +171,8 @@ export interface ProviderConfig {
   api_key_env?: string;
   api_key?: string;
   models?: string[];
+  /** Protocol preference per configured model. Unset entries default to Chat. */
+  model_protocols?: Record<string, "chat" | "responses">;
   headers?: Record<string, string>;
   /** Connection testing is explicit; configuration alone must not imply success. */
   last_test_status?: "untested" | "connected" | "failed" | "simulated";
@@ -184,6 +186,8 @@ export interface CatalogModelEntry {
   display_name?: string;
   backend_model?: string;
   backend_provider?: string;
+  protocol?: "chat" | "responses";
+  backend_protocol?: "chat" | "responses";
   provider?: string;
   description?: string;
   context_window?: number;
