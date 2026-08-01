@@ -9,6 +9,58 @@ import path from "node:path";
 import os from "node:os";
 import { ChatMessage } from "../core/types.js";
 
+function flattenResponseFunctionCallName(item: any): string {
+  if (item?.type === "mcp_call") {
+    const serverLabel = String(item?.server_label || "").trim();
+    const toolName = String(item?.name || "").trim();
+    if (serverLabel === "node_repl" && toolName === "js") return "mcp__node_repl_js";
+    if (serverLabel && toolName) return `mcp__${serverLabel}__${toolName}`;
+  }
+  const name = String(item?.name || "").trim();
+  const namespace = String(item?.namespace || "").trim();
+  if (!namespace || name === namespace || name.startsWith(`${namespace}_`) || name.startsWith(`${namespace}__`)) {
+    return name;
+  }
+  return namespace.endsWith("__") ? `${namespace}${name}` : `${namespace}_${name}`;
+}
+
+function responseContentToChatContent(content: any): string | any[] {
+  if (typeof content === "string") return content;
+  const sourceParts = Array.isArray(content) ? content : [content];
+  const parts: any[] = [];
+  for (const part of sourceParts) {
+    if (typeof part === "string") {
+      if (part) parts.push({ type: "text", text: part });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    if (typeof part.text === "string") {
+      parts.push({ type: "text", text: part.text });
+      continue;
+    }
+    const rawImageUrl = part.image_url;
+    const imageUrl = typeof rawImageUrl === "string"
+      ? rawImageUrl
+      : typeof rawImageUrl?.url === "string"
+        ? rawImageUrl.url
+        : typeof part.data === "string" && typeof part.mimeType === "string"
+          ? `data:${part.mimeType};base64,${part.data}`
+          : "";
+    if (imageUrl) {
+      const detail = typeof part.detail === "string"
+        ? part.detail
+        : typeof rawImageUrl?.detail === "string"
+          ? rawImageUrl.detail
+          : undefined;
+      parts.push({ type: "image_url", image_url: { url: imageUrl, ...(detail ? { detail } : {}) } });
+    }
+  }
+  if (parts.length === 0) return JSON.stringify(content || "");
+  return parts.some((part) => part?.type === "image_url")
+    ? parts
+    : parts.map((part) => String(part.text || "")).join("");
+}
+
 export class SessionHistoryService {
   private static sessionsDir = path.join(os.homedir(), ".codex", "sessions");
 
@@ -59,31 +111,40 @@ export class SessionHistoryService {
         if (item.type === "message" || item.role) {
           let role = item.role || "user";
           if (role === "developer") role = "system";
-          const text = typeof item.content === "string"
-            ? item.content
-            : Array.isArray(item.content)
-              ? item.content.map((c: any) => (typeof c === "string" ? c : c.text || "")).join("")
-              : "";
-          if (text.trim()) {
-            reconstructed.push({ role: role as any, content: text });
+          const content = responseContentToChatContent(item.content);
+          if (typeof content === "string" ? content.trim() : content.length > 0) {
+            reconstructed.push({ role: role as any, content });
           }
-        } else if (item.type === "function_call") {
-          const callId = item.call_id || item.id || `call_${Date.now()}`;
+        } else if (item.type === "function_call" || item.type === "mcp_call") {
+          const callId = String(item.call_id || item.id || `call_repair_${reconstructed.length}`).trim();
           const argsStr = typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {});
           reconstructed.push({
             role: "assistant",
             content: "",
             tool_calls: [{
-              id: callId,
+              id: callId || `call_repair_${reconstructed.length}`,
               type: "function",
-              function: { name: item.name || "", arguments: argsStr }
+              function: { name: flattenResponseFunctionCallName(item), arguments: argsStr }
             }]
           });
+          if (item.type === "mcp_call" && item.output !== undefined) {
+            reconstructed.push({
+              role: "tool",
+              tool_call_id: callId || `call_repair_${reconstructed.length}`,
+              content: responseContentToChatContent(item.output),
+            });
+          }
         } else if (item.type === "function_call_output") {
           reconstructed.push({
             role: "tool",
-            tool_call_id: item.call_id,
-            content: typeof item.output === "string" ? item.output : JSON.stringify(item.output || "")
+            tool_call_id: typeof item.call_id === "string" ? item.call_id.trim() : item.call_id,
+            content: responseContentToChatContent(item.output),
+          });
+        } else if (item.type === "mcp_call_output") {
+          reconstructed.push({
+            role: "tool",
+            tool_call_id: typeof item.call_id === "string" ? item.call_id.trim() : item.call_id,
+            content: responseContentToChatContent(item.output),
           });
         }
       }
@@ -117,16 +178,21 @@ export class SessionHistoryService {
     const repaired: ChatMessage[] = [];
     const activeToolCallIds = new Set<string>();
 
+    let generatedToolId = 0;
     for (const msg of combined) {
       if (msg.role === "assistant" && msg.tool_calls) {
-        for (const tc of msg.tool_calls) {
-          if (tc.id) activeToolCallIds.add(tc.id);
-        }
-        repaired.push(msg);
+        const toolCalls = msg.tool_calls.map((tc) => {
+          const existingId = typeof tc.id === "string" ? tc.id.trim() : "";
+          const id = existingId || `call_repair_${generatedToolId++}`;
+          if (id) activeToolCallIds.add(id);
+          return { ...tc, id };
+        });
+        repaired.push({ ...msg, tool_calls: toolCalls });
       } else if (msg.role === "tool") {
-        if (msg.tool_call_id && activeToolCallIds.has(msg.tool_call_id)) {
-          repaired.push(msg);
-          activeToolCallIds.delete(msg.tool_call_id);
+        const toolCallId = typeof msg.tool_call_id === "string" ? msg.tool_call_id.trim() : "";
+        if (toolCallId && activeToolCallIds.has(toolCallId)) {
+          repaired.push({ ...msg, tool_call_id: toolCallId });
+          activeToolCallIds.delete(toolCallId);
         } else {
           // Drop orphan tool output without matching assistant tool_call
         }

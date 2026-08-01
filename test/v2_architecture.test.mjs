@@ -5,6 +5,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { transformResponsesToChat, convertToolsToChatTools } from "../dist/core/transformer.js";
+import {
+  hasChatToolImages,
+  isConsoleGoToolImageRejection,
+  isXiaomiChatToolTextRejection,
+  isXiaomiMimoProvider,
+  normalizeXiaomiChatToolHistory,
+  stripChatToolImages,
+} from "../dist/services/chat_tool_compat.js";
 import { ResponsesStreamEngine, normalizeToolArguments } from "../dist/core/stream_engine.js";
 import {
   DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL,
@@ -45,6 +53,74 @@ test("v2 transformer handles responses to chat conversion cleanly", () => {
   assert.equal(chat.messages[3].tool_call_id, "call_123");
 });
 
+test("v2 transformer preserves Computer Use screenshot output for Chat vision models", () => {
+  const chat = transformResponsesToChat({
+    model: "computer-model",
+    tools: [{ type: "computer" }],
+    input: [
+      { type: "message", role: "user", content: "检查当前页面" },
+      { type: "function_call", call_id: "call-screen", name: "mcp__node_repl_js", arguments: "{}" },
+      {
+        type: "function_call_output",
+        call_id: "call-screen",
+        output: [
+          { type: "input_text", text: "当前页面状态" },
+          { type: "input_image", image_url: "data:image/jpeg;base64,AAAA", detail: "high" },
+        ],
+      },
+    ],
+  }, "computer-model");
+
+  const toolMessage = chat.messages.find((message) => message.role === "tool");
+  assert.deepEqual(toolMessage?.content, [
+    { type: "text", text: "当前页面状态" },
+    { type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA", detail: "high" } },
+  ]);
+});
+
+test("Chat fallback strips only rejected Computer Use tool screenshots", () => {
+  const payload = {
+    messages: [
+      { role: "user", content: "检查页面" },
+      {
+        role: "tool",
+        tool_call_id: "call-screen",
+        content: [
+          { type: "text", text: "当前页面状态" },
+          { type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } },
+        ],
+      },
+    ],
+  };
+
+  assert.equal(hasChatToolImages(payload), true);
+  assert.equal(isConsoleGoToolImageRejection(400, "Error from provider (Console Go): Upstream request failed", payload), true);
+  const fallback = stripChatToolImages(payload);
+  assert.equal(fallback.messages[1].content, "当前页面状态");
+  assert.equal(payload.messages[1].content[1].type, "image_url");
+  assert.equal(isConsoleGoToolImageRejection(400, "invalid tool arguments", payload), false);
+});
+
+test("MiMo Chat tool continuations receive a non-empty text field without changing other providers", () => {
+  const payload = {
+    messages: [
+      { role: "user", content: "检查页面" },
+      { role: "assistant", content: "", tool_calls: [{ id: "call-screen", type: "function", function: { name: "mcp__node_repl_js", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "call-screen", content: [{ type: "image_url", image_url: { url: "data:image/jpeg;base64,AAAA" } }] },
+    ],
+  };
+
+  const normalized = normalizeXiaomiChatToolHistory(payload);
+  assert.equal(normalized.messages[1].content, " ");
+  assert.equal(normalized.messages[2].content[0].type, "text");
+  assert.equal(normalized.messages[2].content[0].text, " ");
+  assert.equal(payload.messages[1].content, "");
+  assert.equal(isXiaomiChatToolTextRejection(400, "Error from provider (Xiaomi): Param Incorrect", payload), true);
+  assert.equal(isXiaomiChatToolTextRejection(400, "Error from provider (MiniMax): Param Incorrect", payload), false);
+  assert.equal(isXiaomiMimoProvider("opencode", "https://opencode.ai/zen/go/v1", "mimo-v2.5"), true);
+  assert.equal(isXiaomiMimoProvider("minimax", "https://api.minimaxi.com/v1", "minimax-m3"), false);
+});
+
 test("v2 transformer preserves string Responses input as a user message", () => {
   const chat = transformResponsesToChat({
     model: "composer-2.5",
@@ -56,12 +132,44 @@ test("v2 transformer preserves string Responses input as a user message", () => 
   assert.equal(chat.messages.some((message) => String(message.content).includes("Tool Contract & Permission Directive")), false);
 });
 
+test("v2 transformer tells Computer Use models to call the connected tool directly", () => {
+  const chat = transformResponsesToChat({
+    model: "computer-model",
+    instructions: "You are helpful.",
+    tools: [{ type: "computer" }],
+    input: "打开浏览器",
+  }, "computer-model");
+
+  assert.equal(chat.messages[0].role, "system");
+  assert.match(chat.messages[0].content, /native node-repl executor/);
+  assert.match(chat.messages[0].content, /mcp__node_repl_js/);
+  assert.equal(chat.tools.some((tool) => tool.function?.name === "mcp__node_repl_js"), true);
+});
+
+test("v2 transformer forwards the selected reasoning effort to Chat providers", () => {
+  const fromResponsesReasoning = transformResponsesToChat({
+    model: "deepseek-v4-flash",
+    reasoning: { effort: "xhigh" },
+    input: "solve this carefully",
+  }, "deepseek-v4-flash");
+  const fromLegacyField = transformResponsesToChat({
+    model: "deepseek-v4-flash",
+    reasoning_effort: "max",
+    input: "solve this carefully",
+  }, "deepseek-v4-flash");
+
+  assert.equal(fromResponsesReasoning.reasoning_effort, "xhigh");
+  assert.equal(fromLegacyField.reasoning_effort, "max");
+});
+
 test("v2 default tool contract exposes real Codex subagent controls", () => {
   const names = convertToolsToChatTools().map((tool) => tool.function?.name);
 
   assert.equal(names[0], "spawn_agent");
   assert.equal(names.includes("wait_agent"), false);
   assert.equal(names.includes("list_agents"), false);
+  assert.equal(names.includes("opencodex_computer_use"), false);
+  assert.equal(names.includes("mcp__node_repl_js"), false);
 });
 
 test("v2 explicit desktop tools retain the subagent controls", () => {

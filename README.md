@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg"><img src="https://img.shields.io/badge/macOS-Apple%20Silicon-111111?style=flat-square&logo=apple" alt="macOS Apple Silicon"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe"><img src="https://img.shields.io/badge/Windows-10%2F11-0078D6?style=flat-square&logo=windows" alt="Windows 10/11"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
@@ -17,11 +17,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg">⬇️ 下载 OpenCodex v1.0.5（macOS）</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg">⬇️ 下载 OpenCodex v1.0.8（macOS）</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe">🪟 下载 Windows v1.0.3</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.5">查看 Release</a>
+  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.8">查看 Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
@@ -34,7 +34,7 @@
   <a href="./assets/demo.mp4">▶️ 查看应用演示视频</a>
 </p>
 
-> macOS Apple Silicon arm64 v1.0.5 · Windows 10/11 v1.0.3 · 当前 macOS DMG 未经过 Apple 签名
+> macOS Apple Silicon arm64 v1.0.8 · Windows 10/11 v1.0.3 · 当前 macOS DMG 未经过 Apple 签名
 
 > ✅ 当前 Release 的 DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 
@@ -98,7 +98,7 @@ OpenCodex App
 #### 普通用户
 
 1. 确保已经安装 Codex Desktop。
-2. 下载 [OpenCodex-1.0.5-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg)。
+2. 下载 [OpenCodex-1.0.8-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg)。
 3. 将 OpenCodex 拖入 `Applications` 并打开。
 4. 在应用内管理网关、语音和会话功能。
 
@@ -134,7 +134,7 @@ http://localhost:8765/dashboard
 
 ### 项目状态
 
-当前 macOS 发布版本为 `v1.0.5`，Windows 发布版本为 `v1.0.3`。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
+当前 macOS 发布版本为 `v1.0.8`，Windows 发布版本为 `v1.0.3`。项目仍在持续迭代中，建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本。
 
 ---
 
@@ -176,7 +176,7 @@ Official Codex models stay on their native route. Only models explicitly added b
 ### Installation
 
 1. Install Codex Desktop on macOS.
-2. Download the [OpenCodex v1.0.5 Apple Silicon DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg).
+2. Download the [OpenCodex v1.0.8 Apple Silicon DMG](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg).
 3. Drag OpenCodex into `Applications` and launch it.
 4. Manage providers, voice, sessions, and third-party models from the app.
 
@@ -212,12 +212,12 @@ http://localhost:8765/dashboard
 
 ### Project status
 
-The current macOS release is `v1.0.5`, while Windows remains at `v1.0.3`. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
+The current macOS release is `v1.0.8`, while Windows remains at `v1.0.3`. OpenCodex is actively evolving; see [GitHub Releases](https://github.com/AITabby/opencodex/releases) for the latest build.
 
 ### Links
 
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.0.5 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.0.5/OpenCodex-1.0.5-arm64.dmg)
+- [Download OpenCodex v1.0.8 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg)
 - [Download OpenCodex v1.0.3 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.3/OpenCodex-1.0.3-win-x64.exe)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)

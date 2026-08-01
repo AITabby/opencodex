@@ -1,8 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { buildFullCatalogEntry } from "../dist/services/catalog_sync.js";
-import { buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, stripManagedCodexConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import {
+  buildFullCatalogEntry,
+  CatalogSyncService,
+  extractModelReasoningLevels,
+  flattenModelRegistry,
+  getActualContextWindow,
+  getProviderModelContextWindow,
+} from "../dist/services/catalog_sync.js";
+import { clearProviderModelSelections } from "../dist/services/credential_store.js";
+import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, stripManagedCodexConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 
 test("catalog entries preserve the selected upstream protocol", () => {
   const responses = buildFullCatalogEntry("opencode/deepseek-v4-flash", "opencode", undefined, "responses");
@@ -12,6 +20,249 @@ test("catalog entries preserve the selected upstream protocol", () => {
   assert.equal(responses.backend_protocol, "responses");
   assert.equal(chat.protocol, "chat");
   assert.equal(chat.backend_protocol, "chat");
+});
+
+test("third-party catalog entries use the common baseline without inventing extra tiers", () => {
+  const entry = buildFullCatalogEntry("deepseek-v4-flash", "deepseek", undefined, "chat");
+
+  assert.deepEqual(
+    entry.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "medium", "high"],
+  );
+  assert.equal(entry.default_reasoning_level, "medium");
+  assert.equal(entry.supported_reasoning_levels.some((level) => level.effort === "xhigh"), false);
+});
+
+test("manual models without reasoning metadata remain parseable with the baseline tiers", () => {
+  const entry = buildFullCatalogEntry("manual/manual-model", "manual");
+
+  assert.deepEqual(
+    entry.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "medium", "high"],
+  );
+  assert.equal(entry.default_reasoning_level, "medium");
+  assert.equal(entry.context_window, 200000);
+  assert.deepEqual(entry.truncation_policy, { mode: "tokens", limit: 40000 });
+});
+
+test("model-specific reasoning metadata adds only that model's extra tiers", () => {
+  const baseline = buildFullCatalogEntry("provider/model-a", "provider");
+  const extended = buildFullCatalogEntry("provider/model-b", "provider", undefined, "chat", {
+    supported_reasoning_levels: [
+      { effort: "low" },
+      { effort: "medium" },
+      { effort: "high" },
+      { effort: "xhigh", description: "Provider-reported extra tier" },
+      { effort: "max", description: "Provider-reported maximum tier" },
+    ],
+  });
+
+  assert.deepEqual(
+    baseline.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "medium", "high"],
+  );
+  assert.deepEqual(
+    extended.supported_reasoning_levels.map((level) => level.effort),
+    ["low", "medium", "high", "xhigh", "max"],
+  );
+  assert.ok(extended.supported_reasoning_levels.every((level) => typeof level.description === "string" && level.description.length > 0));
+  assert.equal(extended.default_reasoning_level, "medium");
+});
+
+test("an explicit non-reasoning model does not receive the baseline tiers", () => {
+  const entry = buildFullCatalogEntry("provider/model-c", "provider", undefined, "chat", { reasoning: false });
+  assert.deepEqual(entry.supported_reasoning_levels, []);
+  assert.equal(entry.default_reasoning_level, undefined);
+});
+
+test("third-party context uses exact metadata and never guesses from a model name", () => {
+  assert.equal(getActualContextWindow("deepseek-v4-flash"), undefined);
+  assert.equal(getActualContextWindow("minimax-m3"), undefined);
+  assert.equal(getActualContextWindow("gemini-2.5-pro"), undefined);
+  assert.equal(buildFullCatalogEntry("custom-model", "test", 1048576).context_window, 1048576);
+  assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, metadata_source: "model_registry" }).context_window, 200000);
+  assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, metadata_source: "model_registry" }).context_window_source, "model_registry");
+  assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, context_window_source: "provider_metadata", metadata_source: "provider_metadata" }).context_window, 1000000);
+  assert.equal(getProviderModelContextWindow({ model_metadata: { "provider-model": { context_length: 123456 } } }, "provider-model"), 123456);
+  assert.equal(getProviderModelContextWindow({ model_metadata: { "registry-model": { context_length: 1000000, metadata_source: "model_registry" } } }, "registry-model"), undefined);
+  assert.equal(getProviderModelContextWindow({ models: [{ name: "gemini-2.5-pro", inputTokenLimit: 1048576 }] }, "gemini-2.5-pro"), 1048576);
+});
+
+test("model registry context stays conservative until provider metadata confirms it", () => {
+  const metadata = {
+    limit: { context: 1000000, output: 128000 },
+    reasoning: true,
+    reasoning_options: [{ type: "toggle" }],
+  };
+
+  assert.equal(getActualContextWindow("minimax-m3"), undefined);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).context_window, 200000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).max_context_window, 200000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).auto_compact_token_limit, 160000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, context_window_source: "provider_metadata", metadata_source: "provider_metadata" }).context_window, 1000000);
+});
+
+test("a registry-only refresh cannot overwrite a previously verified provider context", () => {
+  const preserved = CatalogSyncService.mergeProviderModelMetadata(
+    {
+      "gpt-5.6-luna": {
+        context_window: 1050000,
+        max_context_window: 1050000,
+        context_window_source: "provider_metadata",
+        metadata_source: "provider_metadata",
+      },
+    },
+    {
+      "gpt-5.6-luna": {
+        context_window: 200000,
+        max_context_window: 200000,
+        context_window_source: "model_registry",
+        metadata_source: "model_registry",
+      },
+    },
+  );
+
+  assert.equal(preserved["gpt-5.6-luna"].context_window, 1050000);
+  assert.equal(preserved["gpt-5.6-luna"].context_window_source, "provider_metadata");
+
+  const lowered = CatalogSyncService.mergeProviderModelMetadata(
+    preserved,
+    {
+      "gpt-5.6-luna": {
+        context_window: 272000,
+        max_context_window: 272000,
+        context_window_source: "provider_metadata",
+        metadata_source: "provider_metadata",
+      },
+    },
+  );
+  assert.equal(lowered["gpt-5.6-luna"].context_window, 272000);
+});
+
+test("provider-owned registry metadata is allowed to enlarge the provider route while native remains separate", () => {
+  const opencode = buildFullCatalogEntry(
+    "opencode/gpt-5.6-luna",
+    "opencode",
+    undefined,
+    "responses",
+    {
+      context_window: 1050000,
+      max_context_window: 1050000,
+      context_window_source: "provider_metadata",
+      metadata_source: "provider_metadata",
+    },
+  );
+  const native = { slug: "gpt-5.6-luna", context_window: 272000 };
+
+  assert.equal(opencode.context_window, 1050000);
+  assert.equal(native.context_window, 272000);
+});
+
+test("native restore clears provider model state without removing credentials", () => {
+  const cleared = clearProviderModelSelections([{
+    name: "opencode",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    credential_ref: "keychain:OpenCodex Provider Credential:provider:opencode",
+    models: ["gpt-5.6-luna"],
+    model_protocols: { "gpt-5.6-luna": "responses" },
+    model_metadata: { "gpt-5.6-luna": { context_window: 1050000 } },
+    last_test_status: "connected",
+  }]);
+
+  assert.deepEqual(cleared, [{
+    name: "opencode",
+    baseUrl: "https://opencode.ai/zen/go/v1",
+    credential_ref: "keychain:OpenCodex Provider Credential:provider:opencode",
+    models: [],
+  }]);
+});
+
+test("Codex cache rebuild removes stale third-party models and preserves native context", () => {
+  const models = CatalogSyncService.mergeCatalogModelsIntoCodexCache(
+    [
+      { slug: "gpt-5.6-luna", context_window: 272000 },
+      { slug: "opencode/gpt-5.6-luna", provider: "opencodex", context_window: 200000 },
+      { slug: "legacy-third-party", context_window: 200000 },
+    ],
+    [{ slug: "opencode/gpt-5.6-luna", context_window: 1050000 }],
+  );
+
+  assert.deepEqual(models.map((model) => model.slug), ["gpt-5.6-luna", "opencode/gpt-5.6-luna"]);
+  assert.equal(models[0].context_window, 272000);
+  assert.equal(models[1].context_window, 1050000);
+});
+
+test("configured provider models can reconstruct a missing Codex catalog entry", () => {
+  const entries = buildConfiguredProviderCatalogEntries([{
+    name: "minimax",
+    baseUrl: "https://api.minimaxi.com/v1",
+    models: ["minimax-m3"],
+    model_protocols: { "minimax-m3": "chat" },
+    model_metadata: {
+      "minimax-m3": { context_window: 1000000, reasoning: true, supported_reasoning_levels: [] },
+    },
+  }]);
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].slug, "minimax/minimax-m3");
+  assert.equal(entries[0].backend_model, "minimax-m3");
+  assert.equal(entries[0].context_window, 1000000);
+});
+
+test("existing provider-owned catalog entries preserve their explicit reasoning range", () => {
+  const catalog = {
+    models: [{
+      slug: "deepseek/deepseek-v4-flash",
+      model: "deepseek/deepseek-v4-flash",
+      backend_model: "deepseek-v4-flash",
+      backend_provider: "deepseek",
+      supported_reasoning_levels: [{ effort: "high" }],
+    }],
+  };
+
+  preserveOfficialModels(catalog);
+  const entry = catalog.models.find((model) => model.backend_provider === "deepseek");
+
+  assert.deepEqual(
+    entry.supported_reasoning_levels.map((level) => level.effort),
+    ["high"],
+  );
+});
+
+test("model registry metadata is read by provider and model rather than a hardcoded model map", () => {
+  const records = flattenModelRegistry({
+    "opencode-go": {
+      models: {
+        "mimo-v2.5": {
+          reasoning: true,
+          reasoning_options: [],
+          limit: { context: 1000000 },
+        },
+      },
+    },
+  });
+  assert.equal(records.length, 1);
+  assert.equal(records[0].provider, "opencode-go");
+  assert.equal(records[0].metadata.limit.context, 1000000);
+  assert.deepEqual(extractModelReasoningLevels(records[0].metadata), []);
+});
+
+test("reasoning option descriptors expose their discrete effort values", () => {
+  assert.deepEqual(
+    extractModelReasoningLevels({
+      reasoning: true,
+      reasoning_options: [
+        { type: "toggle" },
+        { type: "effort", values: ["low", "medium", "high"] },
+        { type: "budget_tokens", min: 1 },
+      ],
+    }),
+    [
+      { effort: "low", description: "Minimal reasoning for simple tasks" },
+      { effort: "medium", description: "Balances speed and reasoning depth" },
+      { effort: "high", description: "Greater reasoning depth for complex problems" },
+    ],
+  );
 });
 
 test("managed Codex config follows the current gateway port across restarts", () => {
@@ -35,6 +286,23 @@ test("managed Codex config strips corrupted duplicate blocks and orphaned keys i
   assert.equal((firstPass.match(/model_catalog_json/g) || []).length, 1);
   assert.equal((firstPass.match(/\[model_providers\.opencodex\]/g) || []).length, 1);
   assert.equal(firstPass, secondPass);
+});
+
+test("Codex restart waits for the new gateway before launching the desktop", async () => {
+  const gateway = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");
+  const restartStart = gateway.indexOf('url.pathname === "/api/restart-codex"');
+  const restartEnd = gateway.indexOf('url.pathname === "/assets/opencodex-logo.png"', restartStart);
+  assert.ok(restartStart >= 0 && restartEnd > restartStart);
+
+  const restartBlock = gateway.slice(restartStart, restartEnd);
+  assert.match(restartBlock, /requestDesktopLaunchAfterGatewayReady\(\);\s*stopDesktopClients\(\);/);
+  assert.ok(
+    restartBlock.indexOf("stopDesktopClients();") < restartBlock.indexOf('execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"]'),
+  );
+  assert.match(
+    gateway,
+    /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);\s*resolve\(\);/,
+  );
 });
 
 test("custom providers derive a stable namespace from known and unknown URLs", () => {
@@ -118,6 +386,26 @@ test("upserting a model records native Responses preference", () => {
 
   assert.equal(catalog.models[0].protocol, "responses");
   assert.equal(catalog.models[0].backend_protocol, "responses");
+});
+
+test("updating an existing provider model preserves its recorded metadata context", () => {
+  const catalog = {
+    models: [{
+      slug: "deepseek/deepseek-v4-flash",
+      model: "deepseek/deepseek-v4-flash",
+      backend_model: "deepseek-v4-flash",
+      backend_provider: "deepseek",
+      context_window: 200000,
+      max_context_window: 200000,
+      context_window_source: "model_registry",
+    }],
+  };
+
+  upsertProviderCatalogModel(catalog, "deepseek-v4-flash", "deepseek-v4-flash", "DeepSeek V4 Flash", "deepseek");
+
+  assert.equal(catalog.models[0].context_window, 200000);
+  assert.equal(catalog.models[0].max_context_window, 200000);
+  assert.equal(catalog.models[0].context_window_source, "model_registry");
 });
 
 test("legacy provider-owned entries migrate to the provider namespace", () => {

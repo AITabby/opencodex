@@ -7,8 +7,29 @@ import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { extractImageGenerationContext, generateNativeCodexImage, parseImageGenerationArguments } from "../services/native_image_bridge.js";
-import { cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
+import { appendComputerUseInstructions, hasComputerUseTool, hasNativeComputerUseTool, normalizeComputerUseResponsesTools, normalizeNativeComputerUseResponsesPayload } from "../services/computer_use_native.js";
+import {
+  hasChatToolImages,
+  isConsoleGoToolImageRejection,
+  isXiaomiChatToolTextRejection,
+  isXiaomiMimoProvider,
+  normalizeXiaomiChatToolHistory,
+  stripChatToolImages,
+} from "../services/chat_tool_compat.js";
+import { optimizeThirdPartyComputerUseImages } from "../services/computer_use_image_compat.js";
+import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
+import {
+  buildCompactionResponse,
+  buildFallbackCompactionSummary,
+  COMPACTION_SYSTEM_PROMPT,
+  COMPACTION_USER_PROMPT,
+  expandGatewayCompactionItems,
+  extractProviderTextFromBody,
+  encodeGatewayCompaction,
+} from "../services/compaction_compat.js";
+import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
+import { CatalogSyncService } from "../services/catalog_sync.js";
 
 
 
@@ -26,6 +47,8 @@ type CursorPendingToolCall = {
   continuation: CursorToolContinuation;
   /** The still-open native AgentService response body for this turn. */
   providerResponse?: Response;
+  /** The single reader that owns providerResponse.body across continuations. */
+  providerReader?: ReadableStreamDefaultReader<Uint8Array>;
   /** Sends the outer Codex result over that same native session. */
   respond?: (output: string, isError?: boolean) => Promise<void>;
   createdAt: number;
@@ -49,7 +72,11 @@ function isResponsesUnsupported(status: number, body: string): boolean {
   return /response|protocol|endpoint|unsupported|not supported|not found/i.test(body);
 }
 
-function sanitizeThirdPartyResponsesPayload(payload: any, blockedReasoningIds: Set<string>): any | null {
+function sanitizeThirdPartyResponsesPayload(
+  payload: any,
+  blockedReasoningIds: Set<string>,
+  nativeComputerUseCallIds?: Set<string>,
+): any | null {
   if (!payload || typeof payload !== "object") return payload;
 
   const item = payload.item;
@@ -79,10 +106,27 @@ function sanitizeThirdPartyResponsesPayload(payload: any, blockedReasoningIds: S
     payload = { ...payload, response: { ...payload.response, output } };
   }
 
-  return payload;
+  return normalizeNativeComputerUseResponsesPayload(payload, nativeComputerUseCallIds);
 }
 
-function sanitizeThirdPartySseEvent(event: string, blockedReasoningIds: Set<string>): string | null {
+function rewriteThirdPartyResponseModel(payload: any, responseModel: string): any {
+  if (!payload || typeof payload !== "object" || !responseModel) return payload;
+  let next = payload;
+  if (payload.response && typeof payload.response === "object") {
+    next = { ...next, response: { ...payload.response, model: responseModel } };
+  }
+  if (typeof payload.model === "string") {
+    next = { ...next, model: responseModel };
+  }
+  return next;
+}
+
+function sanitizeThirdPartySseEvent(
+  event: string,
+  blockedReasoningIds: Set<string>,
+  nativeComputerUseCallIds?: Set<string>,
+  responseModel = "",
+): string | null {
   const lines = event.split(/\r?\n/);
   const dataIndexes: number[] = [];
   const dataLines: string[] = [];
@@ -98,7 +142,10 @@ function sanitizeThirdPartySseEvent(event: string, blockedReasoningIds: Set<stri
 
   let payload: any;
   try { payload = JSON.parse(raw); } catch { return `${event}\n\n`; }
-  const sanitized = sanitizeThirdPartyResponsesPayload(payload, blockedReasoningIds);
+  const sanitized = rewriteThirdPartyResponseModel(
+    sanitizeThirdPartyResponsesPayload(payload, blockedReasoningIds, nativeComputerUseCallIds),
+    responseModel,
+  );
   if (sanitized === null) return null;
   const output = JSON.stringify(sanitized);
   const rewritten = lines.map((line, index) => {
@@ -108,38 +155,52 @@ function sanitizeThirdPartySseEvent(event: string, blockedReasoningIds: Set<stri
   return `${rewritten.join("\n")}\n\n`;
 }
 
-async function pipeFilteredThirdPartyResponses(body: AsyncIterable<Uint8Array>, res: http.ServerResponse): Promise<void> {
+async function pipeFilteredThirdPartyResponses(
+  body: AsyncIterable<Uint8Array>,
+  res: http.ServerResponse,
+  responseModel = "",
+): Promise<void> {
   const decoder = new TextDecoder();
   const blockedReasoningIds = new Set<string>();
+  const nativeComputerUseCallIds = new Set<string>();
   let buffer = "";
-  const flush = (final = false) => {
+  const flush = async (final = false) => {
     const chunks = buffer.split(/\r?\n\r?\n/);
     buffer = final ? "" : (chunks.pop() || "");
     for (const chunk of chunks) {
       if (!chunk.trim()) continue;
-      const sanitized = sanitizeThirdPartySseEvent(chunk, blockedReasoningIds);
-      if (sanitized) res.write(sanitized);
+      const sanitized = sanitizeThirdPartySseEvent(chunk, blockedReasoningIds, nativeComputerUseCallIds, responseModel);
+      if (sanitized) await writeHttpResponseChunked(res, sanitized);
     }
   };
 
   for await (const chunk of body) {
     buffer += decoder.decode(chunk, { stream: true });
-    flush();
+    await flush();
   }
   buffer += decoder.decode();
-  flush(true);
+  await flush(true);
 }
 
 async function proxyThirdPartyResponses(
   reqBody: any,
   upstreamModel: string,
+  responseModel: string,
   apiKey: string,
   providerUrl: string,
   res: http.ServerResponse,
 ): Promise<"handled" | "fallback"> {
   const targetUrl = responsesEndpointForProvider(providerUrl);
-  const upstreamBody = { ...reqBody, model: upstreamModel };
+  const optimized = await optimizeThirdPartyComputerUseImages(reqBody);
+  const upstreamBody = { ...optimized.body, model: upstreamModel };
   delete upstreamBody.protocol;
+  if (optimized.stats.optimized || optimized.stats.deduplicated) {
+    console.info(
+      `[OpenCodex Computer Use] optimized third-party Responses screenshots ` +
+      `optimized=${optimized.stats.optimized} deduplicated=${optimized.stats.deduplicated} ` +
+      `bytes=${optimized.stats.inputBytes}->${optimized.stats.outputBytes}`,
+    );
+  }
 
   try {
     const upstreamRes = await fetchUpstream(targetUrl, {
@@ -166,24 +227,27 @@ async function proxyThirdPartyResponses(
       return "handled";
     }
 
-    const responseHeaders: Record<string, string> = {};
-    upstreamRes.headers.forEach((value, key) => {
-      if (key.toLowerCase() !== "content-length") responseHeaders[key] = value;
-    });
+    const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
     res.writeHead(upstreamRes.status, responseHeaders);
     const contentType = upstreamRes.headers.get("content-type") || "";
     if (contentType.toLowerCase().includes("text/event-stream")) {
       // @ts-ignore Node's fetch body is an async iterable at runtime.
-      await pipeFilteredThirdPartyResponses(upstreamRes.body, res);
+      await pipeFilteredThirdPartyResponses(upstreamRes.body, res, responseModel);
     } else {
       const raw = await upstreamRes.text();
       try {
         const blockedReasoningIds = new Set<string>();
-        const payload = sanitizeThirdPartyResponsesPayload(JSON.parse(raw), blockedReasoningIds);
-        res.end(payload === null ? "{}" : JSON.stringify(payload));
+        const payload = rewriteThirdPartyResponseModel(sanitizeThirdPartyResponsesPayload(
+          JSON.parse(raw),
+          blockedReasoningIds,
+          new Set<string>(),
+        ), responseModel);
+        await writeHttpResponseChunked(res, payload === null ? "{}" : JSON.stringify(payload));
+        res.end();
         return;
       } catch {
-        res.end(raw);
+        await writeHttpResponseChunked(res, raw);
+        res.end();
         return;
       }
     }
@@ -258,6 +322,7 @@ function pruneCursorPendingToolCalls(): void {
     if (pending.createdAt < cutoff) {
       cursorPendingToolCalls.delete(key);
       cursorExternalToolQueues.delete(key);
+      void pending.providerReader?.cancel().catch(() => {});
     }
   }
 }
@@ -314,6 +379,177 @@ function rememberCursorSession(
 }
 
 export class GatewayRouter {
+  /**
+   * Codex's remote compaction endpoint is a Responses-specific endpoint. Most
+   * third-party providers implement neither that endpoint nor OpenAI's opaque
+   * encrypted compaction format, so compact through their selected protocol
+   * and wrap the resulting continuation state in a gateway-owned envelope.
+   */
+  public async compactResponses(
+    reqBody: any,
+    upstreamModel: string,
+    apiKey: string,
+    providerUrl: string,
+    providerName = "",
+  ): Promise<any> {
+    const optimized = await optimizeThirdPartyComputerUseImages(reqBody || {});
+    const expandedBody = expandGatewayCompactionItems(optimized.body);
+    if (optimized.stats.optimized || optimized.stats.deduplicated) {
+      console.info(
+        `[OpenCodex Computer Use] optimized third-party compaction screenshots ` +
+        `optimized=${optimized.stats.optimized} deduplicated=${optimized.stats.deduplicated} ` +
+        `bytes=${optimized.stats.inputBytes}->${optimized.stats.outputBytes}`,
+      );
+    }
+    const rawInput = typeof expandedBody.input === "string"
+      ? [expandedBody.input]
+      : Array.isArray(expandedBody.input)
+        ? expandedBody.input.filter((item: any) => item?.type !== "compaction_trigger")
+        : Array.isArray(expandedBody.messages)
+          ? expandedBody.messages
+          : [];
+
+    let summary = "";
+    let compactedWithProvider = false;
+    const protocol = String(expandedBody.protocol || "").toLowerCase();
+
+    if (protocol === "responses") {
+      try {
+        summary = await this.requestCompactionThroughResponses(
+          expandedBody,
+          rawInput,
+          upstreamModel,
+          apiKey,
+          providerUrl,
+          providerName,
+        );
+        compactedWithProvider = Boolean(summary);
+      } catch (err: any) {
+        console.warn(`[OpenCodex Compaction] Responses compaction fallback provider=${providerName || "provider"} model=${upstreamModel}: ${err?.message || err}`);
+      }
+    }
+
+    if (!summary) {
+      try {
+        summary = await this.requestCompactionThroughChat(
+          expandedBody,
+          rawInput,
+          upstreamModel,
+          apiKey,
+          providerUrl,
+          providerName,
+        );
+        compactedWithProvider = Boolean(summary);
+      } catch (err: any) {
+        console.warn(`[OpenCodex Compaction] Chat compaction fallback provider=${providerName || "provider"} model=${upstreamModel}: ${err?.message || err}`);
+      }
+    }
+
+    if (!summary) {
+      const fallbackBody = { ...expandedBody, protocol: "chat", input: rawInput, tools: undefined };
+      const fallbackMessages = transformResponsesToChat(fallbackBody, upstreamModel).messages;
+      summary = buildFallbackCompactionSummary(fallbackMessages, expandedBody.instructions);
+    }
+
+    const encryptedContent = encodeGatewayCompaction(summary, upstreamModel, !compactedWithProvider);
+    return buildCompactionResponse(upstreamModel, encryptedContent);
+  }
+
+  private async requestCompactionThroughResponses(
+    body: any,
+    input: any[],
+    upstreamModel: string,
+    apiKey: string,
+    providerUrl: string,
+    providerName: string,
+  ): Promise<string> {
+    const targetUrl = responsesEndpointForProvider(providerUrl);
+    const upstreamBody: any = {
+      model: upstreamModel,
+      instructions: [body.instructions, COMPACTION_SYSTEM_PROMPT].filter(Boolean).join("\n\n"),
+      input: [
+        ...input,
+        { type: "message", role: "user", content: [{ type: "input_text", text: COMPACTION_USER_PROMPT }] },
+      ],
+      stream: false,
+      store: false,
+      max_output_tokens: 4096,
+    };
+
+    const response = await fetchUpstream(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(upstreamBody),
+      maxAttempts: 1,
+      timeoutMs: 120_000,
+      operation: `compact:responses:${providerName || "provider"}`,
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`HTTP ${response.status}${raw ? `: ${raw.replace(/\s+/g, " ").slice(0, 240)}` : ""}`);
+    const summary = extractProviderTextFromBody(raw);
+    if (!summary) throw new Error("provider returned no compacted text");
+    return summary;
+  }
+
+  private async requestCompactionThroughChat(
+    body: any,
+    input: any[],
+    upstreamModel: string,
+    apiKey: string,
+    providerUrl: string,
+    providerName: string,
+  ): Promise<string> {
+    const chatBody = transformResponsesToChat({
+      ...body,
+      protocol: "chat",
+      input,
+      tools: undefined,
+      stream: false,
+      max_output_tokens: 4096,
+    }, upstreamModel);
+    chatBody.messages = [
+      { role: "system", content: COMPACTION_SYSTEM_PROMPT },
+      ...chatBody.messages,
+      { role: "user", content: COMPACTION_USER_PROMPT },
+    ];
+    chatBody.stream = false;
+    chatBody.max_tokens = 4096;
+    delete chatBody.tools;
+    delete chatBody.tool_choice;
+
+    const adapter = AdapterFactory.getAdapter(body.protocol, providerUrl);
+    const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(chatBody);
+    const providerBaseUrl = providerUrl.replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "");
+    const adapterPath = /\/v1$/i.test(providerBaseUrl) && /^\/v1\//i.test(urlEndpoint)
+      ? urlEndpoint.slice("/v1".length)
+      : urlEndpoint;
+    const targetUrl = adapterPath
+      ? `${providerBaseUrl.replace(/\/$/, "")}${adapterPath}`
+      : /\/chat\/completions\/?$/i.test(providerUrl)
+        ? providerUrl
+        : `${providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+      ...adapterHeaders,
+    };
+    if (adapter.name === "anthropic" && apiKey) headers["x-api-key"] = apiKey;
+
+    const response = await fetchUpstream(targetUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payloadBody),
+      maxAttempts: 1,
+      timeoutMs: 120_000,
+      operation: `compact:chat:${providerName || "provider"}`,
+    });
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`HTTP ${response.status}${raw ? `: ${raw.replace(/\s+/g, " ").slice(0, 240)}` : ""}`);
+    const summary = extractProviderTextFromBody(raw);
+    if (!summary) throw new Error("provider returned no compacted text");
+    return summary;
+  }
+
   public async handleResponses(
     reqBody: any,
     upstreamModel: string,
@@ -322,24 +558,57 @@ export class GatewayRouter {
     res: http.ServerResponse,
     providerName = "",
     nativeImageHeaders: Record<string, string> = {},
+    responseModel = "",
   ): Promise<void> {
+    reqBody = expandGatewayCompactionItems(reqBody);
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
+    const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
+    const requestUsesComputerUse = hasComputerUseTool(reqBody?.tools);
+    if (requestUsesComputerUse) {
+      // Native third-party Responses providers do not pass through the Chat
+      // transformer, so give both protocol paths the same direct-use rule.
+      reqBody = {
+        ...reqBody,
+        tools: normalizeComputerUseResponsesTools(reqBody.tools),
+        instructions: appendComputerUseInstructions(reqBody.instructions, reqBody.tools),
+      };
+    }
     if (String(reqBody?.protocol || "").toLowerCase() === "responses") {
-      const nativeResult = await proxyThirdPartyResponses(reqBody, upstreamModel, apiKey, providerUrl, res);
+      // Responses-capable third-party providers receive the request as-is.
+      // Computer Use is still a client-owned native tool call; the gateway
+      // must never execute desktop actions or synthesize a second bridge.
+      const nativeResult = await proxyThirdPartyResponses(reqBody, upstreamModel, selectedResponseModel, apiKey, providerUrl, res);
       if (nativeResult === "handled") return;
-      // The native request was rejected before execution because the endpoint
-      // does not expose Responses. Honor the configured preference by making
-      // the one explicit Responses -> Chat fallback and continue normally.
+      // The configured Responses endpoint is unavailable; use the existing
+      // Chat compatibility conversion for this request.
       reqBody = { ...reqBody, protocol: "chat" };
     }
     const imageGenerationContext = extractImageGenerationContext(reqBody);
     const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId);
-    chatBody.stream = true;
+    const optimizedChat = await optimizeThirdPartyComputerUseImages(chatBody);
+    const optimizedChatBody = optimizedChat.body;
+    const isXiaomiMimoChat = isXiaomiMimoProvider(providerName, providerUrl, upstreamModel);
+    // MiMo's Chat validator is stricter than the OpenAI schema for tool
+    // history: an assistant tool-call turn and an image-only tool result must
+    // still carry a text field. Keep this isolated to the Xiaomi/MiMo route;
+    // MiniMax and all other providers retain the ordinary Chat payload.
+    const providerChatBody = isXiaomiMimoChat
+      ? normalizeXiaomiChatToolHistory(optimizedChatBody)
+      : optimizedChatBody;
+    providerChatBody.stream = true;
+    if (optimizedChat.stats.optimized || optimizedChat.stats.deduplicated) {
+      console.info(
+        `[OpenCodex Computer Use] optimized third-party Chat screenshots ` +
+        `optimized=${optimizedChat.stats.optimized} deduplicated=${optimizedChat.stats.deduplicated} ` +
+        `bytes=${optimizedChat.stats.inputBytes}->${optimizedChat.stats.outputBytes}`,
+      );
+    }
+    optimizedChatBody.stream = true;
 
     const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl);
-    const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(chatBody);
+    const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(providerChatBody);
 
     // Callers may provide either a provider base URL or an already selected
     // OpenAI endpoint. Normalize both forms before an adapter chooses its
@@ -392,7 +661,7 @@ export class GatewayRouter {
         finalHeaders["User-Agent"] = "antigravity/hub/2.2.1 darwin/arm64";
 
         activeAdapter = new GoogleGeminiAdapter();
-        const geminiPayload = activeAdapter.transformPayload(chatBody).body;
+        const geminiPayload = activeAdapter.transformPayload(optimizedChatBody).body;
 
         finalPayloadBody = {
           project: "default-cli-project",
@@ -429,7 +698,7 @@ export class GatewayRouter {
 
     if (isClaudeModel) {
       activeAdapter = new AnthropicAdapter();
-      const payload = activeAdapter.transformPayload(chatBody);
+      const payload = activeAdapter.transformPayload(optimizedChatBody);
       finalTargetUrl = "https://api.anthropic.com/v1/messages";
       finalPayloadBody = payload.body;
 
@@ -458,10 +727,24 @@ export class GatewayRouter {
       finalTargetUrl = "https://agent.api5.cursor.sh/agent.v1.AgentService/Run";
     }
 
+    // Ask OpenAI-compatible Chat endpoints for their actual stream usage when
+    // supported. This is optional metadata; providers that omit it still work
+    // and the Responses engine will simply leave usage absent.
+    if (activeAdapter.name === "openai" && finalPayloadBody && typeof finalPayloadBody === "object") {
+      finalPayloadBody = {
+        ...finalPayloadBody,
+        stream_options: {
+          ...(finalPayloadBody.stream_options || {}),
+          include_usage: true,
+        },
+      };
+    }
+
     console.info(
       `[OpenCodex Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
       `messages=${Array.isArray(finalPayloadBody?.messages) ? finalPayloadBody.messages.length : 0} ` +
       `tools=${Array.isArray(finalPayloadBody?.tools) ? finalPayloadBody.tools.map((tool: any) => tool?.function?.name || tool?.name).filter(Boolean).join(",") || "(none)" : "(none)"} ` +
+      `tool_images=${hasChatToolImages(finalPayloadBody)} ` +
       `continuation=${Boolean(reqBody?.input?.some?.((item: any) => item?.type === "function_call_output"))}`,
     );
 
@@ -488,11 +771,21 @@ export class GatewayRouter {
 
     const writeSse = async (payload: any) => {
       if (!res.writableEnded) {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        await writeSseData(res, payload);
       }
     };
 
-    const engine = new ResponsesStreamEngine(upstreamModel, reqBody?.client_metadata?.turn_id);
+    // Native Computer Use often starts a turn with explanatory text and only
+    // emits the node-repl call a few chunks later. Keep that message in the
+    // commentary phase from its first event; otherwise Codex Desktop may
+    // treat the early text as a replaceable final answer and clear it when
+    // the first desktop action arrives.
+    const nativeComputerUseTurn = requestUsesComputerUse || hasNativeComputerUseTool(optimizedChatBody?.tools);
+    const engine = new ResponsesStreamEngine(
+      upstreamModel,
+      reqBody?.client_metadata?.turn_id,
+      { forceCommentary: nativeComputerUseTurn, responseModel: selectedResponseModel },
+    );
     let engineStarted = false;
     const emitFailedResponse = async (message: string, code = "provider_request_failed"): Promise<void> => {
       if (!engineStarted) {
@@ -506,7 +799,7 @@ export class GatewayRouter {
         created_at: now,
         completed_at: now,
         status: "failed",
-        model: upstreamModel,
+        model: selectedResponseModel,
         output: [],
         error: { code, message },
       };
@@ -532,7 +825,7 @@ export class GatewayRouter {
 
     try {
       const requestCursorMessages = isCursorModel
-        ? chatBody.messages.map((message: any) => ({
+        ? optimizedChatBody.messages.map((message: any) => ({
           role: String(message.role || "user"),
           content: typeof message.content === "string" ? message.content : JSON.stringify(message.content || ""),
         }))
@@ -568,6 +861,7 @@ export class GatewayRouter {
       let response: Response;
       const nativeCursorContinuation = isCursorModel && matchedPendingCursorTool && requestedCursorToolOutput
         && matchedPendingCursorTool.providerResponse?.body
+        && matchedPendingCursorTool.providerReader
         && matchedPendingCursorTool.respond;
       if (nativeCursorContinuation) {
         console.log(`[OpenCodex Cursor] native-session-resume call_id=${matchedPendingCursorTool.callId}`);
@@ -577,8 +871,8 @@ export class GatewayRouter {
         response = await (async () => {
           const cursorToken = await SubscriptionAuthService.getCursorAccessToken();
           if (!cursorToken) throw new Error("未找到有效的 Cursor 本机登录凭证");
-          const inputToolNames = (chatBody.tools || []).map((tool: any) => String(tool?.function?.name || tool?.name || "")).filter(Boolean);
-          const advertisedToolNames = cursorAdvertisedToolNames(chatBody.tools as any);
+          const inputToolNames = (optimizedChatBody.tools || []).map((tool: any) => String(tool?.function?.name || tool?.name || "")).filter(Boolean);
+          const advertisedToolNames = cursorAdvertisedToolNames(optimizedChatBody.tools as any);
           console.log(`[OpenCodex Cursor] AgentRun model=${cursorModelForRequest} input_tools=${inputToolNames.length ? inputToolNames.join(",") : "(none)"} advertised_mcp_tools=${advertisedToolNames.length ? advertisedToolNames.join(",") : "(none)"} tool_choice=${String(reqBody?.tool_choice || "auto")} mode=AGENT${matchedPendingCursorTool ? " continuation=true" : ""}`);
           return streamCursorChat(
             cursorToken,
@@ -590,7 +884,7 @@ export class GatewayRouter {
             controller.signal,
             {
               workspaceRoot: process.cwd(),
-              tools: chatBody.tools as any,
+              tools: optimizedChatBody.tools as any,
               onServerMessage: (message) => {
                 if (message.message.case === "execServerMessage") {
                   console.log(`[OpenCodex Cursor] execServerMessage=${message.message.value.message.case || "unknown"}`);
@@ -649,7 +943,7 @@ export class GatewayRouter {
               controller.signal,
             {
               workspaceRoot: process.cwd(),
-              tools: chatBody.tools as any,
+              tools: optimizedChatBody.tools as any,
               onServerMessage: (message) => {
                 if (message.message.case === "execServerMessage") {
                   console.log(`[OpenCodex Cursor] execServerMessage=${message.message.value.message.case || "unknown"}`);
@@ -686,11 +980,75 @@ export class GatewayRouter {
 
       clearTimeout(timeoutId);
 
+      // Some legacy Chat gateways accept ordinary tool text but reject a
+      // multimodal tool result with a generic Console Go 400. A screenshot
+      // result is optional for Computer Use because the accessibility tree is
+      // still present in the text result, so retry this exact case once with
+      // the image removed. Native Responses providers never enter this path.
+      let preReadErrorText: string | undefined;
+      if (!response.ok || !response.body) {
+        const initialErrorText = await response.text();
+        if (isConsoleGoToolImageRejection(response.status, initialErrorText, finalPayloadBody)) {
+          const fallbackPayloadBody = stripChatToolImages(finalPayloadBody);
+          console.warn(
+            `[OpenCodex Provider] retrying Chat request without tool images provider=${providerName || "provider"} model=${upstreamModel}`,
+          );
+          const fallbackResponse = await fetchUpstream(finalTargetUrl, {
+            method: "POST",
+            headers: finalHeaders,
+            body: JSON.stringify(fallbackPayloadBody),
+            signal: controller.signal,
+            maxAttempts: 1,
+            timeoutMs: 120_000,
+            operation: `responses:${providerName || "provider"}:chat-tool-image-fallback`,
+          });
+          response = fallbackResponse;
+          if (response.ok && response.body) {
+            finalPayloadBody = fallbackPayloadBody;
+          } else {
+            preReadErrorText = await response.text();
+          }
+        } else if (isXiaomiChatToolTextRejection(response.status, initialErrorText, finalPayloadBody)) {
+          // The first MiMo request already has the strict text fields. If its
+          // validator still rejects a screenshot-bearing tool result, retry
+          // once with the textual accessibility result only. Do not apply this
+          // fallback to MiniMax or to an unrelated Xiaomi 400.
+          const normalizedPayload = normalizeXiaomiChatToolHistory(finalPayloadBody);
+          const fallbackPayloadBody = stripChatToolImages(normalizedPayload);
+          console.warn(
+            `[OpenCodex Provider] retrying MiMo Chat continuation with text-only tool results provider=${providerName || "provider"} model=${upstreamModel}`,
+          );
+          const fallbackResponse = await fetchUpstream(finalTargetUrl, {
+            method: "POST",
+            headers: finalHeaders,
+            body: JSON.stringify(fallbackPayloadBody),
+            signal: controller.signal,
+            maxAttempts: 1,
+            timeoutMs: 120_000,
+            operation: `responses:${providerName || "provider"}:mimo-chat-tool-fallback`,
+          });
+          response = fallbackResponse;
+          if (response.ok && response.body) {
+            finalPayloadBody = fallbackPayloadBody;
+          } else {
+            preReadErrorText = await response.text();
+          }
+        } else {
+          preReadErrorText = initialErrorText;
+        }
+      }
+
       if (!response.ok || !response.body) {
         res.flushHeaders();
         const errText = firstAuthErrorText && (response.status === 401 || response.status === 403)
           ? firstAuthErrorText
-          : await response.text();
+          : preReadErrorText ?? await response.text();
+        if (response.status === 400) {
+          // A provider validation enum is authoritative capability metadata.
+          // Record it for the next model-picker refresh, but never silently
+          // replace the user's selected effort on this request.
+          CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errText);
+        }
         console.error(`[CodexBridge V2] Upstream error (${response.status}) for ${finalTargetUrl}: ${errText}`);
         let msg = `Upstream API Error (${response.status})`;
         try {
@@ -735,7 +1093,7 @@ export class GatewayRouter {
       await engine.start(writeSse);
       engineStarted = true;
 
-      const reader = response.body.getReader();
+      const reader = acquireCursorStreamReader(response, matchedPendingCursorTool?.providerReader);
       const decoder = new TextDecoder();
       let buffer = "";
 
@@ -881,6 +1239,7 @@ export class GatewayRouter {
               messages: cursorMessages,
               continuation,
               providerResponse: response,
+              providerReader: reader,
               respond: pendingCursorToolRequest.respond,
               createdAt: Date.now(),
             });
@@ -904,9 +1263,7 @@ export class GatewayRouter {
             // for the Codex function_call_output. The next HTTP request will
             // write the native ExecClientMessage onto this same response
             // body/session.
-            if (pendingCursorToolRequest.respond && response.body) {
-              reader.releaseLock();
-            } else {
+            if (!pendingCursorToolRequest.respond || !response.body) {
               controller.abort();
             }
             break;
@@ -923,6 +1280,7 @@ export class GatewayRouter {
         if (matchedPendingCursorTool && !pendingCursorToolRequest) {
           cursorPendingToolCalls.delete(cursorStateKey);
           cursorExternalToolQueues.delete(cursorStateKey);
+          try { matchedPendingCursorTool.providerReader?.releaseLock(); } catch {}
         }
         if (!pendingCursorToolRequest) rememberCursorSession(cursorHistoryId, cursorMessages, engine.getMessageText());
       } else {
@@ -947,6 +1305,7 @@ export class GatewayRouter {
           }
           if (providerChunkSignalsCompletion(chunk)) providerStreamCompleted = true;
           if (activeAdapter.processStreamChunk) {
+            engine.observeProviderChunk(chunk);
             const normalizedChunks = activeAdapter.processStreamChunk(chunk);
             for (const nc of normalizedChunks) {
               await engine.processChatChunk(writeSse, nc);

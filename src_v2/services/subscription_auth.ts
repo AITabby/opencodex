@@ -24,6 +24,7 @@ const CURSOR_AUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
 const CLAUDE_COOKIE_DB = path.join(os.homedir(), "Library", "Application Support", "Claude", "Cookies");
 const CLAUDE_SAFE_STORAGE_SERVICE = "Claude Safe Storage";
 const CLAUDE_SAFE_STORAGE_ACCOUNT = "Claude Key";
+const CLAUDE_CONFIG_JSON = path.join(os.homedir(), "Library", "Application Support", "Claude", "config.json");
 const CLAUDE_TOKEN_CACHE = path.join(os.homedir(), ".opencodex", "claude_desktop_auth.json");
 const CLAUDE_CODE_CREDENTIALS = path.join(os.homedir(), ".claude", ".credentials.json");
 const CLAUDE_API_HOST = "https://api.anthropic.com";
@@ -119,7 +120,7 @@ function readAntigravityAuth(): AntigravityAuth | null {
 }
 
 type CursorCredentials = { accessToken: string | null; refreshToken: string | null };
-type ClaudeDesktopToken = { accessToken: string; refreshToken: string; expiresAt: number };
+export type ClaudeDesktopToken = { accessToken: string; refreshToken: string; expiresAt: number };
 type ClaudeCookieRow = { name?: string; value?: string; encrypted_value?: string };
 type ClaudeCookieDiagnostic = { name: string; encrypted: boolean; decryptedLength: number; printable: boolean };
 let lastClaudeCookieDiagnostics: ClaudeCookieDiagnostic[] = [];
@@ -221,6 +222,134 @@ function decryptClaudeCookieValue(row: ClaudeCookieRow, safeStorageKey: string):
   return "";
 }
 
+function claudeSafeStorageKeyMaterials(safeStorageKey: string): Buffer[] {
+  const materials = [Buffer.from(safeStorageKey, "utf-8")];
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(safeStorageKey)) {
+    try {
+      const decoded = Buffer.from(safeStorageKey, "base64");
+      if (decoded.length > 0) materials.unshift(decoded);
+    } catch {}
+  }
+  return materials;
+}
+
+/**
+ * Claude Desktop stores oauth:tokenCache as an Electron safeStorage value.
+ * On macOS the serialized value is base64("v10" + AES-CBC ciphertext), while
+ * the key is kept in the macOS Keychain under Claude Safe Storage.
+ */
+export function decryptClaudeSafeStorageValue(encodedValue: string, safeStorageKey: string): string {
+  if (!encodedValue || !safeStorageKey) return "";
+  let encrypted: Buffer;
+  try {
+    encrypted = Buffer.from(encodedValue, "base64");
+  } catch {
+    return "";
+  }
+  if (encrypted.length < 19 || !/^v1[0-2]$/.test(encrypted.subarray(0, 3).toString("ascii"))) return "";
+
+  for (const keyMaterial of claudeSafeStorageKeyMaterials(safeStorageKey)) {
+    const masterKeys: Buffer[] = [];
+    if (keyMaterial.length === 16) masterKeys.push(keyMaterial);
+    masterKeys.push(crypto.pbkdf2Sync(
+      keyMaterial,
+      Buffer.from("saltysalt", "utf-8"),
+      1003,
+      16,
+      "sha1",
+    ));
+    for (const masterKey of masterKeys) {
+      try {
+        const decipher = crypto.createDecipheriv("aes-128-cbc", masterKey, Buffer.alloc(16, 0x20));
+        const plaintext = Buffer.concat([
+          decipher.update(encrypted.subarray(3)),
+          decipher.final(),
+        ]);
+        return plaintext.toString("utf-8");
+      } catch {
+        // Try the next key derivation. The Keychain value format has varied
+        // between Electron/Chromium releases.
+      }
+    }
+  }
+  return "";
+}
+
+function normalizeClaudeDesktopToken(value: any): ClaudeDesktopToken | null {
+  const accessToken = [value?.accessToken, value?.access_token, value?.token]
+    .find((candidate) => typeof candidate === "string" && candidate.trim())
+    ?.trim() || "";
+  if (!accessToken) return null;
+  const expiresAt = isUsableExpiry(
+    value?.expiresAt ?? value?.expires_at ?? value?.expires ?? value?.expiry,
+  ) ?? Number.MAX_SAFE_INTEGER;
+  return {
+    accessToken,
+    refreshToken: String(value?.refreshToken || value?.refresh_token || "").trim(),
+    expiresAt,
+  };
+}
+
+export function selectClaudeDesktopTokenCache(cache: unknown): ClaudeDesktopToken | null {
+  const candidates: Array<{ token: ClaudeDesktopToken; key: string; order: number }> = [];
+  let order = 0;
+  const visit = (value: unknown, key = ""): void => {
+    if (!value || typeof value !== "object") return;
+    const token = normalizeClaudeDesktopToken(value);
+    if (token) candidates.push({ token, key, order: order++ });
+    if (Array.isArray(value)) {
+      for (const [index, item] of value.entries()) visit(item, `${key}[${index}]`);
+      return;
+    }
+    for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
+      visit(child, key ? `${key}:${childKey}` : childKey);
+    }
+  };
+  visit(cache);
+  candidates.sort((left, right) => {
+    const score = (candidate: typeof left): number => {
+      const key = candidate.key.toLowerCase();
+      return (key.includes("api.anthropic.com") ? 8 : 0)
+        + (key.includes("user:inference") ? 4 : 0)
+        + (isStillUsableAccessToken(candidate.token.accessToken, candidate.token.expiresAt) ? 2 : 0);
+    };
+    return score(right) - score(left)
+      || right.token.expiresAt - left.token.expiresAt
+      || left.order - right.order;
+  });
+  return candidates[0]?.token || null;
+}
+
+function readClaudeDesktopConfigToken(): ClaudeDesktopToken | null {
+  if (process.platform !== "darwin" || !fs.existsSync(CLAUDE_CONFIG_JSON)) return null;
+  try {
+    const config = JSON.parse(fs.readFileSync(CLAUDE_CONFIG_JSON, "utf-8")) as Record<string, unknown>;
+    const safeStorageKey = execFileSync("security", [
+      "find-generic-password", "-s", CLAUDE_SAFE_STORAGE_SERVICE,
+      "-a", CLAUDE_SAFE_STORAGE_ACCOUNT, "-w",
+    ], { encoding: "utf-8", timeout: 5000 }).trim();
+    if (!safeStorageKey) return null;
+
+    // V2 is the active Claude Desktop cache. Keep the legacy key as a
+    // fallback for older installed versions and existing login states.
+    for (const cacheKey of ["oauth:tokenCacheV2", "oauth:tokenCache"]) {
+      const encoded = config[cacheKey];
+      if (typeof encoded !== "string" || !encoded) continue;
+      const decrypted = decryptClaudeSafeStorageValue(encoded, safeStorageKey);
+      if (!decrypted) continue;
+      try {
+        const cache = JSON.parse(decrypted) as unknown;
+        const token = selectClaudeDesktopTokenCache(cache);
+        if (token) return token;
+      } catch {
+        // A stale/rotated Electron cache is not a usable credential. The
+        // cookie exchange below remains available as a compatibility path.
+      }
+    }
+  } catch {}
+  return null;
+}
+
 function readClaudeDesktopCookies(): { sessionKey: string; organizationUuid: string } | null {
   if (process.platform !== "darwin" || !fs.existsSync(CLAUDE_COOKIE_DB)) return null;
   try {
@@ -272,11 +401,7 @@ function readClaudeDesktopToken(): ClaudeDesktopToken | null {
   try {
     if (!fs.existsSync(CLAUDE_TOKEN_CACHE)) return null;
     const value = JSON.parse(fs.readFileSync(CLAUDE_TOKEN_CACHE, "utf-8"));
-    if (
-      typeof value?.accessToken === "string" && value.accessToken &&
-      typeof value?.refreshToken === "string" && value.refreshToken &&
-      typeof value?.expiresAt === "number"
-    ) return value as ClaudeDesktopToken;
+    return normalizeClaudeDesktopToken(value);
   } catch {}
   return null;
 }
@@ -554,8 +679,7 @@ export class SubscriptionAuthService {
     }
   }
 
-  private static async refreshClaudeDesktopToken(): Promise<string | null> {
-    const cached = readClaudeDesktopToken();
+  private static async refreshClaudeDesktopToken(cached: ClaudeDesktopToken | null): Promise<string | null> {
     if (!cached?.refreshToken) {
       this.claudeLastAuthFailure = "no_cached_refresh_token";
       return null;
@@ -572,6 +696,7 @@ export class SubscriptionAuthService {
           grant_type: "refresh_token",
           refresh_token: cached.refreshToken,
           client_id: CLAUDE_CODE_CLIENT_ID,
+          scope: CLAUDE_CODE_SCOPE,
         }),
         signal: AbortSignal.timeout(15000),
       });
@@ -717,7 +842,12 @@ export class SubscriptionAuthService {
       return environmentToken;
     }
 
-    const cached = readClaudeDesktopToken() || this.getClaudeCodeToken();
+    // Claude Desktop 1.24+ keeps the authoritative OAuth cache in its
+    // encrypted config.json. The OpenCodex cache and Claude Code credentials
+    // remain fallbacks for older installations and CLI logins.
+    const cached = readClaudeDesktopConfigToken()
+      || readClaudeDesktopToken()
+      || this.getClaudeCodeToken();
     if (!forceRefresh && cached && cached.expiresAt - Date.now() > REFRESH_SKEW_MS) {
       this.claudeLastAuthFailure = "cached_token";
       return cached.accessToken;
@@ -725,7 +855,7 @@ export class SubscriptionAuthService {
 
     if (!this.claudeRefresh) {
       this.claudeRefresh = (async () => {
-        const refreshed = await this.refreshClaudeDesktopToken();
+        const refreshed = await this.refreshClaudeDesktopToken(cached);
         if (refreshed) return refreshed;
         return this.exchangeClaudeDesktopToken();
       })().finally(() => { this.claudeRefresh = null; });
@@ -789,6 +919,7 @@ export class SubscriptionAuthService {
     return Boolean(
       this.getClaudeApiKey() ||
       this.getClaudeEnvironmentToken() ||
+      readClaudeDesktopConfigToken() ||
       readClaudeDesktopCookies() ||
       readClaudeDesktopToken() ||
       this.getClaudeCodeToken(),

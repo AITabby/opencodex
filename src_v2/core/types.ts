@@ -7,7 +7,14 @@
 // 1. OpenAI Responses API Types (/v1/responses)
 // ══════════════════════════════════════════════
 
-export type ResponseItemType = "message" | "function_call" | "function_call_output" | "reasoning";
+export type ResponseItemType =
+  | "message"
+  | "function_call"
+  | "function_call_output"
+  | "mcp_call"
+  | "mcp_call_output"
+  | "reasoning"
+  | "compaction";
 
 export interface ResponseImageContentPart {
   type: "input_image" | "output_image";
@@ -48,7 +55,26 @@ export interface ResponseFunctionCallOutputItem {
   id?: string;
   type: "function_call_output";
   call_id: string;
-  output: string;
+  output: string | ResponseContentPart[];
+}
+
+export interface ResponseMcpCallItem {
+  id?: string;
+  type: "mcp_call";
+  status?: "in_progress" | "calling" | "completed" | "incomplete" | "failed";
+  server_label: string;
+  name: string;
+  arguments: string;
+  output?: string | ResponseContentPart[];
+  error?: string;
+}
+
+/** Client-side MCP continuations may use this explicit output item shape. */
+export interface ResponseMcpCallOutputItem {
+  id?: string;
+  type: "mcp_call_output";
+  call_id?: string;
+  output: string | ResponseContentPart[];
 }
 
 export interface ResponseReasoningItem {
@@ -59,11 +85,20 @@ export interface ResponseReasoningItem {
   encrypted_content?: string | null;
 }
 
+export interface ResponseCompactionItem {
+  id?: string;
+  type: "compaction";
+  encrypted_content: string;
+}
+
 export type ResponseInputItem =
   | ResponseMessageItem
   | ResponseFunctionCallItem
   | ResponseFunctionCallOutputItem
+  | ResponseMcpCallItem
+  | ResponseMcpCallOutputItem
   | ResponseReasoningItem
+  | ResponseCompactionItem
   | string;
 
 export interface ResponseToolFunction {
@@ -94,6 +129,12 @@ export type ResponseTool =
       size?: string;
       background?: string;
       partial_images?: number;
+    }
+  | {
+      type: "computer" | "computer_use_preview";
+      display_width?: number;
+      display_height?: number;
+      environment?: "browser" | "computer";
     }
   | {
       name: string;
@@ -157,6 +198,7 @@ export interface ChatCompletionRequestBody {
   max_tokens?: number;
   parallel_tool_calls?: boolean;
   reasoning_effort?: string;
+  stream_options?: { include_usage?: boolean; [key: string]: any };
 }
 
 // ══════════════════════════════════════════════
@@ -173,6 +215,20 @@ export interface ProviderConfig {
   models?: string[];
   /** Protocol preference per configured model. Unset entries default to Chat. */
   model_protocols?: Record<string, "chat" | "responses">;
+  /**
+   * Metadata learned from the provider /models response or a model registry.
+   * Keys are the provider's backend model ids, not UI aliases.
+   */
+  model_metadata?: Record<string, {
+    context_window?: number;
+    max_context_window?: number;
+    context_window_source?: "provider_metadata" | "model_registry" | "unknown";
+    supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
+    reasoning?: boolean;
+    default_reasoning_level?: string;
+    metadata_source?: string;
+    metadata_updated_at?: string;
+  }>;
   headers?: Record<string, string>;
   /** Connection testing is explicit; configuration alone must not imply success. */
   last_test_status?: "untested" | "connected" | "failed" | "simulated";
@@ -192,8 +248,12 @@ export interface CatalogModelEntry {
   description?: string;
   context_window?: number;
   max_context_window?: number;
+  context_window_source?: "provider_metadata" | "model_registry" | "unknown";
+  context_window_confidence?: "exact" | "unknown";
   vision_bridge_enabled?: boolean;
   supports_image_generation?: boolean;
   image_generation_mode?: "native_responses" | "none";
   supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
+  default_reasoning_level?: string;
+  reasoning?: boolean;
 }

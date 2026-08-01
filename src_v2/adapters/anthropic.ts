@@ -6,6 +6,30 @@
 import { ProtocolAdapter } from "./base.js";
 import { ChatMessage, ChatCompletionRequestBody } from "../core/types.js";
 
+function anthropicToolResultContent(content: any): any {
+  if (!Array.isArray(content)) return typeof content === "string" ? content : JSON.stringify(content || "");
+  const blocks: any[] = [];
+  for (const part of content) {
+    if (typeof part === "string") {
+      if (part) blocks.push({ type: "text", text: part });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+      if (part.text) blocks.push({ type: "text", text: String(part.text) });
+      continue;
+    }
+    const imageUrl = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+    if (imageUrl) {
+      const dataMatch = String(imageUrl).match(/^data:([^;]+);base64,(.+)$/);
+      blocks.push(dataMatch
+        ? { type: "image", source: { type: "base64", media_type: dataMatch[1], data: dataMatch[2] } }
+        : { type: "image", source: { type: "url", url: imageUrl } });
+    }
+  }
+  return blocks.length > 0 ? blocks : JSON.stringify(content);
+}
+
 export class AnthropicAdapter implements ProtocolAdapter {
   public name = "anthropic";
 
@@ -38,12 +62,16 @@ export class AnthropicAdapter implements ProtocolAdapter {
           contentParts.push({ type: "text", text: String(msg.content) });
         }
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-          for (const tc of msg.tool_calls) {
+          for (let index = 0; index < msg.tool_calls.length; index += 1) {
+            const tc = msg.tool_calls[index];
             let args = {};
             try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
             contentParts.push({
               type: "tool_use",
-              id: tc.id,
+              // Anthropic rejects the entire request when one historical
+              // tool_use has no id. Session repair normally supplies this;
+              // keep a deterministic boundary fallback here as a final guard.
+              id: String(tc.id || `toolu_opencodex_${index}`).trim() || `toolu_opencodex_${index}`,
               name: tc.function.name,
               input: args,
             });
@@ -51,12 +79,14 @@ export class AnthropicAdapter implements ProtocolAdapter {
         }
         claudeMessages.push({ role: "assistant", content: contentParts.length > 0 ? contentParts : "" });
       } else if (msg.role === "tool") {
+        const toolUseId = String(msg.tool_call_id || "").trim();
+        if (!toolUseId) continue;
         claudeMessages.push({
           role: "user",
           content: [{
             type: "tool_result",
-            tool_use_id: msg.tool_call_id,
-            content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || ""),
+            tool_use_id: toolUseId,
+            content: anthropicToolResultContent(msg.content),
           }]
         });
       }
@@ -148,4 +178,3 @@ export class AnthropicAdapter implements ProtocolAdapter {
     return chunks;
   }
 }
-

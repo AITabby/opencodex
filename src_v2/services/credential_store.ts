@@ -9,6 +9,35 @@ import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { ProviderConfig } from "../core/types.js";
 
+/**
+ * Restore-native keeps provider identities, endpoints, and credentials, but
+ * removes every selected-model field.  Keeping this as a pure transformation
+ * makes it safe to reuse from the dashboard reset route and from tests.
+ */
+export function clearProviderModelSelections(providers: ProviderConfig[]): ProviderConfig[] {
+  const modelFields = [
+    "models",
+    "selected_models",
+    "active_models",
+    "model_protocols",
+    "model_metadata",
+    "models_metadata",
+    "model_context_windows",
+    "context_windows",
+    "last_test_status",
+    "last_test_at",
+    "last_test_message",
+  ];
+
+  return (Array.isArray(providers) ? providers : []).map((rawProvider: ProviderConfig) => {
+    const provider: any = { ...(rawProvider as any), models: [] };
+    for (const field of modelFields) {
+      if (field !== "models") delete provider[field];
+    }
+    return provider as ProviderConfig;
+  });
+}
+
 export class CredentialStore {
   private static readonly providerService = "OpenCodex Provider Credential";
   private static providersConfigPath = path.join(os.homedir(), ".opencodex", "providers.json");
@@ -59,6 +88,17 @@ export class CredentialStore {
       providers.push(created);
     }
     CredentialStore.saveProviders(providers);
+  }
+
+  /** Attach a credential to a provider already present in the current list. */
+  public static setApiKeyOnProviders(providers: ProviderConfig[], providerName: string, apiKey: string): void {
+    const list = Array.isArray(providers) ? providers : [];
+    const provider = list.find((item: any) => item?.name === providerName);
+    if (!provider) {
+      throw new Error(`Provider ${providerName} was not found while saving its credential`);
+    }
+    CredentialStore.storeProviderSecret(provider, apiKey);
+    CredentialStore.saveProviders(list);
   }
 
   private static storeProviderSecret(provider: any, apiKey: string): void {

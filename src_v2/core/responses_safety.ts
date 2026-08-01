@@ -1,14 +1,26 @@
+import { expandGatewayCompactionItem } from "../services/compaction_compat.js";
+
 export function isNativeResponsesReasoningId(value: unknown): boolean {
   return typeof value === "string" && /^rs(?:_|[A-Za-z0-9_-])+/i.test(value.trim());
 }
 
-export function sanitizeNativeResponsesBody(body: any): { body: any; removedReasoningItems: number; removedPreviousResponseId: boolean } {
+export function sanitizeNativeResponsesBody(body: any): {
+  body: any;
+  removedReasoningItems: number;
+  removedPreviousResponseId: boolean;
+  expandedCompactionItems: number;
+} {
   const sanitized = { ...(body || {}) };
   let removedReasoningItems = 0;
   let removedPreviousResponseId = false;
+  let expandedCompactionItems = 0;
 
   if (Array.isArray(body?.input)) {
-    sanitized.input = body.input.filter((item: any) => {
+    sanitized.input = body.input.map((item: any) => {
+      const expanded = expandGatewayCompactionItem(item);
+      if (expanded !== item) expandedCompactionItems++;
+      return expanded;
+    }).filter((item: any) => {
       if (item?.type !== "reasoning") return true;
       const keep = isNativeResponsesReasoningId(item.id);
       if (!keep) removedReasoningItems++;
@@ -21,5 +33,5 @@ export function sanitizeNativeResponsesBody(body: any): { body: any; removedReas
     removedPreviousResponseId = true;
   }
 
-  return { body: sanitized, removedReasoningItems, removedPreviousResponseId };
+  return { body: sanitized, removedReasoningItems, removedPreviousResponseId, expandedCompactionItems };
 }

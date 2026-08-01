@@ -13,6 +13,10 @@
 
 import { randomBytes } from "crypto";
 import { NATIVE_IMAGE_TOOL_NAME } from "../services/native_image_bridge.js";
+import {
+  nativeComputerUseMcpDescriptor,
+  normalizeNativeComputerUseToolArguments,
+} from "../services/computer_use_native.js";
 
 export class ThinkTagFilter {
   private isThinking = false;
@@ -214,6 +218,7 @@ interface ToolCallState {
   id: string;
   call_id: string;
   name: string;
+  namespace?: string;
   arguments: string;
   output_index: number;
   added: boolean;
@@ -236,6 +241,26 @@ interface ImageGenerationState {
   closed: boolean;
 }
 
+function normalizeResponseUsage(raw: any): Record<string, any> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const input = Number(raw.input_tokens ?? raw.prompt_tokens);
+  const output = Number(raw.output_tokens ?? raw.completion_tokens);
+  const total = Number(raw.total_tokens ?? (Number.isFinite(input) && Number.isFinite(output) ? input + output : NaN));
+  if (![input, output, total].some((value) => Number.isFinite(value))) return undefined;
+
+  const usage: Record<string, any> = {};
+  if (Number.isFinite(input)) usage.input_tokens = input;
+  if (Number.isFinite(output)) usage.output_tokens = output;
+  if (Number.isFinite(total)) usage.total_tokens = total;
+  if (raw.input_tokens_details && typeof raw.input_tokens_details === "object") {
+    usage.input_tokens_details = raw.input_tokens_details;
+  }
+  if (raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object") {
+    usage.input_tokens_details = usage.input_tokens_details || raw.prompt_tokens_details;
+  }
+  return usage;
+}
+
 export class ResponsesStreamEngine {
   private responseId: string;
   private model: string;
@@ -254,12 +279,15 @@ export class ResponsesStreamEngine {
 
   private thinkFilter = new ThinkTagFilter();
   private turnId?: string;
+  private forceCommentary = false;
+  private usage?: Record<string, any>;
 
-  constructor(model: string, turnId?: string) {
-    this.model = model;
+  constructor(model: string, turnId?: string, options?: { forceCommentary?: boolean; responseModel?: string }) {
+    this.model = options?.responseModel || model;
     this.responseId = generateHexId("resp", 24);
     this.messageItemId = generateHexId("msg", 24);
     this.turnId = turnId;
+    this.forceCommentary = options?.forceCommentary === true;
   }
 
   public getResponseId(): string {
@@ -268,6 +296,12 @@ export class ResponsesStreamEngine {
 
   public getMessageText(): string {
     return this.messageText;
+  }
+
+  /** Preserve provider usage for the Responses response consumed by Codex. */
+  public observeProviderChunk(chunk: any): void {
+    const usage = normalizeResponseUsage(chunk?.usage || chunk?.response?.usage);
+    if (usage) this.usage = usage;
   }
 
   /** Internal gateway tool calls are deliberately never emitted as client tools. */
@@ -372,7 +406,9 @@ export class ResponsesStreamEngine {
     this.messageIndex = this.nextOutputIndex++;
     this.messageOpened = true;
 
-    const hasTools = Object.keys(this.toolCalls).length > 0;
+    const phase = this.forceCommentary || Object.keys(this.toolCalls).length > 0
+      ? "commentary"
+      : "final_answer";
     await emit({
       type: "response.output_item.added",
       output_index: this.messageIndex,
@@ -381,7 +417,7 @@ export class ResponsesStreamEngine {
         type: "message",
         status: "in_progress",
         role: "assistant",
-        phase: hasTools ? "commentary" : "final_answer",
+        phase,
         content: [],
       },
     });
@@ -429,6 +465,10 @@ export class ResponsesStreamEngine {
     const index = Number(call.index || 0);
     const fn = call.function || {};
     const isInternalImageCall = fn.name === NATIVE_IMAGE_TOOL_NAME || Boolean(this.internalImageToolCalls[index]);
+    const mcpDescriptor = nativeComputerUseMcpDescriptor(fn.name);
+    const nativeIdentity = mcpDescriptor
+      ? { name: mcpDescriptor.toolName, namespace: `mcp__${mcpDescriptor.serverLabel}` }
+      : undefined;
     const toolStore = isInternalImageCall ? this.internalImageToolCalls : this.toolCalls;
     let state = toolStore[index];
 
@@ -440,22 +480,32 @@ export class ResponsesStreamEngine {
       // the saved input with invalid_id_prefix.
       const callId = call.call_id || call.id || `call_${index}`;
       const itemId = typeof call.id === "string" && /^fc_[A-Za-z0-9_-]+$/.test(call.id)
-        ? call.id
-        : generateHexId("fc", 24);
+          ? call.id
+          : generateHexId("fc", 24);
       state = {
         id: itemId,
         call_id: callId,
-        name: fn.name || "",
+        name: nativeIdentity?.name || fn.name || "",
+        ...(nativeIdentity?.namespace ? { namespace: nativeIdentity.namespace } : {}),
         arguments: "",
         output_index: isInternalImageCall ? -1 : this.nextOutputIndex++,
         added: isInternalImageCall,
         closed: false,
-        deferArguments: !isInternalImageCall && (fn.name || "") === "exec_command",
+        deferArguments: !isInternalImageCall && (
+          (fn.name || "") === "exec_command" ||
+          Boolean(nativeIdentity)
+        ),
       };
       toolStore[index] = state;
     }
 
-    if (fn.name && !state.name) state.name = fn.name;
+    if (nativeIdentity) {
+      state.name = nativeIdentity.name;
+      state.namespace = nativeIdentity.namespace;
+      state.deferArguments = true;
+    } else if (fn.name && !state.name) {
+      state.name = fn.name;
+    }
 
     if (isInternalImageCall) {
       if (fn.arguments) state.arguments += fn.arguments;
@@ -475,6 +525,7 @@ export class ResponsesStreamEngine {
           call_id: state.call_id,
           name: state.name,
           arguments: "",
+          ...(state.namespace ? { namespace: state.namespace } : {}),
         },
       });
     }
@@ -539,6 +590,7 @@ export class ResponsesStreamEngine {
   }
 
   public async processChatChunk(writeSse: (payload: any) => Promise<void>, chunk: any): Promise<void> {
+    this.observeProviderChunk(chunk);
     const emit = this.wrap(writeSse);
     // OpenAI-compatible providers may send an informational chunk with an
     // empty `choices` array before the first token or at stream completion.
@@ -591,6 +643,7 @@ export class ResponsesStreamEngine {
     await this.closeReasoning(emit);
 
     const hasTools = Object.keys(this.toolCalls).length > 0;
+    const messagePhase = this.forceCommentary || hasTools ? "commentary" : "final_answer";
     const hasImages = this.imageGenerations.length > 0;
     if (flushedText && !this.messageClosed) {
       await this.emitTextDelta(emit, flushedText);
@@ -640,7 +693,7 @@ export class ResponsesStreamEngine {
             type: "message",
             status: "completed",
             role: "assistant",
-            phase: hasTools ? "commentary" : "final_answer",
+            phase: messagePhase,
             content: [{ type: "output_text", text: this.messageText, annotations: [] }],
           },
         });
@@ -650,7 +703,9 @@ export class ResponsesStreamEngine {
       const state = Object.values(this.toolCalls).find((candidate) => candidate.output_index === outputIndex);
       if (state && !state.closed) {
         state.closed = true;
-        const normalizedArguments = normalizeToolArguments(state.name, state.arguments);
+        const normalizedArguments = state.namespace === "mcp__node_repl"
+          ? normalizeNativeComputerUseToolArguments(state.arguments)
+          : normalizeToolArguments(state.name, state.arguments);
         if (state.deferArguments && normalizedArguments) {
           await emit({
             type: "response.function_call_arguments.delta",
@@ -676,6 +731,7 @@ export class ResponsesStreamEngine {
             call_id: state.call_id,
             name: state.name,
             arguments: state.arguments,
+            ...(state.namespace ? { namespace: state.namespace } : {}),
           },
         });
         continue;
@@ -705,7 +761,7 @@ export class ResponsesStreamEngine {
         type: "message",
         status: "completed",
         role: "assistant",
-        phase: hasTools ? "commentary" : "final_answer",
+        phase: messagePhase,
         content: [{ type: "output_text", text: this.messageText, annotations: [] }],
       });
     }
@@ -717,6 +773,7 @@ export class ResponsesStreamEngine {
         call_id: state.call_id,
         name: state.name,
         arguments: state.arguments,
+        ...(state.namespace ? { namespace: state.namespace } : {}),
       });
     }
     for (const image of this.imageGenerations) {
@@ -728,30 +785,24 @@ export class ResponsesStreamEngine {
         result: image.result,
       });
     }
+    const completedResponse = {
+      id: this.responseId,
+      object: "response",
+      created_at: now,
+      completed_at: now,
+      status: "completed",
+      model: this.model,
+      output,
+      ...(this.usage ? { usage: this.usage } : {}),
+    };
     await emit({
       type: "response.completed",
-      response: {
-        id: this.responseId,
-        object: "response",
-        created_at: now,
-        completed_at: now,
-        status: "completed",
-        model: this.model,
-        output,
-      },
+      response: completedResponse,
     });
 
     await emit({
       type: "response.done",
-      response: {
-        id: this.responseId,
-        object: "response",
-        created_at: now,
-        completed_at: now,
-        status: "completed",
-        model: this.model,
-        output,
-      },
+      response: completedResponse,
     });
 
     // Real-time broadcast to active voice companion clients for TTS finalization

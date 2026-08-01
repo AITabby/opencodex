@@ -12,17 +12,19 @@ import os from "node:os";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import { GatewayRouter } from "./router.js";
-import { CredentialStore } from "../services/credential_store.js";
+import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
-import { CatalogSyncService, buildFullCatalogEntry } from "../services/catalog_sync.js";
+import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
 import { isNativeResponsesReasoningId, sanitizeNativeResponsesBody } from "../core/responses_safety.js";
+import { buildCompactionStreamEvents, isCompactionRequestBody, isCompactionRequestPath } from "../services/compaction_compat.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
+import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -33,9 +35,15 @@ function normalizeModelProtocol(value: unknown): ModelProtocol {
 }
 
 function splitConfiguredModel(value: unknown): { slug: string; backendModel: string } {
-  const raw = String(value || "").trim();
+  const objectValue = value && typeof value === "object" ? value as any : undefined;
+  const raw = objectValue
+    ? String(objectValue.slug || objectValue.id || objectValue.model || objectValue.name || "").trim()
+    : String(value || "").trim();
+  const inlineBackend = objectValue
+    ? String(objectValue.backend_model || objectValue.backendModel || "").trim()
+    : "";
   const separator = raw.includes("=") ? "=" : (raw.includes("->") ? "->" : "");
-  if (!separator) return { slug: raw, backendModel: raw };
+  if (!separator) return { slug: raw, backendModel: inlineBackend || raw };
   const parts = raw.split(separator);
   return {
     slug: String(parts[0] || "").trim(),
@@ -48,10 +56,15 @@ function protocolForConfiguredModel(
   protocols: Record<string, unknown> | undefined,
   fallback: unknown = "chat",
 ): ModelProtocol {
-  const raw = String(configuredModel || "").trim();
-  const { slug, backendModel } = splitConfiguredModel(raw);
+  const raw = configuredModel && typeof configuredModel === "object"
+    ? String((configuredModel as any).slug || (configuredModel as any).id || (configuredModel as any).model || (configuredModel as any).name || "").trim()
+    : String(configuredModel || "").trim();
+  const { slug, backendModel } = splitConfiguredModel(configuredModel);
+  const inlineProtocol = configuredModel && typeof configuredModel === "object"
+    ? (configuredModel as any).protocol || (configuredModel as any).backend_protocol
+    : undefined;
   const map = protocols || {};
-  return normalizeModelProtocol(map[raw] ?? map[slug] ?? map[backendModel] ?? fallback);
+  return normalizeModelProtocol(map[raw] ?? map[slug] ?? map[backendModel] ?? inlineProtocol ?? fallback);
 }
 
 function buildModelProtocolMap(
@@ -200,18 +213,22 @@ function projectAntigravitySessionMessages(lines: string[]): ProjectedSessionMes
   return messages;
 }
 
-function restartDesktopClients(launchWithCdp: boolean): void {
-  const processNames = [
+const DESKTOP_PROCESS_NAMES = [
     "ChatGPT", "Codex", "Codex (Service)", "bare-modifier-monitor",
     "browser_crashpad_handler", "Codex Helper", "Codex Helper (Renderer)",
     "Codex Helper (GPU)", "SkyComputerUseClient", "SkyComputerUseService"
-  ];
-  for (const processName of processNames) {
+];
+
+function stopDesktopClients(): void {
+  for (const processName of DESKTOP_PROCESS_NAMES) {
     try { execFileSync("killall", ["-9", processName], { stdio: "ignore" }); } catch {}
   }
   try { execFileSync("pkill", ["-TERM", "-f", "[c]odex.*app-server"], { stdio: "ignore" }); } catch {}
   try { execFileSync("sleep", ["0.8"], { stdio: "ignore" }); } catch {}
   try { execFileSync("pkill", ["-KILL", "-f", "[c]odex.*app-server"], { stdio: "ignore" }); } catch {}
+}
+
+function launchDesktopClient(launchWithCdp: boolean): void {
   if (!launchWithCdp) return;
 
   for (const application of ["ChatGPT", "Codex"]) {
@@ -220,6 +237,11 @@ function restartDesktopClients(launchWithCdp: boolean): void {
       return;
     } catch {}
   }
+}
+
+function restartDesktopClients(launchWithCdp: boolean): void {
+  stopDesktopClients();
+  launchDesktopClient(launchWithCdp);
 }
 
 function maskVoiceSettings(settings: any): any {
@@ -381,22 +403,27 @@ function providerDisplayName(providerName: string, rawSlug: string): string {
   return `${owner}/${unscoped || "model"}`;
 }
 
-function runtimeProviderCatalogEntries(): any[] {
+export function buildConfiguredProviderCatalogEntries(providers: ProviderConfig[]): any[] {
   const entries: any[] = [];
-  for (const provider of CredentialStore.loadProviders()) {
+  for (const provider of Array.isArray(providers) ? providers : []) {
     const owner = normalizeNamespace(String(provider?.name || provider?.preset_id || ""));
     if (!owner || !Array.isArray(provider?.models)) continue;
     for (const configuredModel of provider.models) {
-      const value = String(configuredModel || "").trim();
-      if (!value) continue;
-      const separator = value.includes("=") ? "=" : (value.includes("->") ? "->" : "");
-      const parts = separator ? value.split(separator) : [value];
-      const rawSlug = String(parts[0] || "").trim();
-      const backendModel = String(parts[1] || rawSlug).trim();
+      const { slug: rawSlug, backendModel } = splitConfiguredModel(configuredModel);
       if (!rawSlug || !backendModel) continue;
       const slug = namespaceModelSlug(owner, rawSlug);
       const protocol = protocolForConfiguredModel(configuredModel, provider.model_protocols);
+      const capabilities = CatalogSyncService.getKnownModelMetadata(provider, backendModel)
+        || CatalogSyncService.getKnownModelMetadata(provider, rawSlug);
+      const entry = buildFullCatalogEntry(
+        slug,
+        owner,
+        undefined,
+        protocol,
+        capabilities,
+      );
       entries.push({
+        ...entry,
         slug,
         model: slug,
         display_name: providerDisplayName(owner, slug),
@@ -404,12 +431,14 @@ function runtimeProviderCatalogEntries(): any[] {
         backend_model: backendModel,
         protocol,
         backend_protocol: protocol,
-        supports_image_generation: true,
-        image_generation_mode: "native_responses",
       });
     }
   }
   return entries;
+}
+
+function runtimeProviderCatalogEntries(): any[] {
+  return buildConfiguredProviderCatalogEntries(CredentialStore.loadProviders());
 }
 
 function isOfficialCachedModel(model: any): boolean {
@@ -504,6 +533,7 @@ export function upsertProviderCatalogModel(
   displayName: string,
   providerName: string,
   protocol: ModelProtocol = "chat",
+  capabilities?: any,
 ): void {
   if (!catalog || typeof catalog !== "object") return;
   if (!Array.isArray(catalog.models)) catalog.models = [];
@@ -525,12 +555,20 @@ export function upsertProviderCatalogModel(
       || modelBackend === backend.toLowerCase();
   });
   if (owned) {
-    owned.slug = canonicalSlug;
-    owned.model = canonicalSlug;
-    owned.backend_model = backend;
-    owned.display_name = providerDisplayName(owner, canonicalSlug);
-    owned.protocol = normalizedProtocol;
-    owned.backend_protocol = normalizedProtocol;
+    const existingCapabilities = capabilities || owned;
+    const refreshed = buildFullCatalogEntry(
+      canonicalSlug,
+      owner,
+      undefined,
+      normalizedProtocol,
+      existingCapabilities,
+    );
+    Object.assign(owned, refreshed, {
+      slug: canonicalSlug,
+      model: canonicalSlug,
+      backend_model: backend,
+      display_name: providerDisplayName(owner, canonicalSlug),
+    });
     return;
   }
 
@@ -540,7 +578,7 @@ export function upsertProviderCatalogModel(
   const catalogSlug = usedSlugs.has(canonicalSlug.toLowerCase())
     ? scopedCatalogSlug(owner, slug, usedSlugs)
     : canonicalSlug;
-  const entry = buildFullCatalogEntry(catalogSlug, owner, undefined, normalizedProtocol);
+  const entry = buildFullCatalogEntry(catalogSlug, owner, undefined, normalizedProtocol, capabilities);
   entry.backend_model = backend;
   entry.display_name = providerDisplayName(owner, catalogSlug);
   catalog.models.push(entry);
@@ -581,16 +619,88 @@ export function preserveOfficialModels(catalog: any): void {
       ? scopedCatalogSlug(owner, rawSlug, usedSlugs)
       : canonical;
     const backendModel = String(model.backend_model || rawSlug).trim();
-    const moved = {
+    const configuredProvider = CredentialStore.loadProviders().find((provider: any) =>
+      normalizeNamespace(String(provider?.name || provider?.preset_id || "")) === owner
+    );
+    const backendMetadata = configuredProvider
+      ? CatalogSyncService.getKnownModelMetadata(configuredProvider, backendModel)
+      : undefined;
+    const existingReasoningLevels = Array.isArray(model.supported_reasoning_levels)
+      ? model.supported_reasoning_levels
+      : [];
+    const legacyDefaultReasoning = JSON.stringify(existingReasoningLevels.map((level: any) => String(level?.effort || "").toLowerCase()))
+      === JSON.stringify(getDefaultReasoningPresets().map((level) => level.effort));
+    const discoveredReasoningLevels = backendMetadata
+      ? backendMetadata.supported_reasoning_levels
+      : undefined;
+    const capabilities = {
+      // Registry metadata may fill descriptive capabilities, but it must not
+      // replace a context window previously verified by the active provider.
       ...model,
+      ...(backendMetadata || {}),
+      ...(existingReasoningLevels.length > 0
+        && !legacyDefaultReasoning
+        && backendMetadata?.reasoning !== false
+        ? { supported_reasoning_levels: existingReasoningLevels }
+        : {}),
+    };
+    if (model.context_window_source === "provider_metadata"
+      && backendMetadata?.context_window_source !== "provider_metadata") {
+      capabilities.context_window = model.context_window;
+      capabilities.max_context_window = model.max_context_window || model.context_window;
+      capabilities.context_window_source = "provider_metadata";
+      if (capabilities.metadata_source === "model_registry") capabilities.metadata_source = "provider_metadata";
+    }
+    const refreshed = buildFullCatalogEntry(
+      alias,
+      owner,
+      undefined,
+      normalizeModelProtocol(model.protocol || model.backend_protocol),
+      capabilities,
+    );
+    const moved = applyDefaultReasoningCapabilities({
+      ...model,
+      ...refreshed,
       slug: alias,
       model: alias,
       backend_provider: owner,
       backend_model: backendModel,
       display_name: providerDisplayName(owner, alias)
-    };
+    });
     usedSlugs.add(alias.toLowerCase());
     thirdParty.push(moved);
+  }
+
+  // The provider configuration is the durable source of the user's selected
+  // model list. If an older cache/catalog was partially written, reconstruct
+  // missing provider-owned entries from it before publishing the catalog.
+  // Deleting a model also removes it from provider.models, so this does not
+  // resurrect an intentionally deleted entry.
+  for (const configured of runtimeProviderCatalogEntries()) {
+    const owner = catalogModelOwner(configured);
+    const backendModel = String(configured?.backend_model || "").trim().toLowerCase();
+    if (!owner || !backendModel) continue;
+    const existing = thirdParty.find((entry: any) =>
+      catalogModelOwner(entry) === owner
+      && String(entry?.backend_model || "").trim().toLowerCase() === backendModel
+    );
+    if (existing) continue;
+
+    const rawSlug = String(configured.slug || configured.model || backendModel).trim();
+    const canonical = namespaceModelSlug(owner, rawSlug);
+    const alias = usedSlugs.has(canonical.toLowerCase())
+      ? scopedCatalogSlug(owner, rawSlug, usedSlugs)
+      : canonical;
+    const restored = {
+      ...configured,
+      slug: alias,
+      model: alias,
+      backend_provider: owner,
+      backend_model: backendModel,
+      display_name: providerDisplayName(owner, alias),
+    };
+    usedSlugs.add(alias.toLowerCase());
+    thirdParty.push(restored);
   }
 
   // Official native entries are deliberately first; the web endpoint filters
@@ -776,6 +886,7 @@ export class CodexBridgeServer {
   private claudeModelFetchError = "";
   public config: any = { providers: [] };
   private readonly dataDir: string;
+  private readonly desktopRestartMarkerPath: string;
   private readonly adminToken: string;
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
@@ -786,6 +897,7 @@ export class CodexBridgeServer {
   constructor(port = 8765) {
     this.port = port;
     this.dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex");
+    this.desktopRestartMarkerPath = path.join(this.dataDir, "restart_desktop_after_gateway_ready");
     this.adminToken = this.loadOrCreateAdminToken();
     this.config.providers = CredentialStore.loadProviders();
   }
@@ -813,6 +925,28 @@ export class CodexBridgeServer {
 
   private isRealtimeActive(): boolean {
     return this.realtimeActiveUntil > Date.now();
+  }
+
+  private requestDesktopLaunchAfterGatewayReady(): void {
+    fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(this.desktopRestartMarkerPath, `${Date.now()}\n`, { encoding: "utf-8", mode: 0o600 });
+    try { fs.chmodSync(this.desktopRestartMarkerPath, 0o600); } catch {}
+  }
+
+  private launchDesktopAfterGatewayReadyIfRequested(): void {
+    if (!fs.existsSync(this.desktopRestartMarkerPath)) return;
+    try {
+      fs.unlinkSync(this.desktopRestartMarkerPath);
+    } catch (error: any) {
+      console.warn(`[OpenCodex Gateway] Could not consume desktop restart marker: ${error?.message || error}`);
+      return;
+    }
+
+    const launchTimer = setTimeout(() => {
+      launchDesktopClient(true);
+      console.log("[OpenCodex Gateway] Gateway is ready; launched the desktop client after model catalog initialization.");
+    }, 500);
+    launchTimer.unref?.();
   }
 
   private availableRealtimeWorkModels(): string[] {
@@ -1386,8 +1520,11 @@ export class CodexBridgeServer {
     return readOfficialModelMap().has(requested);
   }
 
-  private async proxyNativeResponses(req: http.IncomingMessage, body: any, res: http.ServerResponse): Promise<void> {
-    const targetUrl = "https://chatgpt.com/backend-api/codex/responses";
+  private async proxyNativeResponses(req: http.IncomingMessage, body: any, res: http.ServerResponse, endpoint = "responses"): Promise<void> {
+    const nativeResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses";
+    const targetUrl = endpoint === "responses"
+      ? nativeResponsesEndpoint
+      : `${nativeResponsesEndpoint}/${String(endpoint).replace(/^responses\/?/i, "")}`;
     const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
     forwardHeaders["host"] = "chatgpt.com";
 
@@ -1398,16 +1535,15 @@ export class CodexBridgeServer {
         body: JSON.stringify(body),
         maxAttempts: 1,
         timeoutMs: 600_000,
-        operation: "native-responses",
+        operation: endpoint === "responses" ? "native-responses" : "native-responses-compact",
       });
-      const responseHeaders: Record<string, string> = {};
-      upstreamRes.headers.forEach((value, key) => {
-        responseHeaders[key] = value;
-      });
+      const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
       if (upstreamRes.body) {
         // @ts-ignore Node's fetch body is an async iterable at runtime.
-        for await (const chunk of upstreamRes.body) res.write(chunk);
+        for await (const chunk of upstreamRes.body) {
+          await writeHttpResponseChunked(res, chunk);
+        }
       }
       res.end();
     } catch (err: any) {
@@ -1427,6 +1563,73 @@ export class CodexBridgeServer {
         }));
       }
     }
+  }
+
+  private async handleCompactionRequest(
+    req: http.IncomingMessage,
+    body: any,
+    res: http.ServerResponse,
+    streamOutput = false,
+  ): Promise<void> {
+    const rawRequestedModel = body?.model || "deepseek-v4-pro";
+    const requestedModel = this.stripReasoningSuffix(String(rawRequestedModel));
+    const providers = CredentialStore.loadProviders();
+    const nativeModel = this.isNativeCatalogModel(requestedModel);
+    const provider = nativeModel ? null : this.findCatalogProvider(requestedModel, providers);
+
+    if (!provider && nativeModel) {
+      const cleaned = sanitizeNativeResponsesBody(body);
+      if (cleaned.expandedCompactionItems || cleaned.removedReasoningItems || cleaned.removedPreviousResponseId) {
+        console.warn(
+          `[OpenCodex Native] Sanitized compaction request: expanded=${cleaned.expandedCompactionItems}, ` +
+          `reasoning=${cleaned.removedReasoningItems}, previous_response_id=${cleaned.removedPreviousResponseId}`,
+        );
+      }
+      await this.proxyNativeResponses(req, cleaned.body, res, "responses/compact");
+      return;
+    }
+
+    if (!provider) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: `Model "${rawRequestedModel}" is not present in an imported provider catalog; no compaction provider was selected`,
+      }));
+      return;
+    }
+
+    const apiKey = CredentialStore.resolveApiKey(provider);
+    const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
+    const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
+    const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
+    const protocol = body?.protocol || this.findCatalogProtocol(requestedModel, provider);
+    const result = await this.router.compactResponses(
+      { ...body, model: upstreamModel, protocol },
+      upstreamModel,
+      apiKey,
+      rawUrl,
+      provider.name,
+    );
+    if (body?.stream === true || (streamOutput && body?.stream !== false)) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+      res.socket?.setNoDelay(true);
+      const events = buildCompactionStreamEvents(
+        result.model || upstreamModel,
+        result.output?.[0]?.encrypted_content || "",
+        result.usage,
+      );
+      for (const event of events) await writeSseData(res, event);
+      if (!res.writableEnded) await writeHttpResponseChunked(res, "data: [DONE]\n\n");
+      if (!res.writableEnded) res.end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    await writeHttpResponseChunked(res, JSON.stringify(result));
+    if (!res.writableEnded) res.end();
   }
 
   private ensurePythonScripts() {
@@ -1927,12 +2130,17 @@ if __name__ == "__main__":
     // cannot disappear just because a third-party entry was deleted.
     if (managedConfig.includes("opencodex managed")) {
       try {
+        const configuredProviders = CredentialStore.loadProviders();
+        const metadataChanged = await CatalogSyncService.refreshConfiguredProviderMetadata(configuredProviders);
+        if (metadataChanged) {
+          CredentialStore.saveProviders(configuredProviders);
+          this.config.providers = configuredProviders;
+        }
         const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
         if (synchronizedConfig !== managedConfig) {
           fs.writeFileSync(configPath, synchronizedConfig, "utf-8");
           console.log(`[OpenCodex Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
         }
-        CatalogSyncService.syncCustomModelsToCodexCache();
       } catch (err: any) {
         console.warn(`[OpenCodex Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
       }
@@ -1956,6 +2164,25 @@ if __name__ == "__main__":
           console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
         }
       }
+      // Preserve/restore the provider catalog first, then mirror the final
+      // catalog into Codex's cache. The previous order synced the stale cache
+      // before preserveOfficialModels could restore missing provider entries.
+      CatalogSyncService.syncCustomModelsToCodexCache();
+
+      // Codex may refresh models_cache.json while the desktop client is
+      // booting. Mirror the final catalog once more after that refresh window
+      // so a restart cannot replace the provider models with the native list.
+      const delayedCatalogSync = setTimeout(() => {
+        try {
+          const latestConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : "";
+          if (latestConfig.includes("opencodex managed")) {
+            CatalogSyncService.syncCustomModelsToCodexCache();
+          }
+        } catch (error: any) {
+          console.warn(`[OpenCodex Catalog] Delayed Codex model cache sync failed: ${error?.message || error}`);
+        }
+      }, 2000);
+      delayedCatalogSync.unref?.();
     }
     return new Promise(async (resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
@@ -1979,7 +2206,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.7", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.8", opencodex: true }));
           return;
         }
 
@@ -2063,10 +2290,30 @@ if __name__ == "__main__":
           return;
         }
 
-        // 2. V2 Core: Responses API (/v1/responses)
+        // 2. Responses compaction. Codex uses /responses/compact for remote
+        // compaction v2; keep the body-level trigger for clients that send the
+        // trigger through the normal Responses path.
+        if (req.method === "POST" && isCompactionRequestPath(url.pathname)) {
+          try {
+            const body = await this.parseJsonBody(req);
+            await this.handleCompactionRequest(req, body, res, false);
+          } catch (err: any) {
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: err.message }));
+            }
+          }
+          return;
+        }
+
+        // 3. V2 Core: Responses API (/v1/responses)
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
           try {
             const body = await this.parseJsonBody(req);
+            if (isCompactionRequestBody(body)) {
+              await this.handleCompactionRequest(req, body, res, true);
+              return;
+            }
             const liveWorkModel = await this.chooseLiveWorkModel(body);
             const effectiveBody = liveWorkModel ? { ...body, model: liveWorkModel } : body;
             if (liveWorkModel && body.model !== liveWorkModel) {
@@ -2109,7 +2356,16 @@ if __name__ == "__main__":
             const providerUrl = rawUrl;
 
             const nativeImageHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
-            await this.router.handleResponses(routingBody, upstreamModel, apiKey, providerUrl, res, provider.name, nativeImageHeaders);
+            await this.router.handleResponses(
+              routingBody,
+              upstreamModel,
+              apiKey,
+              providerUrl,
+              res,
+              provider.name,
+              nativeImageHeaders,
+              requestedModel,
+            );
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
@@ -2259,14 +2515,10 @@ if __name__ == "__main__":
 
           const apiProviders = CredentialStore.loadProviders().map((p: any) => {
             const hasApiKey = Boolean(CredentialStore.resolveApiKey(p));
-            const effectiveModels = (p.models || []).filter((model: string) => {
-              const raw = String(model);
-              const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
-              return catalogModels.some((cm: any) =>
-                catalogModelOwner(cm) === normalizeNamespace(p.name)
-                && [cm.slug, cm.id, cm.display_name, cm.backend_model].filter(Boolean).some((value: any) => String(value) === alias)
-              );
-            });
+            // providers.json is the durable source of the selected model
+            // list. The catalog is a derived view and may be stale after
+            // Codex refreshes its native cache during a restart.
+            const effectiveModels = Array.isArray(p.models) ? p.models : [];
             const hasActiveModel = effectiveModels.length > 0;
 
             const status = hasActiveModel || hasApiKey ? "configured" : "not_configured";
@@ -2288,7 +2540,7 @@ if __name__ == "__main__":
                   && [cm.slug, cm.id, cm.display_name, cm.backend_model].filter(Boolean).some((value: any) => String(value) === alias)
                 );
                 return {
-                  id: catalogModel?.slug || alias,
+                  id: catalogModel?.slug || namespaceModelSlug(p.name, alias),
                   enabled: true,
                   protocol: catalogModel?.protocol || catalogModel?.backend_protocol || protocolForConfiguredModel(raw, p.model_protocols),
                 };
@@ -2361,7 +2613,22 @@ if __name__ == "__main__":
             delete provider.last_test_message;
 
             if (apiKey) {
-              CredentialStore.setApiKey(resolvedProviderName, apiKey);
+              // Use the exact list being saved. The credential store may
+              // still cache the pre-create list during a first-time save.
+              CredentialStore.setApiKeyOnProviders(providers, resolvedProviderName, apiKey);
+            }
+            // Refresh only capability metadata here. The configured model
+            // list remains exactly what the user submitted; /models and the
+            // live registry fill context/reasoning facts without guessing from
+            // a model name.
+            try {
+              const liveDescriptors = await CatalogSyncService.fetchLiveModels(provider);
+              const discoveredMetadata = CatalogSyncService.modelMetadataMap(provider, liveDescriptors);
+              if (Object.keys(discoveredMetadata).length > 0) {
+                provider.model_metadata = CatalogSyncService.mergeProviderModelMetadata(provider.model_metadata, discoveredMetadata);
+              }
+            } catch (metadataError: any) {
+              console.warn(`[OpenCodex Catalog] capability refresh skipped: ${metadataError?.message || metadataError}`);
             }
             CredentialStore.saveProviders(providers);
 
@@ -2396,6 +2663,8 @@ if __name__ == "__main__":
 
               for (const modelStr of selectedModels) {
                 const { slug, backendModel } = splitConfiguredModel(modelStr);
+                const capabilities = CatalogSyncService.getKnownModelMetadata(provider, backendModel)
+                  || CatalogSyncService.getKnownModelMetadata(provider, slug);
                 upsertProviderCatalogModel(
                   catalog,
                   slug,
@@ -2403,6 +2672,7 @@ if __name__ == "__main__":
                   slug,
                   resolvedProviderName,
                   selectedModelProtocols[slug] || "chat",
+                  capabilities,
                 );
               }
 
@@ -2415,6 +2685,10 @@ if __name__ == "__main__":
                 let content = fs.readFileSync(configPath, "utf-8");
                 fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
               }
+              // The catalog file is the source of truth, but Codex's desktop
+              // picker reads its local model cache on the next launch. Keep
+              // the cache in sync at the same moment the provider is saved.
+              CatalogSyncService.syncCustomModelsToCodexCache();
             }
 
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -2546,6 +2820,7 @@ if __name__ == "__main__":
               let content = fs.readFileSync(configPath, "utf-8");
               fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
             }
+            CatalogSyncService.syncCustomModelsToCodexCache();
 
             recordSubscriptionImport(this.dataDir, String(cli));
 
@@ -4508,13 +4783,26 @@ if __name__ == "__main__":
               console.log("[OpenCodex Gateway] Applied gateway proxy and custom model catalog to config.toml before restart.");
             }
 
-            restartDesktopClients(true);
+            // Codex reads model_catalog_json only when the desktop process
+            // starts. Stop the desktop before the gateway restart and let the
+            // new gateway launch it after startup has repaired the catalog.
+            // Launching it here races the PM2 restart and makes native-only
+            // models appear permanently until another manual restart.
+            this.requestDesktopLaunchAfterGatewayReady();
+            stopDesktopClients();
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "success", message: "桌面端与网关服务正在重新启动..." }));
 
             setTimeout(() => {
-              try { execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"], { stdio: "ignore" }); } catch {
+              try {
+                execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"], { stdio: "ignore" });
+              } catch {
+                // Keep the current gateway usable if PM2 is unavailable. The
+                // old process already has the final config/catalog, so it is
+                // safe to consume the marker and relaunch the desktop here.
+                try { fs.unlinkSync(this.desktopRestartMarkerPath); } catch {}
+                launchDesktopClient(true);
                 this.gatewayRestartInProgress = false;
               }
             }, 300);
@@ -4669,6 +4957,7 @@ if __name__ == "__main__":
                 });
                 preserveOfficialModels(data);
                 fs.writeFileSync(catalogPath, JSON.stringify(data, null, 2), "utf-8");
+                CatalogSyncService.syncCustomModelsToCodexCache();
               }
             }
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -4699,6 +4988,7 @@ if __name__ == "__main__":
                   );
                   preserveOfficialModels(catalog);
                   fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
+                  CatalogSyncService.syncCustomModelsToCodexCache();
                 }
               } catch {}
             }
@@ -4875,6 +5165,14 @@ if __name__ == "__main__":
         }
         if (req.method === "POST" && url.pathname === "/api/reset") {
           try {
+            // Native restore keeps the configured provider credentials and
+            // endpoints, but must remove every selected third-party model.
+            // Otherwise the dashboard rebuilds the pending list from the
+            // durable providers.json on the next load.
+            const clearedProviders = clearProviderModelSelections(CredentialStore.loadProviders());
+            CredentialStore.saveProviders(clearedProviders);
+            this.config.providers = clearedProviders;
+
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
@@ -4886,6 +5184,7 @@ if __name__ == "__main__":
             if (fs.existsSync(catalogPath)) {
               fs.writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
             }
+            CatalogSyncService.syncCustomModelsToCodexCache();
 
             // Third-party V2 responses used to emit local rs_* reasoning items.
             // Remove those persisted records before the native desktop client
@@ -5246,6 +5545,7 @@ if __name__ == "__main__":
       this.server.listen(this.port, "127.0.0.1", () => {
         console.log(`[CodexBridge V2] Server listening on http://127.0.0.1:${this.port}`);
         this.startLivePickerOverlay();
+        this.launchDesktopAfterGatewayReadyIfRequested();
         resolve();
       });
     });

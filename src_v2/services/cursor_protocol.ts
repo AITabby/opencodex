@@ -1854,6 +1854,22 @@ export function decodeCursorResponse(bytes: Uint8Array): Uint8Array[] {
   return responseLooksFramed(bytes) ? decodeConnectMessages(bytes) : [bytes];
 }
 
+/**
+ * A Cursor AgentService response is kept alive across Responses tool
+ * continuations. Re-acquiring a reader from the same body is racy: the prior
+ * HTTP request may still own the lock when the next continuation arrives.
+ * Keep one reader for the lifetime of that native session instead.
+ */
+export function acquireCursorStreamReader(
+  response: Response,
+  existingReader?: ReadableStreamDefaultReader<Uint8Array>,
+): ReadableStreamDefaultReader<Uint8Array> {
+  if (existingReader) return existingReader;
+  if (!response.body) throw new Error("Cursor provider returned no response body");
+  if (response.body.locked) throw new Error("Cursor provider stream is already consumed");
+  return response.body.getReader();
+}
+
 export async function fetchCursorModels(
   token: string,
   clientVersion: string,

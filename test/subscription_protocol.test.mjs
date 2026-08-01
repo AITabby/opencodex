@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import {
+  acquireCursorStreamReader,
   decodeAvailableModelsResponse,
   decodeConnectMessages,
   decodeCursorEndStreamError,
@@ -15,6 +17,8 @@ import {
   frameConnectMessage,
 } from "../dist/services/cursor_protocol.js";
 import {
+  decryptClaudeSafeStorageValue,
+  selectClaudeDesktopTokenCache,
   selectAntigravityOAuthClientId,
   extractAntigravityOAuthClientSecrets,
 } from "../dist/services/subscription_auth.js";
@@ -30,6 +34,51 @@ import {
 function bytes(...values) {
   return Uint8Array.from(values);
 }
+
+function encryptClaudeSafeStorageValue(value, safeStorageKey) {
+  const masterKey = crypto.pbkdf2Sync(
+    Buffer.from(safeStorageKey, "utf8"),
+    Buffer.from("saltysalt", "utf8"),
+    1003,
+    16,
+    "sha1",
+  );
+  const cipher = crypto.createCipheriv("aes-128-cbc", masterKey, Buffer.alloc(16, 0x20));
+  const encrypted = Buffer.concat([cipher.update(Buffer.from(value, "utf8")), cipher.final()]);
+  return Buffer.concat([Buffer.from("v10"), encrypted]).toString("base64");
+}
+
+test("Claude Desktop safeStorage cache decrypts and selects the Anthropic OAuth entry", () => {
+  const key = "synthetic-claude-safe-storage-key";
+  const expiresAt = Date.now() + 60 * 60 * 1000;
+  const cache = {
+    "desktop-client:org:https://api.anthropic.com:user:inference": {
+      token: "claude-access-token",
+      refreshToken: "claude-refresh-token",
+      expiresAt,
+    },
+  };
+  const encoded = encryptClaudeSafeStorageValue(JSON.stringify(cache), key);
+
+  assert.deepEqual(JSON.parse(decryptClaudeSafeStorageValue(encoded, key)), cache);
+  assert.deepEqual(selectClaudeDesktopTokenCache(cache), {
+    accessToken: "claude-access-token",
+    refreshToken: "claude-refresh-token",
+    expiresAt,
+  });
+});
+
+test("Cursor continuation reuses the original response reader", async () => {
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode("frame"));
+    },
+  }));
+  const reader = acquireCursorStreamReader(response);
+  assert.equal(acquireCursorStreamReader(response, reader), reader);
+  assert.throws(() => acquireCursorStreamReader(response), /already consumed/);
+  await reader.cancel();
+});
 
 test("Antigravity OAuth discovery selects the client ID by local vendor context", () => {
   const internalId = "111111111111111111111111111111111111111111111111111111111111111111111111111.apps.googleusercontent.com";

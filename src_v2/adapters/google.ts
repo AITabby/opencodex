@@ -57,6 +57,31 @@ function sanitizeGeminiSchema(schema: any): any {
   return result;
 }
 
+function appendGeminiContentParts(parts: any[], content: any): void {
+  if (typeof content === "string") {
+    if (content) parts.push({ text: content });
+    return;
+  }
+  if (!Array.isArray(content)) {
+    if (content !== undefined && content !== null) parts.push({ text: JSON.stringify(content) });
+    return;
+  }
+  for (const part of content) {
+    if (typeof part === "string") {
+      if (part) parts.push({ text: part });
+      continue;
+    }
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" || part.type === "input_text" || part.type === "output_text") {
+      if (part.text) parts.push({ text: String(part.text) });
+      continue;
+    }
+    const imageUrl = typeof part.image_url === "string" ? part.image_url : part.image_url?.url;
+    const dataMatch = String(imageUrl || "").match(/^data:([^;]+);base64,(.+)$/);
+    if (dataMatch) parts.push({ inlineData: { mimeType: dataMatch[1], data: dataMatch[2] } });
+  }
+}
+
 export class GoogleGeminiAdapter implements ProtocolAdapter {
   public name = "google";
 
@@ -83,9 +108,7 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
       const role = msg.role === "assistant" ? "model" : "user";
       const parts: any[] = [];
 
-      if (msg.content) {
-        parts.push({ text: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) });
-      }
+      if (msg.role !== "tool") appendGeminiContentParts(parts, msg.content);
 
       if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
         for (const tc of msg.tool_calls) {
@@ -108,9 +131,12 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
         parts.push({
           functionResponse: {
             name: msg.name || "exec_command",
-            response: { output: msg.content }
+            response: { output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "") }
           }
         });
+        // A local Computer Use result carries the screenshot beside the
+        // function response so Gemini can inspect the updated desktop.
+        if (Array.isArray(msg.content)) appendGeminiContentParts(parts, msg.content.filter((part: any) => part?.type !== "text"));
       }
 
       if (parts.length > 0) {
@@ -204,4 +230,3 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
     return chunks;
   }
 }
-
