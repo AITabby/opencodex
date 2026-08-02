@@ -343,6 +343,18 @@ OpenCodex is a local control center for Codex Desktop. It brings third-party mod
 
 Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway.
 
+### Screenshots
+
+![OpenCodex control center](./assets/dashboard-home.png)
+
+![Provider and model configuration](./assets/screenshots/01-provider-model-config.png)
+
+![Voice and GPT-Live](./assets/screenshots/02-voice-gpt-live.png)
+
+![Agent session scanning](./assets/screenshots/03-agent-session-scan.png)
+
+![Enabled model catalog](./assets/screenshots/04-model-catalog.png)
+
 ### Current releases
 
 - macOS Apple Silicon: `v1.0.8` DMG.
@@ -436,18 +448,6 @@ npm start
 ```
 
 Open `http://127.0.0.1:8765/dashboard` after the gateway starts. For the macOS desktop app and bundled voice companion, use `npm run build:all` and `./macos-app/scripts/package-dmg.sh` on macOS.
-
-### Screenshots
-
-The repository includes current screenshots covering provider/model configuration, voice and GPT-Live, Agent session scanning, and the enabled model catalog:
-
-![Provider and model configuration](./assets/screenshots/01-provider-model-config.png)
-
-![Voice and GPT-Live](./assets/screenshots/02-voice-gpt-live.png)
-
-![Agent session scanning](./assets/screenshots/03-agent-session-scan.png)
-
-![Enabled model catalog](./assets/screenshots/04-model-catalog.png)
 
 ### Links
 
