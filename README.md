@@ -81,7 +81,7 @@ OpenCodex 不替换 Codex Desktop，也不会把官方模型强行改走第三�
 | 🧠 动态模型目录 | 自动读取模型推理档位、上下文窗口、协议和其他能力元数据 |
 | 🔌 多协议路由 | 支持 OpenAI Responses、OpenAI Chat Completions，以及 Anthropic、Google、DeepSeek、MiniMax 等适配路径 |
 | 🎙️ 语音助手 | STT、TTS、VAD、语音系统提示、全局语音栏和可视化 HUD |
-| 🤖 GPT-Live | 进行实时语音沟通，并选择真正执行任务的模型；支持随时切换 |
+| 🤖 GPT-Live | 进行实时语音沟通，并可随时把任务安排给任意已接入模型执行；支持随时切换执行模型 |
 | 🖥️ Computer Use | 让第三方模型使用 Codex 原生桌面操作执行器，支持截图结果和工具续接 |
 | 💬 会话中心 | 浏览本地 Codex 会话、查看可见上下文、删除会话、扫描并导入外部 Agent 会话 |
 | 🧰 Agent / MCP | 保留 Codex 原生 MCP 与工具能力，并兼容第三方模型的工具调用和连续执行 |
@@ -163,10 +163,10 @@ OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议�
 
 ### 7. GPT-Live 与实时通信
 
-GPT-Live 用于实时语音沟通和任务交接：
+GPT-Live 用于实时语音沟通和任务安排：
 
-- Live 对话完成后，可以选择真正执行任务的模型。
-- 执行模型可以是官方模型，也可以是已经启用并测试通过的第三方模型。
+- 进行 Live 对话时，可以随时把当前任务安排给任意已接入且可用的模型执行。
+- 执行模型可以是官方模型，也可以是已经启用并测试通过的第三方模型；不需要固定使用 Live 当前的对话模型。
 - 独立的 GPT-Live 模型选择悬浮球不依赖 OpenCodexBar。
 - 支持在一次任务的连续续接过程中保持正确的模型绑定。
 - 原生 Realtime / WebRTC 通信保留独立路径，第三方网关路由不会覆盖原生 Live。
@@ -402,8 +402,8 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 
 #### GPT-Live and voice
 
-- GPT-Live can hand a live conversation to a selected official or connected third-party execution model.
-- The independent Live model picker can switch the work model during a task and does not depend on OpenCodexBar.
+- GPT-Live can assign the current task to any connected and available official or third-party model at any time, without requiring the Live conversation model to perform the work.
+- The independent Live model picker can switch the execution model during a task and does not depend on OpenCodexBar.
 - STT: local Whisper or OpenAI-compatible / Groq transcription APIs.
 - TTS: Edge TTS, Volcengine / Doubao, MiniMax, MiMo, or OpenAI-compatible TTS APIs.
 - VAD threshold and silence duration, interaction mode, voice prompt, voice model, and HUD theme settings.
