@@ -21,7 +21,6 @@ import {
   isComputerUseTool,
   isNativeComputerUseExecutorName,
 } from "../services/computer_use_native.js";
-import { decodeGatewayCompaction, formatGatewayCompactionContext } from "../services/compaction_compat.js";
 
 const THINK_TAG_REGEX = /<think>[\s\S]*?<\/think>/gi;
 
@@ -178,6 +177,7 @@ function appendChatToolCall(messages: ChatMessage[], item: any): string {
   const argsStr = typeof item?.arguments === "string"
     ? item.arguments
     : JSON.stringify(item?.arguments || {});
+  const thoughtSignature = String(item?.thought_signature || item?.thoughtSignature || item?.signature || "").trim();
   const toolCall = {
     id: callId,
     type: "function" as const,
@@ -185,6 +185,7 @@ function appendChatToolCall(messages: ChatMessage[], item: any): string {
       name: responseFunctionCallToolName(item),
       arguments: argsStr,
     },
+    ...(thoughtSignature ? { thought_signature: thoughtSignature, thoughtSignature } : {}),
   };
 
   const last = messages[messages.length - 1];
@@ -197,12 +198,13 @@ function appendChatToolCall(messages: ChatMessage[], item: any): string {
   return callId;
 }
 
-function appendChatToolOutput(messages: ChatMessage[], callId: unknown, output: unknown): void {
+function appendChatToolOutput(messages: ChatMessage[], callId: unknown, output: unknown, name = ""): void {
   const normalizedCallId = String(callId || "").trim();
   if (!normalizedCallId) return;
   messages.push({
     role: "tool",
     tool_call_id: normalizedCallId,
+    ...(name ? { name } : {}),
     content: contentToChatContent(output),
   });
 }
@@ -211,6 +213,7 @@ export function responsesInputToChatMessages(input?: any[]): ChatMessage[] {
   if (!Array.isArray(input) || input.length === 0) return [];
 
   const messages: ChatMessage[] = [];
+  const toolNames = new Map<string, string>();
 
   for (const item of input) {
     if (typeof item === "string") {
@@ -222,16 +225,8 @@ export function responsesInputToChatMessages(input?: any[]): ChatMessage[] {
     const itemType: string = (item as any).type;
 
     if (itemType === "compaction" || itemType === "context_compaction") {
-      const state = decodeGatewayCompaction(item.encrypted_content);
-      // Native OpenAI compaction payloads are opaque to this gateway. Only
-      // expand our own envelope; an unknown encrypted item must not be sent
-      // to a Chat provider as fabricated text.
-      if (state) {
-        messages.push({
-          role: "system",
-          content: formatGatewayCompactionContext(state),
-        });
-      }
+      // Native compaction items are opaque provider state. A Chat provider
+      // cannot consume them, so do not invent a gateway-side summary.
       continue;
     }
 
@@ -251,15 +246,18 @@ export function responsesInputToChatMessages(input?: any[]): ChatMessage[] {
       }
     } else if (itemType === "function_call" || itemType === "mcp_call") {
       const callId = appendChatToolCall(messages, item);
+      const toolName = responseFunctionCallToolName(item);
+      if (toolName) toolNames.set(callId, toolName);
       // A completed MCP item is commonly replayed with its output attached to
       // the same item. Preserve both halves for Chat providers.
       if (itemType === "mcp_call" && item.output !== undefined) {
-        appendChatToolOutput(messages, callId, item.output);
+        appendChatToolOutput(messages, callId, item.output, toolName);
       }
     } else if (itemType === "function_call_output") {
-      appendChatToolOutput(messages, item.call_id, item.output);
+      appendChatToolOutput(messages, item.call_id, item.output, toolNames.get(String(item.call_id || "").trim()) || "");
     } else if (itemType === "mcp_call_output") {
-      appendChatToolOutput(messages, item.call_id || item.id, item.output);
+      const callId = item.call_id || item.id;
+      appendChatToolOutput(messages, callId, item.output, toolNames.get(String(callId || "").trim()) || "");
     }
   }
 
@@ -271,13 +269,16 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
     type: "function",
     function: {
       name: "spawn_agent",
-      description: "Dispatch one real Codex subagent task asynchronously. This desktop integration supports one fire-and-forget dispatch per Live task: after this tool succeeds, do not call wait_agent, list_agents, or spawn_agent again, and do not fall back to doing the delegated work yourself. Use the legacy fields task_name, message, and optional fork_turns exactly as defined here. Do not claim the subagent finished; only report that it was dispatched after this tool succeeds.",
+      description: "Dispatch one real Codex subagent task asynchronously. Before acting, decide whether the task needs no child, one child, or multiple independent children. Call spawn_agent once for each child you decide to create; multiple calls may be issued in the same turn or in subsequent turns. Do not call wait_agent or list_agents, and do not fall back to doing delegated work yourself. When the user explicitly assigns a model or saved Agent Profile to a child, pass exactly one of model or profile_id; that explicit binding overrides capability auto-routing. When no target is named, omit both and let the gateway route from the user's saved model capability directory. Use fork_turns only when conversation context is required, and use reasoning_effort only when deliberately overriding the selected target's saved default. Do not claim a child finished; only report that it was dispatched after each tool call succeeds.",
       parameters: {
         type: "object",
         properties: {
           task_name: { type: "string", description: "Short stable name for the subagent, for example game-builder" },
           message: { type: "string", description: "Complete task instructions and expected deliverable for the subagent" },
-          fork_turns: { type: "string", enum: ["none", "all"], description: "Whether to include the current conversation context; use none unless context is required" }
+          model: { type: "string", description: "Optional exact model slug from the gateway catalog; use only when the user explicitly assigns this child to a model" },
+          profile_id: { type: "string", description: "Optional saved Agent Profile id; use only when the user explicitly assigns this child to a Profile" },
+          fork_turns: { type: "string", enum: ["none", "all"], description: "Whether to include the current conversation context; use none unless context is required" },
+          reasoning_effort: { type: "string", description: "Optional per-child reasoning override; use one of the reasoning levels advertised by the selected model's catalog entry" }
         },
         required: ["task_name", "message"]
       }
@@ -339,6 +340,109 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
 
 const CODEX_SUBAGENT_TOOLS = DEFAULT_WORKSPACE_TOOLS.slice(0, 1);
 
+/**
+ * Responses providers use the flat function-tool shape, while Chat
+ * providers use the nested `function` shape above. Keep one description and
+ * parameter contract for both protocol paths so a third-party main model
+ * cannot lose the real gateway-owned dispatcher merely by switching
+ * protocols.
+ */
+export function buildGatewaySubagentResponseTool(): any {
+  const tool = DEFAULT_WORKSPACE_TOOLS[0]?.function;
+  return {
+    type: "function",
+    name: tool?.name || "spawn_agent",
+    description: tool?.description || "Dispatch a real Codex subagent task.",
+    parameters: tool?.parameters || { type: "object", properties: {}, required: [] },
+    strict: false,
+  };
+}
+
+/**
+ * Subagents are workers, not another orchestration layer. The native Codex
+ * executor currently owns the real multi-agent controls, while the gateway's
+ * generic spawn_agent function is only a main-agent control. Never advertise
+ * either form to a child turn.
+ */
+export function isSubagentDispatchToolName(value: unknown): boolean {
+  const name = String(value || "").trim().toLowerCase();
+  return name === "spawn_agent" || name.startsWith("multi_agent_v1_");
+}
+
+function rawToolName(tool: any): string {
+  return String(tool?.function?.name || tool?.name || "").trim();
+}
+
+/** Remove nested-agent controls before a Responses-native provider sees them. */
+export function stripSubagentDispatchTools(tools?: ResponseTool[]): ResponseTool[] | undefined {
+  if (!Array.isArray(tools)) return tools;
+  const result: ResponseTool[] = [];
+  for (const rawTool of tools as any[]) {
+    if (!rawTool || typeof rawTool !== "object") continue;
+    if (rawTool.type === "namespace") {
+      const namespace = String(rawTool.name || "").trim();
+      const collectionKey = Array.isArray(rawTool.functions) ? "functions" : Array.isArray(rawTool.tools) ? "tools" : "";
+      if (!collectionKey) {
+        if (!isSubagentDispatchToolName(namespace)) result.push(rawTool);
+        continue;
+      }
+      const kept = rawTool[collectionKey].filter((entry: any) => {
+        const fullName = namespace.endsWith("__")
+          ? `${namespace}${String(entry?.name || "")}`
+          : `${namespace}_${String(entry?.name || "")}`;
+        return !isSubagentDispatchToolName(entry?.name) && !isSubagentDispatchToolName(fullName);
+      });
+      if (kept.length > 0) result.push({ ...rawTool, [collectionKey]: kept });
+      continue;
+    }
+    if (!isSubagentDispatchToolName(rawToolName(rawTool))) result.push(rawTool);
+  }
+  return result;
+}
+
+const SUBAGENT_ORCHESTRATION_TOOL_NAMES = new Set([
+  "get_goal",
+  "create_goal",
+  "update_goal",
+  "update_plan",
+  "request_user_input",
+]);
+
+function isSubagentOrchestrationToolName(value: unknown): boolean {
+  const name = String(value || "").trim().toLowerCase();
+  return SUBAGENT_ORCHESTRATION_TOOL_NAMES.has(name) ||
+    name.startsWith("codex_app_") ||
+    name.startsWith("mcp__openaideveloperdocs_");
+}
+
+/** Keep worker tools, but omit host-side orchestration and documentation tools. */
+export function stripSubagentRuntimeTools(tools?: ResponseTool[]): ResponseTool[] | undefined {
+  const dispatchStripped = stripSubagentDispatchTools(tools);
+  if (!Array.isArray(dispatchStripped)) return dispatchStripped;
+  const result: ResponseTool[] = [];
+  for (const rawTool of dispatchStripped as any[]) {
+    if (!rawTool || typeof rawTool !== "object") continue;
+    if (rawTool.type === "namespace") {
+      const namespace = String(rawTool.name || "").trim();
+      const collectionKey = Array.isArray(rawTool.functions) ? "functions" : Array.isArray(rawTool.tools) ? "tools" : "";
+      if (!collectionKey) {
+        if (!isSubagentOrchestrationToolName(namespace)) result.push(rawTool);
+        continue;
+      }
+      const kept = rawTool[collectionKey].filter((entry: any) => {
+        const fullName = namespace.endsWith("__")
+          ? `${namespace}${String(entry?.name || "")}`
+          : `${namespace}_${String(entry?.name || "")}`;
+        return !isSubagentOrchestrationToolName(entry?.name) && !isSubagentOrchestrationToolName(fullName);
+      });
+      if (kept.length > 0) result.push({ ...rawTool, [collectionKey]: kept });
+      continue;
+    }
+    if (!isSubagentOrchestrationToolName(rawToolName(rawTool))) result.push(rawTool);
+  }
+  return result;
+}
+
 const nativeComputerUseSessions = new Map<string, number>();
 const NATIVE_COMPUTER_SESSION_TTL_MS = 30 * 60 * 1000;
 const MAX_NATIVE_COMPUTER_SESSIONS = 256;
@@ -368,11 +472,11 @@ function appendNativeComputerUseTool(tools: ChatTool[]): ChatTool[] {
   return next;
 }
 
-export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: string): ChatTool[] {
+export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: string, allowSubagentDispatch = true): ChatTool[] {
   const requestUsesComputerUse = hasComputerUseTool(tools);
   const rememberedComputerUse = rememberNativeComputerUseSession(sessionId, requestUsesComputerUse);
   if (!Array.isArray(tools) || tools.length === 0) {
-    const defaults = [...DEFAULT_WORKSPACE_TOOLS];
+    const defaults = allowSubagentDispatch ? [...DEFAULT_WORKSPACE_TOOLS] : DEFAULT_WORKSPACE_TOOLS.slice(1);
     return rememberedComputerUse ? appendNativeComputerUseTool(defaults) : defaults;
   }
   const result: ChatTool[] = [];
@@ -425,8 +529,13 @@ export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: stri
       ? buildNativeComputerUseChatTool(tool)
       : tool,
   );
-  const filteredResult = normalizedResult.filter((tool) => !isComputerUseDiscoveryToolName(tool.function?.name));
-  if (filteredResult.length === 0) filteredResult.push(...DEFAULT_WORKSPACE_TOOLS);
+  const filteredResult = normalizedResult.filter((tool) =>
+    !isComputerUseDiscoveryToolName(tool.function?.name) &&
+    (allowSubagentDispatch || !isSubagentDispatchToolName(tool.function?.name)),
+  );
+  if (filteredResult.length === 0) {
+    filteredResult.push(...(allowSubagentDispatch ? DEFAULT_WORKSPACE_TOOLS : DEFAULT_WORKSPACE_TOOLS.slice(1)));
+  }
 
   if (rememberedComputerUse && !filteredResult.some((tool) => isNativeComputerUseExecutorName(tool.function?.name))) {
     filteredResult.push(buildNativeComputerUseChatTool());
@@ -435,10 +544,12 @@ export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: stri
   // Codex Desktop may send its own workspace tool list on every continuation.
   // Keep that list, but never drop the gateway's real subagent controls merely
   // because the client supplied an explicit tools array.
-  const existingNames = new Set(filteredResult.map((tool) => tool.function?.name).filter(Boolean));
-  for (const tool of CODEX_SUBAGENT_TOOLS) {
-    const name = tool.function?.name;
-    if (name && !existingNames.has(name)) filteredResult.unshift(tool);
+  if (allowSubagentDispatch) {
+    const existingNames = new Set(filteredResult.map((tool) => tool.function?.name).filter(Boolean));
+    for (const tool of CODEX_SUBAGENT_TOOLS) {
+      const name = tool.function?.name;
+      if (name && !existingNames.has(name)) filteredResult.unshift(tool);
+    }
   }
 
   return filteredResult;
@@ -465,10 +576,12 @@ import { SessionHistoryService } from "../services/session_history.js";
 export function transformResponsesToChat(
   body: ResponsesRequestBody,
   upstreamModel: string,
-  sessionId?: string
+  sessionId?: string,
+  allowSubagentDispatch = true,
 ): ChatCompletionRequestBody {
   const messages: ChatMessage[] = [];
-  const tools = convertToolsToChatTools(body.tools, sessionId);
+  const sourceTools = allowSubagentDispatch ? body.tools : stripSubagentRuntimeTools(body.tools);
+  const tools = convertToolsToChatTools(sourceTools, sessionId, allowSubagentDispatch);
 
   const systemPrompt = appendComputerUseInstructions(
     body.instructions ? stripInternalCodexEnvelopes(body.instructions) : "",
@@ -508,6 +621,16 @@ export function transformResponsesToChat(
 
   if (tools.length > 0) {
     chatBody.tools = tools;
+  }
+
+  // A complex main-agent turn may emit more than one spawn_agent call. Keep
+  // the caller's explicit choice when present; otherwise enable parallel tool
+  // calls whenever the gateway has exposed its real subagent control.
+  const hasSpawnAgentTool = tools.some((tool) => tool.function?.name === "spawn_agent");
+  if (body.parallel_tool_calls !== undefined) {
+    chatBody.parallel_tool_calls = body.parallel_tool_calls;
+  } else if (hasSpawnAgentTool) {
+    chatBody.parallel_tool_calls = true;
   }
 
   if (body.temperature !== undefined) chatBody.temperature = body.temperature;

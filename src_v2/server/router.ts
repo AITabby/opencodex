@@ -1,6 +1,6 @@
 import http from "node:http";
 import { ResponsesStreamEngine } from "../core/stream_engine.js";
-import { transformResponsesToChat } from "../core/transformer.js";
+import { buildGatewaySubagentResponseTool, isSubagentDispatchToolName, stripSubagentRuntimeTools, transformResponsesToChat } from "../core/transformer.js";
 import { AdapterFactory } from "../adapters/factory.js";
 import { GoogleGeminiAdapter } from "../adapters/google.js";
 import { AnthropicAdapter } from "../adapters/anthropic.js";
@@ -19,17 +19,38 @@ import {
 import { optimizeThirdPartyComputerUseImages } from "../services/computer_use_image_compat.js";
 import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
-import {
-  buildCompactionResponse,
-  buildFallbackCompactionSummary,
-  COMPACTION_SYSTEM_PROMPT,
-  COMPACTION_USER_PROMPT,
-  expandGatewayCompactionItems,
-  extractProviderTextFromBody,
-  encodeGatewayCompaction,
-} from "../services/compaction_compat.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 import { CatalogSyncService } from "../services/catalog_sync.js";
+
+export interface GatewaySubagentDispatchCall {
+  id: string;
+  call_id: string;
+  name: string;
+  arguments: string;
+  thought_signature?: string;
+}
+
+export interface GatewaySubagentDispatchContext {
+  parent_task_id?: string;
+  parent_model?: string;
+  provider?: string;
+  backend_model?: string;
+  parent_reasoning_effort?: string;
+}
+
+export interface GatewaySubagentDispatchResult {
+  call_id: string;
+  task_id?: string;
+  model?: string;
+  reasoning_effort?: string;
+  output: string;
+  error?: string;
+}
+
+export type GatewaySubagentDispatcher = (
+  calls: GatewaySubagentDispatchCall[],
+  context: GatewaySubagentDispatchContext,
+) => Promise<GatewaySubagentDispatchResult[]>;
 
 
 
@@ -64,6 +85,22 @@ const CURSOR_PENDING_TOOL_TTL_MS = 10 * 60 * 1000;
 function responsesEndpointForProvider(providerUrl: string): string {
   const base = String(providerUrl || "").replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "").replace(/\/$/, "");
   return `${base}/responses`;
+}
+
+function responsesCompactionEndpointForProvider(providerUrl: string): string {
+  return `${responsesEndpointForProvider(providerUrl)}/compact`;
+}
+
+/**
+ * A third-party provider that exposes /responses/compact receives the same
+ * native compact request shape as GPT. Only the backend model name changes;
+ * the provider must perform the compaction and return its native item.
+ */
+export function buildThirdPartyNativeCompactionBody(body: any, upstreamModel: string): any {
+  const upstreamBody = { ...(body || {}), model: upstreamModel };
+  // `protocol` is a gateway catalog hint, not an upstream Responses field.
+  delete upstreamBody.protocol;
+  return upstreamBody;
 }
 
 function isResponsesUnsupported(status: number, body: string): boolean {
@@ -182,6 +219,137 @@ async function pipeFilteredThirdPartyResponses(
   await flush(true);
 }
 
+type CollectedThirdPartyResponses = {
+  events: string[];
+  response?: any;
+  calls: GatewaySubagentDispatchCall[];
+  json?: any;
+};
+
+function responseFunctionCallFromItem(item: any): GatewaySubagentDispatchCall | null {
+  const name = String(item?.name || "").trim();
+  if (!item || item.type !== "function_call" || !isSubagentDispatchToolName(name)) return null;
+  const callId = String(item.call_id || item.id || "").trim();
+  if (!callId) return null;
+  return {
+    id: String(item.id || callId),
+    call_id: callId,
+    name,
+    arguments: typeof item.arguments === "string" ? item.arguments : JSON.stringify(item.arguments || {}),
+    ...((item.thought_signature || item.thoughtSignature || item.signature)
+      ? { thought_signature: String(item.thought_signature || item.thoughtSignature || item.signature) }
+      : {}),
+  };
+}
+
+function collectResponseFunctionCall(
+  calls: Map<string, GatewaySubagentDispatchCall>,
+  item: any,
+): void {
+  const call = responseFunctionCallFromItem(item);
+  if (call) calls.set(call.call_id, call);
+}
+
+async function collectThirdPartyResponsesBody(response: Response): Promise<CollectedThirdPartyResponses> {
+  const calls = new Map<string, GatewaySubagentDispatchCall>();
+  const events: string[] = [];
+  let responseObject: any;
+  const contentType = response.headers.get("content-type") || "";
+
+  const observe = (raw: string): void => {
+    const dataLines = raw.split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart());
+    if (dataLines.length === 0) return;
+    const data = dataLines.join("\n").trim();
+    if (!data || data === "[DONE]") return;
+    let payload: any;
+    try { payload = JSON.parse(data); } catch { return; }
+    if (payload?.response && typeof payload.response === "object") {
+      responseObject = payload.response;
+    }
+    if (payload?.type === "response.output_item.added" || payload?.type === "response.output_item.done") {
+      collectResponseFunctionCall(calls, payload.item);
+    }
+    if (payload?.type === "response.function_call_arguments.delta") {
+      const itemId = String(payload.item_id || "").trim();
+      const existing = Array.from(calls.values()).find((call) => call.id === itemId);
+      if (existing) existing.arguments += String(payload.delta || "");
+    }
+    if (payload?.type === "response.completed" && Array.isArray(payload.response?.output)) {
+      for (const item of payload.response.output) collectResponseFunctionCall(calls, item);
+    }
+  };
+
+  if (!response.body || !contentType.toLowerCase().includes("text/event-stream")) {
+    const raw = await response.text();
+    let json: any;
+    try { json = JSON.parse(raw); } catch { json = undefined; }
+    const output = json?.response || json;
+    if (output && typeof output === "object") {
+      responseObject = output;
+      for (const item of Array.isArray(output.output) ? output.output : []) collectResponseFunctionCall(calls, item);
+    }
+    return { events, response: responseObject, calls: Array.from(calls.values()), json };
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  // @ts-ignore Node's fetch body is an async iterable at runtime.
+  for await (const chunk of response.body) {
+    buffer += decoder.decode(chunk, { stream: true });
+    const chunks = buffer.split(/\r?\n\r?\n/);
+    buffer = chunks.pop() || "";
+    for (const event of chunks) {
+      if (!event.trim()) continue;
+      events.push(event);
+      observe(event);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) {
+    events.push(buffer);
+    observe(buffer);
+  }
+  return { events, response: responseObject, calls: Array.from(calls.values()) };
+}
+
+function buildThirdPartyResponsesSubagentContinuation(
+  body: any,
+  calls: GatewaySubagentDispatchCall[],
+  results: GatewaySubagentDispatchResult[],
+): any {
+  const originalInput = Array.isArray(body?.input)
+    ? body.input
+    : body?.input
+      ? [{ type: "message", role: "user", content: [{ type: "input_text", text: String(body.input) }] }]
+      : [];
+  const resultByCallId = new Map(results.map((result) => [result.call_id, result]));
+  return {
+    ...body,
+    stream: true,
+    input: [
+      ...originalInput,
+      ...calls.map((call) => ({
+        type: "function_call",
+        id: call.id,
+        call_id: call.call_id,
+        name: call.name,
+        arguments: call.arguments,
+        ...(call.thought_signature ? { thought_signature: call.thought_signature, thoughtSignature: call.thought_signature } : {}),
+      })),
+      ...calls.map((call) => {
+        const result = resultByCallId.get(call.call_id);
+        return {
+          type: "function_call_output",
+          call_id: call.call_id,
+          output: result?.error ? `子代理执行失败：${result.error}` : result?.output || "子代理已完成，但没有返回文本。",
+        };
+      }),
+    ],
+  };
+}
+
 async function proxyThirdPartyResponses(
   reqBody: any,
   upstreamModel: string,
@@ -189,10 +357,28 @@ async function proxyThirdPartyResponses(
   apiKey: string,
   providerUrl: string,
   res: http.ServerResponse,
+  isSubagentRequest = false,
+  subagentDispatcher: GatewaySubagentDispatcher | null = null,
+  subagentContext: GatewaySubagentDispatchContext = {},
+  providerName = "",
 ): Promise<"handled" | "fallback"> {
   const targetUrl = responsesEndpointForProvider(providerUrl);
   const optimized = await optimizeThirdPartyComputerUseImages(reqBody);
-  const upstreamBody = { ...optimized.body, model: upstreamModel };
+  const upstreamBody = {
+    ...optimized.body,
+    model: upstreamModel,
+    ...(isSubagentRequest
+      ? { tools: stripSubagentRuntimeTools(optimized.body?.tools) }
+      : subagentDispatcher
+        ? {
+          tools: [
+            ...(Array.isArray(optimized.body?.tools) ? optimized.body.tools : []),
+            buildGatewaySubagentResponseTool(),
+          ].filter((tool: any, index: number, list: any[]) => list.findIndex((candidate) => String(candidate?.name || candidate?.function?.name || "") === String(tool?.name || tool?.function?.name || "")) === index),
+          ...(optimized.body?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
+        }
+        : {}),
+  };
   delete upstreamBody.protocol;
   if (optimized.stats.optimized || optimized.stats.deduplicated) {
     console.info(
@@ -217,6 +403,9 @@ async function proxyThirdPartyResponses(
 
     if (!upstreamRes.ok || !upstreamRes.body) {
       const errorText = await upstreamRes.text();
+      if (upstreamRes.status === 400) {
+        CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errorText);
+      }
       if (isResponsesUnsupported(upstreamRes.status, errorText)) {
         console.warn(`[OpenCodex Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
         return "fallback";
@@ -227,29 +416,57 @@ async function proxyThirdPartyResponses(
       return "handled";
     }
 
-    const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
-    res.writeHead(upstreamRes.status, responseHeaders);
-    const contentType = upstreamRes.headers.get("content-type") || "";
-    if (contentType.toLowerCase().includes("text/event-stream")) {
-      // @ts-ignore Node's fetch body is an async iterable at runtime.
-      await pipeFilteredThirdPartyResponses(upstreamRes.body, res, responseModel);
-    } else {
-      const raw = await upstreamRes.text();
-      try {
-        const blockedReasoningIds = new Set<string>();
-        const payload = rewriteThirdPartyResponseModel(sanitizeThirdPartyResponsesPayload(
-          JSON.parse(raw),
-          blockedReasoningIds,
-          new Set<string>(),
-        ), responseModel);
-        await writeHttpResponseChunked(res, payload === null ? "{}" : JSON.stringify(payload));
-        res.end();
-        return;
-      } catch {
-        await writeHttpResponseChunked(res, raw);
-        res.end();
-        return;
+    let responseForHeaders = upstreamRes;
+    let collected: CollectedThirdPartyResponses = await collectThirdPartyResponsesBody(upstreamRes);
+    let continuationRound = 0;
+    while (subagentDispatcher && !isSubagentRequest && collected.calls.length > 0) {
+      continuationRound += 1;
+      if (continuationRound > 8) throw new Error("第三方主模型连续调度子代理超过 8 轮，已停止继续递归");
+      const results = await subagentDispatcher(collected.calls, subagentContext);
+      if (results.length > 0 && results.every((result) => Boolean(result.error))) {
+        const details = results.map((result) => result.error).filter(Boolean).join("；");
+        throw new Error(`子代理调度失败，已停止主模型重试：${details || "没有可用的子代理结果"}`);
       }
+      const continuationBody = buildThirdPartyResponsesSubagentContinuation(upstreamBody, collected.calls, results);
+      const continuationResponse = await fetchUpstream(targetUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(continuationBody),
+        maxAttempts: 1,
+        timeoutMs: 120_000,
+        operation: "native-third-party-responses-subagent-continuation",
+      });
+      if (!continuationResponse.ok || !continuationResponse.body) {
+        const errorText = await continuationResponse.text();
+        if (continuationResponse.status === 400) {
+          CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errorText);
+        }
+        throw new Error(`第三方主模型子代理续答失败（HTTP ${continuationResponse.status}）：${errorText.slice(0, 800)}`);
+      }
+      responseForHeaders = continuationResponse;
+      collected = await collectThirdPartyResponsesBody(continuationResponse);
+    }
+
+    const responseHeaders = copySafeResponseHeaders(responseForHeaders.headers);
+    res.writeHead(responseForHeaders.status, responseHeaders);
+    if (collected.events.length > 0) {
+      const blockedReasoningIds = new Set<string>();
+      const nativeComputerUseCallIds = new Set<string>();
+      for (const event of collected.events) {
+        const sanitized = sanitizeThirdPartySseEvent(event, blockedReasoningIds, nativeComputerUseCallIds, responseModel);
+        if (sanitized) await writeHttpResponseChunked(res, sanitized);
+      }
+    } else {
+      const blockedReasoningIds = new Set<string>();
+      const payload = rewriteThirdPartyResponseModel(sanitizeThirdPartyResponsesPayload(
+        collected.json,
+        blockedReasoningIds,
+        new Set<string>(),
+      ), responseModel);
+      await writeHttpResponseChunked(res, payload === null ? "{}" : JSON.stringify(payload));
     }
     res.end();
     return "handled";
@@ -379,175 +596,92 @@ function rememberCursorSession(
 }
 
 export class GatewayRouter {
+  private subagentDispatcher: GatewaySubagentDispatcher | null = null;
+
+  public setSubagentDispatcher(dispatcher: GatewaySubagentDispatcher | null): void {
+    this.subagentDispatcher = dispatcher;
+  }
+
   /**
-   * Codex's remote compaction endpoint is a Responses-specific endpoint. Most
-   * third-party providers implement neither that endpoint nor OpenAI's opaque
-   * encrypted compaction format, so compact through their selected protocol
-   * and wrap the resulting continuation state in a gateway-owned envelope.
+   * Use a provider's native Codex compaction endpoint when it actually
+   * implements it. The client-facing contract stays identical to native GPT:
+   * the gateway only rewrites the backend model name and response model label.
+   * A 404/405/unsupported response is returned to the client; there is no
+   * gateway-generated summary fallback.
    */
-  public async compactResponses(
+  public async proxyNativeThirdPartyCompaction(
     reqBody: any,
     upstreamModel: string,
+    responseModel: string,
     apiKey: string,
     providerUrl: string,
-    providerName = "",
-  ): Promise<any> {
-    const optimized = await optimizeThirdPartyComputerUseImages(reqBody || {});
-    const expandedBody = expandGatewayCompactionItems(optimized.body);
-    if (optimized.stats.optimized || optimized.stats.deduplicated) {
-      console.info(
-        `[OpenCodex Computer Use] optimized third-party compaction screenshots ` +
-        `optimized=${optimized.stats.optimized} deduplicated=${optimized.stats.deduplicated} ` +
-        `bytes=${optimized.stats.inputBytes}->${optimized.stats.outputBytes}`,
-      );
-    }
-    const rawInput = typeof expandedBody.input === "string"
-      ? [expandedBody.input]
-      : Array.isArray(expandedBody.input)
-        ? expandedBody.input.filter((item: any) => item?.type !== "compaction_trigger")
-        : Array.isArray(expandedBody.messages)
-          ? expandedBody.messages
-          : [];
+    res: http.ServerResponse,
+  ): Promise<"handled" | "unsupported"> {
+    // Keep the native compact request shape identical to the native GPT lane.
+    // Only the provider backend model name is translated; the provider owns
+    // compaction and must return its native compact response.
+    const upstreamBody = buildThirdPartyNativeCompactionBody(reqBody, upstreamModel);
+    const targetUrl = responsesCompactionEndpointForProvider(providerUrl);
 
-    let summary = "";
-    let compactedWithProvider = false;
-    const protocol = String(expandedBody.protocol || "").toLowerCase();
+    try {
+      const upstreamRes = await fetchUpstream(targetUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(upstreamBody),
+        maxAttempts: 1,
+        timeoutMs: 120_000,
+        operation: "native-third-party-responses-compact",
+      });
 
-    if (protocol === "responses") {
-      try {
-        summary = await this.requestCompactionThroughResponses(
-          expandedBody,
-          rawInput,
-          upstreamModel,
-          apiKey,
-          providerUrl,
-          providerName,
-        );
-        compactedWithProvider = Boolean(summary);
-      } catch (err: any) {
-        console.warn(`[OpenCodex Compaction] Responses compaction fallback provider=${providerName || "provider"} model=${upstreamModel}: ${err?.message || err}`);
+      if (!upstreamRes.ok || !upstreamRes.body) {
+        const errorText = await upstreamRes.text();
+        if (isResponsesUnsupported(upstreamRes.status, errorText)) {
+          console.info(`[OpenCodex Compaction] Native endpoint unsupported by ${targetUrl}`);
+          return "unsupported";
+        }
+        res.writeHead(upstreamRes.status, { "Content-Type": "application/json" });
+        res.end(errorText || JSON.stringify({ error: `Upstream API Error (${upstreamRes.status})` }));
+        return "handled";
       }
-    }
 
-    if (!summary) {
-      try {
-        summary = await this.requestCompactionThroughChat(
-          expandedBody,
-          rawInput,
-          upstreamModel,
-          apiKey,
-          providerUrl,
-          providerName,
-        );
-        compactedWithProvider = Boolean(summary);
-      } catch (err: any) {
-        console.warn(`[OpenCodex Compaction] Chat compaction fallback provider=${providerName || "provider"} model=${upstreamModel}: ${err?.message || err}`);
+      const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
+      res.writeHead(upstreamRes.status, responseHeaders);
+      const contentType = upstreamRes.headers.get("content-type") || "";
+      if (contentType.toLowerCase().includes("text/event-stream")) {
+        // @ts-ignore Node's fetch body is an async iterable at runtime.
+        await pipeFilteredThirdPartyResponses(upstreamRes.body, res, responseModel);
+      } else {
+        const raw = await upstreamRes.text();
+        try {
+          const payload = rewriteThirdPartyResponseModel(JSON.parse(raw), responseModel);
+          await writeHttpResponseChunked(res, JSON.stringify(payload));
+        } catch {
+          await writeHttpResponseChunked(res, raw);
+        }
       }
+      res.end();
+      console.info(`[OpenCodex Compaction] Native third-party compaction passthrough provider=${targetUrl}`);
+      return "handled";
+    } catch (err: any) {
+      const details = upstreamErrorDetails(err);
+      console.error(`[CodexBridge V2] Native third-party compaction proxy error:`, {
+        ...details,
+        attempts: err?.attempts,
+      });
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: err.message,
+          type: "upstream_unreachable",
+          retryable: Boolean(err?.retryable),
+          cause_code: details.code,
+        }));
+      }
+      return "handled";
     }
-
-    if (!summary) {
-      const fallbackBody = { ...expandedBody, protocol: "chat", input: rawInput, tools: undefined };
-      const fallbackMessages = transformResponsesToChat(fallbackBody, upstreamModel).messages;
-      summary = buildFallbackCompactionSummary(fallbackMessages, expandedBody.instructions);
-    }
-
-    const encryptedContent = encodeGatewayCompaction(summary, upstreamModel, !compactedWithProvider);
-    return buildCompactionResponse(upstreamModel, encryptedContent);
-  }
-
-  private async requestCompactionThroughResponses(
-    body: any,
-    input: any[],
-    upstreamModel: string,
-    apiKey: string,
-    providerUrl: string,
-    providerName: string,
-  ): Promise<string> {
-    const targetUrl = responsesEndpointForProvider(providerUrl);
-    const upstreamBody: any = {
-      model: upstreamModel,
-      instructions: [body.instructions, COMPACTION_SYSTEM_PROMPT].filter(Boolean).join("\n\n"),
-      input: [
-        ...input,
-        { type: "message", role: "user", content: [{ type: "input_text", text: COMPACTION_USER_PROMPT }] },
-      ],
-      stream: false,
-      store: false,
-      max_output_tokens: 4096,
-    };
-
-    const response = await fetchUpstream(targetUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify(upstreamBody),
-      maxAttempts: 1,
-      timeoutMs: 120_000,
-      operation: `compact:responses:${providerName || "provider"}`,
-    });
-    const raw = await response.text();
-    if (!response.ok) throw new Error(`HTTP ${response.status}${raw ? `: ${raw.replace(/\s+/g, " ").slice(0, 240)}` : ""}`);
-    const summary = extractProviderTextFromBody(raw);
-    if (!summary) throw new Error("provider returned no compacted text");
-    return summary;
-  }
-
-  private async requestCompactionThroughChat(
-    body: any,
-    input: any[],
-    upstreamModel: string,
-    apiKey: string,
-    providerUrl: string,
-    providerName: string,
-  ): Promise<string> {
-    const chatBody = transformResponsesToChat({
-      ...body,
-      protocol: "chat",
-      input,
-      tools: undefined,
-      stream: false,
-      max_output_tokens: 4096,
-    }, upstreamModel);
-    chatBody.messages = [
-      { role: "system", content: COMPACTION_SYSTEM_PROMPT },
-      ...chatBody.messages,
-      { role: "user", content: COMPACTION_USER_PROMPT },
-    ];
-    chatBody.stream = false;
-    chatBody.max_tokens = 4096;
-    delete chatBody.tools;
-    delete chatBody.tool_choice;
-
-    const adapter = AdapterFactory.getAdapter(body.protocol, providerUrl);
-    const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(chatBody);
-    const providerBaseUrl = providerUrl.replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "");
-    const adapterPath = /\/v1$/i.test(providerBaseUrl) && /^\/v1\//i.test(urlEndpoint)
-      ? urlEndpoint.slice("/v1".length)
-      : urlEndpoint;
-    const targetUrl = adapterPath
-      ? `${providerBaseUrl.replace(/\/$/, "")}${adapterPath}`
-      : /\/chat\/completions\/?$/i.test(providerUrl)
-        ? providerUrl
-        : `${providerBaseUrl.replace(/\/$/, "")}/chat/completions`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-      ...adapterHeaders,
-    };
-    if (adapter.name === "anthropic" && apiKey) headers["x-api-key"] = apiKey;
-
-    const response = await fetchUpstream(targetUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payloadBody),
-      maxAttempts: 1,
-      timeoutMs: 120_000,
-      operation: `compact:chat:${providerName || "provider"}`,
-    });
-    const raw = await response.text();
-    if (!response.ok) throw new Error(`HTTP ${response.status}${raw ? `: ${raw.replace(/\s+/g, " ").slice(0, 240)}` : ""}`);
-    const summary = extractProviderTextFromBody(raw);
-    if (!summary) throw new Error("provider returned no compacted text");
-    return summary;
   }
 
   public async handleResponses(
@@ -557,10 +691,10 @@ export class GatewayRouter {
     providerUrl: string,
     res: http.ServerResponse,
     providerName = "",
-    nativeImageHeaders: Record<string, string> = {},
-    responseModel = "",
-  ): Promise<void> {
-    reqBody = expandGatewayCompactionItems(reqBody);
+  nativeImageHeaders: Record<string, string> = {},
+  responseModel = "",
+  isSubagentRequest = false,
+): Promise<void> {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
     const cursorHistoryId = cursorHistoryKey(reqBody);
@@ -579,14 +713,30 @@ export class GatewayRouter {
       // Responses-capable third-party providers receive the request as-is.
       // Computer Use is still a client-owned native tool call; the gateway
       // must never execute desktop actions or synthesize a second bridge.
-      const nativeResult = await proxyThirdPartyResponses(reqBody, upstreamModel, selectedResponseModel, apiKey, providerUrl, res);
+      const nativeResult = await proxyThirdPartyResponses(
+        reqBody,
+        upstreamModel,
+        selectedResponseModel,
+        apiKey,
+        providerUrl,
+        res,
+        isSubagentRequest,
+        this.subagentDispatcher,
+        {
+          parent_task_id: sessionId,
+          parent_model: selectedResponseModel,
+          backend_model: upstreamModel,
+          parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+        },
+        providerName,
+      );
       if (nativeResult === "handled") return;
       // The configured Responses endpoint is unavailable; use the existing
       // Chat compatibility conversion for this request.
       reqBody = { ...reqBody, protocol: "chat" };
     }
     const imageGenerationContext = extractImageGenerationContext(reqBody);
-    const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId);
+    const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId, !isSubagentRequest);
     const optimizedChat = await optimizeThirdPartyComputerUseImages(chatBody);
     const optimizedChatBody = optimizedChat.body;
     const isXiaomiMimoChat = isXiaomiMimoProvider(providerName, providerUrl, upstreamModel);
@@ -784,7 +934,15 @@ export class GatewayRouter {
     const engine = new ResponsesStreamEngine(
       upstreamModel,
       reqBody?.client_metadata?.turn_id,
-      { forceCommentary: nativeComputerUseTurn, responseModel: selectedResponseModel },
+      {
+        forceCommentary: nativeComputerUseTurn,
+        responseModel: selectedResponseModel,
+        // A third-party main model must be handled by the gateway itself.
+        // Child turns are intentionally excluded so delegation cannot recurse.
+        internalToolNames: !isSubagentRequest && !isCursorModel && this.subagentDispatcher
+          ? ["spawn_agent", "multi_agent_v1_spawn_agent"]
+          : [],
+      },
     );
     let engineStarted = false;
     const emitFailedResponse = async (message: string, code = "provider_request_failed"): Promise<void> => {
@@ -1111,6 +1269,8 @@ export class GatewayRouter {
       };
 
       let providerStreamCompleted = false;
+      let providerDataObserved = false;
+      let parentTextLength = 0;
 
       if (isCursorModel) {
         let binaryBuffer = new Uint8Array(0);
@@ -1294,6 +1454,8 @@ export class GatewayRouter {
             return;
           }
 
+          providerDataObserved = true;
+
           let chunk: any;
           try {
             chunk = JSON.parse(dataStr);
@@ -1335,8 +1497,177 @@ export class GatewayRouter {
         }
 
         if (!providerStreamCompleted) {
-          throw new Error("上游流在完成事件前结束，已拒绝伪造 response.completed");
+          // Some OpenAI-compatible gateways close a successful stream after
+          // the last content/tool delta and omit both `[DONE]` and
+          // `finish_reason`. The output already received from the provider is
+          // sufficient to close the local Responses turn; do not fabricate a
+          // response for an empty stream.
+          if (providerDataObserved && engine.hasOutput()) {
+            console.warn(
+              `[OpenCodex Provider] upstream stream ended after valid output ` +
+              `without a terminal event provider=${providerName || "provider"} model=${upstreamModel}`,
+            );
+            providerStreamCompleted = true;
+          } else {
+            throw new Error("上游流在完成事件前结束，且没有收到可收尾的模型输出");
+          }
         }
+      }
+
+      // Third-party main models cannot hand `spawn_agent` back to Codex
+      // Desktop: the desktop only knows its native private tool executor.
+      // Consume the gateway-owned calls here, run the selected child models,
+      // append their outputs to the provider conversation, and let the same
+      // parent model continue. This supports multiple independent children in
+      // one turn and keeps the custom tool completely out of the client stream.
+      const readAdditionalStandardProviderResponse = async (nextResponse: Response): Promise<void> => {
+        if (!nextResponse.ok || !nextResponse.body) {
+          const errorText = await nextResponse.text();
+          throw new Error(`子代理调度后的主模型续答失败（HTTP ${nextResponse.status}）：${errorText.slice(0, 800)}`);
+        }
+
+        const nextReader = acquireCursorStreamReader(nextResponse);
+        const nextDecoder = new TextDecoder();
+        let nextBuffer = "";
+        let nextCompleted = false;
+        let nextDataObserved = false;
+        const nextReadWithTimeout = (): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("主模型子代理续答流读取超时（600s）")), 600000);
+          nextReader.read().then((result) => {
+            clearTimeout(timer);
+            resolve(result);
+          }, (error) => {
+            clearTimeout(timer);
+            reject(error);
+          });
+        });
+        const processContinuationLine = async (line: string): Promise<void> => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) return;
+          const dataStr = trimmed.slice("data:".length).trim();
+          if (!dataStr) return;
+          if (dataStr === "[DONE]") {
+            nextCompleted = true;
+            return;
+          }
+          nextDataObserved = true;
+          let chunk: any;
+          try { chunk = JSON.parse(dataStr); } catch { return; }
+          if (providerChunkSignalsCompletion(chunk)) nextCompleted = true;
+          if (activeAdapter.processStreamChunk) {
+            engine.observeProviderChunk(chunk);
+            for (const normalizedChunk of activeAdapter.processStreamChunk(chunk)) {
+              await engine.processChatChunk(writeSse, normalizedChunk);
+            }
+          } else {
+            await engine.processChatChunk(writeSse, chunk);
+          }
+        };
+
+        while (!nextCompleted) {
+          const readResult = await nextReadWithTimeout();
+          if (readResult.done) {
+            nextBuffer += nextDecoder.decode();
+            if (nextBuffer.trim()) {
+              for (const line of nextBuffer.split("\n")) await processContinuationLine(line);
+            }
+            nextBuffer = "";
+            break;
+          }
+          nextBuffer += nextDecoder.decode(readResult.value, { stream: true });
+          const lines = nextBuffer.split("\n");
+          nextBuffer = lines.pop() || "";
+          for (const line of lines) await processContinuationLine(line);
+        }
+        if (!nextCompleted && !nextDataObserved) {
+          throw new Error("主模型子代理续答流在完成事件前结束");
+        }
+      };
+
+      const rebuildProviderPayloadForContinuation = (): void => {
+        const continuationChatBody = isXiaomiMimoChat
+          ? normalizeXiaomiChatToolHistory(optimizedChatBody)
+          : optimizedChatBody;
+        const transformed = activeAdapter.transformPayload(continuationChatBody);
+        finalPayloadBody = transformed.body;
+        if (isAntigravityModel) {
+          finalPayloadBody = {
+            project: "default-cli-project",
+            model: upstreamModel,
+            request: transformed.body,
+          };
+        }
+        if (activeAdapter.name === "openai" && finalPayloadBody && typeof finalPayloadBody === "object") {
+          finalPayloadBody = {
+            ...finalPayloadBody,
+            stream_options: {
+              ...(finalPayloadBody.stream_options || {}),
+              include_usage: true,
+            },
+          };
+        }
+      };
+
+      let subagentRound = 0;
+      while (this.subagentDispatcher && !isSubagentRequest && !isCursorModel) {
+        const internalCalls = engine.takeInternalToolCalls();
+        if (internalCalls.length === 0) break;
+        subagentRound += 1;
+        if (subagentRound > 8) throw new Error("主模型连续调度子代理超过 8 轮，已停止继续递归");
+
+        const results = await this.subagentDispatcher(internalCalls, {
+          parent_task_id: sessionId,
+          parent_model: selectedResponseModel,
+          provider: providerName,
+          backend_model: upstreamModel,
+          parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+        });
+        if (results.length > 0 && results.every((result) => Boolean(result.error))) {
+          const details = results.map((result) => result.error).filter(Boolean).join("；");
+          throw new Error(`子代理调度失败，已停止主模型重试：${details || "没有可用的子代理结果"}`);
+        }
+        const resultByCallId = new Map(results.map((result) => [result.call_id, result]));
+        const currentText = engine.getMessageText();
+        const assistantText = currentText.slice(parentTextLength);
+        parentTextLength = currentText.length;
+          optimizedChatBody.messages.push({
+          role: "assistant",
+          content: assistantText,
+          tool_calls: internalCalls.map((call) => ({
+            id: call.call_id,
+            type: "function",
+            function: { name: call.name, arguments: call.arguments },
+            ...(call.thought_signature ? { thought_signature: call.thought_signature, thoughtSignature: call.thought_signature } : {}),
+          })),
+        });
+        for (const call of internalCalls) {
+          const result = resultByCallId.get(call.call_id);
+          const output = result?.error
+            ? `子代理执行失败：${result.error}`
+            : result?.output || "子代理已完成，但没有返回文本。";
+          optimizedChatBody.messages.push({
+            role: "tool",
+            tool_call_id: call.call_id,
+            name: call.name,
+            content: output,
+          });
+        }
+        rebuildProviderPayloadForContinuation();
+        console.info(
+          `[OpenCodex Subagent] third-party parent continuation round=${subagentRound} ` +
+          `children=${internalCalls.length} ` +
+          `models=${results.map((result) => result.model || "unresolved").join(",")}`,
+        );
+        const continuationResponse = await fetchUpstream(finalTargetUrl, {
+          method: "POST",
+          headers: finalHeaders,
+          body: JSON.stringify(finalPayloadBody),
+          signal: controller.signal,
+          maxAttempts: 1,
+          timeoutMs: 120_000,
+          operation: `responses:${providerName || "provider"}:subagent-continuation`,
+        });
+        await readAdditionalStandardProviderResponse(continuationResponse);
       }
 
       const internalImageCalls = engine.getInternalImageToolCalls();

@@ -1,16 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import {
   buildFullCatalogEntry,
   CatalogSyncService,
   extractModelReasoningLevels,
+  findModelRegistryMatch,
   flattenModelRegistry,
   getActualContextWindow,
   getProviderModelContextWindow,
 } from "../dist/services/catalog_sync.js";
 import { clearProviderModelSelections } from "../dist/services/credential_store.js";
 import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, migrateProviderCatalogOwner, preserveOfficialModels, stripManagedCodexConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import { readRoutingCatalog } from "../dist/services/task_router.js";
 
 test("catalog entries preserve the selected upstream protocol", () => {
   const responses = buildFullCatalogEntry("opencode/deepseek-v4-flash", "opencode", undefined, "responses");
@@ -22,24 +26,17 @@ test("catalog entries preserve the selected upstream protocol", () => {
   assert.equal(chat.backend_protocol, "chat");
 });
 
-test("third-party catalog entries use the common baseline without inventing extra tiers", () => {
-  const entry = buildFullCatalogEntry("deepseek-v4-flash", "deepseek", undefined, "chat");
+test("reasoning-enabled catalog entries expose the default low/medium/high tiers", () => {
+  const entry = buildFullCatalogEntry("deepseek-v4-flash", "deepseek", undefined, "chat", { reasoning: true });
 
-  assert.deepEqual(
-    entry.supported_reasoning_levels.map((level) => level.effort),
-    ["low", "medium", "high"],
-  );
+  assert.deepEqual(entry.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high"]);
   assert.equal(entry.default_reasoning_level, "medium");
-  assert.equal(entry.supported_reasoning_levels.some((level) => level.effort === "xhigh"), false);
 });
 
-test("manual models without reasoning metadata remain parseable with the baseline tiers", () => {
+test("models without an explicit non-reasoning flag receive the default reasoning tiers", () => {
   const entry = buildFullCatalogEntry("manual/manual-model", "manual");
 
-  assert.deepEqual(
-    entry.supported_reasoning_levels.map((level) => level.effort),
-    ["low", "medium", "high"],
-  );
+  assert.deepEqual(entry.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high"]);
   assert.equal(entry.default_reasoning_level, "medium");
   assert.equal(entry.context_window, 200000);
   assert.deepEqual(entry.truncation_policy, { mode: "tokens", limit: 40000 });
@@ -57,10 +54,8 @@ test("model-specific reasoning metadata adds only that model's extra tiers", () 
     ],
   });
 
-  assert.deepEqual(
-    baseline.supported_reasoning_levels.map((level) => level.effort),
-    ["low", "medium", "high"],
-  );
+  assert.deepEqual(baseline.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high"]);
+  assert.equal(baseline.default_reasoning_level, "medium");
   assert.deepEqual(
     extended.supported_reasoning_levels.map((level) => level.effort),
     ["low", "medium", "high", "xhigh", "max"],
@@ -69,18 +64,50 @@ test("model-specific reasoning metadata adds only that model's extra tiers", () 
   assert.equal(extended.default_reasoning_level, "medium");
 });
 
-test("an explicit non-reasoning model does not receive the baseline tiers", () => {
+test("native model capability fields use the existing camelCase interface", () => {
+  const entry = buildFullCatalogEntry("gpt-native", "openai", undefined, "responses", {
+    supportedReasoningEfforts: [
+      { reasoningEffort: "low", description: "Fast" },
+      { reasoningEffort: "ultra", description: "Deep" },
+    ],
+    defaultReasoningEffort: "ultra",
+  });
+
+  assert.deepEqual(entry.supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high", "ultra"]);
+  assert.equal(entry.default_reasoning_level, "ultra");
+});
+
+test("Agent routing reads the existing native Codex model cache", async () => {
+  const nativeDir = await mkdtemp(path.join(os.tmpdir(), "opencodex-native-models-"));
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "opencodex-routing-models-"));
+  try {
+    await writeFile(path.join(nativeDir, "models_cache.json"), JSON.stringify({ models: [{
+      slug: "native-model",
+      display_name: "Native Model",
+      supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "ultra" }],
+      defaultReasoningEffort: "ultra",
+    }] }));
+    const models = readRoutingCatalog(dataDir, nativeDir);
+    assert.deepEqual(models.map((model) => model.slug), ["native-model"]);
+    assert.deepEqual(models[0].supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high", "ultra"]);
+    assert.equal(models[0].default_reasoning_level, "ultra");
+  } finally {
+    await Promise.all([rm(nativeDir, { recursive: true, force: true }), rm(dataDir, { recursive: true, force: true })]);
+  }
+});
+
+test("an explicit non-reasoning model exposes no selectable reasoning tiers", () => {
   const entry = buildFullCatalogEntry("provider/model-c", "provider", undefined, "chat", { reasoning: false });
   assert.deepEqual(entry.supported_reasoning_levels, []);
   assert.equal(entry.default_reasoning_level, undefined);
 });
 
-test("third-party context uses exact metadata and never guesses from a model name", () => {
+test("third-party context uses provider or registry metadata and never invents a size", () => {
   assert.equal(getActualContextWindow("deepseek-v4-flash"), undefined);
   assert.equal(getActualContextWindow("minimax-m3"), undefined);
   assert.equal(getActualContextWindow("gemini-2.5-pro"), undefined);
   assert.equal(buildFullCatalogEntry("custom-model", "test", 1048576).context_window, 1048576);
-  assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, metadata_source: "model_registry" }).context_window, 200000);
+  assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, metadata_source: "model_registry" }).context_window, 1000000);
   assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, metadata_source: "model_registry" }).context_window_source, "model_registry");
   assert.equal(buildFullCatalogEntry("mimo-v2.5", "opencode", undefined, "chat", { context_window: 1000000, context_window_source: "provider_metadata", metadata_source: "provider_metadata" }).context_window, 1000000);
   assert.equal(getProviderModelContextWindow({ model_metadata: { "provider-model": { context_length: 123456 } } }, "provider-model"), 123456);
@@ -88,7 +115,7 @@ test("third-party context uses exact metadata and never guesses from a model nam
   assert.equal(getProviderModelContextWindow({ models: [{ name: "gemini-2.5-pro", inputTokenLimit: 1048576 }] }, "gemini-2.5-pro"), 1048576);
 });
 
-test("model registry context stays conservative until provider metadata confirms it", () => {
+test("model registry context is used when the model identity is known", () => {
   const metadata = {
     limit: { context: 1000000, output: 128000 },
     reasoning: true,
@@ -96,10 +123,22 @@ test("model registry context stays conservative until provider metadata confirms
   };
 
   assert.equal(getActualContextWindow("minimax-m3"), undefined);
-  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).context_window, 200000);
-  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).max_context_window, 200000);
-  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).auto_compact_token_limit, 160000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).context_window, 1000000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).max_context_window, 1000000);
+  assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, metadata_source: "model_registry" }).auto_compact_token_limit, 800000);
   assert.equal(buildFullCatalogEntry("minimax/minimax-m3", "minimax", undefined, "chat", { ...metadata, context_window_source: "provider_metadata", metadata_source: "provider_metadata" }).context_window, 1000000);
+});
+
+test("provider model variants resolve to the base model registry context", () => {
+  const match = findModelRegistryMatch({
+    google: {
+      models: {
+        "gemini-3.6-flash": { limit: { context: 1048576 } },
+      },
+    },
+  }, { name: "antigravity" }, "gemini-3.6-flash-medium");
+  assert.equal(match?.metadata?.limit?.context, 1048576);
+  assert.equal(match?.providerMatched, false);
 });
 
 test("a registry-only refresh cannot overwrite a previously verified provider context", () => {
@@ -207,6 +246,7 @@ test("configured provider models can reconstruct a missing Codex catalog entry",
   assert.equal(entries[0].slug, "minimax/minimax-m3");
   assert.equal(entries[0].backend_model, "minimax-m3");
   assert.equal(entries[0].context_window, 1000000);
+  assert.deepEqual(entries[0].supported_reasoning_levels.map((level) => level.effort), ["low", "medium", "high"]);
 });
 
 test("existing provider-owned catalog entries preserve their explicit reasoning range", () => {
@@ -225,7 +265,7 @@ test("existing provider-owned catalog entries preserve their explicit reasoning 
 
   assert.deepEqual(
     entry.supported_reasoning_levels.map((level) => level.effort),
-    ["high"],
+    ["low", "medium", "high"],
   );
 });
 
@@ -258,9 +298,9 @@ test("reasoning option descriptors expose their discrete effort values", () => {
       ],
     }),
     [
-      { effort: "low", description: "Minimal reasoning for simple tasks" },
-      { effort: "medium", description: "Balances speed and reasoning depth" },
-      { effort: "high", description: "Greater reasoning depth for complex problems" },
+      { effort: "low", description: "轻度推理（速度优先）" },
+      { effort: "medium", description: "中等推理（速度与深度平衡）" },
+      { effort: "high", description: "深度推理（复杂任务）" },
     ],
   );
 });

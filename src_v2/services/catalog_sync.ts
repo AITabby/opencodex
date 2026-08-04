@@ -15,10 +15,23 @@ import { NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS } from "./computer_use_native.j
 import { stripManagedCodexConfig } from "../server/gateway.js";
 
 const DEFAULT_REASONING_PRESETS = [
-  { effort: "low", description: "Minimal reasoning for simple tasks" },
-  { effort: "medium", description: "Balances speed and reasoning depth" },
-  { effort: "high", description: "Greater reasoning depth for complex problems" },
+  { effort: "low", description: "轻度推理（速度优先）" },
+  { effort: "medium", description: "中等推理（速度与深度平衡）" },
+  { effort: "high", description: "深度推理（复杂任务）" },
 ];
+
+const EXTRA_REASONING_DESCRIPTIONS: Record<string, string> = {
+  minimal: "最小推理",
+  xhigh: "极高推理",
+  max: "最高推理",
+  ultra: "极限推理",
+  none: "不使用推理",
+};
+
+function reasoningDescription(effort: string): string | undefined {
+  return DEFAULT_REASONING_PRESETS.find((level) => level.effort === effort)?.description
+    || EXTRA_REASONING_DESCRIPTIONS[effort];
+}
 
 // Codex requires a positive context window and truncation policy to parse a
 // catalog entry. This is only a schema-safe fallback for manually configured
@@ -82,15 +95,15 @@ function normalizeReasoningLevels(value: any): Array<{ effort: string; descripti
 
     const effort = typeof raw === "string"
       ? raw.trim().toLowerCase()
-      : String(raw?.effort || raw?.level || raw?.value || raw?.name || raw?.id || "").trim().toLowerCase();
+      : String(raw?.effort || raw?.reasoning_effort || raw?.reasoningEffort || raw?.level || raw?.value || raw?.name || raw?.id || "").trim().toLowerCase();
     if (!effort || effort === "toggle" || effort === "budget_tokens" || seen.has(effort)) return;
     const reportedDescription = typeof raw === "object" && typeof raw?.description === "string"
       ? raw.description.trim()
       : "";
-    const description = reportedDescription
+    const description = reasoningDescription(effort)
+      || reportedDescription
       || inheritedDescription
-      || DEFAULT_REASONING_PRESETS.find((level) => level.effort === effort)?.description
-      || `Reasoning effort: ${effort}`;
+      || `推理档位：${effort}`;
     // Codex requires a description for every supported_reasoning_levels item.
     // Providers commonly publish only the extra effort name (for example
     // `xhigh` or `max`), so never emit a partially shaped level here.
@@ -104,9 +117,8 @@ function normalizeReasoningLevels(value: any): Array<{ effort: string; descripti
 /**
  * Read exact reasoning options when a provider or registry publishes them.
  * `undefined` means the source did not say; an empty array means it explicitly
- * said there are no enumerated options. The catalog resolver below adds only
- * the common low/medium/high baseline when the provider has not published
- * capability metadata.
+ * said there are no enumerated options. The catalog resolver keeps both cases
+ * automatic-only until a provider or registry returns real effort names.
  */
 export function extractModelReasoningLevels(model: any): Array<{ effort: string; description?: string }> | undefined {
   if (!model || typeof model !== "object") return undefined;
@@ -116,6 +128,10 @@ export function extractModelReasoningLevels(model: any): Array<{ effort: string;
     "reasoning_efforts",
     "reasoning_levels",
     "reasoning_options",
+    "supportedReasoningEfforts",
+    "reasoningEfforts",
+    "reasoningLevels",
+    "reasoningOptions",
   ]) {
     if (Object.prototype.hasOwnProperty.call(model, key)) return normalizeReasoningLevels(model[key]);
   }
@@ -132,30 +148,46 @@ export function extractModelReasoningLevels(model: any): Array<{ effort: string;
   return undefined;
 }
 
+function withDefaultReasoningLevels(
+  discovered: Array<{ effort: string; description?: string }>,
+): Array<{ effort: string; description?: string }> {
+  const byEffort = new Map(discovered.map((level) => [level.effort, level]));
+  const baseline = DEFAULT_REASONING_PRESETS.map((level) => ({ ...level }));
+  const extras = discovered
+    .filter((level) => !DEFAULT_REASONING_PRESETS.some((base) => base.effort === level.effort))
+    .map((level) => ({
+      ...level,
+      description: reasoningDescription(level.effort) || level.description || `推理档位：${level.effort}`,
+    }));
+  return [...baseline, ...extras];
+}
+
 /**
- * Resolve the picker levels for one model. Unknown models get the common
- * low/medium/high baseline; a non-empty provider/registry list is authoritative
- * for that model and may include extra levels. An explicit reasoning=false
- * remains authoritative.
+ * Resolve the picker levels for one model. low/medium/high are the stable
+ * Codex baseline for every imported model unless the provider explicitly
+ * marks it as non-reasoning; provider-returned levels outside that baseline
+ * are appended verbatim.
+ * An explicit non-reasoning model remains automatic-only.
  */
 function resolveModelReasoningLevels(model: any): Array<{ effort: string; description?: string }> {
-  if (model?.reasoning === false) return [];
-
   const discovered = extractModelReasoningLevels(model);
-  // A non-empty provider/registry enum is authoritative for this model. In
-  // particular, do not add the baseline to an explicitly narrow model.
-  if (discovered && discovered.length > 0) return discovered;
-
-  const merged = new Map<string, { effort: string; description?: string }>();
-  for (const level of DEFAULT_REASONING_PRESETS) merged.set(level.effort, { ...level });
-  return Array.from(merged.values());
+  // A provider/registry can publish both a boolean capability flag and an
+  // explicit effort enum. The enum is the more precise contract for the
+  // picker and must not be discarded just because the broad flag is false
+  // (some registries use that flag for a different reasoning capability).
+  if (model?.reasoning === false) return discovered || [];
+  if (discovered && discovered.length > 0) return withDefaultReasoningLevels(discovered);
+  return withDefaultReasoningLevels([]);
 }
 
 export function applyDefaultReasoningCapabilities(model: any): any {
   const levels = resolveModelReasoningLevels(model);
   const result = { ...model, supported_reasoning_levels: levels };
   if (levels.length > 0) {
-    const requested = String(model?.default_reasoning_level || "").trim().toLowerCase();
+    const defaultValue = model?.default_reasoning_level ?? model?.defaultReasoningEffort ?? model?.defaultReasoningLevel;
+    const requested = String(typeof defaultValue === "object"
+      ? defaultValue?.effort || defaultValue?.reasoningEffort || ""
+      : defaultValue || "").trim().toLowerCase();
     result.default_reasoning_level = levels.some((level) => level.effort === requested)
       ? requested
       : levels.some((level) => level.effort === "medium")
@@ -240,7 +272,9 @@ export function normalizeProviderModelDescriptor(value: any): ProviderModelDescr
     ...(context ? { context_window: context, max_context_window: context } : {}),
     ...(reasoningLevels !== undefined ? { supported_reasoning_levels: reasoningLevels } : {}),
     ...(typeof value.reasoning === "boolean" ? { reasoning: value.reasoning } : {}),
-    ...(typeof value.default_reasoning_level === "string" ? { default_reasoning_level: value.default_reasoning_level } : {}),
+    ...(typeof (value.default_reasoning_level ?? value.defaultReasoningEffort ?? value.defaultReasoningLevel) === "string"
+      ? { default_reasoning_level: value.default_reasoning_level ?? value.defaultReasoningEffort ?? value.defaultReasoningLevel }
+      : {}),
   };
 }
 
@@ -269,6 +303,27 @@ function providerMetadataEntry(provider: any, modelSlug: string): any | undefine
     }
   }
   return undefined;
+}
+
+/**
+ * Codex Desktop's cache is also a capability source for imported models. A
+ * provider may expose only a bare model id from /models while the desktop
+ * catalog already knows the exact selectable effort enum, including `max`.
+ */
+function codexModelCacheMetadata(modelSlug: string): any | undefined {
+  const requested = String(modelSlug || "").trim().toLowerCase();
+  if (!requested) return undefined;
+  try {
+    const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+    const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+    const models = Array.isArray(cache?.models) ? cache.models : [];
+    return models.find((model: any) => [model?.slug, model?.id, model?.model, model?.backend_model]
+      .map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean)
+      .includes(requested));
+  } catch {
+    return undefined;
+  }
 }
 
 export function getProviderModelContextWindow(provider: any, modelSlug: string): number | undefined {
@@ -321,9 +376,15 @@ export function buildFullCatalogEntry(
   const providerMetadataContext = getProviderReportedContextWindow(capabilities);
   const registryContext = getRegistryContextWindow(capabilities);
   const reportedContext = directContext || providerMetadataContext;
-  const catalogContext = reportedContext || DEFAULT_CATALOG_CONTEXT_WINDOW;
+  // A matched model-registry record is the model's published capability, not
+  // an unknown-model guess. Only use the schema fallback when neither the
+  // provider nor the registry knows this model.
+  const catalogContext = reportedContext || registryContext || DEFAULT_CATALOG_CONTEXT_WINDOW;
   const reasoningLevels = resolveModelReasoningLevels(capabilities);
-  const requestedDefaultReasoning = String(capabilities?.default_reasoning_level || "").trim().toLowerCase();
+  const defaultValue = capabilities?.default_reasoning_level ?? capabilities?.defaultReasoningEffort ?? capabilities?.defaultReasoningLevel;
+  const requestedDefaultReasoning = String(typeof defaultValue === "object"
+    ? defaultValue?.effort || defaultValue?.reasoningEffort || ""
+    : defaultValue || "").trim().toLowerCase();
   const defaultReasoning = reasoningLevels.some((level) => level.effort === requestedDefaultReasoning)
     ? requestedDefaultReasoning
     : reasoningLevels.some((level) => level.effort === "medium")
@@ -346,7 +407,7 @@ export function buildFullCatalogEntry(
     model_provider: "opencodex",
     description: `${providerName}: ${modelSlug} (${catalogContext.toLocaleString()} context${reportedContext ? "" : "; fallback until provider metadata is available"})`,
     context_window_source: contextSource,
-    context_window_confidence: reportedContext ? "exact" : "unknown",
+    context_window_confidence: reportedContext || registryContext ? "exact" : "unknown",
     context_window: catalogContext,
     max_context_window: catalogContext,
     auto_compact_token_limit: Math.floor(catalogContext * 0.8),
@@ -456,11 +517,20 @@ function normalizeRegistryIdentity(value: unknown): string {
   return String(value || "").trim().toLowerCase().replace(/^models\//, "");
 }
 
-function registryIdentityCandidates(value: unknown): string[] {
+export function registryIdentityCandidates(value: unknown): string[] {
   const normalized = normalizeRegistryIdentity(value);
   if (!normalized) return [];
   const parts = normalized.split("/").filter(Boolean);
-  return Array.from(new Set([normalized, parts.at(-1) || normalized]));
+  const candidates = [normalized, parts.at(-1) || normalized];
+  // Compatible providers commonly expose reasoning/deployment variants as a
+  // suffix (for example gemini-3.6-flash-medium), while the registry records
+  // the base model (gemini-3.6-flash). This is identity normalization, not a
+  // context-size guess: the context still comes from the matched registry.
+  for (const candidate of [...candidates]) {
+    const base = candidate.replace(/-(?:minimal|low|medium|high|max|xhigh|thinking|reasoning)$/i, "");
+    if (base && base !== candidate) candidates.push(base);
+  }
+  return Array.from(new Set(candidates));
 }
 
 function providerRegistryHints(provider: any): string[] {
@@ -489,7 +559,7 @@ type ModelRegistryMatch = {
   providerMatched: boolean;
 };
 
-function findModelRegistryMatch(payload: any, provider: any, modelSlug: string): ModelRegistryMatch | undefined {
+export function findModelRegistryMatch(payload: any, provider: any, modelSlug: string): ModelRegistryMatch | undefined {
   const target = registryIdentityCandidates(modelSlug);
   if (target.length === 0) return undefined;
   const hints = providerRegistryHints(provider);
@@ -569,16 +639,31 @@ export class CatalogSyncService {
     const explicit = providerMetadataEntry(provider, modelSlug);
     const registryMatch = findModelRegistryMatch(CatalogSyncService.readModelRegistryCache(), provider, modelSlug);
     const registry = registryMatch?.metadata;
-    if (!explicit && !registry) return undefined;
+    const desktopCache = codexModelCacheMetadata(modelSlug);
+    if (!explicit && !registry && !desktopCache) return undefined;
     const explicitContext = extractModelContextWindow(explicit);
     const registryContext = extractModelContextWindow(registry);
     const explicitSource = contextWindowSource(explicit);
     const explicitContextIsLive = Boolean(explicitContext && explicitSource !== "model_registry" && explicitSource !== "unknown");
     const explicitLevels = extractModelReasoningLevels(explicit);
     const registryLevels = extractModelReasoningLevels(registry);
+    const desktopLevels = extractModelReasoningLevels(desktopCache);
     const registrySource = registryMatch?.providerMatched ? "provider_metadata" : "model_registry";
+    // The Desktop cache is derived and can contain an older third-party
+    // projection. Keep its reasoning capabilities as a compatibility source,
+    // but never let its context window override the provider or registry.
+    const desktopCapabilities = desktopCache && typeof desktopCache === "object"
+      ? { ...desktopCache }
+      : undefined;
+    if (desktopCapabilities) {
+      delete desktopCapabilities.context_window;
+      delete desktopCapabilities.max_context_window;
+      delete desktopCapabilities.context_window_source;
+      delete desktopCapabilities.context_window_confidence;
+    }
     return {
       ...(registry && typeof registry === "object" ? registry : {}),
+      ...(desktopCapabilities || {}),
       ...(explicit && typeof explicit === "object" ? explicit : {}),
       ...(explicitContextIsLive
         ? {
@@ -593,14 +678,14 @@ export class CatalogSyncService {
             context_window_source: registrySource,
           }
           : {}),
-      ...(explicitLevels !== undefined || registryLevels !== undefined
-        ? { supported_reasoning_levels: explicitLevels !== undefined ? explicitLevels : registryLevels }
+      ...(explicitLevels !== undefined || desktopLevels !== undefined || registryLevels !== undefined
+        ? { supported_reasoning_levels: explicitLevels !== undefined ? explicitLevels : desktopLevels !== undefined ? desktopLevels : registryLevels }
         : {}),
       metadata_source: registryMatch?.providerMatched
         ? "provider_metadata"
         : explicit?.metadata_source
           ? explicit.metadata_source
-          : explicitContextIsLive || explicitLevels !== undefined
+          : explicitContextIsLive || explicitLevels !== undefined || desktopLevels !== undefined
             ? "provider_metadata"
             : registrySource,
     };
@@ -624,11 +709,11 @@ export class CatalogSyncService {
     for (const model of Array.isArray(catalogModels) ? catalogModels : []) {
       const slug = String(model?.slug || "").trim();
       if (!slug || isNativeCodexCacheModel(model)) continue;
-      next.set(slug, withComputerUseCatalogInstructions({
+      next.set(slug, withComputerUseCatalogInstructions(applyDefaultReasoningCapabilities({
         ...model,
         provider: "opencodex",
         model_provider: "opencodex",
-      }));
+      })));
     }
     return Array.from(next.values());
   }
@@ -721,26 +806,37 @@ export class CatalogSyncService {
     return models.map((model) => {
       const registryMatch = findModelRegistryMatch(registry, provider, model.id);
       const registryMetadata = registryMatch?.metadata;
+      // A provider validation response is a stronger, model-specific
+      // capability signal than a shared registry entry. In particular, the
+      // registry may advertise `max` while Xiaomi/OpenCode rejects it for the
+      // exact DeepSeek deployment. Keep the learned provider metadata in the
+      // catalog refresh path so the invalid level is not reintroduced.
+      const providerMetadata = getProviderModelMetadata(provider, model.id);
       const registryContext = extractModelContextWindow(registryMetadata);
       const registryLevels = extractModelReasoningLevels(registryMetadata);
       const directContext = extractModelContextWindow(model);
       const directLevels = extractModelReasoningLevels(model);
+      const providerContext = extractModelContextWindow(providerMetadata);
+      const providerLevels = extractModelReasoningLevels(providerMetadata);
+      const selectedLevels = directLevels !== undefined ? directLevels : providerLevels !== undefined ? providerLevels : registryLevels;
       const contextSource = directContext
         ? "provider_metadata"
+        : providerContext
+          ? "provider_metadata"
         : registryContext
           ? (registryMatch?.providerMatched ? "provider_metadata" : "model_registry")
           : "unknown";
       return {
         ...model,
-        ...(directContext || registryContext ? { context_window: directContext || registryContext, max_context_window: directContext || registryContext } : {}),
+        ...(directContext || providerContext || registryContext ? { context_window: directContext || providerContext || registryContext, max_context_window: directContext || providerContext || registryContext } : {}),
         ...(contextSource !== "unknown" ? { context_window_source: contextSource } : {}),
-        ...(directLevels !== undefined || registryLevels !== undefined
-          ? { supported_reasoning_levels: directLevels !== undefined ? directLevels : registryLevels }
+        ...(selectedLevels !== undefined
+          ? { supported_reasoning_levels: selectedLevels }
           : {}),
-        ...(typeof model.reasoning === "boolean" || typeof registryMetadata?.reasoning === "boolean"
-          ? { reasoning: typeof model.reasoning === "boolean" ? model.reasoning : registryMetadata.reasoning }
+        ...(typeof model.reasoning === "boolean" || typeof providerMetadata?.reasoning === "boolean" || typeof registryMetadata?.reasoning === "boolean"
+          ? { reasoning: typeof model.reasoning === "boolean" ? model.reasoning : typeof providerMetadata?.reasoning === "boolean" ? providerMetadata.reasoning : registryMetadata.reasoning }
           : {}),
-        ...((directContext || directLevels !== undefined)
+        ...((directContext || providerContext || directLevels !== undefined || providerLevels !== undefined)
           ? { metadata_source: "provider_metadata" }
           : (registryContext || registryLevels !== undefined)
             ? { metadata_source: registryMatch?.providerMatched ? "provider_metadata" : "model_registry" }

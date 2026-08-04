@@ -194,7 +194,21 @@ export class SessionHistoryService {
           repaired.push({ ...msg, tool_call_id: toolCallId });
           activeToolCallIds.delete(toolCallId);
         } else {
-          // Drop orphan tool output without matching assistant tool_call
+          // Codex may send only function_call_output on a continuation when
+          // the previous response is referenced by id. If the local session
+          // cache has not persisted the preceding function_call yet, dropping
+          // this result leaves the provider with no new task and the second
+          // round appears to hang. Preserve it as a user-visible continuation
+          // message instead of inventing a fake tool name/id pair.
+          const content = typeof msg.content === "string"
+            ? msg.content
+            : JSON.stringify(msg.content ?? "");
+          if (content.trim()) {
+            repaired.push({
+              role: "user",
+              content: `上一轮工具执行结果（${toolCallId || "未知工具"}）：\n${content}`,
+            });
+          }
         }
       } else {
         repaired.push(msg);

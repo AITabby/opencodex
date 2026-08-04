@@ -7,7 +7,7 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg"><img src="https://img.shields.io/badge/macOS-v1.0.8-111111?style=flat-square&logo=apple" alt="macOS v1.0.8"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg"><img src="https://img.shields.io/badge/macOS-v1.1.0-111111?style=flat-square&logo=apple" alt="macOS v1.1.0"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe"><img src="https://img.shields.io/badge/Windows-v1.0.8-0078D6?style=flat-square&logo=windows" alt="Windows v1.0.8"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
@@ -17,11 +17,11 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg">⬇️ 下载 OpenCodex v1.0.8（macOS）</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg">⬇️ 下载 OpenCodex v1.1.0（macOS）</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe">🪟 下载 Windows v1.0.8</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.0.8">查看 Release</a>
+  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.1.0">查看 Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
@@ -56,7 +56,9 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/04-model-catalog.png" alt="第三方模型目录与服务商命名空间" width="960">
 </p>
 
-> 当前发布状态：macOS Apple Silicon `v1.0.8`，Windows `v1.0.8`。Linux 版本尚未发布。
+> 当前发布状态：macOS Apple Silicon `v1.1.0`，Windows `v1.0.8`。Linux 版本尚未发布。
+>
+> `v1.1.0` 修复了原生 GPT 上下文压缩透传、第三方模型上下文元数据，以及 Agent 路由目录的模型能力返回。
 >
 > ✅ macOS Release DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 >
@@ -111,7 +113,7 @@ OpenCodex 控制中心提供常用服务商预设，也允许手动添加 OpenAI
 - 如果厂商接口返回了推理档位，就使用该模型自己的档位列表。
 - 如果模型注册表返回了明确档位，也会按注册表显示。
 - 已返回的窄档位不会被强行补成其他档位；模型只有两档或四档时，就显示两档或四档。
-- 如果没有任何能力描述，才使用通用的 `low / medium / high` 作为安全默认值。
+- 如果模型没有返回可枚举的推理档位，只保留“自动”，不会猜测或发送固定档位。
 - 如果服务商明确声明模型不支持推理，则不显示推理档位。
 - 模型的默认档位会从该模型实际支持的列表中选择，不会发送不存在的档位。
 
@@ -148,7 +150,7 @@ OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议�
 - 支持流式输出、推理内容、工具调用、工具结果和多轮续接。
 - 第三方 Responses 不支持某项能力时，可以按协议安全回退到 Chat 路径。
 - 支持请求体解压、流式背压、上游瞬时网络错误重试和响应头安全转发。
-- 支持第三方上下文压缩兼容路径，避免不同协议之间丢失压缩结果。
+- 原生 GPT 的上下文压缩完全透传；第三方 Responses 模型仅在原生支持 `/responses/compact` 时转发并转换后端模型名，不生成网关自定义压缩结果。
 
 ### 6. Computer Use、图像和 MCP
 
@@ -233,7 +235,7 @@ GPT-Live 用于实时语音沟通和任务安排：
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载 [OpenCodex-1.0.8-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg)。
+2. 下载 [OpenCodex-1.1.0-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg)。
 3. 打开 DMG，把 `OpenCodex.app` 拖入 `Applications`。
 4. 启动 OpenCodex，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
@@ -316,7 +318,7 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 OpenCodex 正在持续迭代。当前发布状态：
 
-- macOS Apple Silicon：`v1.0.8`，DMG 已发布。
+- macOS Apple Silicon：`v1.1.0`，DMG 已发布。
 - Windows 10/11：`v1.0.8`，安装包已发布。
 - Linux：暂未发布桌面安装包。
 
@@ -327,7 +329,7 @@ OpenCodex 正在持续迭代。当前发布状态：
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [GitHub Issues](https://github.com/AITabby/opencodex/issues)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.0.8 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg)
+- [Download OpenCodex v1.1.0 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg)
 - [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
 - [语音助手使用指南](./VOICE_GUIDE.md)
 - [测试流程](./TEST_FLOW.md)
@@ -357,7 +359,7 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: `v1.0.8` DMG.
+- macOS Apple Silicon: `v1.1.0` DMG.
 - Windows 10/11: `v1.0.8` installer.
 - Linux: no desktop package is published yet.
 
@@ -379,9 +381,9 @@ The macOS DMG includes a standalone Node.js runtime and the bundled voice runtim
 
 - Reasoning levels come from provider metadata or the model registry when available.
 - A model-specific list is authoritative: narrow or extended lists are preserved as returned.
-- Unknown models receive the safe `low / medium / high` baseline.
+- Models without returned selectable levels expose automatic reasoning only; no fixed levels are guessed.
 - Explicitly non-reasoning models expose no reasoning picker.
-- Context windows prefer live provider metadata, then registry metadata, and fall back to `200K` when neither source is available.
+- Context windows prefer live provider metadata, then the matching model-registry value, and fall back to `200K` only when neither source is available.
 - Native Codex model metadata remains independent from third-party catalog metadata.
 
 #### Local subscription imports
@@ -393,7 +395,7 @@ On macOS, the dashboard can detect and import available local login states for A
 - OpenAI Responses and Chat Completions support.
 - Anthropic, Google Gemini, DeepSeek, MiniMax, and OpenAI-compatible adapters.
 - Streaming, reasoning, tool calls, tool results, multi-turn continuations, request decompression, bounded streaming writes, and transient upstream retries.
-- Context compaction compatibility across Chat and Responses.
+- Native GPT compaction is passed through unchanged; third-party compaction is forwarded only when the provider exposes native `/responses/compact`.
 - Native Codex Responses, native Live / Realtime, Computer Use, and MCP remain isolated from third-party routing.
 
 #### Computer Use, images, and MCP
@@ -429,7 +431,7 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download [OpenCodex v1.0.8 for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg).
+2. Download [OpenCodex v1.1.0 for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg).
 3. Drag `OpenCodex.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 
@@ -454,7 +456,7 @@ Open `http://127.0.0.1:8765/dashboard` after the gateway starts. For the macOS d
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [GitHub Issues](https://github.com/AITabby/opencodex/issues)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.0.8 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-arm64.dmg)
+- [Download OpenCodex v1.1.0 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.0/OpenCodex-1.1.0-arm64.dmg)
 - [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
 - [Voice Assistant Guide](./VOICE_GUIDE.md)
 - [Test Flow](./TEST_FLOW.md)

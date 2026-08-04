@@ -71,3 +71,46 @@ test("dashboard refreshes subscription status after every model deletion path", 
   assert.match(text, /post\('\/api\/models\/delete',\{ids:ids\}\);await syncDashboardState\(\)/);
   assert.match(text, /post\('\/api\/providers\/delete',\{name:name\}\);await syncDashboardState\(\)/);
 });
+
+test("1.1.0 dashboard exposes the simple model capability directory", async () => {
+  const text = await source();
+  for (const marker of [
+    "view-agent-routing",
+    "agent-routing-mode",
+    "agent-routing-save",
+    "agent-model-add",
+    "agent-model-policy-list",
+    "agent-model-select",
+    "agent-model-policy-compact",
+    "agent-model-policy-editor",
+    "agent-model-toggle",
+    "agent-description",
+    "agent-reasoning",
+    "agent-auto",
+    "模型能力目录",
+    "擅长领域 / 工作说明",
+    "/api/agent-profiles",
+    "/api/agent-routing/settings",
+  ]) {
+    assert.match(text, new RegExp(marker.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")));
+  }
+  assert.match(text, /自动分配/);
+  assert.match(text, /强制选择/);
+  assert.match(text, /重新导入不会覆盖/);
+  assert.match(text, /按每个子任务的能力说明分别分配/);
+  assert.match(text, /主 Agent 会根据任务难度决定/);
+  assert.match(text, /0、1 还是多个子 Agent/);
+  assert.match(text, /强制模式需要选择一个模型/);
+  assert.match(text, /agentModelDescriptionSummary/);
+  assert.match(text, /supported_reasoning_levels/);
+  assert.match(text, /default_reasoning_level/);
+  assert.match(text, /agentReasoningSupported/);
+  assert.match(text, /AGENT_DEFAULT_REASONING_LEVELS/);
+  assert.match(text, /low/);
+  assert.match(text, /medium/);
+  assert.match(text, /high/);
+  assert.match(text, /agentReasoningLabel/);
+  assert.doesNotMatch(text, /agentReasoningOptions\(selected\)\{return \['', 'low', 'medium', 'high', 'xhigh', 'max'\]/);
+  assert.match(text, /编辑/);
+  assert.match(text, /view\.active#view-agent-routing/);
+});

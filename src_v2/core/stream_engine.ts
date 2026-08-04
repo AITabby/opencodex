@@ -219,11 +219,20 @@ interface ToolCallState {
   call_id: string;
   name: string;
   namespace?: string;
+  thought_signature?: string;
   arguments: string;
   output_index: number;
   added: boolean;
   closed: boolean;
   deferArguments?: boolean;
+}
+
+export interface InternalToolCall {
+  id: string;
+  call_id: string;
+  name: string;
+  arguments: string;
+  thought_signature?: string;
 }
 
 interface ReasoningState {
@@ -273,6 +282,7 @@ export class ResponsesStreamEngine {
   private messageClosed = false;
 
   private toolCalls: Record<number, ToolCallState> = {};
+  private internalToolCalls: Record<number, ToolCallState> = {};
   private internalImageToolCalls: Record<number, ToolCallState> = {};
   private imageGenerations: ImageGenerationState[] = [];
   private reasoningState: ReasoningState | null = null;
@@ -280,14 +290,16 @@ export class ResponsesStreamEngine {
   private thinkFilter = new ThinkTagFilter();
   private turnId?: string;
   private forceCommentary = false;
+  private internalToolNames: Set<string>;
   private usage?: Record<string, any>;
 
-  constructor(model: string, turnId?: string, options?: { forceCommentary?: boolean; responseModel?: string }) {
+  constructor(model: string, turnId?: string, options?: { forceCommentary?: boolean; responseModel?: string; internalToolNames?: string[] }) {
     this.model = options?.responseModel || model;
     this.responseId = generateHexId("resp", 24);
     this.messageItemId = generateHexId("msg", 24);
     this.turnId = turnId;
     this.forceCommentary = options?.forceCommentary === true;
+    this.internalToolNames = new Set((options?.internalToolNames || []).map((name) => String(name || "").trim().toLowerCase()).filter(Boolean));
   }
 
   public getResponseId(): string {
@@ -296,6 +308,22 @@ export class ResponsesStreamEngine {
 
   public getMessageText(): string {
     return this.messageText;
+  }
+
+  /**
+   * A few OpenAI-compatible gateways close a successful SSE body without a
+   * final `[DONE]` or `finish_reason`. Let the HTTP boundary distinguish that
+   * case from an empty/failed provider response without inventing assistant
+   * content.
+   */
+  public hasOutput(): boolean {
+    return Boolean(
+      this.messageText.trim() ||
+      Object.keys(this.toolCalls).length > 0 ||
+      Object.keys(this.internalToolCalls).length > 0 ||
+      this.imageGenerations.length > 0 ||
+      this.reasoningState,
+    );
   }
 
   /** Preserve provider usage for the Responses response consumed by Codex. */
@@ -312,6 +340,23 @@ export class ResponsesStreamEngine {
       name: state.name,
       arguments: state.arguments,
     }));
+  }
+
+  /**
+   * Consume gateway-owned tool calls without exposing them to Codex Desktop.
+   * The router executes these calls and continues the provider conversation
+   * with the resulting function outputs.
+   */
+  public takeInternalToolCalls(): InternalToolCall[] {
+    const calls = Object.values(this.internalToolCalls).map((state) => ({
+      id: state.id,
+      call_id: state.call_id,
+      name: state.name,
+      arguments: state.arguments,
+      ...(state.thought_signature ? { thought_signature: state.thought_signature } : {}),
+    }));
+    this.internalToolCalls = {};
+    return calls;
   }
 
   private wrap(writeSse: (payload: any) => Promise<void>) {
@@ -465,11 +510,16 @@ export class ResponsesStreamEngine {
     const index = Number(call.index || 0);
     const fn = call.function || {};
     const isInternalImageCall = fn.name === NATIVE_IMAGE_TOOL_NAME || Boolean(this.internalImageToolCalls[index]);
+    const isInternalGatewayCall = this.internalToolNames.has(String(fn.name || "").trim().toLowerCase()) || Boolean(this.internalToolCalls[index]);
     const mcpDescriptor = nativeComputerUseMcpDescriptor(fn.name);
     const nativeIdentity = mcpDescriptor
       ? { name: mcpDescriptor.toolName, namespace: `mcp__${mcpDescriptor.serverLabel}` }
       : undefined;
-    const toolStore = isInternalImageCall ? this.internalImageToolCalls : this.toolCalls;
+    const toolStore = isInternalImageCall
+      ? this.internalImageToolCalls
+      : isInternalGatewayCall
+        ? this.internalToolCalls
+        : this.toolCalls;
     let state = toolStore[index];
 
     if (!state) {
@@ -487,11 +537,15 @@ export class ResponsesStreamEngine {
         call_id: callId,
         name: nativeIdentity?.name || fn.name || "",
         ...(nativeIdentity?.namespace ? { namespace: nativeIdentity.namespace } : {}),
+        ...((call.thought_signature || call.thoughtSignature || call.signature)
+          ? { thought_signature: String(call.thought_signature || call.thoughtSignature || call.signature) }
+          : {}),
         arguments: "",
         output_index: isInternalImageCall ? -1 : this.nextOutputIndex++,
         added: isInternalImageCall,
         closed: false,
         deferArguments: !isInternalImageCall && (
+          isInternalGatewayCall ||
           (fn.name || "") === "exec_command" ||
           Boolean(nativeIdentity)
         ),
@@ -506,8 +560,11 @@ export class ResponsesStreamEngine {
     } else if (fn.name && !state.name) {
       state.name = fn.name;
     }
+    if (call.thought_signature || call.thoughtSignature || call.signature) {
+      state.thought_signature = String(call.thought_signature || call.thoughtSignature || call.signature);
+    }
 
-    if (isInternalImageCall) {
+    if (isInternalImageCall || isInternalGatewayCall) {
       if (fn.arguments) state.arguments += fn.arguments;
       return;
     }
@@ -732,6 +789,7 @@ export class ResponsesStreamEngine {
             name: state.name,
             arguments: state.arguments,
             ...(state.namespace ? { namespace: state.namespace } : {}),
+            ...(state.thought_signature ? { thought_signature: state.thought_signature, thoughtSignature: state.thought_signature } : {}),
           },
         });
         continue;

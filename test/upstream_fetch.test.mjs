@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fetchUpstream, UpstreamFetchError } from "../dist/services/upstream_fetch.js";
+import { fetchUpstream, MAX_UPSTREAM_HEADERS_TIMEOUT_MS, UPSTREAM_ALLOW_H2, UpstreamFetchError } from "../dist/services/upstream_fetch.js";
+
+test("upstream dispatcher leaves enough header budget for native compaction", () => {
+  assert.equal(MAX_UPSTREAM_HEADERS_TIMEOUT_MS, 600_000);
+  assert.equal(UPSTREAM_ALLOW_H2, false);
+});
 
 test("upstream fetch retries transient pre-response failures and then recovers", async () => {
   let attempts = 0;

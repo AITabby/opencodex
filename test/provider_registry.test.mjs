@@ -110,7 +110,7 @@ test("V2 source keeps Computer Use on the Codex-native executor path", async () 
   assert.match(source, /proxyNativeResponses/);
   assert.match(router, /上游流在完成事件前结束/);
   assert.match(router, /generateNativeCodexImage/);
-  assert.match(router, /proxyThirdPartyResponses\(reqBody/);
+  assert.match(router, /proxyThirdPartyResponses\(\s*reqBody/);
   assert.match(router, /hasComputerUseTool/);
   assert.doesNotMatch(router, /proxyThirdPartyResponsesWithComputerUse|ensureResponsesComputerUseTool|computer_call_output|opencodex_computer_use/);
   assert.match(catalog, /NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS/);

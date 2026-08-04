@@ -4,7 +4,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { transformResponsesToChat, convertToolsToChatTools } from "../dist/core/transformer.js";
+import { transformResponsesToChat, convertToolsToChatTools, stripSubagentDispatchTools, stripSubagentRuntimeTools, buildGatewaySubagentResponseTool } from "../dist/core/transformer.js";
 import {
   hasChatToolImages,
   isConsoleGoToolImageRejection,
@@ -172,6 +172,89 @@ test("v2 default tool contract exposes real Codex subagent controls", () => {
   assert.equal(names.includes("mcp__node_repl_js"), false);
 });
 
+test("1.1.0 subagent tool lets the main agent dispatch zero, one, or many children", () => {
+  const spawnTool = convertToolsToChatTools().find((tool) => tool.function?.name === "spawn_agent");
+  const properties = spawnTool?.function?.parameters?.properties;
+  assert.equal(typeof properties?.reasoning_effort?.description, "string");
+  assert.equal(typeof properties?.model?.description, "string");
+  assert.equal(typeof properties?.profile_id?.description, "string");
+  assert.equal(properties?.task_type, undefined);
+  assert.equal(properties?.required_tools, undefined);
+  assert.equal(properties?.permission, undefined);
+  assert.match(spawnTool?.function?.description || "", /explicit binding overrides capability auto-routing/);
+  assert.match(spawnTool?.function?.description || "", /saved model capability directory/);
+  assert.match(spawnTool?.function?.description || "", /no child, one child, or multiple independent children/);
+  assert.match(spawnTool?.function?.description || "", /multiple calls may be issued/);
+});
+
+test("1.1.0 exposes the same spawn_agent contract on the native Responses tool path", () => {
+  const tool = buildGatewaySubagentResponseTool();
+  assert.equal(tool.type, "function");
+  assert.equal(tool.name, "spawn_agent");
+  assert.equal(typeof tool.parameters?.properties?.reasoning_effort?.description, "string");
+  assert.match(tool.description, /multiple independent children/);
+});
+
+test("subagent turns do not advertise nested gateway or native agent controls", () => {
+  const tools = convertToolsToChatTools([
+    { type: "function", function: { name: "spawn_agent", parameters: { type: "object" } } },
+    { type: "function", function: { name: "multi_agent_v1_spawn_agent", parameters: { type: "object" } } },
+    { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
+  ], undefined, false);
+  const names = tools.map((tool) => tool.function?.name);
+  assert.equal(names.includes("spawn_agent"), false);
+  assert.equal(names.includes("multi_agent_v1_spawn_agent"), false);
+  assert.equal(names.includes("exec_command"), true);
+
+  const raw = stripSubagentDispatchTools([
+    { type: "function", function: { name: "spawn_agent" } },
+    { type: "function", function: { name: "multi_agent_v1_wait_agent" } },
+    { type: "function", function: { name: "view_file" } },
+  ]);
+  assert.deepEqual(raw?.map((tool) => tool.function?.name), ["view_file"]);
+});
+
+test("subagent Responses conversion keeps worker tools but removes nested dispatch", () => {
+  const chat = transformResponsesToChat({
+    model: "child-model",
+    input: "只完成当前分析，不再创建子代理",
+    tools: [
+      { type: "function", function: { name: "spawn_agent", parameters: { type: "object" } } },
+      { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
+    ],
+  }, "child-model", undefined, false);
+  const names = (chat.tools || []).map((tool) => tool.function?.name);
+  assert.equal(names.includes("spawn_agent"), false);
+  assert.equal(names.includes("exec_command"), true);
+});
+
+test("subagent runtime tools omit host orchestration tools while keeping workers", () => {
+  const tools = stripSubagentRuntimeTools([
+    { type: "function", function: { name: "exec_command" } },
+    { type: "function", function: { name: "update_plan" } },
+    { type: "function", function: { name: "codex_app_read_thread_terminal" } },
+    { type: "function", function: { name: "mcp__openaiDeveloperDocs_search_openai_docs" } },
+  ]);
+  assert.deepEqual(tools?.map((tool) => tool.function?.name), ["exec_command"]);
+});
+
+test("1.1.0 enables parallel tool calls for dynamic subagent fan-out", () => {
+  const chat = transformResponsesToChat({
+    model: "main-model",
+    input: "拆解这个复杂任务",
+  }, "main-model");
+
+  assert.equal(chat.parallel_tool_calls, true);
+  assert.equal(chat.tools.some((tool) => tool.function?.name === "spawn_agent"), true);
+
+  const explicitlySequential = transformResponsesToChat({
+    model: "main-model",
+    input: "保持顺序",
+    parallel_tool_calls: false,
+  }, "main-model");
+  assert.equal(explicitlySequential.parallel_tool_calls, false);
+});
+
 test("v2 explicit desktop tools retain the subagent controls", () => {
   const names = convertToolsToChatTools([
     { type: "function", function: { name: "exec_command", parameters: { type: "object" } } },
@@ -258,6 +341,13 @@ test("v2 stream engine keeps third-party reasoning internal and emits text", asy
   assert.equal(textEvent.delta, "hello world");
 });
 
+test("stream engine reports output so providers without a terminal SSE marker can close cleanly", async () => {
+  const engine = new ResponsesStreamEngine("deepseek-v4-flash");
+  assert.equal(engine.hasOutput(), false);
+  await engine.processChatChunk(async () => {}, { choices: [{ delta: { content: "已完成分析" } }] });
+  assert.equal(engine.hasOutput(), true);
+});
+
 test("v2 tool-only responses do not announce an empty message before the tool call", async () => {
   const events = [];
   const engine = new ResponsesStreamEngine("mock-coder", "tool-turn");
@@ -280,6 +370,49 @@ test("v2 tool-only responses do not announce an empty message before the tool ca
   const responseDoneIndex = events.findIndex((event) => event.type === "response.done");
   assert.ok(completedToolIndex >= 0);
   assert.ok(completedToolIndex < responseDoneIndex);
+});
+
+test("1.1.0 stream preserves multiple subagent calls from one main-agent turn", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("main-model", "fanout-turn");
+  const emit = async (event) => events.push(event);
+
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { tool_calls: [
+      { index: 0, id: "child-call-1", function: { name: "spawn_agent", arguments: '{"task_name":"analysis","message":"分析任务"}' } },
+      { index: 1, id: "child-call-2", function: { name: "spawn_agent", arguments: '{"task_name":"review","message":"审查任务"}' } },
+    ] } }],
+  });
+  await engine.finish(emit);
+
+  const completedCalls = events.filter((event) => event.type === "response.output_item.done" && event.item?.type === "function_call");
+  assert.equal(completedCalls.length, 2);
+  assert.deepEqual(completedCalls.map((event) => event.item.name), ["spawn_agent", "spawn_agent"]);
+  assert.deepEqual(completedCalls.map((event) => event.item.call_id), ["child-call-1", "child-call-2"]);
+});
+
+test("1.1.0 consumes gateway-owned spawn_agent calls without leaking them to Desktop", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("third-party-main", "gateway-dispatch-turn", {
+    internalToolNames: ["spawn_agent"],
+  });
+  const emit = async (event) => events.push(event);
+
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id: "child-call-1",
+      function: { name: "spawn_agent", arguments: '{"message":"分析 DeepSeek 的调用链","reasoning_effort":"max"}' },
+    }] } }],
+  });
+
+  const calls = engine.takeInternalToolCalls();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "spawn_agent");
+  assert.match(calls[0].arguments, /max/);
+  assert.equal(events.some((event) => event.item?.type === "function_call"), false);
 });
 
 test("v2 executes internal image calls without leaking them as client function calls", async () => {

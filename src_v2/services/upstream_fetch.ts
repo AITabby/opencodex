@@ -3,6 +3,15 @@ import { Agent, fetch as undiciFetch, setGlobalDispatcher } from "undici";
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_DELAY_MS = 250;
+// The caller owns the per-request timeout through attemptSignal().  The
+// dispatcher-level header timeout must not be shorter than the native
+// Responses compaction timeout, otherwise a valid but slow compaction request
+// is aborted after 30 seconds before the caller's 10-minute budget applies.
+export const MAX_UPSTREAM_HEADERS_TIMEOUT_MS = 600_000;
+// Keep the gateway's HTTP client on HTTP/1.1. Native Codex already owns the
+// native transport; the gateway must not introduce a separate HTTP/2 session
+// whose stream lifecycle differs from the native client.
+export const UPSTREAM_ALLOW_H2 = false;
 
 const RETRYABLE_ERROR_CODES = new Set([
   "ECONNRESET",
@@ -27,11 +36,12 @@ const RETRYABLE_ERROR_CODES = new Set([
 export const upstreamAgent = new Agent({
   connections: 8,
   pipelining: 1,
+  allowH2: UPSTREAM_ALLOW_H2,
   keepAliveTimeout: 10_000,
   keepAliveMaxTimeout: 30_000,
   maxRequestsPerClient: 100,
   connectTimeout: 10_000,
-  headersTimeout: DEFAULT_REQUEST_TIMEOUT_MS,
+  headersTimeout: MAX_UPSTREAM_HEADERS_TIMEOUT_MS,
   // Streaming responses have their own idle timeout in the caller.
   bodyTimeout: 0,
 });

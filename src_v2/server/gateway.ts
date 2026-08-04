@@ -10,8 +10,9 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { spawn, execFileSync } from "node:child_process";
-import { GatewayRouter } from "./router.js";
+import { spawn, execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
+import { GatewayRouter, type GatewaySubagentDispatchCall, type GatewaySubagentDispatchContext, type GatewaySubagentDispatchResult } from "./router.js";
 import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
 import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
@@ -20,15 +21,81 @@ import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig } from "../core/types.js";
-import { isNativeResponsesReasoningId, sanitizeNativeResponsesBody } from "../core/responses_safety.js";
-import { buildCompactionStreamEvents, isCompactionRequestBody, isCompactionRequestPath } from "../services/compaction_compat.js";
+import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
+import { AgentProfileStore } from "../services/agent_profile_store.js";
+import { TaskRouter, extractTaskText } from "../services/task_router.js";
+import { SubagentOrchestrator } from "../services/subagent_orchestrator.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
 type ModelProtocol = "chat" | "responses";
+
+function isResponsesCompactionPath(pathname: string): boolean {
+  const pathValue = String(pathname || "").replace(/\/+$/, "").toLowerCase();
+  return pathValue === "/v1/responses/compact" || pathValue === "/responses/compact";
+}
+const SUBAGENT_ROUTE_BINDING_TTL_MS = 30 * 60 * 1000;
+const MAX_SUBAGENT_ROUTE_BINDINGS = 256;
+const execFileAsync = promisify(execFile);
+type SubagentRouteBinding = {
+  expiresAt: number;
+  route: { model: string; reasoning_effort?: string; profile_id?: string; reason?: string; task_id?: string };
+};
+
+type GatewaySubagentWorkerCall = {
+  id: string;
+  call_id: string;
+  name: string;
+  arguments: string;
+  thought_signature?: string;
+};
+
+type GatewaySubagentTurn = {
+  output: string;
+  tool_calls: GatewaySubagentWorkerCall[];
+  error?: string;
+};
+
+/**
+ * Native Codex GPT turns stay on the native transport even when the gateway
+ * is active. A child-turn boundary is the only place where the gateway may
+ * inspect the request for configured subagent routing.
+ */
+export function isNativeCodexPassthrough(modelIsNative: boolean, _isSubagent: boolean): boolean {
+  return modelIsNative;
+}
+
+function requestHeader(req: http.IncomingMessage | undefined, name: string): string {
+  if (!req) return "";
+  const value = req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return String(value[0] || "").trim();
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function requestTurnMetadata(req: http.IncomingMessage | undefined): Record<string, any> {
+  const raw = requestHeader(req, "x-codex-turn-metadata");
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function requestKind(body: any, req: http.IncomingMessage | undefined, headerMetadata: Record<string, any>): string {
+  const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
+  return String(
+    body?.request_kind ||
+    bodyMetadata.request_kind ||
+    headerMetadata.request_kind ||
+    requestHeader(req, "x-codex-request-kind") ||
+    "",
+  ).trim().toLowerCase();
+}
 
 function normalizeModelProtocol(value: unknown): ModelProtocol {
   return String(value || "").trim().toLowerCase() === "responses" ? "responses" : "chat";
@@ -87,6 +154,18 @@ export function stripManagedCodexConfig(content: string): string {
   cleaned = cleaned.replace(/^\s*openai_base_url\s*=.*$\r?\n?/gm, "");
   cleaned = cleaned.replace(/^\s*\[model_providers\.opencodex\][\s\S]*?(?=\n\s*\[|\n\s*# >>>|$)/gm, "");
   return cleaned.trim();
+}
+
+export function buildCodexRoutingConfig(
+  content: string,
+  port: number,
+  adminToken: string,
+  catalogPath: string,
+  gatewayActive: boolean,
+): string {
+  if (gatewayActive) return buildManagedCodexConfig(content, port, adminToken, catalogPath);
+  const nativeConfig = stripManagedCodexConfig(content);
+  return nativeConfig ? `${nativeConfig}\n` : "";
 }
 
 export function buildManagedCodexConfig(
@@ -328,6 +407,15 @@ function catalogModelOwner(model: any): string {
 
 function catalogModelSlug(model: any): string {
   return String(model?.slug || model?.model || model?.id || "").trim();
+}
+
+export function hasThirdPartyModels(providers: ProviderConfig[] = [], catalog: any = {}): boolean {
+  const providerHasModels = (Array.isArray(providers) ? providers : []).some((provider: any) =>
+    [provider?.models, provider?.selected_models, provider?.active_models]
+      .some((models: any) => Array.isArray(models) && models.some((model: any) => String(model || "").trim()))
+  );
+  if (providerHasModels) return true;
+  return Array.isArray(catalog?.models) && catalog.models.some((model: any) => Boolean(catalogModelOwner(model)));
 }
 
 function normalizeNamespace(value: string): string {
@@ -640,7 +728,6 @@ export function preserveOfficialModels(catalog: any): void {
       ...(backendMetadata || {}),
       ...(existingReasoningLevels.length > 0
         && !legacyDefaultReasoning
-        && backendMetadata?.reasoning !== false
         ? { supported_reasoning_levels: existingReasoningLevels }
         : {}),
     };
@@ -888,6 +975,10 @@ export class CodexBridgeServer {
   private readonly dataDir: string;
   private readonly desktopRestartMarkerPath: string;
   private readonly adminToken: string;
+  private readonly agentProfileStore: AgentProfileStore;
+  private readonly taskRouter: TaskRouter;
+  private readonly subagentOrchestrator: SubagentOrchestrator;
+  private subagentRouteBindings = new Map<string, SubagentRouteBinding>();
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
@@ -899,7 +990,365 @@ export class CodexBridgeServer {
     this.dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex");
     this.desktopRestartMarkerPath = path.join(this.dataDir, "restart_desktop_after_gateway_ready");
     this.adminToken = this.loadOrCreateAdminToken();
+    this.agentProfileStore = new AgentProfileStore(this.dataDir);
+    this.taskRouter = new TaskRouter(this.agentProfileStore);
+    this.subagentOrchestrator = new SubagentOrchestrator(this.dataDir);
+    this.router.setSubagentDispatcher((calls, context) => this.dispatchThirdPartySubagents(calls, context));
     this.config.providers = CredentialStore.loadProviders();
+  }
+
+  /**
+   * Execute a third-party main model's gateway-owned spawn_agent calls.
+   * Native Codex normally owns this loop, but a third-party provider cannot
+   * call the desktop's private tool executor. The gateway therefore starts a
+   * real child Responses turn locally and returns its text as the tool result
+   * for the parent provider continuation.
+   */
+  private findSubagentProfileForModel(modelValue: string): any | undefined {
+    const requested = this.stripReasoningSuffix(String(modelValue || "").trim()).toLowerCase();
+    if (!requested) return undefined;
+    const normalizedRequested = requested.replace(/^opencode-go\//i, "opencode/");
+    const catalogModel = this.taskRouter.listModels().find((model) =>
+      model.slug.toLowerCase() === requested || model.backend_model.toLowerCase() === requested,
+    );
+    return this.taskRouter.listProfiles().find((profile: any) => {
+      if (!profile?.enabled || !profile?.subagent_enabled || !profile.model_ref) return false;
+      const ref = profile.model_ref;
+      const catalogSlug = String(ref.catalog_slug || "").trim().toLowerCase();
+      const profileName = String(profile.name || "").trim().toLowerCase();
+      if (catalogSlug && (catalogSlug === requested || catalogSlug.replace(/^opencode-go\//i, "opencode/") === normalizedRequested)) return true;
+      if (profileName && (profileName === requested || profileName.replace(/^opencode-go\//i, "opencode/") === normalizedRequested)) return true;
+      if (!catalogModel) return false;
+      return String(ref.backend_model || "").trim().toLowerCase() === catalogModel.backend_model.toLowerCase()
+        && String(ref.provider || "").trim().toLowerCase() === catalogModel.provider.toLowerCase();
+    });
+  }
+
+  private resolveSubagentWorkspacePath(rawValue: unknown): string {
+    const root = path.resolve(process.cwd());
+    let raw = String(rawValue || ".").trim() || ".";
+    if (raw === "~") raw = ".";
+    if (raw.startsWith("~/")) raw = raw.slice(2);
+    const requested = path.resolve(root, raw);
+    if (requested !== root && !requested.startsWith(`${root}${path.sep}`)) {
+      throw new Error("子代理工具只能访问当前工作区");
+    }
+    return requested;
+  }
+
+  private async executeGatewaySubagentWorkerTool(call: GatewaySubagentWorkerCall): Promise<string> {
+    let args: any = {};
+    try {
+      args = call.arguments ? JSON.parse(call.arguments) : {};
+    } catch {
+      return JSON.stringify({ error: "工具参数不是有效 JSON" });
+    }
+
+    const name = String(call.name || "").trim().toLowerCase();
+    try {
+      if (name === "view_file") {
+        const filePath = this.resolveSubagentWorkspacePath(args?.path);
+        const content = fs.readFileSync(filePath, "utf8");
+        return JSON.stringify({ path: filePath, content: content.slice(0, 200_000) });
+      }
+      if (name === "list_dir") {
+        const directory = this.resolveSubagentWorkspacePath(args?.path);
+        const entries = fs.readdirSync(directory, { withFileTypes: true }).map((entry) => ({
+          name: entry.name,
+          type: entry.isDirectory() ? "directory" : entry.isFile() ? "file" : "other",
+        }));
+        return JSON.stringify({ path: directory, entries });
+      }
+      if (name === "exec_command") {
+        const command = String(args?.cmd || args?.command || "").trim();
+        if (!command) return JSON.stringify({ error: "exec_command 缺少 cmd" });
+        if (args?.sandbox_permissions === "require_escalated") {
+          return JSON.stringify({ error: "子代理不能自动申请桌面权限升级，请由主 Agent 处理该操作" });
+        }
+        const workdir = this.resolveSubagentWorkspacePath(args?.workdir);
+        try {
+          const result: any = await execFileAsync("/bin/zsh", ["-lc", command], {
+            cwd: workdir,
+            timeout: 120_000,
+            maxBuffer: 4 * 1024 * 1024,
+          });
+          return JSON.stringify({
+            command,
+            exit_code: 0,
+            stdout: String(result?.stdout || "").slice(0, 120_000),
+            stderr: String(result?.stderr || "").slice(0, 40_000),
+          });
+        } catch (error: any) {
+          return JSON.stringify({
+            command,
+            exit_code: Number.isFinite(Number(error?.code)) ? Number(error.code) : 1,
+            stdout: String(error?.stdout || "").slice(0, 120_000),
+            stderr: String(error?.stderr || error?.message || "命令执行失败").slice(0, 40_000),
+          });
+        }
+      }
+      return JSON.stringify({ error: `网关未实现子代理工具：${name || "(unnamed)"}` });
+    } catch (error: any) {
+      return JSON.stringify({ error: String(error?.message || error || "子代理工具执行失败") });
+    }
+  }
+
+  private async dispatchThirdPartySubagents(
+    calls: GatewaySubagentDispatchCall[],
+    context: GatewaySubagentDispatchContext,
+  ): Promise<GatewaySubagentDispatchResult[]> {
+    return Promise.all(calls.map((call, index) => this.dispatchThirdPartySubagent(call, context, index)));
+  }
+
+  private async dispatchThirdPartySubagent(
+    call: GatewaySubagentDispatchCall,
+    context: GatewaySubagentDispatchContext,
+    index: number,
+  ): Promise<GatewaySubagentDispatchResult> {
+    let argumentsValue: any = {};
+    try {
+      argumentsValue = call.arguments ? JSON.parse(call.arguments) : {};
+    } catch {
+      return { call_id: call.call_id, output: "", error: "spawn_agent 参数不是有效 JSON" };
+    }
+
+    const message = String(argumentsValue?.message || argumentsValue?.task || argumentsValue?.instructions || "").trim();
+    const forcedModel = String(argumentsValue?.model || "").trim();
+    const profileId = String(argumentsValue?.profile_id || "").trim();
+    const configuredProfiles = this.taskRouter.listProfiles();
+    const explicitProfile = profileId
+      ? configuredProfiles.find((profile: any) => profile.id === profileId)
+      : undefined;
+    // A model entry created in the Web directory is itself a durable user
+    // binding. If the main model repeats its own `high` value in the tool
+    // arguments, do not let that generated value override the child's saved
+    // DeepSeek `max` profile.
+    // A model generated by the parent may include a stale/unknown profile_id.
+    // If the exact model has a saved Web Profile, that model binding remains
+    // authoritative; do not let an invalid profile_id bypass its saved effort.
+    const modelProfile = forcedModel ? this.findSubagentProfileForModel(forcedModel) : undefined;
+    const boundProfile = explicitProfile || modelProfile;
+    const callReasoning = String(
+      argumentsValue?.reasoning_effort || argumentsValue?.reasoning?.effort || "",
+    ).trim();
+    const requestedReasoning = String(
+      boundProfile?.reasoning_effort ||
+      callReasoning ||
+      "",
+    ).trim();
+    if (!message) {
+      return { call_id: call.call_id, output: "", error: "spawn_agent 缺少 message" };
+    }
+
+    const taskId = `gateway-child-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 7)}`;
+    const routeRequest = {
+      source: "subagent" as const,
+      task_id: taskId,
+      task_text: message,
+      profile_id: boundProfile?.id || profileId,
+      forced_model: boundProfile ? "" : forcedModel,
+      reasoning_effort: requestedReasoning,
+      preserve_reasoning_effort: Boolean(requestedReasoning),
+    };
+    const route = this.taskRouter.resolve(routeRequest);
+    this.taskRouter.record(routeRequest, route);
+    if (!route.ok || !route.model) {
+      return { call_id: call.call_id, task_id: taskId, output: "", error: route.reason || "没有可用的子代理模型" };
+    }
+
+    this.subagentOrchestrator.start({
+      task_id: taskId,
+      parent_task_id: context.parent_task_id,
+      profile_id: route.profile_id,
+      provider: route.provider,
+      model: route.model,
+      backend_model: route.backend_model,
+      reasoning_effort: route.reasoning_effort,
+    });
+
+    const childBody: any = {
+      model: route.model,
+      input: message,
+      stream: true,
+      client_metadata: {
+        "x-openai-subagent": "1",
+        thread_source: "subagent",
+        subagent_kind: "gateway-dispatch",
+        request_kind: "turn",
+        session_id: taskId,
+        parent_task_id: context.parent_task_id || "gateway-main",
+        model_override: route.model,
+        turn_id: `turn-${taskId}`,
+      },
+    };
+    if (route.reasoning_effort) {
+      childBody.reasoning = { effort: route.reasoning_effort };
+      childBody.reasoning_effort = route.reasoning_effort;
+    }
+
+    try {
+      let childInput: any = message;
+      const childHistory: any[] = [];
+      for (let toolRound = 0; toolRound <= 32; toolRound += 1) {
+        const childResponse = await fetch(`http://127.0.0.1:${this.port}/v1/responses`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.adminToken}`,
+            "x-openai-subagent": "1",
+            "x-codex-parent-thread-id": context.parent_task_id || "gateway-main",
+          },
+          body: JSON.stringify({ ...childBody, input: childInput }),
+          signal: AbortSignal.timeout(600_000),
+        });
+        if (!childResponse.ok) {
+          const errorText = await childResponse.text();
+          throw new Error(`子代理 HTTP ${childResponse.status}: ${errorText.slice(0, 800)}`);
+        }
+        const turn = await this.readGatewaySubagentOutput(childResponse);
+        if (turn.error) throw new Error(turn.error);
+        if (turn.tool_calls.length === 0) {
+          if (!turn.output) throw new Error("子代理没有返回文本结果");
+          this.subagentOrchestrator.complete(taskId);
+          return {
+            call_id: call.call_id,
+            task_id: taskId,
+            model: route.model,
+            reasoning_effort: route.reasoning_effort,
+            output: turn.output,
+          };
+        }
+
+        if (turn.output) {
+          childHistory.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: turn.output }],
+          });
+        }
+        childHistory.push(...turn.tool_calls.map((workerCall) => ({
+          type: "function_call",
+          id: workerCall.id,
+          call_id: workerCall.call_id,
+          name: workerCall.name,
+          arguments: workerCall.arguments,
+          ...(workerCall.thought_signature
+            ? { thought_signature: workerCall.thought_signature, thoughtSignature: workerCall.thought_signature }
+            : {}),
+        })));
+        const toolResults = await Promise.all(turn.tool_calls.map((workerCall) =>
+          this.executeGatewaySubagentWorkerTool(workerCall)
+        ));
+        childHistory.push(...turn.tool_calls.map((workerCall, resultIndex) => ({
+          type: "function_call_output",
+          call_id: workerCall.call_id,
+          output: toolResults[resultIndex],
+        })));
+        childInput = [
+          { type: "message", role: "user", content: [{ type: "input_text", text: message }] },
+          ...childHistory,
+        ];
+      }
+      throw new Error("子代理工具调用超过 32 轮，已停止继续执行");
+    } catch (error: any) {
+      const messageText = String(error?.message || error || "子代理执行失败").slice(0, 1000);
+      this.subagentOrchestrator.fail(taskId, messageText);
+      return {
+        call_id: call.call_id,
+        task_id: taskId,
+        model: route.model,
+        reasoning_effort: route.reasoning_effort,
+        output: "",
+        error: messageText,
+      };
+    }
+  }
+
+  private async readGatewaySubagentOutput(response: Response): Promise<GatewaySubagentTurn> {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let text = "";
+    let fallbackText = "";
+    let failure = "";
+    const toolCalls = new Map<string, GatewaySubagentWorkerCall>();
+
+    const consume = (raw: string): void => {
+      const trimmed = raw.trim();
+      if (!trimmed) return;
+      const dataLines = trimmed.split(/\r?\n/)
+        .filter((line) => line.startsWith("data:"))
+        .map((line) => line.slice(5).trim())
+        .filter(Boolean);
+      const data = dataLines.length > 0 ? dataLines.join("\n") : trimmed;
+      if (!data || data === "[DONE]") return;
+      let payload: any;
+      try { payload = JSON.parse(data); } catch { return; }
+      const type = String(payload?.type || "");
+      if (type === "response.output_text.delta") text += String(payload.delta || "");
+      if (type === "response.output_item.done" && payload.item?.type === "message") {
+        const content = Array.isArray(payload.item.content)
+          ? payload.item.content.map((part: any) => part?.text || "").join("")
+          : "";
+        if (content) fallbackText += content;
+      }
+      const rememberToolCall = (item: any): void => {
+        if (!item || item.type !== "function_call") return;
+        const id = String(item.id || item.call_id || `worker-call-${toolCalls.size}`).trim();
+        const callId = String(item.call_id || item.id || id).trim();
+        const existing = toolCalls.get(callId) || toolCalls.get(id);
+        const next: GatewaySubagentWorkerCall = {
+          id: String(existing?.id || id),
+          call_id: callId,
+          name: String(item.name || existing?.name || "").trim(),
+          arguments: typeof item.arguments === "string" ? item.arguments : existing?.arguments || JSON.stringify(item.arguments || {}),
+          ...((item.thought_signature || item.thoughtSignature || existing?.thought_signature)
+            ? { thought_signature: String(item.thought_signature || item.thoughtSignature || existing?.thought_signature) }
+            : {}),
+        };
+        toolCalls.delete(id);
+        toolCalls.delete(callId);
+        toolCalls.set(callId, next);
+      };
+      if (type === "response.output_item.added" || type === "response.output_item.done") {
+        rememberToolCall(payload.item);
+      }
+      if (type === "response.function_call_arguments.delta") {
+        const itemId = String(payload.item_id || payload.call_id || "").trim();
+        const existing = Array.from(toolCalls.values()).find((call) => call.id === itemId || call.call_id === itemId);
+        if (existing) existing.arguments += String(payload.delta || "");
+      }
+      if (type === "response.function_call_arguments.done") {
+        const itemId = String(payload.item_id || payload.call_id || "").trim();
+        const existing = Array.from(toolCalls.values()).find((call) => call.id === itemId || call.call_id === itemId);
+        if (existing && typeof payload.arguments === "string") existing.arguments = payload.arguments;
+      }
+      if (type === "response.failed") {
+        failure = String(payload.response?.error?.message || payload.response?.error || "子代理返回失败");
+      }
+      if (type === "response.completed" && payload.response?.status === "failed") {
+        failure = String(payload.response?.error?.message || payload.response?.error || "子代理返回失败");
+      }
+      if (type === "response.completed" && Array.isArray(payload.response?.output)) {
+        for (const item of payload.response.output) rememberToolCall(item);
+      }
+    };
+
+    if (!response.body) throw new Error("子代理没有返回响应流");
+    // @ts-ignore Node's fetch body is an async iterable at runtime.
+    for await (const chunk of response.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || "";
+      for (const event of events) consume(event);
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) consume(buffer);
+    const result = (text || fallbackText).trim();
+    return {
+      output: result,
+      tool_calls: Array.from(toolCalls.values()).filter((call) => Boolean(call.name)),
+      ...(failure ? { error: failure } : {}),
+    };
   }
 
   private loadOrCreateAdminToken(): string {
@@ -977,11 +1426,11 @@ export class CodexBridgeServer {
   }
 
   private liveModelPickerSettingsPath(): string {
-    return path.join(os.homedir(), ".opencodex", "voice_settings.json");
+    return path.join(this.dataDir, "voice_settings.json");
   }
 
   private liveModelPickerStatePath(): string {
-    return path.join(os.homedir(), ".opencodex", "live_model_picker.json");
+    return path.join(this.dataDir, "live_model_picker.json");
   }
 
   private isLiveModelPickerEnabled(): boolean {
@@ -1058,64 +1507,247 @@ export class CodexBridgeServer {
     if (child && !child.killed) child.kill();
   }
 
-  private async chooseLiveWorkModel(body: any): Promise<string> {
-    if (!this.isLiveModelPickerEnabled()) {
-      this.activeLiveModel = null;
-      this.liveModelBindings.clear();
-      return "";
+  private liveRoutingMode(): "auto" | "forced" | "off" {
+    const routingPath = path.join(this.dataDir, "live_routing.json");
+    if (!fs.existsSync(routingPath)) {
+      // Existing 1.0.8 installations have only the picker flag. Preserve that
+      // behavior until the user explicitly saves the 1.1.0 routing setting.
+      return this.isLiveModelPickerEnabled() ? "forced" : "off";
     }
+    return this.taskRouter.getSettings().mode;
+  }
+
+  private liveRouteRequest(body: any, source: "gpt-live" = "gpt-live") {
+    const metadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
+    return {
+      source,
+      task_id: liveModelSessionKey(body),
+      task_text: extractTaskText(body),
+      task_type: body?.task_type || metadata.task_type || metadata.taskType || "",
+      tags: Array.isArray(body?.tags) ? body.tags : (Array.isArray(metadata.tags) ? metadata.tags : []),
+      profile_id: body?.agent_profile_id || metadata.agent_profile_id || metadata.agentProfileId || "",
+      reasoning_effort: body?.reasoning?.effort || body?.reasoning_effort || metadata.reasoning_effort || "",
+      required_tools: Array.isArray(body?.required_tools) ? body.required_tools : (Array.isArray(metadata.required_tools) ? metadata.required_tools : []),
+      permission: body?.permission || metadata.permission || "",
+    };
+  }
+
+  private isSubagentResponsesRequest(body: any, req?: http.IncomingMessage): boolean {
+    const metadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
+    const headerMetadata = requestTurnMetadata(req);
+    const subagentHeader = requestHeader(req, "x-openai-subagent");
+    const headerMarksSubagent = Boolean(
+      subagentHeader ||
+      headerMetadata.thread_source === "subagent" ||
+      headerMetadata.subagent_kind ||
+      requestHeader(req, "x-codex-parent-thread-id"),
+    );
+    // Codex sends a prewarm request for a native child before the real turn.
+    // It carries the same subagent headers but must not create or route a task.
+    if (requestKind(body, req, headerMetadata) === "prewarm") return false;
+    return Boolean(
+      metadata["x-openai-subagent"] === true ||
+      metadata["x-openai-subagent"] === "1" ||
+      metadata.thread_source === "subagent" ||
+      body?.thread_source === "subagent" ||
+      body?.source?.subagent === true ||
+      headerMarksSubagent,
+    );
+  }
+
+  private chooseSubagentRoute(body: any, req?: http.IncomingMessage): { model: string; reasoning_effort?: string; profile_id?: string; reason?: string; task_id?: string } | null {
+    if (!this.isSubagentResponsesRequest(body, req)) return null;
+    const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
+    const headerMetadata = requestTurnMetadata(req);
+    const metadata = { ...headerMetadata, ...bodyMetadata };
+    const taskId = String(
+      metadata.session_id ||
+      metadata.thread_id ||
+      metadata.conversation_id ||
+      body?.session_id ||
+      body?.thread_id ||
+      body?.conversation_id ||
+      requestHeader(req, "session-id") ||
+      requestHeader(req, "thread-id") ||
+      requestHeader(req, "x-client-request-id") ||
+      "__active__",
+    ).trim() || "__active__";
+    const bodyModel = this.stripReasoningSuffix(String(body?.model || "").trim());
+    const bodyModelIsNative = Boolean(bodyModel) && this.isNativeCatalogModel(bodyModel);
+    const explicitModel = String(
+      body?.forced_model ||
+      body?.subagent_model ||
+      body?.child_model ||
+      body?.agent_model ||
+      metadata.forced_model ||
+      metadata.forcedModel ||
+      metadata.subagent_model ||
+      metadata.child_model ||
+      metadata.agent_model ||
+      metadata.model_override ||
+      // For a child request, a non-native body model is itself an explicit
+      // target. Native GPT is the inherited parent model and must not be
+      // mistaken for a user-selected third-party child model.
+      (!bodyModelIsNative ? bodyModel : "") ||
+      "",
+    ).trim();
+    const now = Date.now();
+    for (const [bindingId, binding] of this.subagentRouteBindings) {
+      if (binding.expiresAt <= now) this.subagentRouteBindings.delete(bindingId);
+    }
+    const existingBinding = taskId !== "__active__" ? this.subagentRouteBindings.get(taskId) : undefined;
+    const explicitReasoning = String(
+      body?.reasoning?.effort ||
+      body?.reasoning_effort ||
+      metadata.reasoning_effort ||
+      "",
+    ).trim();
+    if (existingBinding && (!explicitModel || explicitModel.toLowerCase() === existingBinding.route.model.toLowerCase())) {
+      existingBinding.expiresAt = now + SUBAGENT_ROUTE_BINDING_TTL_MS;
+      const reasoning = explicitReasoning
+        ? this.taskRouter.normalizeReasoningEffort(existingBinding.route.model, explicitReasoning, true) || existingBinding.route.reasoning_effort
+        : existingBinding.route.reasoning_effort;
+      existingBinding.route = {
+        ...existingBinding.route,
+        ...(reasoning ? { reasoning_effort: reasoning } : {}),
+      };
+      console.log(`[OpenCodex Subagent] Reusing child route: ${existingBinding.route.model}${existingBinding.route.reasoning_effort ? ` reasoning=${existingBinding.route.reasoning_effort}` : ""}`);
+      return existingBinding.route;
+    }
+    const routeRequest = {
+      source: "subagent" as const,
+      task_id: taskId,
+      task_text: extractTaskText(body),
+      task_type: body?.task_type || metadata.task_type || metadata.taskType || "",
+      tags: Array.isArray(body?.tags) ? body.tags : (Array.isArray(metadata.tags) ? metadata.tags : []),
+      profile_id: body?.agent_profile_id || body?.profile_id || body?.subagent_profile_id || body?.child_profile_id || metadata.agent_profile_id || metadata.agentProfileId || metadata.profile_id || metadata.subagent_profile_id || metadata.child_profile_id || "",
+      forced_model: explicitModel,
+      reasoning_effort: body?.reasoning?.effort || body?.reasoning_effort || metadata.reasoning_effort || "",
+      preserve_reasoning_effort: Boolean(explicitReasoning),
+      required_tools: Array.isArray(body?.required_tools) ? body.required_tools : (Array.isArray(metadata.required_tools) ? metadata.required_tools : []),
+      permission: body?.permission || metadata.permission || "",
+    };
+    const route = this.taskRouter.resolve(routeRequest);
+    if (!route.ok || !route.model) {
+      console.warn(`[OpenCodex Subagent] Routing did not select a model: ${route.reason}`);
+      return null;
+    }
+    this.taskRouter.record(routeRequest, route);
+    const task = this.subagentOrchestrator.start({
+      task_id: routeRequest.task_id,
+      parent_task_id:
+        metadata.parent_task_id ||
+        metadata.parentThreadId ||
+        body?.parent_task_id ||
+        body?.parent_thread_id ||
+        headerMetadata.parent_thread_id ||
+        headerMetadata.parent_task_id ||
+        requestHeader(req, "x-codex-parent-thread-id"),
+      profile_id: route.profile_id,
+      provider: route.provider,
+      model: route.model,
+      backend_model: route.backend_model,
+      reasoning_effort: route.reasoning_effort,
+    });
+    console.log(`[OpenCodex Subagent] Routed child task: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
+    const selectedRoute = { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason, task_id: task.id };
+    if (taskId !== "__active__") {
+      this.subagentRouteBindings.set(taskId, { expiresAt: now + SUBAGENT_ROUTE_BINDING_TTL_MS, route: selectedRoute });
+      while (this.subagentRouteBindings.size > MAX_SUBAGENT_ROUTE_BINDINGS) {
+        const oldest = this.subagentRouteBindings.keys().next().value;
+        if (!oldest) break;
+        this.subagentRouteBindings.delete(oldest);
+      }
+    }
+    return selectedRoute;
+  }
+
+  private async chooseLiveWorkRoute(body: any): Promise<{ model: string; reasoning_effort?: string; profile_id?: string; reason?: string } | null> {
     if (!this.isRealtimeActive()) {
       this.activeLiveModel = null;
       this.liveModelBindings.clear();
-      return "";
+      return null;
     }
 
+    const mode = this.liveRoutingMode();
     const now = Date.now();
     const sessionKey = liveModelSessionKey(body);
     const isLiveRequest = isLikelyLiveWorkRequest(body) || isToolContinuation(body);
     const isLiveSessionRequest = isLiveRequest || isLikelyLiveModelIntentRequest(body, this.isRealtimeActive());
 
-    // A spoken model choice is exactly the same state change as clicking a
-    // model in the floating-ball picker. The voice turn itself stays native;
-    // the binding is used by the next real work handoff.
-    if (isLiveSessionRequest) {
+    // Explicit model speech remains a force action even in automatic mode.
+    // The voice turn itself stays native; the binding is used by the next
+    // actual work handoff.
+    if (isLiveSessionRequest && (mode === "auto" || this.isLiveModelPickerEnabled())) {
       const requestedModel = extractLiveModelIntent(body, this.liveModelIntentCandidates());
       if (requestedModel) {
-        const selected = this.bindLiveModel(requestedModel);
-        this.resolvePendingLiveModelSelection(selected, true);
-        console.log(`[OpenCodex Realtime] Voice model selection updated: ${selected}${isLiveRequest ? " (current work handoff)" : " (next work handoff)"}`);
-        return isLiveRequest ? selected : "";
+        const routeRequest = { ...this.liveRouteRequest(body), forced_model: requestedModel };
+        const route = this.taskRouter.resolve(routeRequest);
+        if (route.ok && route.model) {
+          this.taskRouter.record(routeRequest, route);
+          const selected = this.bindLiveModel(route.model);
+          this.resolvePendingLiveModelSelection(selected, true);
+          console.log(`[OpenCodex Realtime] Voice model selection updated: ${selected}${isLiveRequest ? " (current work handoff)" : " (next work handoff)"}`);
+          return isLiveRequest ? { model: selected, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "explicit voice model selection" } : null;
+        }
+        console.warn(`[OpenCodex Realtime] Explicit Live model was not routable: ${route.reason}`);
       }
     }
 
-    // If speech mentioned a model that is not present in the catalog, do not
-    // clear the current choice. This is the same as leaving the manual
-    // picker untouched: the previous choice remains the fallback.
-    // Live can send the next task without repeating the Live marker on every
-    // request, so keep using the bound model before opening a new picker.
+    if (mode === "off" || !isLiveRequest) return null;
+
+    if (mode === "auto") {
+      const routeRequest = this.liveRouteRequest(body);
+      const route = this.taskRouter.resolve(routeRequest);
+      if (route.ok && route.model) {
+        this.taskRouter.record(routeRequest, route);
+        console.log(`[OpenCodex Realtime] Auto-routed Live work: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
+        return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason };
+      }
+      console.warn(`[OpenCodex Realtime] Auto routing did not select a model: ${route.reason}`);
+      return null;
+    }
+
+    const settings = this.taskRouter.getSettings();
+    if (settings.forced_model || settings.forced_profile_id) {
+      const routeRequest = {
+        ...this.liveRouteRequest(body),
+        forced_model: settings.forced_model || "",
+        profile_id: settings.forced_profile_id || "",
+      };
+      const route = this.taskRouter.resolve(routeRequest);
+      if (route.ok && route.model) {
+        this.taskRouter.record(routeRequest, route);
+        this.bindLiveModel(route.model);
+        return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason };
+      }
+      console.warn(`[OpenCodex Realtime] Forced routing did not select a model: ${route.reason}`);
+      return null;
+    }
+
+    if (!this.isLiveModelPickerEnabled()) return null;
+
+    // Legacy 1.0.8 floating-picker behavior.
     const sessionBinding = this.liveModelBindings.get(sessionKey);
     if (sessionBinding?.expiresAt > now) {
       sessionBinding.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
       this.activeLiveModel = sessionBinding;
-      return sessionBinding.model;
+      return { model: sessionBinding.model, reason: "existing Live picker binding" };
     }
     if (sessionBinding) this.liveModelBindings.delete(sessionKey);
 
-    if (this.activeLiveModel?.expiresAt > now && isLiveRequest) {
-      // GPT-Live uses one floating-ball choice, so keep that choice across
-      // Live tasks even when the upstream conversation/session id changes.
+    if (this.activeLiveModel?.expiresAt > now) {
       this.activeLiveModel.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
       this.liveModelBindings.set(sessionKey, this.activeLiveModel);
-      return this.activeLiveModel.model;
+      return { model: this.activeLiveModel.model, reason: "active Live picker binding" };
     }
     if (this.activeLiveModel?.expiresAt <= now) this.activeLiveModel = null;
     this.liveModelBindings.delete(sessionKey);
-    if (!isLiveRequest) return "";
 
     const models = this.availableRealtimeWorkModels();
     if (models.length === 0) {
       console.warn("[OpenCodex Realtime] No models available for the Live picker; falling back to the desktop model");
-      return "";
+      return null;
     }
 
     const requestId = randomUUID();
@@ -1140,21 +1772,17 @@ export class CodexBridgeServer {
         expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
       };
       this.liveModelBindings.set(sessionKey, this.activeLiveModel);
-      return selected;
+      return { model: selected, reason: "manual Live picker selection" };
     }
 
-    // Do not leave the Live request waiting forever when the user ignores the
-    // floating ball. The incoming model is the desktop's current/default
-    // model, so use it as the deterministic timeout fallback and remember it
-    // for the following Live task.
     const fallbackModel = normalizeRealtimeWorkModel(body?.model);
     if (fallbackModel) {
       this.bindLiveModel(fallbackModel);
       console.warn(`[OpenCodex Realtime] Live picker timed out; using incoming default model: ${fallbackModel}`);
-      return fallbackModel;
+      return { model: fallbackModel, reason: "Live picker timeout fallback" };
     }
     console.warn("[OpenCodex Realtime] Live picker timed out; no incoming default model was available");
-    return "";
+    return null;
   }
 
   private pendingLiveModelPicker(): any {
@@ -1360,6 +1988,10 @@ export class CodexBridgeServer {
   }
 
   private parseJsonBody(req: http.IncomingMessage): Promise<any> {
+    return this.parseJsonRequest(req).then((request) => request.body);
+  }
+
+  private parseJsonRequest(req: http.IncomingMessage): Promise<{ body: any; rawBody: Buffer }> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
@@ -1379,7 +2011,7 @@ export class CodexBridgeServer {
           const contentEncoding = req.headers["content-encoding"] as string | null;
           const decompressed = RequestDecompressor.decompressBody(rawBuffer, contentEncoding);
           const str = decompressed.toString("utf-8");
-          resolve(str ? JSON.parse(str) : {});
+          resolve({ body: str ? JSON.parse(str) : {}, rawBody: decompressed });
         } catch (err) {
           reject(new Error("Invalid JSON body"));
         }
@@ -1520,19 +2152,26 @@ export class CodexBridgeServer {
     return readOfficialModelMap().has(requested);
   }
 
-  private async proxyNativeResponses(req: http.IncomingMessage, body: any, res: http.ServerResponse, endpoint = "responses"): Promise<void> {
+  private async proxyNativeResponses(req: http.IncomingMessage, body: any | Buffer, res: http.ServerResponse, endpoint = "responses"): Promise<void> {
     const nativeResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses";
     const targetUrl = endpoint === "responses"
       ? nativeResponsesEndpoint
       : `${nativeResponsesEndpoint}/${String(endpoint).replace(/^responses\/?/i, "")}`;
     const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
-    forwardHeaders["host"] = "chatgpt.com";
+    const requestBody = Buffer.isBuffer(body)
+      ? body
+      : typeof body === "string"
+        ? body
+        : JSON.stringify(body);
 
     try {
       const upstreamRes = await fetchUpstream(targetUrl, {
         method: "POST",
         headers: forwardHeaders,
-        body: JSON.stringify(body),
+        // Keep the decompressed JSON bytes unchanged. Undici's BodyInit type
+        // does not include Node's Buffer type even though fetch accepts it at
+        // runtime.
+        body: requestBody as any,
         maxAttempts: 1,
         timeoutMs: 600_000,
         operation: endpoint === "responses" ? "native-responses" : "native-responses-compact",
@@ -1569,7 +2208,7 @@ export class CodexBridgeServer {
     req: http.IncomingMessage,
     body: any,
     res: http.ServerResponse,
-    streamOutput = false,
+    rawBody?: Buffer,
   ): Promise<void> {
     const rawRequestedModel = body?.model || "deepseek-v4-pro";
     const requestedModel = this.stripReasoningSuffix(String(rawRequestedModel));
@@ -1578,14 +2217,9 @@ export class CodexBridgeServer {
     const provider = nativeModel ? null : this.findCatalogProvider(requestedModel, providers);
 
     if (!provider && nativeModel) {
-      const cleaned = sanitizeNativeResponsesBody(body);
-      if (cleaned.expandedCompactionItems || cleaned.removedReasoningItems || cleaned.removedPreviousResponseId) {
-        console.warn(
-          `[OpenCodex Native] Sanitized compaction request: expanded=${cleaned.expandedCompactionItems}, ` +
-          `reasoning=${cleaned.removedReasoningItems}, previous_response_id=${cleaned.removedPreviousResponseId}`,
-        );
-      }
-      await this.proxyNativeResponses(req, cleaned.body, res, "responses/compact");
+      // The native provider owns compaction. The gateway only selects the
+      // compact endpoint and forwards the request bytes unchanged.
+      await this.proxyNativeResponses(req, rawBody ?? body, res, "responses/compact");
       return;
     }
 
@@ -1602,34 +2236,33 @@ export class CodexBridgeServer {
     const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
     const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
     const protocol = body?.protocol || this.findCatalogProtocol(requestedModel, provider);
-    const result = await this.router.compactResponses(
-      { ...body, model: upstreamModel, protocol },
-      upstreamModel,
-      apiKey,
-      rawUrl,
-      provider.name,
-    );
-    if (body?.stream === true || (streamOutput && body?.stream !== false)) {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
-      });
-      res.socket?.setNoDelay(true);
-      const events = buildCompactionStreamEvents(
-        result.model || upstreamModel,
-        result.output?.[0]?.encrypted_content || "",
-        result.usage,
-      );
-      for (const event of events) await writeSseData(res, event);
-      if (!res.writableEnded) await writeHttpResponseChunked(res, "data: [DONE]\n\n");
-      if (!res.writableEnded) res.end();
+    if (String(protocol || "").toLowerCase() !== "responses") {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: `Provider model "${rawRequestedModel}" does not expose the native Responses compaction endpoint`,
+        type: "compaction_unsupported",
+      }));
       return;
     }
-    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-    await writeHttpResponseChunked(res, JSON.stringify(result));
-    if (!res.writableEnded) res.end();
+
+    // A Responses-capable third-party provider owns its own compaction. The
+    // gateway only translates the backend model name and forwards the native
+    // compact request. There is intentionally no summary or envelope fallback.
+    const nativeCompaction = await this.router.proxyNativeThirdPartyCompaction(
+      { ...body, model: upstreamModel, protocol },
+      upstreamModel,
+      requestedModel,
+      apiKey,
+      rawUrl,
+      res,
+    );
+    if (nativeCompaction === "unsupported" && !res.headersSent) {
+      res.writeHead(501, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: `Provider model "${rawRequestedModel}" does not expose the native Responses compaction endpoint`,
+        type: "compaction_unsupported",
+      }));
+    }
   }
 
   private ensurePythonScripts() {
@@ -2125,6 +2758,21 @@ if __name__ == "__main__":
     const configPath = path.join(os.homedir(), ".codex", "config.toml");
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+    const startupCatalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    let startupCatalog: any = { models: [] };
+    if (fs.existsSync(startupCatalogPath)) {
+      try { startupCatalog = JSON.parse(fs.readFileSync(startupCatalogPath, "utf-8")); } catch {}
+    }
+    const startupHasThirdPartyModels = hasThirdPartyModels(CredentialStore.loadProviders(), startupCatalog);
+    if (managedConfig.includes("opencodex managed") && !startupHasThirdPartyModels) {
+      try {
+        managedConfig = buildCodexRoutingConfig(managedConfig, this.port, this.adminToken, startupCatalogPath, false);
+        fs.writeFileSync(configPath, managedConfig, "utf-8");
+        console.log("[OpenCodex Gateway] Removed stale managed routing; native Codex remains active because no third-party models are selected.");
+      } catch (err: any) {
+        console.warn(`[OpenCodex Gateway] Could not remove stale managed routing: ${err?.message || err}`);
+      }
+    }
     // Native mode deliberately leaves the imported catalog untouched. In
     // managed mode, always repair the catalog first so native Codex models
     // cannot disappear just because a third-party entry was deleted.
@@ -2206,7 +2854,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.0.8", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.0", opencodex: true }));
           return;
         }
 
@@ -2291,12 +2939,12 @@ if __name__ == "__main__":
         }
 
         // 2. Responses compaction. Codex uses /responses/compact for remote
-        // compaction v2; keep the body-level trigger for clients that send the
-        // trigger through the normal Responses path.
-        if (req.method === "POST" && isCompactionRequestPath(url.pathname)) {
+        // compaction v2. Ordinary /responses requests stay on the ordinary
+        // native route and are never reclassified by the gateway.
+        if (req.method === "POST" && isResponsesCompactionPath(url.pathname)) {
           try {
-            const body = await this.parseJsonBody(req);
-            await this.handleCompactionRequest(req, body, res, false);
+            const request = await this.parseJsonRequest(req);
+            await this.handleCompactionRequest(req, request.body, res, request.rawBody);
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(500, { "Content-Type": "application/json" });
@@ -2308,16 +2956,56 @@ if __name__ == "__main__":
 
         // 3. V2 Core: Responses API (/v1/responses)
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+          let subagentTaskId = "";
           try {
-            const body = await this.parseJsonBody(req);
-            if (isCompactionRequestBody(body)) {
-              await this.handleCompactionRequest(req, body, res, true);
-              return;
+            const request = await this.parseJsonRequest(req);
+            const body = request.body;
+            const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
+            const requestedModelBeforeRouting = this.stripReasoningSuffix(String(body?.model || ""));
+            const nativeModelRequest = Boolean(requestedModelBeforeRouting)
+              && this.isNativeCatalogModel(requestedModelBeforeRouting);
+            const nativePassthroughTurn = isNativeCodexPassthrough(nativeModelRequest, isSubagentRequest);
+            const subagentRoute = isSubagentRequest ? this.chooseSubagentRoute(body, req) : null;
+            // Native GPT turns are transport-only even while the gateway is
+            // active. The one deliberate exception is a native child turn:
+            // the gateway may inspect that boundary to select a configured
+            // subagent model. Once selected, native targets still use the
+            // native proxy and third-party targets use the provider router.
+            const liveWorkRoute = isSubagentRequest || nativePassthroughTurn
+              ? null
+              : await this.chooseLiveWorkRoute(body);
+            subagentTaskId = subagentRoute?.task_id || "";
+            const selectedWorkRoute = liveWorkRoute || subagentRoute;
+            let effectiveBody = body;
+            if (selectedWorkRoute) {
+              const selectedModel = this.stripReasoningSuffix(String(selectedWorkRoute.model || ""));
+              const thirdPartyWorkRoute = Boolean(selectedModel) && !this.isNativeCatalogModel(selectedModel);
+              effectiveBody = { ...body, model: selectedWorkRoute.model };
+              if (thirdPartyWorkRoute) {
+                // The parent native turn may carry an effort such as `max`
+                // that the selected provider does not understand. The route
+                // resolver has already normalized it against the target
+                // catalog; never leak the inherited native value downstream.
+                delete effectiveBody.reasoning;
+                delete effectiveBody.reasoning_effort;
+                if (selectedWorkRoute.reasoning_effort) {
+                  effectiveBody.reasoning = { effort: selectedWorkRoute.reasoning_effort };
+                  effectiveBody.reasoning_effort = selectedWorkRoute.reasoning_effort;
+                }
+                if (isSubagentRequest) {
+                  // A worker no longer receives the nested spawn control after
+                  // runtime tool filtering, so keep its provider turn
+                  // sequential. The parent native turn retains its own
+                  // parallel_tool_calls value untouched.
+                  effectiveBody.parallel_tool_calls = false;
+                }
+              } else if (selectedWorkRoute.reasoning_effort) {
+                effectiveBody.reasoning = { ...(body.reasoning || {}), effort: selectedWorkRoute.reasoning_effort };
+                effectiveBody.reasoning_effort = selectedWorkRoute.reasoning_effort;
+              }
             }
-            const liveWorkModel = await this.chooseLiveWorkModel(body);
-            const effectiveBody = liveWorkModel ? { ...body, model: liveWorkModel } : body;
-            if (liveWorkModel && body.model !== liveWorkModel) {
-              console.log(`[OpenCodex Realtime] Applied selected Live work model: ${body.model || "(default)"} -> ${liveWorkModel}`);
+            if (selectedWorkRoute?.model && body.model !== selectedWorkRoute.model) {
+              console.log(`[OpenCodex Routing] Applied selected work model: ${body.model || "(default)"} -> ${selectedWorkRoute.model}`);
             }
             console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
             const rawRequestedModel = effectiveBody.model || "deepseek-v4-pro";
@@ -2333,13 +3021,15 @@ if __name__ == "__main__":
 
             if (!provider) {
               if (nativeModel) {
-                const cleaned = sanitizeNativeResponsesBody(effectiveBody);
-                if (cleaned.removedReasoningItems || cleaned.removedPreviousResponseId) {
-                  console.warn(`[OpenCodex Native] Removed incompatible third-party history: reasoning=${cleaned.removedReasoningItems}, previous_response_id=${cleaned.removedPreviousResponseId}`);
-                }
-                await this.proxyNativeResponses(req, cleaned.body, res);
+                // Keep the native GPT lane transparent. No body-level
+                // translation, reasoning rewrite, or provider fallback is
+                // allowed here.
+                const nativeRawBody = effectiveBody === body ? request.rawBody : undefined;
+                await this.proxyNativeResponses(req, nativeRawBody ?? effectiveBody, res);
+                if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
                 return;
               }
+              if (subagentTaskId) this.subagentOrchestrator.fail(subagentTaskId, "selected subagent model is not present in an imported provider catalog");
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({
                 error: `Model "${rawRequestedModel}" is not present in an imported provider catalog; no fallback provider was selected`
@@ -2352,7 +3042,18 @@ if __name__ == "__main__":
             const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
             const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
             const protocol = effectiveBody.protocol || this.findCatalogProtocol(requestedModel, provider);
-            const routingBody = protocol ? { ...effectiveBody, protocol } : effectiveBody;
+            const normalizedReasoning = this.taskRouter.normalizeReasoningEffort(
+              requestedModel,
+              effectiveBody?.reasoning?.effort || effectiveBody?.reasoning_effort,
+              true,
+            );
+            const routingBody = protocol ? { ...effectiveBody, protocol } : { ...effectiveBody };
+            delete routingBody.reasoning;
+            delete routingBody.reasoning_effort;
+            if (normalizedReasoning) {
+              routingBody.reasoning = { effort: normalizedReasoning };
+              routingBody.reasoning_effort = normalizedReasoning;
+            }
             const providerUrl = rawUrl;
 
             const nativeImageHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
@@ -2365,8 +3066,11 @@ if __name__ == "__main__":
               provider.name,
               nativeImageHeaders,
               requestedModel,
+              isSubagentRequest,
             );
+            if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
           } catch (err: any) {
+            if (subagentTaskId) this.subagentOrchestrator.fail(subagentTaskId, err?.message || "subagent request failed");
             if (!res.headersSent) {
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: err.message }));
@@ -2448,6 +3152,126 @@ if __name__ == "__main__":
           this.resetLiveModelPicker();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, reset: true }));
+          return;
+        }
+
+        // 1.1.0 Agent Profile and routing APIs. Profiles are user-owned
+        // policy data; the imported model catalog remains a separate derived
+        // inventory and is never rewritten by these endpoints.
+        if (req.method === "GET" && url.pathname === "/api/agent-routing/catalog") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ models: this.taskRouter.listModels() }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/agent-profiles") {
+          const profiles = this.taskRouter.listProfiles();
+          const models = this.taskRouter.listModels();
+          const availability = new Map(models.map((model) => [`${model.provider}|${model.backend_model}`.toLowerCase(), model]));
+          const enriched = profiles.map((profile) => {
+            const ref = profile.model_ref;
+            const model = ref
+              ? models.find((candidate) =>
+                (ref.catalog_slug && candidate.slug === ref.catalog_slug) ||
+                (candidate.provider === ref.provider.toLowerCase() && candidate.backend_model === ref.backend_model)
+              )
+              : undefined;
+            return { ...profile, model_available: Boolean(model?.available), catalog_model: model || null };
+          });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ profiles: enriched, models, routing: this.taskRouter.getSettings(), availability_count: availability.size }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/agent-profiles") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const profile = this.agentProfileStore.upsertProfile(body);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ profile }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const profilePathMatch = url.pathname.match(/^\/api\/agent-profiles\/([^/]+)$/);
+        if (profilePathMatch && req.method === "PUT") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const profile = this.agentProfileStore.upsertProfile({ ...body, id: decodeURIComponent(profilePathMatch[1]) });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ profile }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (profilePathMatch && req.method === "DELETE") {
+          const deleted = this.agentProfileStore.deleteProfile(decodeURIComponent(profilePathMatch[1]));
+          res.writeHead(deleted ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(deleted ? { ok: true } : { error: "Agent Profile 不存在" }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/agent-routing/settings") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(this.taskRouter.getSettings()));
+          return;
+        }
+
+        if ((req.method === "POST" || req.method === "PUT") && url.pathname === "/api/agent-routing/settings") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const settings = this.agentProfileStore.saveRoutingSettings(body);
+            // Auto mode must not leave the 1.0.8 floating picker waiting for a
+            // selection. Forced mode without a fixed target keeps that picker.
+            const pickerEnabled = settings.mode === "forced" && !settings.forced_model && !settings.forced_profile_id;
+            this.setLiveModelPickerEnabled(pickerEnabled);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(settings));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/agent-routing/preview") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const route = this.taskRouter.resolve(body || {});
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ route }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/agent-routing/events") {
+          const limit = Number(url.searchParams.get("limit") || 100);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ events: this.agentProfileStore.readRouteEvents(limit) }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/agent-tasks") {
+          const limit = Number(url.searchParams.get("limit") || 100);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ tasks: this.subagentOrchestrator.list(limit) }));
+          return;
+        }
+
+        const agentTaskPathMatch = url.pathname.match(/^\/api\/agent-tasks\/([^/]+)\/cancel$/);
+        if (agentTaskPathMatch && req.method === "POST") {
+          const task = this.subagentOrchestrator.requestCancel(decodeURIComponent(agentTaskPathMatch[1]));
+          res.writeHead(task ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(task ? { task, note: "已记录取消请求；原生 Desktop 子任务是否立即停止由 Desktop 生命周期决定" } : { error: "子任务不存在" }));
           return;
         }
 
@@ -2679,11 +3503,17 @@ if __name__ == "__main__":
               preserveOfficialModels(catalog);
               fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
-              // Ensure opencodex managed block is enabled in config.toml
+              // Enable or remove the managed block according to the final
+              // selected-model state. Saving credentials alone must not route
+              // native Codex traffic through the gateway.
               const configPath = path.join(os.homedir(), ".codex", "config.toml");
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
-                fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
+                fs.writeFileSync(
+                  configPath,
+                  buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasThirdPartyModels(providers, catalog)),
+                  "utf-8",
+                );
               }
               // The catalog file is the source of truth, but Codex's desktop
               // picker reads its local model cache on the next launch. Keep
@@ -2814,11 +3644,16 @@ if __name__ == "__main__":
             preserveOfficialModels(catalog);
             fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
-            // Also ensure opencodex block is enabled in config.toml
+            // CLI imports add provider-owned models, so managed routing is
+            // enabled only when the final catalog actually contains one.
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
+              fs.writeFileSync(
+                configPath,
+                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasThirdPartyModels(CredentialStore.loadProviders(), catalog)),
+                "utf-8",
+              );
             }
             CatalogSyncService.syncCustomModelsToCodexCache();
 
@@ -4768,19 +5603,21 @@ if __name__ == "__main__":
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
             const configPath = path.join(os.homedir(), ".codex", "config.toml");
 
-            let hasModels = false;
+            let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
-              try {
-                const cat = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
-                hasModels = Array.isArray(cat.models) && cat.models.length > 0;
-              } catch {}
+              try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
             }
+            const hasModels = hasThirdPartyModels(CredentialStore.loadProviders(), catalog);
 
-            if (hasModels && fs.existsSync(configPath)) {
+            if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              fs.writeFileSync(configPath, buildManagedCodexConfig(content, this.port, this.adminToken, catalogPath), "utf-8");
+              fs.writeFileSync(
+                configPath,
+                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasModels),
+                "utf-8",
+              );
               CatalogSyncService.syncCustomModelsToCodexCache();
-              console.log("[OpenCodex Gateway] Applied gateway proxy and custom model catalog to config.toml before restart.");
+              console.log(`[OpenCodex Gateway] Applied ${hasModels ? "managed gateway" : "native"} Codex routing before restart.`);
             }
 
             // Codex reads model_catalog_json only when the desktop process
@@ -4944,24 +5781,33 @@ if __name__ == "__main__":
             if (providersChanged) CredentialStore.saveProviders(providers);
 
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
-              const data = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
-              if (Array.isArray(data.models)) {
-                preserveOfficialModels(data);
-                data.models = data.models.filter((model: any) => {
+              catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
+              if (Array.isArray(catalog.models)) {
+                preserveOfficialModels(catalog);
+                catalog.models = catalog.models.filter((model: any) => {
                   // Native Codex models are immutable from the web manager.
                   if (!catalogModelOwner(model)) return true;
                   return ![model.id, model.slug, model.model, model.backend_model]
                     .filter(Boolean)
                     .some((value: any) => ids.includes(String(value)));
                 });
-                preserveOfficialModels(data);
-                fs.writeFileSync(catalogPath, JSON.stringify(data, null, 2), "utf-8");
+                preserveOfficialModels(catalog);
+                fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
                 CatalogSyncService.syncCustomModelsToCodexCache();
               }
             }
+            const gatewayActive = hasThirdPartyModels(providers, catalog);
+            if (!gatewayActive) {
+              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              if (fs.existsSync(configPath)) {
+                const content = fs.readFileSync(configPath, "utf-8");
+                fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
+              }
+            }
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", deleted: ids }));
+            res.end(JSON.stringify({ status: "success", deleted: ids, gateway_active: gatewayActive }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
@@ -4979,9 +5825,10 @@ if __name__ == "__main__":
             CredentialStore.saveProviders(providers);
 
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
               try {
-                const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
+                catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
                 if (Array.isArray(catalog.models)) {
                   catalog.models = catalog.models.filter((model: any) =>
                     String(model.backend_provider || model.provider_name || "").toLowerCase() !== String(providerName).toLowerCase()
@@ -4992,9 +5839,17 @@ if __name__ == "__main__":
                 }
               } catch {}
             }
+            const gatewayActive = hasThirdPartyModels(providers, catalog);
+            if (!gatewayActive) {
+              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              if (fs.existsSync(configPath)) {
+                const content = fs.readFileSync(configPath, "utf-8");
+                fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
+              }
+            }
 
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", deleted: providerName }));
+            res.end(JSON.stringify({ status: "success", deleted: providerName, gateway_active: gatewayActive }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
