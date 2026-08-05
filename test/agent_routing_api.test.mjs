@@ -27,7 +27,9 @@ function request(url, options = {}) {
 test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-agent-api-"));
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  const previousConfigPath = process.env.OPENCODEX_CODEX_CONFIG_PATH;
   process.env.OPENCODEX_DATA_DIR = dataDir;
+  process.env.OPENCODEX_CODEX_CONFIG_PATH = path.join(dataDir, "config.toml");
   await fs.writeFile(path.join(dataDir, "custom_model_catalog.json"), JSON.stringify({ models: [{
     slug: "antigravity/code-model",
     backend_model: "gemini-code-1",
@@ -43,6 +45,8 @@ test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => 
       t.skip("sandbox forbids local listen; run this integration test outside the restricted test environment");
       if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
       else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+      if (previousConfigPath === undefined) delete process.env.OPENCODEX_CODEX_CONFIG_PATH;
+      else process.env.OPENCODEX_CODEX_CONFIG_PATH = previousConfigPath;
       await fs.rm(dataDir, { recursive: true, force: true });
       return;
     }
@@ -83,6 +87,8 @@ test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => 
     if (started) await server.stop();
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    if (previousConfigPath === undefined) delete process.env.OPENCODEX_CODEX_CONFIG_PATH;
+    else process.env.OPENCODEX_CODEX_CONFIG_PATH = previousConfigPath;
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });

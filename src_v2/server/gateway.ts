@@ -147,6 +147,11 @@ function buildModelProtocolMap(
   return result;
 }
 
+export function codexConfigPath(): string {
+  const configured = String(process.env.OPENCODEX_CODEX_CONFIG_PATH || "").trim();
+  return configured || path.join(os.homedir(), ".codex", "config.toml");
+}
+
 export function stripManagedCodexConfig(content: string): string {
   let cleaned = content || "";
   cleaned = cleaned.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed (?:>>>|<<<)\r?\n?/gi, "");
@@ -2789,7 +2794,7 @@ if __name__ == "__main__":
       this.releaseServerLock();
       throw error;
     }
-    const configPath = path.join(os.homedir(), ".codex", "config.toml");
+    const configPath = codexConfigPath();
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
     const startupCatalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
@@ -3115,7 +3120,7 @@ if __name__ == "__main__":
 
         // 3. Dashboard REST API Routes
         if (req.method === "GET" && url.pathname === "/api/gateway/status") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let active = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -3327,7 +3332,7 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/providers") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let isGatewayActive = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -3540,7 +3545,7 @@ if __name__ == "__main__":
               // Enable or remove the managed block according to the final
               // selected-model state. Saving credentials alone must not route
               // native Codex traffic through the gateway.
-              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              const configPath = codexConfigPath();
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
                 fs.writeFileSync(
@@ -3565,7 +3570,7 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/cli-bridge/status") {
-          const configPath = path.join(os.homedir(), ".codex", "config.toml");
+          const configPath = codexConfigPath();
           let isGatewayActive = false;
           if (fs.existsSync(configPath)) {
             const content = fs.readFileSync(configPath, "utf-8");
@@ -3680,7 +3685,7 @@ if __name__ == "__main__":
 
             // CLI imports add provider-owned models, so managed routing is
             // enabled only when the final catalog actually contains one.
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
               fs.writeFileSync(
@@ -5635,7 +5640,7 @@ if __name__ == "__main__":
           this.gatewayRestartInProgress = true;
           try {
             const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
 
             let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
@@ -5834,7 +5839,7 @@ if __name__ == "__main__":
             }
             const gatewayActive = hasThirdPartyModels(providers, catalog);
             if (!gatewayActive) {
-              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              const configPath = codexConfigPath();
               if (fs.existsSync(configPath)) {
                 const content = fs.readFileSync(configPath, "utf-8");
                 fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
@@ -5875,7 +5880,7 @@ if __name__ == "__main__":
             }
             const gatewayActive = hasThirdPartyModels(providers, catalog);
             if (!gatewayActive) {
-              const configPath = path.join(os.homedir(), ".codex", "config.toml");
+              const configPath = codexConfigPath();
               if (fs.existsSync(configPath)) {
                 const content = fs.readFileSync(configPath, "utf-8");
                 fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
@@ -6062,7 +6067,7 @@ if __name__ == "__main__":
             CredentialStore.saveProviders(clearedProviders);
             this.config.providers = clearedProviders;
 
-            const configPath = path.join(os.homedir(), ".codex", "config.toml");
+            const configPath = codexConfigPath();
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
               content = stripManagedCodexConfig(content);

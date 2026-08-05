@@ -12,7 +12,7 @@ import { ProviderConfig } from "../core/types.js";
 import { CredentialStore } from "./credential_store.js";
 import { NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS } from "./computer_use_native.js";
 
-import { stripManagedCodexConfig } from "../server/gateway.js";
+import { codexConfigPath, stripManagedCodexConfig } from "../server/gateway.js";
 
 const DEFAULT_REASONING_PRESETS = [
   { effort: "low", description: "轻度推理（速度优先）" },
@@ -742,7 +742,7 @@ export class CatalogSyncService {
 
   public static getOfficialModels(): any[] {
     try {
-      const configPath = path.join(os.homedir(), ".codex", "config.toml");
+      const configPath = codexConfigPath();
       if (!fs.existsSync(configPath)) return [];
       const backup = fs.readFileSync(configPath, "utf-8");
       const tempContent = stripManagedCodexConfig(backup);
