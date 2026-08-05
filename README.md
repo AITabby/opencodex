@@ -56,6 +56,12 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/04-model-catalog.png" alt="第三方模型目录与服务商命名空间" width="960">
 </p>
 
+### Agent 路由与模型能力目录
+
+<p align="center">
+  <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
+</p>
+
 > 当前发布状态：macOS Apple Silicon `v1.1.1`，Windows `v1.0.8`。Linux 版本尚未发布。
 >
 > `v1.1.1` 在 `v1.1.0` 基础上修复了 GPT-Live 悬浮球随 DMG 启动自动出现的问题；GPT-Live 现在只在用户主动开启时启动。
@@ -87,6 +93,7 @@ OpenCodex 不替换 Codex Desktop，也不会把官方模型强行改走第三�
 | 🖥️ Computer Use | 让第三方模型使用 Codex 原生桌面操作执行器，支持截图结果和工具续接 |
 | 💬 会话中心 | 浏览本地 Codex 会话、查看可见上下文、删除会话、扫描并导入外部 Agent 会话 |
 | 🧰 Agent / MCP | 保留 Codex 原生 MCP 与工具能力，并兼容第三方模型的工具调用和连续执行 |
+| 🧭 Agent 路由 | 按模型能力说明和默认推理强度自动分配子任务，也支持强制指定模型或关闭路由 |
 | 🛡️ 原生保护 | 一键重启应用模型，或一键恢复原生 Codex，不破坏官方模型路径 |
 | 📋 日志与诊断 | 查看网关实时日志、服务商连接状态、模型测试状态和启动状态 |
 
@@ -173,7 +180,16 @@ GPT-Live 用于实时语音沟通和任务安排：
 - 支持在一次任务的连续续接过程中保持正确的模型绑定。
 - 原生 Realtime / WebRTC 通信保留独立路径，第三方网关路由不会覆盖原生 Live。
 
-### 8. 语音助手与 OpenCodexBar
+### 8. Agent 路由与模型能力目录
+
+Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务：
+
+- 在“模型能力目录”中，为已接入模型填写擅长领域 / 工作说明，选择该模型支持的默认推理强度，并决定是否参与自动分配。
+- 自动分配只使用用户保存的模型说明，不根据模型名称猜测能力；主 Agent 会根据任务难度决定是否拆分，以及使用 0、1 还是多个子 Agent。
+- 支持“自动分配”“强制选择”和“关闭路由”三种模式；强制模式下，每个子任务使用指定模型。
+- 能力说明和路由规则独立于模型导入目录，重新导入模型不会覆盖已保存的配置。
+
+### 9. 语音助手与 OpenCodexBar
 
 语音页包含完整的输入、输出和会话设置：
 
@@ -199,7 +215,7 @@ GPT-Live 用于实时语音沟通和任务安排：
 - 支持重启 Codex、等待 CDP 就绪并启动语音助手。
 - 提供 `/visualizer` 动效实验室，可预览和切换语音 HUD 主题。
 
-### 9. 会话中心与 Agent 导入
+### 10. 会话中心与 Agent 导入
 
 会话中心可以浏览 Codex 本地会话，并查看完整的可见对话内容：
 
@@ -219,7 +235,7 @@ GPT-Live 用于实时语音沟通和任务安排：
 
 导入后会把会话转换为 Codex 可识别的 rollout，并注册到 Codex 会话数据库，使它出现在 Desktop 侧边栏中。
 
-### 10. 应用、安全与还原
+### 11. 应用、安全与还原
 
 - 网关默认只监听 `127.0.0.1`，不直接暴露到局域网。
 - 管理接口使用本地 admin cookie / bearer 授权。
@@ -341,7 +357,7 @@ OpenCodex 正在持续迭代。当前发布状态：
 
 ### A local AI workspace for Codex Desktop
 
-OpenCodex is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
+OpenCodex is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
 Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway.
 
@@ -356,6 +372,8 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 ![Agent session scanning](./assets/screenshots/03-agent-session-scan.png)
 
 ![Enabled model catalog](./assets/screenshots/04-model-catalog.png)
+
+![Agent routing and model capability directory](./assets/screenshots/05-agent-routing.png)
 
 ### Current releases
 
@@ -410,6 +428,13 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 - TTS: Edge TTS, Volcengine / Doubao, MiniMax, MiMo, or OpenAI-compatible TTS APIs.
 - VAD threshold and silence duration, interaction mode, voice prompt, voice model, and HUD theme settings.
 - OpenCodexBar global voice bar, CDP restart flow, and the `/visualizer` theme lab.
+
+#### Agent routing and model capability directory
+
+- Write a capability or work description for each connected model, choose a supported default reasoning level, and decide whether it participates in automatic assignment.
+- Automatic assignment uses the descriptions saved by the user; the main Agent decides whether to split a task and how many sub-agents to use.
+- Routing supports automatic assignment, a forced model, or routing disabled. Forced mode sends each subtask to the selected model.
+- Routing rules and capability descriptions are independent from the imported model directory and survive model re-imports.
 
 #### Sessions and Agent import
 
