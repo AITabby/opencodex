@@ -231,7 +231,7 @@ test("1.1.0 routes from the user's model capability description and preserves it
   }
 });
 
-test("1.1.0 forced routing wins over auto and task reasoning overrides Profile default", async () => {
+test("1.1.0 forced routing uses the request reasoning when the target has no bound Profile", async () => {
   const dataDir = await fixture();
   try {
     const store = new AgentProfileStore(dataDir);
@@ -253,7 +253,7 @@ test("1.1.0 forced routing wins over auto and task reasoning overrides Profile d
   }
 });
 
-test("1.1.0 honors an explicit per-turn reasoning choice over a saved Profile default", async () => {
+test("1.1.0 keeps a saved Profile reasoning setting over an explicit per-turn value", async () => {
   const dataDir = await fixture();
   try {
     const store = new AgentProfileStore(dataDir);
@@ -272,7 +272,7 @@ test("1.1.0 honors an explicit per-turn reasoning choice over a saved Profile de
       reasoning_effort: "low",
     });
     assert.equal(route.ok, true);
-    assert.equal(route.reasoning_effort, "low");
+    assert.equal(route.reasoning_effort, "high");
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
@@ -496,6 +496,44 @@ test("1.1.0 routes an actual native subagent request through the shared gateway 
   }
 });
 
+test("1.1.0 binds an explicitly named native child model to its Web Profile reasoning", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.upsertProfile({
+      id: "code",
+      name: "代码实现",
+      description: "负责代码实现",
+      model_ref: { provider: "antigravity", backend_model: "gemini-code-1", catalog_slug: "antigravity/code-model" },
+      reasoning_effort: "high",
+      subagent_enabled: true,
+    });
+    store.saveRoutingSettings({ mode: "auto" });
+
+    const server = new CodexBridgeServer(0);
+    const route = server.chooseSubagentRoute({
+      model: "antigravity/code-model",
+      reasoning: { effort: "low" },
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "parent-profile",
+        thread_id: "child-profile",
+        parent_thread_id: "parent-profile",
+      },
+      input: "请完成代码实现",
+    });
+    assert.equal(route?.model, "antigravity/code-model");
+    assert.equal(route?.reasoning_effort, "high");
+    server.subagentOrchestrator.complete(route.task_id);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("1.1.0 recognizes native subagent headers and ignores their prewarm request", async () => {
   const dataDir = await fixture();
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
@@ -575,18 +613,34 @@ test("1.1.0 accepts multiple child requests from one parent and routes each inde
 
     const server = new CodexBridgeServer(0);
     const first = server.chooseSubagentRoute({
-      client_metadata: { "x-openai-subagent": "1", session_id: "child-implementation", parent_task_id: "parent-1" },
+      client_metadata: {
+        "x-openai-subagent": "1",
+        // Real child turns can inherit the parent's session_id while exposing
+        // their own thread_id. The latter must be the routing identity.
+        session_id: "parent-1",
+        thread_id: "child-implementation",
+        parent_thread_id: "parent-1",
+        parent_task_id: "parent-1",
+      },
       task_type: "implementation",
       input: "完成一个快速的前端实现任务",
     });
     const second = server.chooseSubagentRoute({
-      client_metadata: { "x-openai-subagent": "1", session_id: "child-review", parent_task_id: "parent-1" },
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "parent-1",
+        thread_id: "child-review",
+        parent_thread_id: "parent-1",
+        parent_task_id: "parent-1",
+      },
       task_type: "review",
       input: "进行一次复杂的架构审查",
     });
 
     assert.equal(first?.model, "antigravity/code-model");
     assert.equal(second?.model, "thirdparty/review-model");
+    assert.equal(first?.task_id, "child-implementation");
+    assert.equal(second?.task_id, "child-review");
     assert.equal(server.subagentOrchestrator.list(10).filter((task) => task.parent_task_id === "parent-1").length, 2);
   } finally {
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;

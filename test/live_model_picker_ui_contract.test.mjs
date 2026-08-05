@@ -35,6 +35,9 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(gateway, /Do not let a generic/);
   assert.match(gateway, /this\.resetLiveModelPicker\(\)/);
   assert.match(gateway, /if \(!this\.isLiveModelPickerEnabled\(\)\) return/);
+  assert.doesNotMatch(gateway, /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);/);
+  assert.match(gatewayProcess, /OPENCODEX_LIVE_PICKER_PATH/);
+  assert.doesNotMatch(gatewayProcess, /adminToken = readAdminToken\(\);\s*startLiveModelPicker\(\);/);
   assert.match(floatingPicker, /rightMouseDown/);
   assert.doesNotMatch(floatingPicker, /取消当前模型/);
   assert.doesNotMatch(dashboard, /oncontextmenu/);

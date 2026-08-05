@@ -339,9 +339,10 @@ test("Codex restart waits for the new gateway before launching the desktop", asy
   assert.ok(
     restartBlock.indexOf("stopDesktopClients();") < restartBlock.indexOf('execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"]'),
   );
-  assert.match(
+  assert.match(gateway, /this\.launchDesktopAfterGatewayReadyIfRequested\(\);\s*resolve\(\);/);
+  assert.doesNotMatch(
     gateway,
-    /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);\s*resolve\(\);/,
+    /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);/,
   );
 });
 

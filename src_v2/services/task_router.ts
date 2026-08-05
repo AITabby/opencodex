@@ -495,13 +495,15 @@ export class TaskRouter {
     }
     const requestedReasoning = clean(request.reasoning_effort, 40);
     const profileReasoning = profile?.reasoning_effort;
-    // The request-level value is an explicit per-turn choice (including a
-    // value selected in Codex Desktop or passed to spawn_agent). The saved
-    // Profile is the fallback default only when that turn did not choose one.
+    // A saved Web Profile is the durable model binding. Once a Profile has
+    // been selected or explicitly bound, its reasoning setting must remain
+    // authoritative across routing modes; task-level values are only a
+    // fallback for models without a bound Profile.
+    const configuredReasoning = profileReasoning || requestedReasoning;
     const reasoning = normalizeReasoningForModel(
       model,
-      requestedReasoning || profileReasoning,
-      Boolean(request.preserve_reasoning_effort && requestedReasoning),
+      configuredReasoning,
+      Boolean(!profileReasoning && request.preserve_reasoning_effort && requestedReasoning),
     );
     return {
       ok: true,

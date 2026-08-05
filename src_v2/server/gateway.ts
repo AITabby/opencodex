@@ -1560,16 +1560,24 @@ export class CodexBridgeServer {
     const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
     const headerMetadata = requestTurnMetadata(req);
     const metadata = { ...headerMetadata, ...bodyMetadata };
+    // Codex child turns can carry the parent session in `session_id` while
+    // `thread_id` identifies the actual child. Route/task bindings must use
+    // the child identity first; otherwise concurrent children of one parent
+    // overwrite each other's model and lifecycle state.
     const taskId = String(
-      metadata.session_id ||
+      metadata.child_thread_id ||
+      metadata.subagent_thread_id ||
       metadata.thread_id ||
-      metadata.conversation_id ||
-      body?.session_id ||
+      body?.child_thread_id ||
+      body?.subagent_thread_id ||
       body?.thread_id ||
-      body?.conversation_id ||
-      requestHeader(req, "session-id") ||
       requestHeader(req, "thread-id") ||
       requestHeader(req, "x-client-request-id") ||
+      metadata.session_id ||
+      metadata.conversation_id ||
+      body?.session_id ||
+      body?.conversation_id ||
+      requestHeader(req, "session-id") ||
       "__active__",
     ).trim() || "__active__";
     const bodyModel = this.stripReasoningSuffix(String(body?.model || "").trim());
@@ -1591,6 +1599,27 @@ export class CodexBridgeServer {
       (!bodyModelIsNative ? bodyModel : "") ||
       "",
     ).trim();
+    const configuredProfiles = this.taskRouter.listProfiles();
+    const requestedProfileId = String(
+      body?.agent_profile_id ||
+      body?.profile_id ||
+      body?.subagent_profile_id ||
+      body?.child_profile_id ||
+      metadata.agent_profile_id ||
+      metadata.agentProfileId ||
+      metadata.profile_id ||
+      metadata.subagent_profile_id ||
+      metadata.child_profile_id ||
+      "",
+    ).trim();
+    const explicitProfile = requestedProfileId
+      ? configuredProfiles.find((profile: any) => profile.id === requestedProfileId)
+      : undefined;
+    const modelProfile = explicitModel ? this.findSubagentProfileForModel(explicitModel) : undefined;
+    // A model selected in the Web directory carries its own durable Profile.
+    // Bind that Profile here as well as in the gateway-owned spawn_agent path,
+    // so a parent-generated reasoning value cannot override its configuration.
+    const boundProfile = explicitProfile || modelProfile;
     const now = Date.now();
     for (const [bindingId, binding] of this.subagentRouteBindings) {
       if (binding.expiresAt <= now) this.subagentRouteBindings.delete(bindingId);
@@ -1604,9 +1633,13 @@ export class CodexBridgeServer {
     ).trim();
     if (existingBinding && (!explicitModel || explicitModel.toLowerCase() === existingBinding.route.model.toLowerCase())) {
       existingBinding.expiresAt = now + SUBAGENT_ROUTE_BINDING_TTL_MS;
-      const reasoning = explicitReasoning
+      const bindingProfile = existingBinding.route.profile_id
+        ? configuredProfiles.find((profile: any) => profile.id === existingBinding.route.profile_id)
+        : undefined;
+      const profileReasoning = boundProfile?.reasoning_effort || bindingProfile?.reasoning_effort;
+      const reasoning = profileReasoning || (explicitReasoning
         ? this.taskRouter.normalizeReasoningEffort(existingBinding.route.model, explicitReasoning, true) || existingBinding.route.reasoning_effort
-        : existingBinding.route.reasoning_effort;
+        : existingBinding.route.reasoning_effort);
       existingBinding.route = {
         ...existingBinding.route,
         ...(reasoning ? { reasoning_effort: reasoning } : {}),
@@ -1620,10 +1653,10 @@ export class CodexBridgeServer {
       task_text: extractTaskText(body),
       task_type: body?.task_type || metadata.task_type || metadata.taskType || "",
       tags: Array.isArray(body?.tags) ? body.tags : (Array.isArray(metadata.tags) ? metadata.tags : []),
-      profile_id: body?.agent_profile_id || body?.profile_id || body?.subagent_profile_id || body?.child_profile_id || metadata.agent_profile_id || metadata.agentProfileId || metadata.profile_id || metadata.subagent_profile_id || metadata.child_profile_id || "",
-      forced_model: explicitModel,
-      reasoning_effort: body?.reasoning?.effort || body?.reasoning_effort || metadata.reasoning_effort || "",
-      preserve_reasoning_effort: Boolean(explicitReasoning),
+      profile_id: boundProfile?.id || requestedProfileId,
+      forced_model: boundProfile ? "" : explicitModel,
+      reasoning_effort: boundProfile?.reasoning_effort || explicitReasoning,
+      preserve_reasoning_effort: Boolean(!boundProfile && explicitReasoning),
       required_tools: Array.isArray(body?.required_tools) ? body.required_tools : (Array.isArray(metadata.required_tools) ? metadata.required_tools : []),
       permission: body?.permission || metadata.permission || "",
     };
@@ -1638,6 +1671,7 @@ export class CodexBridgeServer {
       parent_task_id:
         metadata.parent_task_id ||
         metadata.parentThreadId ||
+        metadata.parent_thread_id ||
         body?.parent_task_id ||
         body?.parent_thread_id ||
         headerMetadata.parent_thread_id ||
@@ -2854,7 +2888,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.0", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.1", opencodex: true }));
           return;
         }
 
@@ -6399,7 +6433,9 @@ if __name__ == "__main__":
 
       this.server.listen(this.port, "127.0.0.1", () => {
         console.log(`[CodexBridge V2] Server listening on http://127.0.0.1:${this.port}`);
-        this.startLivePickerOverlay();
+        // GPT-Live's floating picker is opt-in. Do not relaunch a persisted
+        // picker just because the DMG/gateway has started; the settings POST
+        // below is the explicit user action that starts it.
         this.launchDesktopAfterGatewayReadyIfRequested();
         resolve();
       });
