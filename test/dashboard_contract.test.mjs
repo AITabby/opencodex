@@ -110,6 +110,13 @@ test("1.1.0 dashboard exposes the simple model capability directory", async () =
   assert.match(text, /medium/);
   assert.match(text, /high/);
   assert.match(text, /agentReasoningLabel/);
+  assert.match(text, /Agent Routing/);
+  assert.match(text, /Model Capability Directory/);
+  assert.match(text, /Assignment Rules/);
+  assert.match(text, /Loading model configurations/);
+  assert.match(text, /Reasoning: \$1/);
+  assert.match(text, /Strictly match task types/);
+  assert.match(text, /translateText/);
   assert.doesNotMatch(text, /agentReasoningOptions\(selected\)\{return \['', 'low', 'medium', 'high', 'xhigh', 'max'\]/);
   assert.match(text, /编辑/);
   assert.match(text, /view\.active#view-agent-routing/);

@@ -13,6 +13,7 @@ import {
   encodeComposerChatRequest,
   encodeGetChatRequest,
   encodeUnifiedChatRequest,
+  resolveCursorAgentModelSelector,
   cursorNativeToolRequest,
   frameConnectMessage,
 } from "../dist/services/cursor_protocol.js";
@@ -118,6 +119,133 @@ test("Cursor AvailableModels response decodes names and nested model metadata", 
     { slug: "composer", name: "composer" },
     { slug: "sonnet", name: "Claude Sonnet" },
   ]);
+});
+
+test("Cursor AvailableModels preserves AgentService selector IDs", () => {
+  const selector = new TextEncoder().encode("cursor-grok-4.5-high");
+  const model = bytes(
+    0x0a, 0x08, ...new TextEncoder().encode("grok-4.5"),
+    0x8a, 0x01, 0x0b, ...new TextEncoder().encode("Cursor Grok"),
+    0xa2, 0x02, selector.length, ...selector,
+  );
+  const response = bytes(0x12, model.length, ...model);
+
+  assert.deepEqual(decodeAvailableModelsResponse(response), [{
+    slug: "grok-4.5",
+    name: "Cursor Grok",
+    agentModelIds: ["cursor-grok-4.5-high"],
+  }]);
+});
+
+test("Cursor resolves the selected effort from real AgentService metadata", () => {
+  const availableModels = [{
+    slug: "grok-4.5",
+    name: "Cursor Grok 4.5",
+    agentModelIds: [
+      "cursor-grok-4.5-low",
+      "cursor-grok-4.5-medium",
+      "cursor-grok-4.5-high",
+    ],
+  }];
+
+  assert.equal(
+    resolveCursorAgentModelSelector("grok-4.5", "high", availableModels),
+    "cursor-grok-4.5-high",
+  );
+  assert.equal(
+    resolveCursorAgentModelSelector("grok-4.5", "medium", availableModels),
+    "cursor-grok-4.5-medium",
+  );
+  assert.throws(
+    () => resolveCursorAgentModelSelector("grok-4.5", "xhigh", availableModels),
+    /不支持 reasoning_effort="xhigh"/,
+  );
+
+  // Composer is a Cursor-native model with only a fast selector and no
+  // low/medium/high variants; it must use the selector Cursor actually
+  // returned rather than the published picker slug.
+  assert.equal(
+    resolveCursorAgentModelSelector("composer-2.5", "high", [{
+      slug: "composer-2.5",
+      name: "Composer 2.5",
+      agentModelIds: ["composer-2.5-fast"],
+    }]),
+    "composer-2.5-fast",
+  );
+});
+
+test("Cursor selector resolution follows model-specific metadata naming", () => {
+  assert.equal(
+    resolveCursorAgentModelSelector("gpt-5.5", "xhigh", [{
+      slug: "gpt-5.5",
+      name: "GPT-5.5",
+      agentModelIds: ["gpt-5.5-high", "gpt-5.5-extra-high", "gpt-5.5-extra-high-fast"],
+    }]),
+    "gpt-5.5-extra-high",
+  );
+  assert.equal(
+    resolveCursorAgentModelSelector("claude-sonnet-4-6", "high", [{
+      slug: "claude-sonnet-4-6",
+      name: "Sonnet 4.6",
+      agentModelIds: [
+        "claude-4.6-sonnet-high",
+        "claude-4.6-sonnet-high-thinking",
+      ],
+    }]),
+    "claude-4.6-sonnet-high",
+  );
+  assert.equal(
+    resolveCursorAgentModelSelector("kimi-k3", "high", [{
+      slug: "kimi-k3",
+      name: "Kimi K3",
+      agentModelIds: ["kimi-k3-low", "kimi-k3-high", "kimi-k3-max"],
+    }]),
+    "kimi-k3-high",
+  );
+  assert.equal(
+    resolveCursorAgentModelSelector("glm-5.2", "high", [{
+      slug: "glm-5.2",
+      name: "GLM 5.2",
+      agentModelIds: ["glm-5.2-high", "glm-5.2-max"],
+    }]),
+    "glm-5.2-high",
+  );
+});
+
+test("Cursor does not fall back to a base slug when a requested effort is unavailable", () => {
+  assert.throws(
+    () => resolveCursorAgentModelSelector("kimi-k3", "medium", [{
+      slug: "kimi-k3",
+      name: "Kimi K3",
+      agentModelIds: ["kimi-k3-low", "kimi-k3-high", "kimi-k3-max"],
+    }]),
+    /不支持 reasoning_effort="medium"/,
+  );
+  assert.throws(
+    () => resolveCursorAgentModelSelector("gpt-5.3-codex", "medium", [{
+      slug: "gpt-5.3-codex",
+      name: "Codex 5.3",
+      agentModelIds: ["gpt-5.3-codex-low", "gpt-5.3-codex-fast", "gpt-5.3-codex-high"],
+    }]),
+    /不支持 reasoning_effort="medium"/,
+  );
+});
+
+test("Cursor AgentService regression sends the resolved modelId", () => {
+  const availableModels = [{
+    slug: "grok-4.5",
+    name: "Cursor Grok 4.5",
+    agentModelIds: ["cursor-grok-4.5-high"],
+  }];
+  const modelId = resolveCursorAgentModelSelector("grok-4.5", "high", availableModels);
+  const framed = encodeAgentRunRequest(
+    [{ role: "user", content: "hello" }],
+    modelId,
+    "request-grok-regression",
+    "conversation-grok-regression",
+  );
+  const message = fromBinary(AgentClientMessageSchema, framed.slice(5));
+  assert.equal(message.message.value.modelDetails?.modelId, "cursor-grok-4.5-high");
 });
 
 test("Cursor chat request contains conversation, model, request, and conversation IDs", () => {

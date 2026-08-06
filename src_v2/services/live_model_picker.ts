@@ -1,6 +1,31 @@
 export const LIVE_MODEL_PICKER_TIMEOUT_MS = 15 * 1000;
 export const LIVE_MODEL_BINDING_TTL_MS = 30 * 60 * 1000;
 
+/**
+ * Keep the Live picker aligned with the Desktop model menu: native/official
+ * models are shown first, followed by provider-owned models. The input is
+ * sorted once for deterministic UI output, then partitioned without allowing
+ * a third-party model to move ahead of the official group.
+ */
+export function orderOfficialModelsFirst(models: string[], officialModels: Iterable<string> = []): string[] {
+  const unique = Array.from(new Set(
+    (Array.isArray(models) ? models : [])
+      .map((model) => String(model || "").trim())
+      .filter(Boolean),
+  )).sort((a, b) => a.localeCompare(b));
+  const official = new Set(Array.from(officialModels, (model) => String(model || "").trim().toLowerCase()).filter(Boolean));
+  return [
+    ...unique.filter((model) => official.has(model.toLowerCase())),
+    ...unique.filter((model) => !official.has(model.toLowerCase())),
+  ];
+}
+
+/** Internal Codex aliases such as Work Mode are not user-selectable Live models. */
+export function isLiveModelPickerEntryVisible(model: any): boolean {
+  const visibility = String(model?.visibility || "").trim().toLowerCase();
+  return visibility !== "hide" && visibility !== "hidden" && model?.supported_in_api !== false;
+}
+
 const NEGATED_MODEL_DIRECTIVE_PATTERN = /(?:不要\s*(?:用|使用)|别\s*(?:用|使用)|不用|不使用|do not use|don't use)\s*$/i;
 const INCIDENTAL_MODEL_MENTION_PATTERN = /(?:关于|相关|了解|介绍|比较|区别|说明|文档|是什么|what\s+is|about|compare|difference)/i;
 const SPEECH_MODEL_ALIASES: Record<string, string[]> = {

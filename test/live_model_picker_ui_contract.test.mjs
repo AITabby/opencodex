@@ -5,14 +5,15 @@ import { readFile } from "node:fs/promises";
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
 test("Live model picker is independent from OpenCodexBar", async () => {
-  const [picker, statusBar, app, gatewayProcess, dashboard, gateway, floatingPicker] = await Promise.all([
+  const [picker, statusBar, app, gatewayProcess, dashboard, gateway, floatingPicker, liveModelPicker] = await Promise.all([
     read("macos-app/Sources/OpenCodex/LiveModelPicker.swift"),
     read("voice/OpenCodexBar/Sources/OpenCodexBar/StatusBarController.swift"),
     read("macos-app/Sources/OpenCodex/OpenCodexApp.swift"),
     read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
     read("src_v2/services/dashboard.ts"),
     read("src_v2/server/gateway.ts"),
-    read("macos-app/Sources/OpenCodexLivePicker/main.swift")
+    read("macos-app/Sources/OpenCodexLivePicker/main.swift"),
+    read("src_v2/services/live_model_picker.ts")
   ]);
 
   assert.match(picker, /选择 GPT-Live 执行模型/);
@@ -31,6 +32,9 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(dashboard, /post\('\/api\/live-model-picker\/settings'/);
   assert.match(gateway, /api\/live-model-picker\/settings/);
   assert.match(gateway, /api\/live-model-picker\/select/);
+  assert.match(gateway, /isLiveModelPickerEntryVisible/);
+  assert.match(liveModelPicker, /supported_in_api !== false/);
+  assert.match(liveModelPicker, /visibility !== "hide"/);
   assert.match(gateway, /liveModelPickerStatePath/);
   assert.match(gateway, /Do not let a generic/);
   assert.match(gateway, /this\.resetLiveModelPicker\(\)/);

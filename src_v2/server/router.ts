@@ -17,7 +17,7 @@ import {
   stripChatToolImages,
 } from "../services/chat_tool_compat.js";
 import { optimizeThirdPartyComputerUseImages } from "../services/computer_use_image_compat.js";
-import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
+import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, fetchCursorModelsCached, resolveCursorAgentModelSelector, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 import { CatalogSyncService } from "../services/catalog_sync.js";
@@ -1009,6 +1009,11 @@ export class GatewayRouter {
         ? [...cursorSystemMessages, ...rememberedCursorMessages, ...currentCursorMessages]
         : requestCursorMessages);
       const cursorModelForRequest = matchedPendingCursorTool?.model || upstreamModel;
+      // AgentService model IDs are provider metadata, not the same thing as
+      // the imported picker slug. Resolve them once at the Cursor boundary so
+      // the selected reasoning effort is preserved without touching native
+      // GPT or ordinary third-party requests.
+      let cursorAgentModelForRequest = cursorModelForRequest;
       const cursorContinuation = matchedPendingCursorTool && requestedCursorToolOutput
         ? {
           ...matchedPendingCursorTool.continuation,
@@ -1029,13 +1034,23 @@ export class GatewayRouter {
         response = await (async () => {
           const cursorToken = await SubscriptionAuthService.getCursorAccessToken();
           if (!cursorToken) throw new Error("未找到有效的 Cursor 本机登录凭证");
+          const cursorModels = await fetchCursorModelsCached(
+            cursorToken,
+            getCursorClientVersion(),
+            AbortSignal.timeout(15000),
+          );
+          cursorAgentModelForRequest = resolveCursorAgentModelSelector(
+            cursorModelForRequest,
+            String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+            cursorModels,
+          );
           const inputToolNames = (optimizedChatBody.tools || []).map((tool: any) => String(tool?.function?.name || tool?.name || "")).filter(Boolean);
           const advertisedToolNames = cursorAdvertisedToolNames(optimizedChatBody.tools as any);
-          console.log(`[OpenCodex Cursor] AgentRun model=${cursorModelForRequest} input_tools=${inputToolNames.length ? inputToolNames.join(",") : "(none)"} advertised_mcp_tools=${advertisedToolNames.length ? advertisedToolNames.join(",") : "(none)"} tool_choice=${String(reqBody?.tool_choice || "auto")} mode=AGENT${matchedPendingCursorTool ? " continuation=true" : ""}`);
+          console.log(`[OpenCodex Cursor] AgentRun model=${cursorAgentModelForRequest} source_model=${cursorModelForRequest} input_tools=${inputToolNames.length ? inputToolNames.join(",") : "(none)"} advertised_mcp_tools=${advertisedToolNames.length ? advertisedToolNames.join(",") : "(none)"} tool_choice=${String(reqBody?.tool_choice || "auto")} mode=AGENT${matchedPendingCursorTool ? " continuation=true" : ""}`);
           return streamCursorChat(
             cursorToken,
             cursorMessages,
-            cursorModelForRequest,
+            cursorAgentModelForRequest,
             String(reqBody?.client_metadata?.turn_id || `opencodex-${Date.now()}`),
             String(matchedPendingCursorTool?.conversationId || sessionId || `opencodex-${Date.now()}`),
             getCursorClientVersion(),
@@ -1094,7 +1109,7 @@ export class GatewayRouter {
             response = await streamCursorChat(
               refreshedToken,
               cursorMessages,
-              cursorModelForRequest,
+              cursorAgentModelForRequest,
               String(reqBody?.client_metadata?.turn_id || `opencodex-${Date.now()}`),
               String(matchedPendingCursorTool?.conversationId || sessionId || `opencodex-${Date.now()}`),
               getCursorClientVersion(),
@@ -1394,7 +1409,7 @@ export class GatewayRouter {
             cursorPendingToolCalls.set(cursorStateKey, {
               key: cursorStateKey,
               callId,
-              model: cursorModelForRequest,
+              model: cursorAgentModelForRequest,
               conversationId: String(matchedPendingCursorTool?.conversationId || sessionId || `opencodex-${Date.now()}`),
               messages: cursorMessages,
               continuation,

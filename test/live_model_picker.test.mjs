@@ -4,10 +4,29 @@ import {
   extractLiveModelIntent,
   isLikelyLiveModelIntentRequest,
   isLikelyLiveWorkRequest,
+  isLiveModelPickerEntryVisible,
   isToolContinuation,
   liveModelSessionKey,
   normalizeRealtimeWorkModel,
+  orderOfficialModelsFirst,
 } from "../dist/services/live_model_picker.js";
+
+test("Live model picker keeps official models before third-party models", () => {
+  assert.deepEqual(
+    orderOfficialModelsFirst(
+      ["provider/zeta", "gpt-5.5", "provider/alpha", "gpt-5.4", "gpt-5.5"],
+      ["gpt-5.4", "gpt-5.5"],
+    ),
+    ["gpt-5.4", "gpt-5.5", "provider/alpha", "provider/zeta"],
+  );
+});
+
+test("Live model picker hides internal and non-API catalog entries", () => {
+  assert.equal(isLiveModelPickerEntryVisible({ slug: "gpt-5.6-sol-wm", visibility: "hide", supported_in_api: false }), false);
+  assert.equal(isLiveModelPickerEntryVisible({ slug: "internal-alias", visibility: "hidden" }), false);
+  assert.equal(isLiveModelPickerEntryVisible({ slug: "provider/model", supported_in_api: true }), true);
+  assert.equal(isLiveModelPickerEntryVisible({ slug: "provider/model" }), true);
+});
 
 test("Live voice intent selects one uniquely named model", () => {
   const models = ["anthropic/claude-sonnet-4-20250514", "deepseek/deepseek-chat", "opencode/kimi-k2.7-code", "gpt-5.4", "gpt-5.4-mini"];

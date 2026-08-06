@@ -23,7 +23,7 @@ import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBod
 import { ProviderConfig } from "../core/types.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
-import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel } from "../services/live_model_picker.js";
+import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isLiveModelPickerEntryVisible, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel, orderOfficialModelsFirst } from "../services/live_model_picker.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 import { AgentProfileStore } from "../services/agent_profile_store.js";
 import { TaskRouter, extractTaskText } from "../services/task_router.js";
@@ -1409,6 +1409,7 @@ export class CodexBridgeServer {
       try {
         const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
         for (const model of Array.isArray(catalog?.models) ? catalog.models : []) {
+          if (!isLiveModelPickerEntryVisible(model)) continue;
           const slug = normalizeRealtimeWorkModel(model?.slug || model?.id || model?.model);
           if (slug) models.add(slug);
         }
@@ -1416,7 +1417,7 @@ export class CodexBridgeServer {
     };
     addCatalog(path.join(os.homedir(), ".codex", "models_catalog.json"));
     addCatalog(path.join(os.homedir(), ".opencodex", "custom_model_catalog.json"));
-    return Array.from(models).sort((a, b) => a.localeCompare(b));
+    return orderOfficialModelsFirst(Array.from(models), readOfficialModelMap().keys());
   }
 
   private liveModelIntentCandidates(): string[] {
@@ -1427,7 +1428,7 @@ export class CodexBridgeServer {
       const slug = normalizeRealtimeWorkModel(model.slug);
       if (slug) models.add(slug);
     }
-    return Array.from(models).sort((a, b) => a.localeCompare(b));
+    return orderOfficialModelsFirst(Array.from(models), readOfficialModelMap().keys());
   }
 
   private liveModelPickerSettingsPath(): string {

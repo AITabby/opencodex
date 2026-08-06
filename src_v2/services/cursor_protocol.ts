@@ -1712,7 +1712,163 @@ async function writeCursorFrames(
   }
 }
 
-export type CursorModel = { slug: string; name: string };
+export type CursorModel = {
+  slug: string;
+  name: string;
+  /** AgentService selectors returned by AvailableModels field 36. */
+  agentModelIds?: string[];
+};
+
+const CURSOR_MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
+let cursorModelCache: {
+  tokenFingerprint: string;
+  models: CursorModel[];
+  expiresAt: number;
+} | null = null;
+let cursorModelFetch: {
+  tokenFingerprint: string;
+  promise: Promise<CursorModel[]>;
+} | null = null;
+
+function cursorTokenFingerprint(token: string): string {
+  return createHash("sha256").update(String(token || "")).digest("hex").slice(0, 16);
+}
+
+function cacheCursorModels(token: string, models: CursorModel[]): void {
+  cursorModelCache = {
+    tokenFingerprint: cursorTokenFingerprint(token),
+    models,
+    expiresAt: Date.now() + CURSOR_MODEL_CACHE_TTL_MS,
+  };
+}
+
+function cursorModelMatchesRequested(model: CursorModel, requested: string): boolean {
+  const normalized = requested.trim().toLowerCase();
+  if (!normalized) return false;
+  return model.slug.trim().toLowerCase() === normalized
+    || (model.agentModelIds || []).some((id) => id.trim().toLowerCase() === normalized);
+}
+
+type CursorSelectorProfile = {
+  id: string;
+  effort?: string;
+  thinking: boolean;
+  fast: boolean;
+  cursorFamily: boolean;
+};
+
+function normalizeCursorEffort(value: string | undefined): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized === "extra-high" || normalized === "extra_high" || normalized === "extrahigh") return "xhigh";
+  return normalized || "medium";
+}
+
+function cursorSelectorEffort(modelId: string): string | undefined {
+  const normalized = modelId.trim().toLowerCase();
+  // Cursor currently uses both `xhigh` and `extra-high` for the same
+  // Responses reasoning level, depending on the upstream model family.
+  if (/(^|-)extra-high(?:-|$)/.test(normalized)) return "xhigh";
+  const match = normalized.match(/(?:^|-)(none|minimal|low|medium|high|xhigh|max)(?:-|$)/);
+  return match?.[1];
+}
+
+function cursorSelectorProfile(id: string): CursorSelectorProfile {
+  const normalized = id.trim().toLowerCase();
+  return {
+    id,
+    effort: cursorSelectorEffort(id),
+    thinking: /(?:^|-)thinking(?:-|$)/.test(normalized),
+    fast: /(?:^|-)fast(?:-|$)/.test(normalized),
+    cursorFamily: /^cursor-/.test(normalized),
+  };
+}
+
+function chooseCursorSelector(profiles: CursorSelectorProfile[]): string | undefined {
+  if (profiles.length === 0) return undefined;
+  const hasCursorFamily = profiles.some((profile) => profile.cursorFamily);
+  return profiles
+    .slice()
+    .sort((left, right) => {
+      // When Cursor exposes both `cursor-*` and legacy/unprefixed IDs, use
+      // the Cursor-native family. This is a metadata property, not a vendor
+      // or model-name special case.
+      if (hasCursorFamily && left.cursorFamily !== right.cursorFamily) {
+        return left.cursorFamily ? -1 : 1;
+      }
+      // Prefer the ordinary selector over a thinking variant unless the
+      // ordinary one is unavailable for the requested effort.
+      if (left.thinking !== right.thinking) return left.thinking ? 1 : -1;
+      // Prefer the non-fast selector when both are returned. A fast-only
+      // model, such as Composer in the current catalogue, still works.
+      if (left.fast !== right.fast) return left.fast ? 1 : -1;
+      return left.id.localeCompare(right.id);
+    })
+    .at(0)?.id;
+}
+
+/**
+ * Resolve the model selector that Cursor's AgentService actually accepts.
+ *
+ * AvailableModels exposes both the user-facing base slug (for example
+ * `grok-4.5`) and the concrete AgentService IDs (for example
+ * `cursor-grok-4.5-high`). Never invent a selector when Cursor returned
+ * metadata: choose an exact selector from that metadata and fail explicitly
+ * when the requested effort is unavailable. This keeps Cursor-specific
+ * protocol translation at the provider boundary and leaves native GPT and
+ * ordinary third-party routes untouched.
+ */
+export function resolveCursorAgentModelSelector(
+  model: string,
+  reasoningEffort: string | undefined,
+  availableModels: CursorModel[] = [],
+): string {
+  const raw = String(model || "").trim();
+  if (!raw) throw new Error("Cursor 模型为空，无法选择 AgentService modelId");
+
+  const requestedEffort = normalizeCursorEffort(reasoningEffort);
+  const matched = availableModels.find((entry) => cursorModelMatchesRequested(entry, raw));
+  const selectors = Array.from(new Set((matched?.agentModelIds || []).map((id) => String(id).trim()).filter(Boolean)));
+
+  // A model that already is an exact selector is safe to preserve when the
+  // request does not ask for a different effort. This also keeps a manually
+  // configured valid Cursor selector working while the catalogue refreshes.
+  const exactSelector = selectors.find((id) => id.toLowerCase() === raw.toLowerCase());
+  if (exactSelector && (!reasoningEffort || cursorSelectorEffort(exactSelector) === requestedEffort)) {
+    return exactSelector;
+  }
+
+  if (selectors.length > 0) {
+    const profiles = selectors.map(cursorSelectorProfile);
+    const effortProfiles = profiles.filter((profile) => profile.effort);
+    if (effortProfiles.length > 0) {
+      const selected = chooseCursorSelector(
+        effortProfiles.filter((profile) => profile.effort === requestedEffort),
+      );
+      if (selected) return selected;
+
+      const availableEfforts = Array.from(new Set(
+        effortProfiles.map((profile) => profile.effort).filter((effort): effort is string => Boolean(effort)),
+      )).join(", ");
+      throw new Error(`Cursor 模型 "${raw}" 不支持 reasoning_effort="${requestedEffort}"；AvailableModels 返回的可用档位：${availableEfforts || "未知"}`);
+    }
+
+    // Some Cursor-native models expose no reasoning dimension at all. Use
+    // the exact selector returned by Cursor (Composer currently returns only
+    // `composer-2.5-fast`), never the published slug if it was not returned.
+    const baseSelector = profiles.find((profile) => profile.id.toLowerCase() === raw.toLowerCase())
+      || profiles.find((profile) => profile.id.toLowerCase() === (matched?.slug || "").toLowerCase());
+    return baseSelector?.id || chooseCursorSelector(profiles) || raw;
+  } else if (matched && matched.slug.trim().toLowerCase() === raw.toLowerCase()) {
+    // Auto/default Cursor entries can legitimately have no field-36 selector;
+    // their AvailableModels slug is itself the callable AgentService ID.
+    return matched.slug.trim();
+  }
+
+  const availableHint = availableModels.length > 0
+    ? "；Cursor AvailableModels 未返回对应的 AgentService selector"
+    : "；尚未获取 Cursor AvailableModels 的 AgentService selector 元数据";
+  throw new Error(`Cursor 模型 "${raw}" 不支持 reasoning_effort="${requestedEffort}"${availableHint}`);
+}
 
 export function decodeAvailableModelsResponse(message: Uint8Array): CursorModel[] {
   const result: CursorModel[] = [];
@@ -1732,6 +1888,7 @@ export function decodeAvailableModelsResponse(message: Uint8Array): CursorModel[
     let slug = "";
     let name = "";
     let hidden = false;
+    const agentModelIds: string[] = [];
     for (const modelField of parseFields(modelBytes)) {
       if (modelField.field === 1 && modelField.wireType === 2) slug = asString(modelField.value).trim();
       if (modelField.field === 17 && modelField.wireType === 2) name = asString(modelField.value).trim();
@@ -1740,10 +1897,21 @@ export function decodeAvailableModelsResponse(message: Uint8Array): CursorModel[
         if (serverName) slug = serverName;
       }
       if (modelField.field === 35 && modelField.wireType === 0) hidden = Number(modelField.value) !== 0;
+      // Cursor's current model metadata repeats concrete AgentService IDs in
+      // field 36. The top-level field 1 slug is only the picker/base model ID
+      // for entries such as `grok-4.5`.
+      if (modelField.field === 36 && modelField.wireType === 2) {
+        const agentModelId = asString(modelField.value).trim();
+        if (agentModelId && !agentModelIds.includes(agentModelId)) agentModelIds.push(agentModelId);
+      }
     }
     if (slug && !hidden && !seen.has(slug)) {
       seen.add(slug);
-      result.push({ slug, name: name || slug });
+      result.push({
+        slug,
+        name: name || slug,
+        ...(agentModelIds.length > 0 ? { agentModelIds } : {}),
+      });
     }
   }
   return result;
@@ -1884,7 +2052,36 @@ export async function fetchCursorModels(
   });
   if (!response.ok) throw new Error(`Cursor AvailableModels returned HTTP ${response.status}`);
   const bytes = new Uint8Array(await response.arrayBuffer());
-  return decodeAvailableModelsResponse(bytes);
+  const models = decodeAvailableModelsResponse(bytes);
+  cacheCursorModels(token, models);
+  return models;
+}
+
+/**
+ * Reuse a short-lived live Cursor catalogue during generation. Import/test
+ * calls still use fetchCursorModels() directly; this cache only prevents a
+ * first request after restart from re-fetching the same metadata repeatedly.
+ */
+export async function fetchCursorModelsCached(
+  token: string,
+  clientVersion: string,
+  signal?: AbortSignal,
+): Promise<CursorModel[]> {
+  const tokenFingerprint = cursorTokenFingerprint(token);
+  if (cursorModelCache
+    && cursorModelCache.tokenFingerprint === tokenFingerprint
+    && cursorModelCache.expiresAt > Date.now()) {
+    return cursorModelCache.models;
+  }
+
+  if (cursorModelFetch?.tokenFingerprint === tokenFingerprint) return cursorModelFetch.promise;
+  const promise = fetchCursorModels(token, clientVersion, signal);
+  cursorModelFetch = { tokenFingerprint, promise };
+  try {
+    return await promise;
+  } finally {
+    if (cursorModelFetch?.promise === promise) cursorModelFetch = null;
+  }
 }
 
 export async function streamCursorChat(
