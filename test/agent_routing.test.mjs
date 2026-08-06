@@ -454,9 +454,18 @@ test("1.1.0 records native child-task lifecycle without claiming cancellation is
       reasoning_effort: "high",
     });
     assert.equal(started.status, "running");
+    const lifecycleEvents = orchestrator.listEvents({ parent_task_id: "parent-1" });
+    assert.equal(lifecycleEvents.length, 1);
+    assert.equal(lifecycleEvents[0].type, "started");
+    assert.equal(lifecycleEvents[0].task.model, "antigravity/code-model");
     assert.equal(orchestrator.requestCancel("child-1")?.status, "cancel_requested");
     assert.equal(orchestrator.list(1)[0].parent_task_id, "parent-1");
     assert.equal(orchestrator.complete("child-1")?.status, "completed");
+    assert.deepEqual(orchestrator.listEvents({ parent_task_id: "parent-1" }).map((event) => event.type), [
+      "started",
+      "cancel_requested",
+      "completed",
+    ]);
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
@@ -481,12 +490,13 @@ test("1.1.0 routes an actual native subagent request through the shared gateway 
     store.saveRoutingSettings({ mode: "auto", default_profile_id: "code" });
     const server = new CodexBridgeServer(0);
     const route = server.chooseSubagentRoute({
-      client_metadata: { "x-openai-subagent": "1", session_id: "child-1", parent_task_id: "parent-1" },
+      client_metadata: { "x-openai-subagent": "1", session_id: "child-1", parent_task_id: "parent-1", parent_turn_id: "turn-parent-1" },
       input: "请完成代码实现",
     });
     assert.equal(route?.model, "antigravity/code-model");
     assert.equal(route?.reasoning_effort, "high");
     assert.equal(server.subagentOrchestrator.list(1)[0].status, "running");
+    assert.equal(server.subagentOrchestrator.list(1)[0].parent_turn_id, "turn-parent-1");
     server.subagentOrchestrator.complete(route.task_id);
     assert.equal(server.subagentOrchestrator.list(1)[0].status, "completed");
   } finally {
@@ -526,6 +536,43 @@ test("1.1.0 binds an explicitly named native child model to its Web Profile reas
     });
     assert.equal(route?.model, "antigravity/code-model");
     assert.equal(route?.reasoning_effort, "high");
+    server.subagentOrchestrator.complete(route.task_id);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("1.1.5 routes an explicitly named official child by its own model identity", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.upsertProfile({
+      id: "third-party-default",
+      name: "第三方默认子代理",
+      description: "没有明确模型时才使用的第三方子代理",
+      model_ref: { provider: "antigravity", backend_model: "gemini-code-1", catalog_slug: "antigravity/code-model" },
+      reasoning_effort: "high",
+      subagent_enabled: true,
+    });
+    store.saveRoutingSettings({ mode: "auto", default_profile_id: "third-party-default" });
+
+    const server = new CodexBridgeServer(0);
+    const route = server.chooseSubagentRoute({
+      model: "gpt-5.5",
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "official-child",
+        thread_id: "official-child",
+        parent_task_id: "parent-third-party",
+      },
+      input: "官方子代理任务",
+    });
+    assert.equal(route?.model, "gpt-5.5");
+    assert.equal(server.subagentOrchestrator.list(1)[0].model, "gpt-5.5");
     server.subagentOrchestrator.complete(route.task_id);
   } finally {
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
@@ -674,6 +721,48 @@ test("1.1.0 keeps a non-native child body's explicit reasoning selection", async
     assert.equal(route?.model, "thirdparty/review-model");
     assert.equal(route?.reasoning_effort, "max");
     server.subagentOrchestrator.complete(route.task_id);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("1.1.0 shares the subagent lifecycle feed with GPT-Live child handoffs", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.upsertProfile({
+      id: "live-code",
+      name: "Live 代码执行",
+      description: "负责 GPT-Live 交接的代码任务",
+      model_ref: { provider: "antigravity", backend_model: "gemini-code-1", catalog_slug: "antigravity/code-model" },
+      reasoning_effort: "medium",
+      live_enabled: true,
+      subagent_enabled: true,
+    });
+    store.saveRoutingSettings({ mode: "auto", default_profile_id: "live-code" });
+
+    const server = new CodexBridgeServer(0);
+    const route = server.chooseSubagentRoute({
+      model: "antigravity/code-model",
+      client_metadata: {
+        "x-openai-subagent": "1",
+        thread_source: "subagent",
+        session_id: "live-child",
+        parent_task_id: "live-session",
+        parent_turn_id: "live-turn-1",
+      },
+      input: "执行 GPT-Live 交接任务",
+    });
+    assert.equal(route?.model, "antigravity/code-model");
+    const events = server.subagentOrchestrator.listEvents({ parent_task_id: "live-session" });
+    assert.equal(events[0].parent_turn_id, "live-turn-1");
+    assert.equal(events[0].task.model, "antigravity/code-model");
+    server.subagentOrchestrator.complete(route.task_id);
+    assert.deepEqual(server.subagentOrchestrator.listEvents({ parent_task_id: "live-session" }).map((event) => event.type), ["started", "completed"]);
   } finally {
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;

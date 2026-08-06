@@ -1,20 +1,23 @@
 /**
  * Provider-aware stdio bridge for the native Codex app-server.
  *
- * Codex stores `model_provider` inside an app-server thread. A running
- * app-server ignores a later provider override on `thread/resume`, so one
- * child process cannot safely serve both native OpenAI and a gateway thread.
- * The bridge therefore runs one native app-server child at a time and
- * recreates that child when the selected model crosses providers. The new
- * child resumes the same thread from the shared Codex history directory;
- * only the provider process changes, never the Desktop conversation or id.
+ * The native app-server has one provider configuration which it copies into
+ * internally-created child agents. The bridge gives that runtime one local
+ * provider multiplexer instead of a global gateway provider. The multiplexer
+ * classifies every Responses request by its model: official models go
+ * directly to ChatGPT, while namespaced/custom models go to the OpenCodex
+ * gateway. The Desktop conversation and thread id stay shared.
  */
 
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
+import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
+import { copyNativeRequestHeaders } from "./server/webrtc_proxy.js";
 
 export type CodexProvider = "openai" | "opencodex";
 
@@ -79,8 +82,32 @@ type GatewayTurn = {
   forwarding: boolean;
 };
 
+type GatewaySubagentEvent = {
+  seq: number;
+  type: "started" | "completed" | "failed" | "cancel_requested";
+  task_id: string;
+  parent_task_id?: string;
+  parent_turn_id?: string;
+  task?: JsonRecord;
+  created_at?: string;
+};
+
+type SubagentEventPoller = {
+  cursor: number;
+  startedAt: number;
+  parentTurnId?: string;
+  stopAt?: number;
+  timer?: ReturnType<typeof setTimeout>;
+  inFlight: boolean;
+};
+
 const NATIVE_PROVIDER: CodexProvider = "openai";
 const GATEWAY_PROVIDER: CodexProvider = "opencodex";
+// The native app-server has one provider field for the whole parent runtime
+// and copies it into internally-created child configs. Keep that field on a
+// local multiplexer so each HTTP request can be classified by its own model:
+// official models go directly to ChatGPT, namespaced models go to 8765.
+const NATIVE_RUNTIME_PROVIDER = "opencodex_native_router";
 const MODEL_CATALOG_FILES = [
   path.join(os.homedir(), ".opencodex", "custom_model_catalog.json"),
   path.join(os.homedir(), ".codex", "models_cache.json"),
@@ -221,6 +248,38 @@ function threadIdFrom(value: unknown): string {
   return cleanString(value);
 }
 
+function providerBridgeGatewayPort(): number {
+  const configured = Number(process.env.OPENCODEX_GATEWAY_PORT || process.env.OPENCODEX_PORT || 8765);
+  return Number.isFinite(configured) && configured > 0 && configured < 65536 ? Math.floor(configured) : 8765;
+}
+
+function providerBridgeAdminToken(): string {
+  const configured = cleanString(process.env.OPENCODEX_ADMIN_TOKEN);
+  if (configured) return configured;
+  const configuredPath = cleanString(process.env.OPENCODEX_ADMIN_TOKEN_PATH);
+  const candidates = [configuredPath, path.join(os.homedir(), ".opencodex", "admin_token")].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const token = cleanString(fs.readFileSync(candidate, "utf8"));
+      if (token) return token;
+    } catch {}
+  }
+  return "";
+}
+
+function providerBridgeExecutablePath(): string {
+  const configured = cleanString(process.env.OPENCODEX_PROVIDER_BRIDGE_PATH)
+    || cleanString(process.env.CODEX_CLI_PATH);
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    configured,
+    path.join(moduleDir, "codex-provider-bridge"),
+  ].filter(Boolean);
+  return candidates.find((candidate) => {
+    try { return fs.statSync(candidate).isFile(); } catch { return false; }
+  }) || "";
+}
+
 function writeParent(value: JsonRecord): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
@@ -267,7 +326,7 @@ function passthroughNative(args: string[]): void {
 }
 
 
-function runProviderBridge(): void {
+async function runProviderBridge(): Promise<void> {
   const args = process.argv.slice(2);
   if (!isAppServerInvocation(args)) {
     passthroughNative(args);
@@ -281,7 +340,10 @@ function runProviderBridge(): void {
   const legacyThreads = new Map<string, LegacyThread>();
   const pendingMigrations = new Map<string, Array<(route: ThreadRoute | null, error?: string) => void>>();
   const gatewayTurns = new Map<string, GatewayTurn>();
-  const activeTurns = new Map<string, { provider: CodexProvider; physicalThreadId: string }>();
+  const activeTurns = new Map<string, { provider: CodexProvider; physicalThreadId: string; parentTurnId?: string }>();
+  const subagentEventPollers = new Map<string, SubagentEventPoller>();
+  const gatewayPort = providerBridgeGatewayPort();
+  const gatewayAdminToken = providerBridgeAdminToken();
   const pendingSelectedModels = new Map<string, string>();
   const suppressedNotifications = new Map<string, number>();
   const routes = loadThreadRoutes();
@@ -291,6 +353,119 @@ function runProviderBridge(): void {
   let bridgeStopping = false;
   let lastInitializeParams: JsonRecord | null = null;
   let lastInitializeResult: JsonRecord | null = null;
+
+  const nativeRouter = http.createServer();
+  let nativeRouterPort = 0;
+
+  async function readNativeRouterBody(req: http.IncomingMessage): Promise<Buffer> {
+    const chunks: Buffer[] = [];
+    let length = 0;
+    for await (const chunk of req) {
+      const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      length += value.length;
+      if (length > 64 * 1024 * 1024) throw new Error("native provider request body is too large");
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  async function forwardNativeRouterResponse(upstream: Response, response: http.ServerResponse): Promise<void> {
+    response.writeHead(upstream.status, copySafeResponseHeaders(upstream.headers));
+    if (upstream.body) {
+      // @ts-ignore Node's fetch body is an async iterable at runtime.
+      for await (const chunk of upstream.body) {
+        await writeHttpResponseChunked(response, chunk);
+      }
+    }
+    response.end();
+  }
+
+  async function handleNativeRouterRequest(req: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+    if (req.method !== "POST") {
+      response.writeHead(405, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "native provider router only accepts POST" }));
+      return;
+    }
+
+    const rawBody = await readNativeRouterBody(req);
+    let body: JsonRecord = {};
+    try {
+      const parsed = JSON.parse(rawBody.toString("utf8"));
+      body = parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as JsonRecord : {};
+    } catch {
+      response.writeHead(400, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ error: "native provider router received invalid JSON" }));
+      return;
+    }
+
+    const model = modelSlug(body.model) || nativeDefaultModel();
+    const provider = classifyRuntimeModel(model) || NATIVE_PROVIDER;
+    const requestPath = String(req.url || "/v1/responses").split("?", 1)[0];
+    const isCompaction = /responses\/compact$/i.test(requestPath);
+    const officialTargetBase = cleanString(process.env.OPENCODEX_NATIVE_ROUTER_OPENAI_URL)
+      || "https://chatgpt.com/backend-api/codex/responses";
+    const nativeTarget = isCompaction
+      ? `${officialTargetBase.replace(/\/$/, "")}/compact`
+      : officialTargetBase;
+    const gatewayTarget = `http://127.0.0.1:${gatewayPort}${requestPath.startsWith("/") ? requestPath : `/${requestPath}`}`;
+    const target = provider === NATIVE_PROVIDER ? nativeTarget : gatewayTarget;
+    const headers = provider === NATIVE_PROVIDER
+      ? copyNativeRequestHeaders(req, { localAdminToken: gatewayAdminToken }, true)
+      : copyNativeRequestHeaders(req, { localAdminToken: gatewayAdminToken }, false);
+    if (provider === GATEWAY_PROVIDER && gatewayAdminToken) {
+      headers.authorization = `Bearer ${gatewayAdminToken}`;
+    }
+
+    console.log(
+      `[OpenCodex Native Router] model=${model} route=`
+      + (provider === NATIVE_PROVIDER ? "openai-direct" : `gateway:${gatewayPort}`),
+    );
+    try {
+      const upstream = await fetchUpstream(target, {
+        method: "POST",
+        headers,
+        body: rawBody as any,
+        maxAttempts: 1,
+        timeoutMs: 600_000,
+        operation: provider === NATIVE_PROVIDER ? "native-router-openai" : "native-router-gateway",
+      });
+      await forwardNativeRouterResponse(upstream, response);
+    } catch (error: any) {
+      const details = upstreamErrorDetails(error);
+      console.error(`[OpenCodex Native Router] upstream failed route=${provider === NATIVE_PROVIDER ? "openai-direct" : "gateway"}`, {
+        ...details,
+        attempts: error?.attempts,
+      });
+      if (!response.headersSent) {
+        response.writeHead(provider === NATIVE_PROVIDER ? 502 : 503, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({
+          error: details.message,
+          type: "native_provider_router_upstream_unreachable",
+          route: provider === NATIVE_PROVIDER ? "openai-direct" : "gateway",
+        }));
+      }
+    }
+  }
+
+  nativeRouter.on("request", (req, response) => {
+    void handleNativeRouterRequest(req, response).catch((error: any) => {
+      if (!response.headersSent) {
+        response.writeHead(500, { "Content-Type": "application/json" });
+        response.end(JSON.stringify({ error: String(error?.message || error || "native provider router failed") }));
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    nativeRouter.once("error", reject);
+    nativeRouter.listen(0, "127.0.0.1", () => {
+      nativeRouter.off("error", reject);
+      const address = nativeRouter.address();
+      nativeRouterPort = address && typeof address === "object" ? address.port : 0;
+      if (!nativeRouterPort) reject(new Error("native provider router did not receive a port"));
+      else resolve();
+    });
+  });
+  console.log(`[OpenCodex Native Router] listening on http://127.0.0.1:${nativeRouterPort}/v1`);
 
   function statePath(): string {
     const configured = cleanString(process.env.OPENCODEX_PROVIDER_SESSION_MAP_PATH);
@@ -444,6 +619,143 @@ function runProviderBridge(): void {
 
   function isSuppressed(runtime: ProviderRuntime, threadId: string): boolean {
     return (suppressedNotifications.get(notificationKey(runtime, threadId)) || 0) > 0;
+  }
+
+  function subagentEventParentIds(externalId: string): Set<string> {
+    const parentIds = new Set<string>([externalId]);
+    const route = routes.get(externalId);
+    if (route?.nativeId) parentIds.add(route.nativeId);
+    const active = activeTurns.get(externalId);
+    if (active?.physicalThreadId) parentIds.add(active.physicalThreadId);
+    return parentIds;
+  }
+
+  function subagentEventItem(event: GatewaySubagentEvent, parentThreadId: string): JsonRecord {
+    const task = event.task && typeof event.task === "object" ? event.task : {};
+    const isStarted = event.type === "started";
+    const isCancelled = event.type === "cancel_requested";
+    const isFailed = event.type === "failed";
+    const agentStatus = isStarted
+      ? "running"
+      : isCancelled
+        ? "interrupted"
+        : isFailed
+          ? "errored"
+          : "completed";
+    const message = cleanString(task.error) || (isCancelled ? "子代理取消请求已记录" : "");
+    return {
+      type: "collabAgentToolCall",
+      id: `opencodex-collab-${cleanString(event.task_id)}`,
+      senderThreadId: parentThreadId,
+      receiverThreadIds: [cleanString(event.task_id)],
+      status: isStarted ? "inProgress" : (isFailed || isCancelled ? "failed" : "completed"),
+      tool: "spawnAgent",
+      agentsStates: {
+        [cleanString(event.task_id)]: {
+          status: agentStatus,
+          ...(message ? { message } : {}),
+        },
+      },
+      ...(cleanString(task.model) ? { model: cleanString(task.model) } : {}),
+      ...(cleanString(task.prompt) ? { prompt: cleanString(task.prompt) } : {}),
+      ...(cleanString(task.reasoning_effort) ? { reasoningEffort: cleanString(task.reasoning_effort) } : {}),
+    };
+  }
+
+  function emitSubagentEvent(externalId: string, state: SubagentEventPoller, event: GatewaySubagentEvent): void {
+    const taskId = cleanString(event.task_id);
+    if (!taskId) return;
+    const active = activeTurns.get(externalId);
+    const parentTurnId = state.parentTurnId || event.parent_turn_id || active?.parentTurnId || `turn-${taskId}`;
+    const item = subagentEventItem(event, externalId);
+    const params: JsonRecord = {
+      threadId: externalId,
+      turnId: parentTurnId,
+      item,
+    };
+    if (event.type === "started") params.startedAtMs = Date.now();
+    else params.completedAtMs = Date.now();
+    writeParent({
+      method: event.type === "started" ? "item/started" : "item/completed",
+      params,
+    });
+  }
+
+  function scheduleSubagentEventPoll(externalId: string, delayMs: number): void {
+    const state = subagentEventPollers.get(externalId);
+    if (!state) return;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => {
+      void pollSubagentEvents(externalId);
+    }, delayMs);
+    (state.timer as any)?.unref?.();
+  }
+
+  async function pollSubagentEvents(externalId: string): Promise<void> {
+    const state = subagentEventPollers.get(externalId);
+    if (!state || state.inFlight || !gatewayAdminToken) return;
+    state.inFlight = true;
+    try {
+      const endpoint = `http://127.0.0.1:${gatewayPort}/api/agent-tasks/events?after=${encodeURIComponent(String(state.cursor))}&limit=500`;
+      const response = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${gatewayAdminToken}` },
+        signal: AbortSignal.timeout(1200),
+      });
+      if (!response.ok) return;
+      const payload: any = await response.json();
+      const events = Array.isArray(payload?.events) ? payload.events as GatewaySubagentEvent[] : [];
+      const parentIds = subagentEventParentIds(externalId);
+      for (const event of events) {
+        const sequence = Number(event?.seq || 0);
+        if (!Number.isFinite(sequence) || sequence <= state.cursor) continue;
+        state.cursor = Math.max(state.cursor, sequence);
+        if (!event.parent_task_id || !parentIds.has(cleanString(event.parent_task_id))) continue;
+        const createdAt = Date.parse(cleanString(event.created_at));
+        if (Number.isFinite(createdAt) && createdAt < state.startedAt) continue;
+        emitSubagentEvent(externalId, state, event);
+      }
+      const nextCursor = Number(payload?.next_cursor || 0);
+      if (Number.isFinite(nextCursor)) state.cursor = Math.max(state.cursor, nextCursor);
+    } catch {
+      // The gateway may be stopped independently. The native GPT lane must
+      // remain untouched; the event sideband simply retries on the next tick.
+    } finally {
+      state.inFlight = false;
+      if (subagentEventPollers.get(externalId) !== state) return;
+      if (state.stopAt && Date.now() >= state.stopAt) {
+        if (state.timer) clearTimeout(state.timer);
+        subagentEventPollers.delete(externalId);
+        return;
+      }
+      scheduleSubagentEventPoll(externalId, state.stopAt ? 100 : 250);
+    }
+  }
+
+  function startSubagentEventPolling(externalId: string, parentTurnId?: string): void {
+    if (!externalId || !gatewayAdminToken) return;
+    let state = subagentEventPollers.get(externalId);
+    if (!state) {
+      state = { cursor: 0, startedAt: Date.now(), inFlight: false };
+      subagentEventPollers.set(externalId, state);
+    } else if (state.stopAt) {
+      state.startedAt = Date.now();
+    }
+    state.stopAt = undefined;
+    if (parentTurnId) state.parentTurnId = parentTurnId;
+    scheduleSubagentEventPoll(externalId, 0);
+  }
+
+  function drainSubagentEventPolling(externalId: string): void {
+    const state = subagentEventPollers.get(externalId);
+    if (!state) return;
+    state.stopAt = Date.now() + 1500;
+    scheduleSubagentEventPoll(externalId, 0);
+  }
+
+  function stopSubagentEventPolling(externalId: string): void {
+    const state = subagentEventPollers.get(externalId);
+    if (state?.timer) clearTimeout(state.timer);
+    subagentEventPollers.delete(externalId);
   }
 
   function rewriteThreadIds(value: any, physicalId: string, externalId: string): void {
@@ -657,6 +969,23 @@ function runProviderBridge(): void {
     if (runtimeByProvider.get(runtime.provider) === runtime) runtimeByProvider.delete(runtime.provider);
   }
 
+  function nativeRuntimeArgs(): string[] {
+    const routerConfig = [
+      "-c", `model_provider=${NATIVE_RUNTIME_PROVIDER}`,
+      "-c", `model_providers.${NATIVE_RUNTIME_PROVIDER}.name=OpenCodexNativeRouter`,
+      "-c", `model_providers.${NATIVE_RUNTIME_PROVIDER}.base_url=http://127.0.0.1:${nativeRouterPort}/v1`,
+      "-c", `model_providers.${NATIVE_RUNTIME_PROVIDER}.wire_api=responses`,
+      "-c", `model_providers.${NATIVE_RUNTIME_PROVIDER}.requires_openai_auth=false`,
+    ];
+    const appServerIndex = args.indexOf("app-server");
+    if (appServerIndex < 0) return [...routerConfig, ...args];
+    return [
+      ...args.slice(0, appServerIndex),
+      ...routerConfig,
+      ...args.slice(appServerIndex),
+    ];
+  }
+
   function consumeOutput(runtime: ProviderRuntime, chunk: Buffer | string): void {
     const previous = outputBuffers.get(runtime) || "";
     const lines = (previous + chunk.toString()).split(/\r?\n/);
@@ -672,10 +1001,19 @@ function runProviderBridge(): void {
   }
 
   function spawnRuntime(provider: CodexProvider): ProviderRuntime {
-    const child = spawn(nativeCodexPath(), args, {
+    const bridge = providerBridgeExecutablePath();
+    const childArgs = provider === NATIVE_PROVIDER ? nativeRuntimeArgs() : args;
+    const child = spawn(nativeCodexPath(), childArgs, {
       env: {
         ...process.env,
-        CODEX_CLI_PATH: undefined,
+        // Native Codex owns the child-agent lifecycle. Keep its child
+        // launcher on this bridge so each child can be classified by its own
+        // model: official GPT stays native, namespaced models enter the
+        // gateway. Do not route every child based on the parent runtime.
+        ...(bridge ? {
+          CODEX_CLI_PATH: bridge,
+          OPENCODEX_PROVIDER_BRIDGE_PATH: bridge,
+        } : {}),
         OPENCODEX_PROVIDER_BRIDGE_RUNTIME: provider,
       },
       stdio: ["pipe", "pipe", "pipe"],
@@ -747,6 +1085,7 @@ function runProviderBridge(): void {
     const finish = () => {
       if (turn.physicalThreadId) gatewayTurns.delete(turn.physicalThreadId);
       activeTurns.delete(turn.externalThreadId);
+      drainSubagentEventPolling(turn.externalThreadId);
       const output = cloneValue(completed);
       if (turn.physicalThreadId) rewriteThreadIds(output, turn.physicalThreadId, turn.externalThreadId);
       writeParent(output);
@@ -787,6 +1126,7 @@ function runProviderBridge(): void {
       }
     } else if (message.method === "turn/completed") {
       turn.forwarding = false;
+      drainSubagentEventPolling(turn.externalThreadId);
       finishGatewayTurn(turn, message);
       return null;
     }
@@ -805,7 +1145,22 @@ function runProviderBridge(): void {
     const output = cloneValue(message);
     rewriteThreadIds(output, route.nativeId, route.externalId);
     decorateThreadModel(output, route.selectedModel, providerForModel(route.selectedModel));
-    if (message.method === "turn/completed") activeTurns.delete(route.externalId);
+    if (message.method === "turn/started") {
+      const active = activeTurns.get(route.externalId);
+      const turnId = threadIdFrom(params.turnId || params.turn_id);
+      if (active && turnId) active.parentTurnId = turnId;
+      startSubagentEventPolling(route.externalId, turnId || undefined);
+    }
+    if (message.method === "thread/realtime/started" || message.method === "thread/realtime/resumed") {
+      startSubagentEventPolling(route.externalId, threadIdFrom(params.turnId || params.turn_id) || undefined);
+    }
+    if (message.method === "thread/realtime/closed" || message.method === "thread/realtime/error") {
+      drainSubagentEventPolling(route.externalId);
+    }
+    if (message.method === "turn/completed") {
+      drainSubagentEventPolling(route.externalId);
+      activeTurns.delete(route.externalId);
+    }
     return output;
   }
 
@@ -874,7 +1229,7 @@ function runProviderBridge(): void {
       const startParams: JsonRecord = {
         ...(params.cwd ? { cwd: params.cwd } : sourceThread.cwd ? { cwd: sourceThread.cwd } : {}),
         model: nativeDefaultModel(),
-        modelProvider: NATIVE_PROVIDER,
+        modelProvider: NATIVE_RUNTIME_PROVIDER,
         threadSource: "user",
       };
       sendInternal(native, "thread/start", startParams, (started) => {
@@ -1033,6 +1388,7 @@ function runProviderBridge(): void {
           turn.forwarding = true;
           gatewayTurns.set(gatewayId, turn);
           activeTurns.set(route.externalId, { provider: GATEWAY_PROVIDER, physicalThreadId: gatewayId });
+          startSubagentEventPolling(route.externalId);
           const turnParams = stripRequestProvider({ ...params, threadId: gatewayId, model });
           sendParent(gateway, parent, "turn/start", turnParams, {
             externalThreadId: route.externalId,
@@ -1043,6 +1399,7 @@ function runProviderBridge(): void {
               if (response.error) {
                 gatewayTurns.delete(gatewayId);
                 activeTurns.delete(route.externalId);
+                drainSubagentEventPolling(route.externalId);
               }
               return decorateParentResponse(response, {
                 kind: "parent",
@@ -1090,7 +1447,7 @@ function runProviderBridge(): void {
     const selected = selectedModel(params);
     const physicalModel = providerForModel(selected) === NATIVE_PROVIDER ? selected : nativeDefaultModel();
     const native = ensureRuntime(NATIVE_PROVIDER);
-    const nextParams = { ...stripRequestProvider(params), model: physicalModel, modelProvider: NATIVE_PROVIDER };
+    const nextParams = { ...stripRequestProvider(params), model: physicalModel, modelProvider: NATIVE_RUNTIME_PROVIDER };
     sendParent(native, message, "thread/start", nextParams, {
       displayModel: selected,
       displayProvider: providerForModel(selected),
@@ -1143,7 +1500,7 @@ function runProviderBridge(): void {
         ...(route.settings || {}),
         threadId: route.nativeId,
         model: nativeModel(params, route),
-        modelProvider: NATIVE_PROVIDER,
+        modelProvider: NATIVE_RUNTIME_PROVIDER,
       };
       delete nextParams.path;
       if (route.nativePath) nextParams.path = route.nativePath;
@@ -1174,7 +1531,7 @@ function runProviderBridge(): void {
         ...(route.settings || {}),
         threadId: route.nativeId,
         model: nativeModel(params, route),
-        modelProvider: NATIVE_PROVIDER,
+        modelProvider: NATIVE_RUNTIME_PROVIDER,
       };
       sendParent(native, message, "thread/fork", nextParams, {
         displayModel: selected,
@@ -1293,7 +1650,12 @@ function runProviderBridge(): void {
         return;
       }
       const native = ensureRuntime(NATIVE_PROVIDER);
-      const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId, model: selected };
+      const nextParams = {
+        ...stripRequestProvider(params),
+        threadId: route.nativeId,
+        model: selected,
+        modelProvider: NATIVE_RUNTIME_PROVIDER,
+      };
       sendParent(native, message, "thread/settings/update", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
@@ -1323,15 +1685,22 @@ function runProviderBridge(): void {
         return;
       }
       const native = ensureRuntime(NATIVE_PROVIDER);
-      const nextParams = stripRequestProvider({ ...params, threadId: route.nativeId, model: selected });
+      const nextParams = {
+        ...stripRequestProvider({ ...params, threadId: route.nativeId, model: selected }),
+        modelProvider: NATIVE_RUNTIME_PROVIDER,
+      };
       activeTurns.set(route.externalId, { provider: NATIVE_PROVIDER, physicalThreadId: route.nativeId });
+      startSubagentEventPolling(route.externalId);
       sendParent(native, message, "turn/start", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
         displayModel: selected,
         displayProvider: NATIVE_PROVIDER,
         onResponse: (response) => {
-          if (response.error) activeTurns.delete(route.externalId);
+          if (response.error) {
+            activeTurns.delete(route.externalId);
+            drainSubagentEventPolling(route.externalId);
+          }
           return decorateParentResponse(response, {
             kind: "parent",
             id: message.id,
@@ -1371,6 +1740,13 @@ function runProviderBridge(): void {
       }
       const native = ensureRuntime(NATIVE_PROVIDER);
       const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId };
+      const realtimeMethod = method.toLowerCase();
+      if (realtimeMethod.includes("realtime") && /(start|resume|connect)/.test(realtimeMethod)) {
+        startSubagentEventPolling(route.externalId, threadIdFrom(params.turnId || params.turn_id) || undefined);
+      }
+      if (realtimeMethod.includes("realtime") && /(close|stop|disconnect)/.test(realtimeMethod)) {
+        drainSubagentEventPolling(route.externalId);
+      }
       sendParent(native, message, method, nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
@@ -1445,8 +1821,12 @@ function runProviderBridge(): void {
   });
   const stop = (): void => {
     bridgeStopping = true;
+    for (const [externalId, state] of subagentEventPollers) {
+      if (state.timer) clearTimeout(state.timer);
+      subagentEventPollers.delete(externalId);
+    }
     for (const runtime of [...runtimes]) stopRuntime(runtime);
-    setImmediate(() => process.exit(0));
+    nativeRouter.close(() => setImmediate(() => process.exit(0)));
   };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
