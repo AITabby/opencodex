@@ -56,6 +56,60 @@ final class GatewayProcess: ObservableObject {
         }
     }
 
+    private func runLaunchctl(_ arguments: [String]) {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        task.arguments = arguments
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            // The gateway remains usable when launchd registration is
+            // unavailable; an explicit Desktop restart still injects the
+            // bridge directly.
+        }
+    }
+
+    private func configureProviderBridgeEnvironment(root: URL?, resources: URL?) -> (bridge: URL, native: URL)? {
+        var bridgeCandidates: [String] = []
+        if let configured = ProcessInfo.processInfo.environment["OPENCODEX_PROVIDER_BRIDGE_PATH"], !configured.isEmpty {
+            bridgeCandidates.append(configured)
+        }
+        if let root {
+            bridgeCandidates.append(root.appendingPathComponent("dist/codex-provider-bridge").path)
+        }
+        if let resources {
+            bridgeCandidates.append(resources.appendingPathComponent("dist/codex-provider-bridge").path)
+        }
+        guard let bridgePath = bridgeCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT"]
+                .forEach { runLaunchctl(["unsetenv", $0]) }
+            return nil
+        }
+
+        var nativeCandidates: [String] = []
+        if let configured = ProcessInfo.processInfo.environment["OPENCODEX_NATIVE_CODEX_PATH"], !configured.isEmpty {
+            nativeCandidates.append(configured)
+        }
+        nativeCandidates.append(contentsOf: [
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex"
+        ])
+        guard let nativePath = nativeCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT"]
+                .forEach { runLaunchctl(["unsetenv", $0]) }
+            return nil
+        }
+
+        runLaunchctl(["setenv", "CODEX_CLI_PATH", bridgePath])
+        runLaunchctl(["setenv", "OPENCODEX_NATIVE_CODEX_PATH", nativePath])
+        runLaunchctl(["setenv", "OPENCODEX_PROVIDER_BRIDGE_PATH", bridgePath])
+        runLaunchctl(["setenv", "OPENCODEX_PROVIDER_SPLIT", "1"])
+        return (URL(fileURLWithPath: bridgePath), URL(fileURLWithPath: nativePath))
+    }
+
     var dashboardURL: URL? {
         guard state == .ready, port > 0 else { return nil }
         return URL(string: "http://127.0.0.1:\(port)/dashboard")
@@ -78,6 +132,15 @@ final class GatewayProcess: ObservableObject {
             return
         }
 
+        let applicationSupport = applicationSupportDirectory
+        try? FileManager.default.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
+        let providerBridge = configureProviderBridgeEnvironment(root: root, resources: resources)
+        if providerBridge != nil {
+            let desktopRestartMarker = applicationSupport.appendingPathComponent("restart_desktop_after_gateway_ready")
+            try? Data("\(Date().timeIntervalSince1970)\n".utf8).write(to: desktopRestartMarker, options: .atomic)
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: desktopRestartMarker.path)
+        }
+
         let executableURL: URL
         let arguments: [String]
         if let bundledNode = resources?.appendingPathComponent("node"), FileManager.default.isExecutableFile(atPath: bundledNode.path) {
@@ -97,8 +160,6 @@ final class GatewayProcess: ObservableObject {
         environment["OPENCODEX_APP_MODE"] = "1"
         environment["OPENCODEX_PARENT_PID"] = String(ProcessInfo.processInfo.processIdentifier)
         environment["OPENCODEX_ADMIN_TOKEN_PATH"] = adminTokenURL.path
-        let applicationSupport = applicationSupportDirectory
-        try? FileManager.default.createDirectory(at: applicationSupport, withIntermediateDirectories: true)
         let runtimeFile = applicationSupport.appendingPathComponent("gateway_runtime_\(ProcessInfo.processInfo.processIdentifier).json")
         let runtimePayload: [String: Any] = ["port": port, "pid": ProcessInfo.processInfo.processIdentifier, "started_at": Date().timeIntervalSince1970]
         if let runtimeData = try? JSONSerialization.data(withJSONObject: runtimePayload) {
@@ -107,6 +168,12 @@ final class GatewayProcess: ObservableObject {
             runtimeFileURL = runtimeFile
         }
         environment["OPENCODEX_DATA_DIR"] = applicationSupport.path
+        if let providerBridge {
+            environment["CODEX_CLI_PATH"] = providerBridge.bridge.path
+            environment["OPENCODEX_NATIVE_CODEX_PATH"] = providerBridge.native.path
+            environment["OPENCODEX_PROVIDER_BRIDGE_PATH"] = providerBridge.bridge.path
+            environment["OPENCODEX_PROVIDER_SPLIT"] = "1"
+        }
         let voiceRuntime = resources?.appendingPathComponent("voice-runtime")
         if let voiceRuntime, FileManager.default.fileExists(atPath: voiceRuntime.path) {
             environment["OPENCODEX_VOICE_RUNTIME_DIR"] = voiceRuntime.path
@@ -179,6 +246,8 @@ final class GatewayProcess: ObservableObject {
         liveModelPickerRequest = nil
         adminToken = ""
         outputPipe?.fileHandleForReading.readabilityHandler = nil
+        ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT"]
+            .forEach { runLaunchctl(["unsetenv", $0]) }
         guard let process else { return }
         if process.isRunning {
             process.terminate()

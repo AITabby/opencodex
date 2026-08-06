@@ -180,7 +180,11 @@ export function buildManagedCodexConfig(
   catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
 ): string {
   const preserved = stripManagedCodexConfig(content);
-  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nopenai_base_url = "http://127.0.0.1:${port}/v1"\n# <<< opencodex managed >>>\n`;
+  // Keep the global default on native OpenAI. The provider bridge explicitly
+  // assigns provider-owned models to opencodex at the thread/turn boundary;
+  // making the gateway the global default hides native history whenever the
+  // Desktop client is not yet attached to the bridge.
+  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\n# <<< opencodex managed >>>\n`;
   const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
@@ -308,16 +312,169 @@ function stopDesktopClients(): void {
     try { execFileSync("killall", ["-9", processName], { stdio: "ignore" }); } catch {}
   }
   try { execFileSync("pkill", ["-TERM", "-f", "[c]odex.*app-server"], { stdio: "ignore" }); } catch {}
+  try { execFileSync("pkill", ["-TERM", "-f", "[c]odex-provider-bridge.*app-server"], { stdio: "ignore" }); } catch {}
   try { execFileSync("sleep", ["0.8"], { stdio: "ignore" }); } catch {}
   try { execFileSync("pkill", ["-KILL", "-f", "[c]odex.*app-server"], { stdio: "ignore" }); } catch {}
+  try { execFileSync("pkill", ["-KILL", "-f", "[c]odex-provider-bridge.*app-server"], { stdio: "ignore" }); } catch {}
+}
+
+function providerBridgePath(): string {
+  const configured = String(process.env.OPENCODEX_PROVIDER_BRIDGE_PATH || "").trim();
+  const candidates = [
+    configured,
+    path.join(process.cwd(), "dist", "codex-provider-bridge"),
+    path.join(process.cwd(), "codex-provider-bridge"),
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+}
+
+function nativeCodexExecutablePath(): string {
+  const configured = String(process.env.OPENCODEX_NATIVE_CODEX_PATH || "").trim();
+  const candidates = [
+    configured,
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+}
+
+function registerProviderBridgeEnvironment(): boolean {
+  if (process.platform !== "darwin") return false;
+  const bridge = providerBridgePath();
+  const nativeCodex = nativeCodexExecutablePath();
+  if (!bridge || !nativeCodex) {
+    console.warn("[OpenCodex Gateway] Provider bridge startup skipped: bridge or native Codex executable is unavailable.");
+    return false;
+  }
+  try {
+    // Keep the bridge lifecycle owned by the gateway itself. This covers a
+    // direct `pm2 start opencodex` as well as the login/DMG startup paths.
+    execFileSync("/bin/launchctl", ["setenv", "CODEX_CLI_PATH", bridge], { stdio: "ignore" });
+    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_NATIVE_CODEX_PATH", nativeCodex], { stdio: "ignore" });
+    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_BRIDGE_PATH", bridge], { stdio: "ignore" });
+    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_SPLIT", "1"], { stdio: "ignore" });
+    console.log(`[OpenCodex Gateway] Provider bridge registered for gateway lifecycle: ${bridge}`);
+    return true;
+  } catch (error: any) {
+    console.warn(`[OpenCodex Gateway] Could not register provider bridge with launchd: ${error?.message || error}`);
+    return false;
+  }
+}
+
+function unregisterProviderBridgeEnvironment(): void {
+  if (process.platform !== "darwin") return;
+  for (const variable of ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT"]) {
+    try { execFileSync("/bin/launchctl", ["unsetenv", variable], { stdio: "ignore" }); } catch {}
+  }
+  // This only affects future Desktop launches. The already-running Desktop
+  // and its provider bridge remain open, so native GPT can keep using the
+  // official path while third-party requests fail closed until the gateway
+  // is started again.
+  console.log("[OpenCodex Gateway] Provider bridge detached from future launches; existing Desktop was left running.");
+}
+
+type DesktopAppServerState = "bridge" | "native" | "absent";
+
+function desktopAppServerState(): DesktopAppServerState {
+  try {
+    execFileSync("pgrep", ["-f", "codex-provider-bridge.*app-server"], { stdio: "ignore" });
+    return "bridge";
+  } catch {}
+  try {
+    execFileSync("pgrep", ["-f", "/Applications/(ChatGPT|Codex)\\.app/Contents/Resources/codex.*app-server"], { stdio: "ignore" });
+    return "native";
+  } catch {}
+  return "absent";
+}
+
+function desktopBundleExecutable(bundlePath: string): string {
+  const candidates: string[] = [];
+  const plistPath = path.join(bundlePath, "Contents", "Info.plist");
+  try {
+    const executable = execFileSync("/usr/libexec/PlistBuddy", ["-c", "Print :CFBundleExecutable", plistPath], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (executable) candidates.push(executable);
+  } catch {}
+  try {
+    const plist = fs.readFileSync(plistPath, "utf-8");
+    const match = plist.match(/<key>CFBundleExecutable<\/key>\s*<string>([^<]+)<\/string>/i);
+    if (match?.[1]) candidates.push(match[1].trim());
+  } catch {}
+
+  const bundleName = path.basename(bundlePath, ".app");
+  candidates.push(bundleName, "ChatGPT", "Codex");
+  for (const name of candidates) {
+    const executable = path.join(bundlePath, "Contents", "MacOS", name);
+    try {
+      if (fs.existsSync(executable) && fs.statSync(executable).isFile()) return executable;
+    } catch {}
+  }
+  return "";
+}
+
+function desktopApplicationExecutable(): string {
+  const bundles = [
+    "/Applications/ChatGPT.app",
+    "/Applications/Codex.app",
+  ];
+  for (const bundle of bundles) {
+    const executable = desktopBundleExecutable(bundle);
+    if (executable) return executable;
+  }
+  return "";
 }
 
 function launchDesktopClient(launchWithCdp: boolean): void {
   if (!launchWithCdp) return;
 
+  const bridge = providerBridgePath();
+  const nativeCodex = nativeCodexExecutablePath();
+  const appExecutable = desktopApplicationExecutable();
+  if (bridge && nativeCodex && process.platform === "darwin" && appExecutable) {
+    try {
+      const child = spawn(appExecutable, ["--remote-debugging-port=8315"], {
+        detached: true,
+        stdio: "ignore",
+        env: {
+          ...process.env,
+          CODEX_CLI_PATH: bridge,
+          OPENCODEX_NATIVE_CODEX_PATH: nativeCodex,
+          OPENCODEX_PROVIDER_SPLIT: "1",
+        },
+      });
+      child.once("error", (error) => {
+        console.warn(`[OpenCodex Gateway] Provider bridge desktop launch failed: ${error?.message || error}`);
+      });
+      child.unref();
+      console.log(`[OpenCodex Gateway] Launched Desktop with provider bridge: ${bridge}`);
+      return;
+    } catch (error: any) {
+      console.warn(`[OpenCodex Gateway] Provider bridge launch failed; keeping native-only desktop fallback: ${error?.message || error}`);
+    }
+  }
+
+  // LaunchServices does not reliably inherit CODEX_CLI_PATH. If a managed
+  // provider catalog exists, opening the app without a complete bridge would
+  // send a third-party slug to the native ChatGPT account and reproduce the
+  // user-visible unsupported-model error. Refuse that unsafe fallback.
+  if (process.platform === "darwin") {
+    const configPath = codexConfigPath();
+    let managed = false;
+    try { managed = fs.readFileSync(configPath, "utf-8").includes("opencodex managed"); } catch {}
+    if (managed && (!bridge || !nativeCodex || !appExecutable)) {
+      console.warn("[OpenCodex Gateway] Managed third-party routing is active but the provider bridge is unavailable; refusing an unbridged Desktop launch.");
+      return;
+    }
+  }
+
   for (const application of ["ChatGPT", "Codex"]) {
     try {
       execFileSync("open", ["-a", application, "--args", "--remote-debugging-port=8315"], { stdio: "ignore" });
+      if (!bridge || !nativeCodex) {
+        console.warn("[OpenCodex Gateway] Desktop provider bridge is unavailable; native GPT remains direct, while third-party models wait for the bridge and gateway.");
+      }
       return;
     } catch {}
   }
@@ -1397,8 +1554,15 @@ export class CodexBridgeServer {
     }
 
     const launchTimer = setTimeout(() => {
-      launchDesktopClient(true);
-      console.log("[OpenCodex Gateway] Gateway is ready; launched the desktop client after model catalog initialization.");
+      if (desktopAppServerState() === "bridge") {
+        console.log("[OpenCodex Gateway] Desktop is already attached to the provider bridge; skipped Desktop restart.");
+        return;
+      }
+      // A native app-server cannot receive CODEX_CLI_PATH retroactively. Only
+      // this one-time takeover path restarts Desktop; ordinary gateway
+      // start/stop cycles leave an already-bridged Desktop untouched.
+      restartDesktopClients(true);
+      console.log("[OpenCodex Gateway] Gateway is ready; launched Desktop through the provider bridge after model catalog initialization.");
     }, 500);
     launchTimer.unref?.();
   }
@@ -2915,6 +3079,14 @@ if __name__ == "__main__":
       }, 2000);
       delayedCatalogSync.unref?.();
     }
+    if (registerProviderBridgeEnvironment()) {
+      const desktopState = desktopAppServerState();
+      if (desktopState !== "bridge") {
+        this.requestDesktopLaunchAfterGatewayReady();
+      } else {
+        console.log("[OpenCodex Gateway] Desktop is already attached to the provider bridge; gateway startup will not restart it.");
+      }
+    }
     return new Promise(async (resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
@@ -2937,7 +3109,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.2", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.5", opencodex: true }));
           return;
         }
 
@@ -6839,6 +7011,7 @@ if __name__ == "__main__":
 
   public stop(): Promise<void> {
     return new Promise((resolve) => {
+      unregisterProviderBridgeEnvironment();
       this.stopLivePickerOverlay();
       if (this.server) {
         this.server.close(() => {

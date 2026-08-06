@@ -71,9 +71,22 @@ test("desktop app publishes the runtime port and uses the embedded voice bar", a
   assert.match(gatewayProcess, /OpenCodexLivePicker/);
   assert.match(gatewayProcess, /OPENCODEX_APP_PORT/);
   assert.match(gatewayProcess, /OPENCODEX_ADMIN_TOKEN_PATH/);
+  assert.match(gatewayProcess, /launchctl/);
+  assert.match(gatewayProcess, /CODEX_CLI_PATH/);
+  assert.match(gatewayProcess, /OPENCODEX_PROVIDER_BRIDGE_PATH/);
+  assert.match(gatewayProcess, /restart_desktop_after_gateway_ready/);
   assert.match(gateway, /buildManagedCodexConfig/);
   assert.match(gateway, /Synchronized managed Codex config to port/);
   assert.match(info, /LSMultipleInstancesProhibited/);
+});
+
+test("login startup exports the provider bridge before launching the gateway", async () => {
+  const startup = await read("startup.sh");
+  assert.match(startup, /launchctl setenv CODEX_CLI_PATH/);
+  assert.match(startup, /launchctl setenv OPENCODEX_NATIVE_CODEX_PATH/);
+  assert.match(startup, /launchctl setenv OPENCODEX_PROVIDER_BRIDGE_PATH/);
+  assert.match(startup, /restart_desktop_after_gateway_ready/);
+  assert.match(startup, /pm2 start \"\$PROJECT_ROOT\/dist\/server\.js\"/);
 });
 
 test("voice streaming deduplicates repeated CDP response snapshots before TTS", async () => {

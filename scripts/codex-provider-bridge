@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+BRIDGE_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -x "$BRIDGE_DIR/../node" ]; then
+  NODE="$BRIDGE_DIR/../node"
+else
+  NODE=${OPENCODEX_PROVIDER_BRIDGE_NODE:-node}
+fi
+
+exec "$NODE" "$BRIDGE_DIR/codex-provider-bridge.js" "$@"

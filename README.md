@@ -7,7 +7,7 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg"><img src="https://img.shields.io/badge/macOS-v1.1.2-111111?style=flat-square&logo=apple" alt="macOS v1.1.2"></a>
+  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/badge/macOS-source%20v1.1.5-111111?style=flat-square&logo=apple" alt="macOS source v1.1.5"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe"><img src="https://img.shields.io/badge/Windows-v1.0.8-0078D6?style=flat-square&logo=windows" alt="Windows v1.0.8"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
@@ -17,7 +17,7 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg">⬇️ 下载 OpenCodex v1.1.2（macOS）</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg">⬇️ 下载已发布的 OpenCodex v1.1.2（macOS）</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe">🪟 下载 Windows v1.0.8</a>
   ·
@@ -62,9 +62,11 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
 </p>
 
-> 当前发布状态：macOS Apple Silicon `v1.1.2`，Windows `v1.0.8`。Linux 版本尚未发布。
+> 当前源码版本：macOS Apple Silicon `v1.1.5`（官方 GPT 直连 / 第三方网关分流验证版）；最近已发布的 macOS DMG 为 `v1.1.2`，Windows 为 `v1.0.8`。Linux 版本尚未发布。
 >
 > `v1.1.2` 在 `v1.1.1` 基础上统一了官方 GPT 与第三方模型的原生 `gpt-image-2` 生图路径，并保留 `gpt-image-1.5` 作为明确兜底；同时 GPT-Live 只在用户主动开启时启动。
+>
+> `v1.1.5` 增加了原生 Codex app-server provider bridge：官方 GPT 由 Codex 原生 OpenAI provider 直连，第三方模型继续通过 `127.0.0.1:8765` 网关；切换 provider 时复用同一个 thread 和 rollout，不改写原生 turn 请求。源码开机项和打包版控制中心会在网关就绪后自动通过 bridge 启动 Desktop；已经独立运行的 Desktop 会在这次接管时重启一次以继承 bridge。bridge 或网关不可用时不启动不安全的第三方路由，只保证原生 GPT 直连。
 >
 > ✅ macOS Release DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 >
@@ -159,6 +161,13 @@ OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议�
 - 支持请求体解压、流式背压、上游瞬时网络错误重试和响应头安全转发。
 - 原生 GPT 的上下文压缩完全透传；第三方 Responses 模型仅在原生支持 `/responses/compact` 时转发并转换后端模型名，不生成网关自定义压缩结果。
 
+#### v1.1.5 provider 分流与原生会话
+
+- 官方 GPT、o-series 和 Codex 模型由原生 Codex app-server 使用 OpenAI provider 直连，不经过第三方适配器。
+- 第三方模型仍使用 OpenCodex 网关的 `8765` 端口，继续沿用各服务商自己的协议、上下文、工具和压缩能力。
+- Codex Desktop 的 `turn/start` 不携带 provider，bridge 会在 provider 边界卸载并重新加载同一个 thread，然后原样转发 turn；会话 ID、rollout 路径和登录态仍由原生 Codex 管理。
+- 从 OpenCodex 的“重启 Codex”入口启动 Desktop 才会注入 bridge。手动启动的旧进程不会自动获得这层分流；此时只保证原生 GPT 直连，第三方模型需重新从 OpenCodex 启动 Desktop。
+
 ### 6. Computer Use、图像和 MCP
 
 第三方模型的 Computer Use 不会伪造一套独立的桌面执行器，而是接入 Codex 的实际工具执行链：
@@ -251,7 +260,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载 [OpenCodex-1.1.2-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)。
+2. 下载最近已发布的 [OpenCodex-1.1.2-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)；`v1.1.5` provider 分流版目前先以源码形式测试。
 3. 打开 DMG，把 `OpenCodex.app` 拖入 `Applications`。
 4. 启动 OpenCodex，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
@@ -332,9 +341,9 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 ## 项目状态
 
-OpenCodex 正在持续迭代。当前发布状态：
+OpenCodex 正在持续迭代。当前状态：
 
-- macOS Apple Silicon：`v1.1.2`，DMG 已发布。
+- macOS Apple Silicon：源码 `v1.1.5`，provider 分流正在进行真实 Desktop 测试；`v1.1.2` DMG 已发布。
 - Windows 10/11：`v1.0.8`，安装包已发布。
 - Linux：暂未发布桌面安装包。
 
@@ -345,7 +354,7 @@ OpenCodex 正在持续迭代。当前发布状态：
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [GitHub Issues](https://github.com/AITabby/opencodex/issues)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.1.2 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)
+- [Download the latest published OpenCodex v1.1.2 DMG for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)
 - [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
 - [语音助手使用指南](./VOICE_GUIDE.md)
 - [测试流程](./TEST_FLOW.md)
@@ -359,7 +368,7 @@ OpenCodex 正在持续迭代。当前发布状态：
 
 OpenCodex is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
-Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway.
+Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway. The v1.1.5 source build adds an app-server bridge so official GPT can remain on the native OpenAI provider while third-party models use the local gateway.
 
 ### Screenshots
 
@@ -377,7 +386,7 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: `v1.1.2` DMG.
+- macOS Apple Silicon: source `v1.1.5` provider-split validation build; `v1.1.2` DMG.
 - Windows 10/11: `v1.0.8` installer.
 - Linux: no desktop package is published yet.
 
@@ -414,6 +423,7 @@ On macOS, the dashboard can detect and import available local login states for A
 - Anthropic, Google Gemini, DeepSeek, MiniMax, and OpenAI-compatible adapters.
 - Streaming, reasoning, tool calls, tool results, multi-turn continuations, request decompression, bounded streaming writes, and transient upstream retries.
 - Native GPT compaction is passed through unchanged; third-party compaction is forwarded only when the provider exposes native `/responses/compact`.
+- v1.1.5 provider split: official GPT stays on the native OpenAI app-server provider, while third-party models use `127.0.0.1:8765`. The bridge switches the same native thread before forwarding the original turn, preserving the thread and rollout path. The source login agent and packaged control center automatically launch Desktop through the bridge after the gateway is ready; an already-running Desktop is restarted once during that takeover. If the bridge or gateway is unavailable, unsafe third-party routing is not launched and native GPT remains direct.
 - Native Codex Responses, native Live / Realtime, Computer Use, and MCP remain isolated from third-party routing.
 
 #### Computer Use, images, and MCP
@@ -456,7 +466,7 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download [OpenCodex v1.1.2 for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg).
+2. Download the latest published [OpenCodex v1.1.2 DMG for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg). The v1.1.5 provider-split build is currently source-only for testing.
 3. Drag `OpenCodex.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 

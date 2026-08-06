@@ -146,6 +146,7 @@ cp -R "$VOICE_BAR_APP" "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app"
 mkdir -p "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets"
 cp -R "$APP_ROOT/src_v2/assets/" "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets/"
 chmod +x "$APP_BUNDLE/Contents/MacOS/OpenCodex" "$APP_BUNDLE/Contents/Resources/OpenCodexLivePicker" "$APP_BUNDLE/Contents/Resources/node" \
+  "$APP_BUNDLE/Contents/Resources/dist/codex-provider-bridge" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uv" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uvx" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/ffmpeg"
