@@ -239,7 +239,6 @@ function stripRequestProvider(params: JsonRecord): JsonRecord {
   return next;
 }
 
-/** Keep the Desktop sidebar provider-neutral so all history remains visible. */
 export function normalizeThreadListParams(params: JsonRecord = {}): JsonRecord {
   const nextParams = { ...params };
   nextParams.modelProviders = [];

@@ -173,6 +173,7 @@ test("provider bridge keeps a resumed third-party thread on the gateway when tur
       CODEX_CLI_PATH: "",
       OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
       OPENCODEX_MODEL_CATALOG_PATH: emptyCatalogPath,
+      OPENCODEX_DATA_DIR: tempRoot,
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
