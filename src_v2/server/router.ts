@@ -32,7 +32,6 @@ export interface GatewaySubagentDispatchCall {
 
 export interface GatewaySubagentDispatchContext {
   parent_task_id?: string;
-  parent_turn_id?: string;
   parent_model?: string;
   provider?: string;
   backend_model?: string;
@@ -697,15 +696,6 @@ export class GatewayRouter {
   isSubagentRequest = false,
 ): Promise<void> {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
-    const parentTurnId = String(
-      reqBody?.client_metadata?.parent_turn_id ||
-      reqBody?.client_metadata?.parentTurnId ||
-      reqBody?.parent_turn_id ||
-      reqBody?.parentTurnId ||
-      reqBody?.client_metadata?.turn_id ||
-      reqBody?.turn_id ||
-      "",
-    ).trim() || undefined;
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
@@ -734,7 +724,6 @@ export class GatewayRouter {
         this.subagentDispatcher,
         {
           parent_task_id: sessionId,
-          parent_turn_id: parentTurnId,
           parent_model: selectedResponseModel,
           backend_model: upstreamModel,
           parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
@@ -1643,7 +1632,6 @@ export class GatewayRouter {
 
         const results = await this.subagentDispatcher(internalCalls, {
           parent_task_id: sessionId,
-          parent_turn_id: parentTurnId,
           parent_model: selectedResponseModel,
           provider: providerName,
           backend_model: upstreamModel,

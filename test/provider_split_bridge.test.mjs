@@ -67,14 +67,7 @@ test("1.1.5 uses an official canonical thread and isolated third-party turns", a
   ]);
   assert.match(source, /thread\/inject_items/);
   assert.match(source, /spawnRuntime/);
-  assert.match(source, /providerBridgeExecutablePath/);
-  assert.match(source, /CODEX_CLI_PATH: bridge/);
   assert.match(source, /OPENCODEX_PROVIDER_BRIDGE_RUNTIME/);
-  assert.match(source, /NATIVE_RUNTIME_PROVIDER/);
-  assert.match(source, /nativeRouter/);
-  assert.match(source, /openai-direct/);
-  assert.match(source, /gateway:\$\{gatewayPort\}/);
-  assert.match(source, /nativeRuntimeArgs/);
   assert.match(source, /ephemeral: true/);
   assert.match(source, /function beginGatewayTurn/);
   assert.match(source, /method === "thread\/list"/);

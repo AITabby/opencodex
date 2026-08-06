@@ -1321,14 +1321,11 @@ export class CodexBridgeServer {
     this.subagentOrchestrator.start({
       task_id: taskId,
       parent_task_id: context.parent_task_id,
-      parent_turn_id: context.parent_turn_id,
       profile_id: route.profile_id,
       provider: route.provider,
       model: route.model,
       backend_model: route.backend_model,
       reasoning_effort: route.reasoning_effort,
-      task_name: String(argumentsValue?.task_name || argumentsValue?.name || "").trim() || undefined,
-      prompt: message,
     });
 
     const childBody: any = {
@@ -1342,7 +1339,6 @@ export class CodexBridgeServer {
         request_kind: "turn",
         session_id: taskId,
         parent_task_id: context.parent_task_id || "gateway-main",
-        parent_turn_id: context.parent_turn_id,
         model_override: route.model,
         turn_id: `turn-${taskId}`,
       },
@@ -1363,7 +1359,6 @@ export class CodexBridgeServer {
             Authorization: `Bearer ${this.adminToken}`,
             "x-openai-subagent": "1",
             "x-codex-parent-thread-id": context.parent_task_id || "gateway-main",
-            ...(context.parent_turn_id ? { "x-codex-parent-turn-id": context.parent_turn_id } : {}),
           },
           body: JSON.stringify({ ...childBody, input: childInput }),
           signal: AbortSignal.timeout(600_000),
@@ -1756,6 +1751,7 @@ export class CodexBridgeServer {
       "__active__",
     ).trim() || "__active__";
     const bodyModel = this.stripReasoningSuffix(String(body?.model || "").trim());
+    const bodyModelIsNative = Boolean(bodyModel) && this.isNativeCatalogModel(bodyModel);
     const explicitModel = String(
       body?.forced_model ||
       body?.subagent_model ||
@@ -1767,10 +1763,10 @@ export class CodexBridgeServer {
       metadata.child_model ||
       metadata.agent_model ||
       metadata.model_override ||
-      // The executing model is the routing boundary. Official models remain
-      // native; namespaced/custom models use the gateway. Only a request with
-      // no model at all falls through to the saved intelligent-routing rules.
-      bodyModel ||
+      // For a child request, a non-native body model is itself an explicit
+      // target. Native GPT is the inherited parent model and must not be
+      // mistaken for a user-selected third-party child model.
+      (!bodyModelIsNative ? bodyModel : "") ||
       "",
     ).trim();
     const configuredProfiles = this.taskRouter.listProfiles();
@@ -1840,38 +1836,22 @@ export class CodexBridgeServer {
       return null;
     }
     this.taskRouter.record(routeRequest, route);
-    const parentTaskId = String(
-      metadata.parent_task_id ||
-      metadata.parentThreadId ||
-      metadata.parent_thread_id ||
-      body?.parent_task_id ||
-      body?.parent_thread_id ||
-      headerMetadata.parent_thread_id ||
-      headerMetadata.parent_task_id ||
-      requestHeader(req, "x-codex-parent-thread-id") ||
-      "",
-    ).trim() || undefined;
-    const parentTurnId = String(
-      metadata.parent_turn_id ||
-      metadata.parentTurnId ||
-      body?.parent_turn_id ||
-      body?.parentTurnId ||
-      headerMetadata.parent_turn_id ||
-      headerMetadata.parentTurnId ||
-      requestHeader(req, "x-codex-parent-turn-id") ||
-      "",
-    ).trim() || undefined;
     const task = this.subagentOrchestrator.start({
       task_id: routeRequest.task_id,
-      parent_task_id: parentTaskId,
-      parent_turn_id: parentTurnId,
+      parent_task_id:
+        metadata.parent_task_id ||
+        metadata.parentThreadId ||
+        metadata.parent_thread_id ||
+        body?.parent_task_id ||
+        body?.parent_thread_id ||
+        headerMetadata.parent_thread_id ||
+        headerMetadata.parent_task_id ||
+        requestHeader(req, "x-codex-parent-thread-id"),
       profile_id: route.profile_id,
       provider: route.provider,
       model: route.model,
       backend_model: route.backend_model,
       reasoning_effort: route.reasoning_effort,
-      task_name: String(body?.task_name || body?.name || metadata.task_name || metadata.taskName || "").trim() || undefined,
-      prompt: extractTaskText(body),
     });
     console.log(`[OpenCodex Subagent] Routed child task: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
     const selectedRoute = { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason, task_id: task.id };
@@ -3557,22 +3537,6 @@ if __name__ == "__main__":
           const limit = Number(url.searchParams.get("limit") || 100);
           res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify({ tasks: this.subagentOrchestrator.list(limit) }));
-          return;
-        }
-
-        if (req.method === "GET" && url.pathname === "/api/agent-tasks/events") {
-          const limit = Number(url.searchParams.get("limit") || 100);
-          const after = Number(url.searchParams.get("after") || 0);
-          const parentTaskId = url.searchParams.get("parent_task_id") || undefined;
-          const parentTurnId = url.searchParams.get("parent_turn_id") || undefined;
-          const events = this.subagentOrchestrator.listEvents({
-            limit,
-            after,
-            parent_task_id: parentTaskId,
-            parent_turn_id: parentTurnId,
-          });
-          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify({ events, next_cursor: this.subagentOrchestrator.latestEventSequence() }));
           return;
         }
 
