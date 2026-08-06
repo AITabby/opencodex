@@ -444,7 +444,7 @@ export function buildFullCatalogEntry(
     // Codex Responses image tool. This capability is independent from
     // the model's own vision input capability.
     supports_image_generation: true,
-    image_generation_mode: "native_responses",
+    image_generation_mode: "native_images",
   };
   if (defaultReasoning) entry.default_reasoning_level = defaultReasoning;
   if (typeof capabilities?.reasoning === "boolean") entry.reasoning = capabilities.reasoning;

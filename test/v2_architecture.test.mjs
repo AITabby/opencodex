@@ -16,6 +16,7 @@ import {
 import { ResponsesStreamEngine, normalizeToolArguments } from "../dist/core/stream_engine.js";
 import {
   DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL,
+  NATIVE_IMAGE_FALLBACK_MODEL,
   NATIVE_IMAGE_TOOL_NAME,
   buildNativeCodexImageRequestBody,
   extractImageGenerationContext,
@@ -288,18 +289,19 @@ test("native Codex image bridge keeps generation independent from the chat model
   });
   assert.equal(context.text, "把这张图改成海报");
   assert.deepEqual(context.images, [{ url: "data:image/png;base64,AAAA" }]);
-  assert.equal(DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL, "gpt-5.6");
+  assert.equal(DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL, "gpt-image-2");
+  assert.equal(NATIVE_IMAGE_FALLBACK_MODEL, "gpt-image-1.5");
   assert.equal(parseImageGenerationArguments('{"prompt":"画一只猫"}').prompt, "画一只猫");
   const nativeRequest = buildNativeCodexImageRequestBody(
     { prompt: "画一只猫", size: "1024x1024", quality: "medium" },
     context,
     DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL,
   );
-  assert.equal(nativeRequest.tools[0].type, "image_generation");
-  assert.equal(nativeRequest.tools[0].action, "auto");
-  assert.equal(nativeRequest.tools[0].partial_images, 0);
-  assert.equal(nativeRequest.tools[0].size, "1024x1024");
-  assert.equal(nativeRequest.input[0].content[1].type, "input_image");
+  assert.equal(nativeRequest.model, "gpt-image-2");
+  assert.equal(nativeRequest.prompt, "画一只猫");
+  assert.equal(nativeRequest.background, "auto");
+  assert.equal(nativeRequest.quality, "medium");
+  assert.equal(nativeRequest.size, "1024x1024");
 });
 
 test("v2 exec command contract can request desktop-path approval", () => {

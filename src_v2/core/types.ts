@@ -252,7 +252,7 @@ export interface CatalogModelEntry {
   context_window_confidence?: "exact" | "unknown";
   vision_bridge_enabled?: boolean;
   supports_image_generation?: boolean;
-  image_generation_mode?: "native_responses" | "none";
+  image_generation_mode?: "native_images" | "none";
   supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
   default_reasoning_level?: string;
   reasoning?: boolean;

@@ -7,7 +7,7 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg"><img src="https://img.shields.io/badge/macOS-v1.1.1-111111?style=flat-square&logo=apple" alt="macOS v1.1.1"></a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg"><img src="https://img.shields.io/badge/macOS-v1.1.2-111111?style=flat-square&logo=apple" alt="macOS v1.1.2"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe"><img src="https://img.shields.io/badge/Windows-v1.0.8-0078D6?style=flat-square&logo=windows" alt="Windows v1.0.8"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
@@ -17,11 +17,11 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg">⬇️ 下载 OpenCodex v1.1.1（macOS）</a>
+  <a href="https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg">⬇️ 下载 OpenCodex v1.1.2（macOS）</a>
   ·
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe">🪟 下载 Windows v1.0.8</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.1.1">查看 Release</a>
+  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.1.2">查看 Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
@@ -62,9 +62,9 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
 </p>
 
-> 当前发布状态：macOS Apple Silicon `v1.1.1`，Windows `v1.0.8`。Linux 版本尚未发布。
+> 当前发布状态：macOS Apple Silicon `v1.1.2`，Windows `v1.0.8`。Linux 版本尚未发布。
 >
-> `v1.1.1` 在 `v1.1.0` 基础上修复了 GPT-Live 悬浮球随 DMG 启动自动出现的问题；GPT-Live 现在只在用户主动开启时启动。
+> `v1.1.2` 在 `v1.1.1` 基础上统一了官方 GPT 与第三方模型的原生 `gpt-image-2` 生图路径，并保留 `gpt-image-1.5` 作为明确兜底；同时 GPT-Live 只在用户主动开启时启动。
 >
 > ✅ macOS Release DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 >
@@ -251,7 +251,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载 [OpenCodex-1.1.1-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg)。
+2. 下载 [OpenCodex-1.1.2-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)。
 3. 打开 DMG，把 `OpenCodex.app` 拖入 `Applications`。
 4. 启动 OpenCodex，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
@@ -334,7 +334,7 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 OpenCodex 正在持续迭代。当前发布状态：
 
-- macOS Apple Silicon：`v1.1.1`，DMG 已发布。
+- macOS Apple Silicon：`v1.1.2`，DMG 已发布。
 - Windows 10/11：`v1.0.8`，安装包已发布。
 - Linux：暂未发布桌面安装包。
 
@@ -345,7 +345,7 @@ OpenCodex 正在持续迭代。当前发布状态：
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [GitHub Issues](https://github.com/AITabby/opencodex/issues)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.1.1 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg)
+- [Download OpenCodex v1.1.2 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)
 - [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
 - [语音助手使用指南](./VOICE_GUIDE.md)
 - [测试流程](./TEST_FLOW.md)
@@ -377,7 +377,7 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: `v1.1.1` DMG.
+- macOS Apple Silicon: `v1.1.2` DMG.
 - Windows 10/11: `v1.0.8` installer.
 - Linux: no desktop package is published yet.
 
@@ -456,7 +456,7 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download [OpenCodex v1.1.1 for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg).
+2. Download [OpenCodex v1.1.2 for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg).
 3. Drag `OpenCodex.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 
@@ -481,7 +481,7 @@ Open `http://127.0.0.1:8765/dashboard` after the gateway starts. For the macOS d
 - [GitHub Repository](https://github.com/AITabby/opencodex)
 - [GitHub Issues](https://github.com/AITabby/opencodex/issues)
 - [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.1.1 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.1/OpenCodex-1.1.1-arm64.dmg)
+- [Download OpenCodex v1.1.2 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)
 - [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
 - [Voice Assistant Guide](./VOICE_GUIDE.md)
 - [Test Flow](./TEST_FLOW.md)

@@ -12,8 +12,9 @@ import { ResponseTool } from "../core/types.js";
 import { fetchUpstream } from "./upstream_fetch.js";
 
 export const NATIVE_IMAGE_TOOL_NAME = "opencodex_generate_image";
-export const NATIVE_CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-export const DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL = "gpt-5.6";
+export const NATIVE_CODEX_IMAGES_URL = "https://chatgpt.com/backend-api/codex/images/generations";
+export const DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL = "gpt-image-2";
+export const NATIVE_IMAGE_FALLBACK_MODEL = "gpt-image-1.5";
 
 export interface ImageInputReference {
   url?: string;
@@ -159,91 +160,21 @@ export function parseImageGenerationArguments(rawArguments: string, fallbackProm
   };
 }
 
-function nativeInputContent(prompt: string, images: ImageInputReference[]): any[] {
-  const content: any[] = [{ type: "input_text", text: prompt }];
-  for (const image of images) {
-    if (image.url) {
-      content.push({
-        type: "input_image",
-        image_url: image.url,
-        ...(image.detail ? { detail: image.detail } : {}),
-      });
-    } else if (image.fileId) {
-      content.push({
-        type: "input_image",
-        file_id: image.fileId,
-        ...(image.detail ? { detail: image.detail } : {}),
-      });
-    }
-  }
-  return content;
-}
-
 export function buildNativeCodexImageRequestBody(
   args: ImageGenerationToolArguments,
   context: ImageGenerationContext,
   model: string,
 ): any {
-  // Let the native Responses image tool choose between a new image and an
-  // edit when reference images are present; the third-party model's prompt
-  // remains the source of truth for the visual operation.
-  const tool: any = { type: "image_generation", action: "auto", partial_images: 0 };
-  // These are hints for the native tool. Unsupported hints are intentionally
-  // omitted rather than translated into a provider-specific image API.
-  if (args.quality) tool.quality = args.quality;
-  if (args.size) tool.size = args.size;
-
+  // Third-party models only decide that an image is needed. The actual image
+  // request uses the same native Codex Images API and image2 model as the
+  // official Codex image-generation extension.
   return {
     model,
-    input: [{ role: "user", content: nativeInputContent(args.prompt || context.text, context.images) }],
-    tools: [tool],
-    stream: true,
+    prompt: args.prompt || context.text,
+    background: "auto",
+    quality: args.quality || "auto",
+    size: args.size || "auto",
   };
-}
-
-function appendNativeImageFromItem(images: NativeGeneratedImage[], item: any): void {
-  if (!item || item.type !== "image_generation_call" || !cleanString(item.result)) return;
-  images.push({
-    data: cleanString(item.result),
-    ...(cleanString(item.revised_prompt || item.revisedPrompt) ? { revisedPrompt: cleanString(item.revised_prompt || item.revisedPrompt) } : {}),
-  });
-}
-
-function parseNativeJsonEvent(images: NativeGeneratedImage[], event: any): void {
-  if (!event || typeof event !== "object") return;
-  if (event.type === "response.output_item.done") appendNativeImageFromItem(images, event.item);
-  if (event.type === "response.completed" || event.type === "response.done") {
-    const output = Array.isArray(event.response?.output) ? event.response.output : [];
-    for (const item of output) appendNativeImageFromItem(images, item);
-  }
-}
-
-async function readNativeImageStream(response: Response): Promise<NativeGeneratedImage[]> {
-  const images: NativeGeneratedImage[] = [];
-  if (!response.body) return images;
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  const consumeLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) return;
-    const data = trimmed.slice("data:".length).trim();
-    if (!data || data === "[DONE]") return;
-    try { parseNativeJsonEvent(images, JSON.parse(data)); } catch {}
-  };
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) consumeLine(line);
-  }
-  buffer += decoder.decode();
-  if (buffer.trim()) for (const line of buffer.split("\n")) consumeLine(line);
-  return images;
 }
 
 function parseNativeError(raw: string): string {
@@ -264,30 +195,62 @@ export async function generateNativeCodexImage(
   const model = cleanString(options.model)
     || cleanString(process.env.OPENCODEX_NATIVE_IMAGE_MAINLINE_MODEL)
     || DEFAULT_NATIVE_IMAGE_MAINLINE_MODEL;
-  const body = buildNativeCodexImageRequestBody(args, context, model);
-  const headers: Record<string, string> = { ...nativeHeaders };
-  for (const key of ["host", "content-length", "transfer-encoding", "connection", "accept-encoding", "content-encoding"]) {
-    delete headers[key];
-    delete headers[key.toLowerCase()];
-  }
-  headers.host = "chatgpt.com";
-  headers["Content-Type"] = "application/json";
-  headers.Accept = "text/event-stream";
+  const authorization = Object.entries(nativeHeaders).find(([key]) => key.toLowerCase() === "authorization")?.[1];
+  const userAgent = Object.entries(nativeHeaders).find(([key]) => key.toLowerCase() === "user-agent")?.[1];
+  const headers: Record<string, string> = {
+    ...(authorization ? { Authorization: authorization } : {}),
+    ...(userAgent ? { "User-Agent": userAgent } : {}),
+    "Content-Type": "application/json",
+  };
+  // The native Images endpoint negotiates JSON with a generic accept header;
+  // explicitly requesting `application/json` is rejected by this backend.
+  headers.Accept = "*/*";
 
-  const response = await fetchUpstream(NATIVE_CODEX_RESPONSES_URL, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    maxAttempts: 1,
-    timeoutMs: 600_000,
-    operation: "native-image-generation",
-  });
+  const requestWithModel = async (requestedModel: string): Promise<NativeGeneratedImage[]> => {
+    const body = buildNativeCodexImageRequestBody(args, context, requestedModel);
+    const response = await fetchUpstream(NATIVE_CODEX_IMAGES_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      maxAttempts: 1,
+      timeoutMs: 600_000,
+      operation: `native-image-generation:${requestedModel}`,
+    });
 
-  if (!response.ok) {
-    const raw = await response.text();
-    throw new Error(`原生 Codex 生图失败（HTTP ${response.status}）：${parseNativeError(raw) || "上游没有返回错误详情"}`);
+    if (!response.ok) {
+      const raw = await response.text();
+      throw new Error(`原生 Codex 生图失败（模型 ${requestedModel}，HTTP ${response.status}）：${parseNativeError(raw) || "上游没有返回错误详情"}`);
+    }
+    let payload: any;
+    try {
+      payload = await response.json();
+    } catch {
+      throw new Error(`原生 Codex 生图失败（模型 ${requestedModel}）：响应不是有效的 JSON 图片结果`);
+    }
+    const images: NativeGeneratedImage[] = Array.isArray(payload?.data)
+      ? payload.data
+        .filter((item: any) => cleanString(item?.b64_json))
+        .map((item: any) => ({
+          data: cleanString(item.b64_json),
+          ...(cleanString(item.revised_prompt) ? { revisedPrompt: cleanString(item.revised_prompt) } : {}),
+        }))
+      : [];
+    if (images.length === 0) throw new Error(`原生 Codex 生图失败（模型 ${requestedModel}）：响应中没有 b64_json 图片结果`);
+    return images;
+  };
+
+  try {
+    return await requestWithModel(model);
+  } catch (primaryError: any) {
+    if (model === NATIVE_IMAGE_FALLBACK_MODEL) throw primaryError;
+    console.warn(`[OpenCodex Image] image2 unavailable; falling back to ${NATIVE_IMAGE_FALLBACK_MODEL}`, {
+      primary_model: model,
+      error: primaryError?.message || String(primaryError),
+    });
+    try {
+      return await requestWithModel(NATIVE_IMAGE_FALLBACK_MODEL);
+    } catch (fallbackError: any) {
+      throw new Error(`${primaryError?.message || primaryError}; fallback ${NATIVE_IMAGE_FALLBACK_MODEL} also failed: ${fallbackError?.message || fallbackError}`);
+    }
   }
-  const images = await readNativeImageStream(response);
-  if (images.length === 0) throw new Error("原生 Codex 生图完成，但响应中没有 image_generation_call 结果");
-  return images;
 }

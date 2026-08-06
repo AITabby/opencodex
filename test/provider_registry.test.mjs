@@ -106,8 +106,13 @@ test("V2 source keeps Computer Use on the Codex-native executor path", async () 
   ]);
   assert.doesNotMatch(source, /responses_request_debug|debug_req\.json/);
   assert.match(catalog, /experimental_supported_tools/);
-  assert.match(catalog, /image_generation_mode: "native_responses"/);
+  assert.match(catalog, /image_generation_mode: "native_images"/);
   assert.match(source, /proxyNativeResponses/);
+  assert.match(source, /\/v1\/images\/generations/);
+  assert.match(source, /proxyNativeImages/);
+  assert.match(source, /chatgpt\.com\/backend-api\/codex\/images\/generations/);
+  assert.doesNotMatch(source, /native_image_bridge/);
+  assert.ok(source.indexOf('url.pathname === "/v1/images/generations"') < source.indexOf('url.pathname === "/v1/responses"'));
   assert.match(router, /上游流在完成事件前结束/);
   assert.match(router, /generateNativeCodexImage/);
   assert.match(router, /proxyThirdPartyResponses\(\s*reqBody/);

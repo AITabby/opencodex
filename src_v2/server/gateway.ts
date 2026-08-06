@@ -2243,6 +2243,49 @@ export class CodexBridgeServer {
     }
   }
 
+  private async proxyNativeImages(req: http.IncomingMessage, body: Buffer, res: http.ServerResponse): Promise<void> {
+    const nativeImagesEndpoint = "https://chatgpt.com/backend-api/codex/images/generations";
+    const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
+
+    try {
+      const upstreamRes = await fetchUpstream(nativeImagesEndpoint, {
+        method: "POST",
+        headers: forwardHeaders,
+        // The native Images API request body is forwarded unchanged after the
+        // gateway removes transport compression, just like native Responses.
+        body: body as any,
+        maxAttempts: 1,
+        timeoutMs: 600_000,
+        operation: "native-images",
+      });
+      const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
+      res.writeHead(upstreamRes.status, responseHeaders);
+      if (upstreamRes.body) {
+        // @ts-ignore Node's fetch body is an async iterable at runtime.
+        for await (const chunk of upstreamRes.body) {
+          await writeHttpResponseChunked(res, chunk);
+        }
+      }
+      res.end();
+    } catch (err: any) {
+      const details = upstreamErrorDetails(err);
+      console.error(`[CodexBridge V2] Native Images proxy error:`, {
+        ...details,
+        attempts: err?.attempts,
+      });
+      if (!res.headersSent) {
+        res.writeHead(502, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: err.message,
+          type: "upstream_unreachable",
+          retryable: Boolean(err?.retryable),
+          attempts: err?.attempts,
+          cause_code: details.code,
+        }));
+      }
+    }
+  }
+
   private async handleCompactionRequest(
     req: http.IncomingMessage,
     body: any,
@@ -2893,7 +2936,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.1", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.1.2", opencodex: true }));
           return;
         }
 
@@ -2987,6 +3030,24 @@ if __name__ == "__main__":
           } catch (err: any) {
             if (!res.headersSent) {
               res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: err.message }));
+            }
+          }
+          return;
+        }
+
+        // Native Images API compatibility. Codex Desktop addresses the
+        // built-in image tool through `/v1/images/generations`; keep it on the
+        // native lane and forward its decompressed request bytes unchanged to
+        // the native Codex Images API. It must not enter provider routing or
+        // the third-party image bridge.
+        if (req.method === "POST" && (url.pathname === "/v1/images/generations" || url.pathname === "/images/generations")) {
+          try {
+            const rawBody = await this.parseRawBuffer(req);
+            await this.proxyNativeImages(req, rawBody, res);
+          } catch (err: any) {
+            if (!res.headersSent) {
+              res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: err.message }));
             }
           }
