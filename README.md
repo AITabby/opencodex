@@ -7,7 +7,7 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 <p align="center">
   <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/badge/macOS-source%20v1.1.5-111111?style=flat-square&logo=apple" alt="macOS source v1.1.5"></a>
+  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/badge/macOS-source%20v1.2.0-111111?style=flat-square&logo=apple" alt="macOS source v1.2.0"></a>
   <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe"><img src="https://img.shields.io/badge/Windows-v1.0.8-0078D6?style=flat-square&logo=windows" alt="Windows v1.0.8"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
@@ -62,11 +62,13 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
 </p>
 
-> 当前源码版本：macOS Apple Silicon `v1.1.5`（官方 GPT 直连 / 第三方网关分流验证版）；最近已发布的 macOS DMG 为 `v1.1.2`，Windows 为 `v1.0.8`。Linux 版本尚未发布。
+> 当前源码版本：macOS Apple Silicon `v1.2.0`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；最近已发布的 macOS DMG 为 `v1.1.2`，Windows 为 `v1.0.8`。Linux 版本尚未发布。
 >
 > `v1.1.2` 在 `v1.1.1` 基础上统一了官方 GPT 与第三方模型的原生 `gpt-image-2` 生图路径，并保留 `gpt-image-1.5` 作为明确兜底；同时 GPT-Live 只在用户主动开启时启动。
 >
 > `v1.1.5` 增加了原生 Codex app-server provider bridge：官方 GPT 由 Codex 原生 OpenAI provider 直连，第三方模型继续通过 `127.0.0.1:8765` 网关；切换 provider 时复用同一个 thread 和 rollout，不改写原生 turn 请求。源码开机项和打包版控制中心会在网关就绪后自动通过 bridge 启动 Desktop；已经独立运行的 Desktop 会在这次接管时重启一次以继承 bridge。bridge 或网关不可用时不启动不安全的第三方路由，只保证原生 GPT 直连。
+>
+> `v1.2.0` 只调整网关拥有的 `spawn_agent` 派发边界：dispatcher 将子任务原始约束发送到 `127.0.0.1:8765/v1/responses`，由网关统一执行模型/Profile 路由；native app-server、主会话和原生 provider 路径保持不变。
 >
 > ✅ macOS Release DMG 已内置独立 Node.js 运行时。下载安装后即可运行网关，不需要额外安装 Node.js、npm 或 Homebrew。
 >
@@ -260,7 +262,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载最近已发布的 [OpenCodex-1.1.2-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)；`v1.1.5` provider 分流版目前先以源码形式测试。
+2. 下载最近已发布的 [OpenCodex-1.1.2-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg)；`v1.2.0` spawn_agent 网关分流版目前先以源码形式测试。
 3. 打开 DMG，把 `OpenCodex.app` 拖入 `Applications`。
 4. 启动 OpenCodex，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
@@ -343,7 +345,7 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 OpenCodex 正在持续迭代。当前状态：
 
-- macOS Apple Silicon：源码 `v1.1.5`，provider 分流正在进行真实 Desktop 测试；`v1.1.2` DMG 已发布。
+- macOS Apple Silicon：源码 `v1.2.0`，spawn_agent 网关分流正在进行真实 Desktop 测试；`v1.1.2` DMG 已发布。
 - Windows 10/11：`v1.0.8`，安装包已发布。
 - Linux：暂未发布桌面安装包。
 
@@ -368,7 +370,7 @@ OpenCodex 正在持续迭代。当前状态：
 
 OpenCodex is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
-Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway. The v1.1.5 source build adds an app-server bridge so official GPT can remain on the native OpenAI provider while third-party models use the local gateway.
+Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway. The v1.2.0 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed without changing the native app-server.
 
 ### Screenshots
 
@@ -386,7 +388,7 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: source `v1.1.5` provider-split validation build; `v1.1.2` DMG.
+- macOS Apple Silicon: source `v1.2.0` spawn_agent gateway-routing validation build; `v1.1.2` DMG.
 - Windows 10/11: `v1.0.8` installer.
 - Linux: no desktop package is published yet.
 
@@ -466,7 +468,7 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download the latest published [OpenCodex v1.1.2 DMG for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg). The v1.1.5 provider-split build is currently source-only for testing.
+2. Download the latest published [OpenCodex v1.1.2 DMG for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.1.2/OpenCodex-1.1.2-arm64.dmg). The v1.2.0 spawn_agent gateway-routing build is currently source-only for testing.
 3. Drag `OpenCodex.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 

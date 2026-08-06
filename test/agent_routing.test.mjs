@@ -334,7 +334,7 @@ test("1.1.0 preserves an explicitly selected DeepSeek max level for a child turn
   }
 });
 
-test("1.1.0 third-party parent binds an explicitly named child to its saved Web Profile", async () => {
+test("1.2.0 spawn_agent forwards the child constraints to the gateway for one routing decision", async () => {
   const dataDir = await fixture();
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
   const previousFetch = globalThis.fetch;
@@ -360,7 +360,15 @@ test("1.1.0 third-party parent binds an explicitly named child to its saved Web 
       childRequest = JSON.parse(init.body);
       return new Response(
         'data: {"type":"response.output_text.delta","delta":"child done"}\n\ndata: [DONE]\n\n',
-        { status: 200, headers: { "content-type": "text/event-stream" } },
+        {
+          status: 200,
+          headers: {
+            "content-type": "text/event-stream",
+            "x-opencodex-subagent-model": "opencode/deepseek-v4-flash",
+            "x-opencodex-subagent-reasoning-effort": "max",
+            "x-opencodex-subagent-task-id": "gateway-selected-child",
+          },
+        },
       );
     };
 
@@ -380,11 +388,25 @@ test("1.1.0 third-party parent binds an explicitly named child to its saved Web 
       }),
     }, { parent_reasoning_effort: "high" }, 0);
 
+    assert.equal(childRequest.model, undefined);
+    assert.equal(childRequest.forced_model, undefined);
+    assert.equal(childRequest.profile_id, undefined);
+    assert.equal(childRequest.task_type, undefined);
+    assert.equal(childRequest.reasoning, undefined);
+    assert.equal(childRequest.client_metadata["x-openai-subagent"], "1");
+    assert.equal(childRequest.client_metadata.thread_source, "subagent");
+    assert.equal(childRequest.client_metadata.parent_task_id, "gateway-main");
+    assert.equal(childRequest.client_metadata.model_override, "opencode/deepseek-v4-flash");
+    assert.equal(childRequest.client_metadata.profile_id, "stale-profile-id");
+    assert.equal(childRequest.client_metadata.task_type, "deep-review");
+    assert.equal(childRequest.client_metadata.reasoning_effort, "high");
     assert.equal(result.model, "opencode/deepseek-v4-flash");
     assert.equal(result.reasoning_effort, "max");
-    assert.equal(childRequest.reasoning.effort, "max");
-    assert.equal(childRequest.reasoning_effort, "max");
+    assert.equal(result.task_id, "gateway-selected-child");
     assert.equal(result.output, "child done");
+    // The dispatcher only forwards the request. No local TaskRouter or task
+    // record is created before the gateway receives it.
+    assert.equal(server.subagentOrchestrator.list(10).length, 0);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
