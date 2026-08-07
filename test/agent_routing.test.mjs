@@ -556,6 +556,74 @@ test("1.1.0 binds an explicitly named native child model to its Web Profile reas
   }
 });
 
+test("1.2.0 follows the current frontend Profile tier for an explicitly named native child", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const catalogPath = path.join(dataDir, "custom_model_catalog.json");
+    const catalog = JSON.parse(await fs.readFile(catalogPath, "utf8"));
+    const model = {
+      slug: "antigravity/tiered-model",
+      backend_model: "tiered-model",
+      backend_provider: "antigravity",
+      reasoning: true,
+      supported_reasoning_levels: [
+        { effort: "low" },
+        { effort: "medium" },
+        { effort: "high" },
+        { effort: "max" },
+      ],
+    };
+    catalog.models.push(model);
+    await fs.writeFile(catalogPath, JSON.stringify(catalog));
+
+    const store = new AgentProfileStore(dataDir);
+    const profile = store.upsertProfile({
+      id: "model-antigravity-tiered-model",
+      name: model.slug,
+      model_ref: {
+        provider: model.backend_provider,
+        backend_model: model.backend_model,
+        catalog_slug: model.slug,
+      },
+      reasoning_effort: "low",
+      subagent_enabled: true,
+    });
+    store.saveRoutingSettings({ mode: "auto" });
+
+    const server = new CodexBridgeServer(0);
+    for (const [index, expectedReasoning] of ["low", "medium", "high", "max"].entries()) {
+      // This is the same state written by the frontend model directory. The
+      // parent deliberately carries a different value to prove the child
+      // follows the current Profile setting rather than inherited reasoning.
+      store.upsertProfile({ ...profile, reasoning_effort: expectedReasoning });
+      const route = server.chooseSubagentRoute({
+        // Native child requests can retain the parent's official model in the
+        // body; the explicit child model is carried in request metadata.
+        model: "gpt-5.5",
+        reasoning: { effort: "max" },
+        client_metadata: {
+          "x-openai-subagent": "1",
+          model_override: model.slug,
+          session_id: "parent-tier",
+          thread_id: `child-tier-${index}`,
+          parent_thread_id: "parent-tier",
+        },
+        input: `测试 ${expectedReasoning}`,
+      });
+      assert.equal(route?.model, model.slug);
+      assert.equal(route?.reasoning_effort, expectedReasoning);
+      assert.equal(route?.profile_id, profile.id);
+      server.subagentOrchestrator.complete(route.task_id);
+    }
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("1.1.0 recognizes native subagent headers and ignores their prewarm request", async () => {
   const dataDir = await fixture();
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;

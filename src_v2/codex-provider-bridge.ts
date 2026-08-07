@@ -1,20 +1,26 @@
 /**
  * Provider-aware stdio bridge for the native Codex app-server.
  *
- * Codex stores `model_provider` inside an app-server thread. A running
- * app-server ignores a later provider override on `thread/resume`, so one
- * child process cannot safely serve both native OpenAI and a gateway thread.
- * The bridge therefore runs one native app-server child at a time and
- * recreates that child when the selected model crosses providers. The new
- * child resumes the same thread from the shared Codex history directory;
- * only the provider process changes, never the Desktop conversation or id.
+ * The native app-server and its internal `spawn_agent` lifecycle remain
+ * untouched. For the native runtime only, this bridge supplies a local
+ * request-level OpenAI base URL. The local egress bridge forwards ordinary
+ * native requests to ChatGPT and forwards requests carrying native child
+ * metadata to the OpenCodex gateway, where TaskRouter selects the model.
+ * Provider-owned Desktop turns continue to use the gateway-owned runtime
+ * below; the native runtime provider itself is never replaced globally.
  */
 
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { RequestDecompressor } from "./core/decompressor.js";
+import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
+import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
+import { copyNativeRequestHeaders } from "./server/webrtc_proxy.js";
 
 export type CodexProvider = "openai" | "opencodex";
 
@@ -38,6 +44,7 @@ type PendingParentRequest = {
   physicalThreadId?: string;
   displayModel?: string;
   displayProvider?: CodexProvider;
+  displayReasoning?: string;
   onResponse?: (message: JsonRecord) => JsonRecord | null;
 };
 
@@ -60,6 +67,15 @@ type ThreadRoute = {
   legacySourcePath?: string;
   legacyModel?: string;
   settings?: JsonRecord;
+};
+
+type NativeSubagentDisplaySettings = {
+  model?: string;
+  effort?: string;
+};
+
+type NativeSubagentDisplayUpdate = NativeSubagentDisplaySettings & {
+  threadId: string;
 };
 
 type LegacyThread = {
@@ -213,6 +229,434 @@ function normalizeProvider(value: unknown): CodexProvider | null {
   return null;
 }
 
+type HeaderBag = Record<string, string | string[] | undefined>;
+
+function headerValue(headers: HeaderBag, name: string): string {
+  const value = headers[name.toLowerCase()];
+  if (Array.isArray(value)) return cleanString(value[0]);
+  return cleanString(value);
+}
+
+function turnMetadataFromHeaders(headers: HeaderBag): JsonRecord {
+  const raw = headerValue(headers, "x-codex-turn-metadata");
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as JsonRecord : {};
+  } catch {
+    return {};
+  }
+}
+
+function nativeSubagentParentIdentityValues(body: unknown, headers: HeaderBag): Set<string> {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const bodyMetadata = value.client_metadata && typeof value.client_metadata === "object"
+    ? value.client_metadata as JsonRecord
+    : {};
+  const headerMetadata = turnMetadataFromHeaders(headers);
+  return new Set([
+    headerValue(headers, "x-codex-parent-thread-id"),
+    headerMetadata.parent_thread_id,
+    headerMetadata.parent_task_id,
+    bodyMetadata.parent_thread_id,
+    bodyMetadata.parent_task_id,
+    value.parent_thread_id,
+    value.parent_task_id,
+  ].map(cleanString).filter(Boolean));
+}
+
+function nativeSubagentIdentityValues(body: unknown, headers: HeaderBag, additionalId = ""): string[] {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const bodyMetadata = value.client_metadata && typeof value.client_metadata === "object"
+    ? value.client_metadata as JsonRecord
+    : {};
+  const headerMetadata = turnMetadataFromHeaders(headers);
+  const candidates = [
+    headerMetadata.child_thread_id,
+    headerMetadata.subagent_thread_id,
+    headerMetadata.thread_id,
+    headerMetadata.session_id,
+    headerMetadata.conversation_id,
+    bodyMetadata.child_thread_id,
+    bodyMetadata.subagent_thread_id,
+    bodyMetadata.thread_id,
+    bodyMetadata.session_id,
+    bodyMetadata.conversation_id,
+    value.child_thread_id,
+    value.subagent_thread_id,
+    value.thread_id,
+    value.session_id,
+    value.conversation_id,
+    value.task_id,
+    headerValue(headers, "thread-id"),
+    headerValue(headers, "session-id"),
+  ].map(cleanString).filter(Boolean);
+  const parentIdentities = nativeSubagentParentIdentityValues(body, headers);
+  return Array.from(new Set(candidates)).filter((identity) => !parentIdentities.has(identity));
+}
+
+function nativeSubagentThreadIdentityValues(body: unknown, headers: HeaderBag, additionalId = ""): string[] {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const bodyMetadata = value.client_metadata && typeof value.client_metadata === "object"
+    ? value.client_metadata as JsonRecord
+    : {};
+  const headerMetadata = turnMetadataFromHeaders(headers);
+  const candidates = [
+    headerMetadata.child_thread_id,
+    headerMetadata.subagent_thread_id,
+    headerMetadata.thread_id,
+    bodyMetadata.child_thread_id,
+    bodyMetadata.subagent_thread_id,
+    bodyMetadata.thread_id,
+    value.child_thread_id,
+    value.subagent_thread_id,
+    value.thread_id,
+    headerValue(headers, "thread-id"),
+    additionalId,
+  ].map(cleanString).filter(Boolean);
+  const parentIdentities = nativeSubagentParentIdentityValues(body, headers);
+  return Array.from(new Set(candidates)).filter((identity) => !parentIdentities.has(identity));
+}
+
+function rememberNativeSubagentDisplaySettings(
+  displaySettings: Map<string, NativeSubagentDisplaySettings>,
+  body: unknown,
+  headers: HeaderBag,
+  responseHeaders: Headers,
+): NativeSubagentDisplayUpdate | null {
+  const model = cleanString(responseHeaders.get("x-opencodex-subagent-model"));
+  const effort = cleanString(responseHeaders.get("x-opencodex-subagent-reasoning-effort"));
+  const taskId = cleanString(responseHeaders.get("x-opencodex-subagent-task-id"));
+  if (!model && !effort) return null;
+  const identities = nativeSubagentIdentityValues(body, headers, taskId);
+  if (!identities.length) return null;
+  for (const identity of identities) {
+    const next = { ...(displaySettings.get(identity) || {}) };
+    if (model) next.model = model;
+    if (effort) next.effort = effort;
+    // Refresh insertion order so active child threads survive the bounded map.
+    displaySettings.delete(identity);
+    displaySettings.set(identity, next);
+  }
+  while (displaySettings.size > 2048) {
+    const oldest = displaySettings.keys().next().value;
+    if (oldest === undefined) break;
+    displaySettings.delete(oldest);
+  }
+  // Only a child/thread-specific identity is safe for an actual native
+  // settings update. A session id can belong to the parent conversation and
+  // must remain a display-only alias unless the request also carries the
+  // explicit child thread id.
+  const threadId = nativeSubagentThreadIdentityValues(body, headers, taskId)[0];
+  if (!threadId) return null;
+  return {
+    threadId,
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  };
+}
+
+/**
+ * Native Codex marks an internally-created child at the HTTP boundary. The
+ * bridge must use this request metadata as the routing boundary; the parent
+ * process and its global provider remain native OpenAI.
+ */
+export function isNativeSubagentRequest(body: unknown, headers: HeaderBag = {}): boolean {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const metadata = value.client_metadata && typeof value.client_metadata === "object"
+    ? value.client_metadata as JsonRecord
+    : {};
+  const headerMetadata = turnMetadataFromHeaders(headers);
+  const subagentHeader = headerValue(headers, "x-openai-subagent");
+  return Boolean(
+    subagentHeader
+    || headerMetadata.thread_source === "subagent"
+    || headerMetadata.subagent_kind
+    || headerValue(headers, "x-codex-parent-thread-id")
+    || metadata["x-openai-subagent"] === true
+    || metadata["x-openai-subagent"] === "1"
+    || metadata.thread_source === "subagent"
+    || value.thread_source === "subagent"
+    || value.source?.subagent === true,
+  );
+}
+
+export function nativeEgressRoute(body: unknown, headers: HeaderBag = {}): "native" | "gateway" {
+  return isNativeSubagentRequest(body, headers) ? "gateway" : "native";
+}
+
+function configuredGatewayPort(): number {
+  const candidates = [process.env.OPENCODEX_GATEWAY_PORT, process.env.OPENCODEX_PORT, "8765"];
+  for (const candidate of candidates) {
+    const port = Number.parseInt(cleanString(candidate), 10);
+    if (Number.isInteger(port) && port > 0 && port <= 65_535) return port;
+  }
+  return 8765;
+}
+
+function nativeEgressPath(pathname: string, basePath = "/v1"): string {
+  const pathValue = pathname || "/";
+  if (basePath !== "/v1") {
+    if (pathValue === basePath) return "/";
+    if (pathValue.startsWith(`${basePath}/`)) return pathValue.slice(basePath.length);
+    return "";
+  }
+  if (pathValue === "/v1" || pathValue === "/") return "/";
+  return pathValue.startsWith("/v1/") ? pathValue.slice(3) : (pathValue.startsWith("/") ? pathValue : `/${pathValue}`);
+}
+
+function nativeUpstreamTarget(pathname: string, search: string, basePath: string): string {
+  return `https://chatgpt.com/backend-api/codex${nativeEgressPath(pathname, basePath)}${search}`;
+}
+
+function gatewayUpstreamTarget(pathname: string, search: string, basePath: string): string {
+  const pathValue = nativeEgressPath(pathname, basePath);
+  const gatewayPath = pathValue === "/" || pathValue.startsWith("/v1/") ? pathValue : `/v1${pathValue}`;
+  return `http://127.0.0.1:${configuredGatewayPort()}${gatewayPath}${search}`;
+}
+
+function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    let settled = false;
+    const maxBytes = 64 * 1024 * 1024;
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
+    req.on("data", (chunk: Buffer) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > maxBytes) {
+        req.destroy();
+        fail(new Error("Native egress request body exceeds limit"));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.once("end", () => {
+      if (settled) return;
+      settled = true;
+      const rawBody = Buffer.concat(chunks);
+      const encoding = headerValue(req.headers, "content-encoding");
+      resolve(RequestDecompressor.decompressBody(rawBody, encoding));
+    });
+    req.once("aborted", () => fail(new Error("Native egress request was aborted")));
+    req.once("error", (error) => fail(error));
+  });
+}
+
+function localEgressHeaders(req: http.IncomingMessage): Record<string, string> {
+  const headers = copyNativeRequestHeaders(req, {}, true);
+  // The bridge sends the decompressed request bytes. Keep the upstream from
+  // trying to decode them a second time and avoid compressed response bodies
+  // while streaming back into native Codex.
+  headers["accept-encoding"] = "identity";
+  return headers;
+}
+
+function writeNativeEgressFallback(res: http.ServerResponse): void {
+  const body = JSON.stringify({
+    error: {
+      message: "Responses WebSocket transport is disabled; use HTTP",
+      type: "upgrade_required",
+    },
+  });
+  res.writeHead(426, {
+    "Content-Type": "application/json",
+    "Content-Length": String(Buffer.byteLength(body)),
+    "Sec-WebSocket-Version": "13",
+    "Connection": "close",
+  });
+  res.end(body);
+}
+
+function writeNativeEgressUpgradeFallback(socket: import("node:stream").Duplex): void {
+  const body = JSON.stringify({
+    error: {
+      message: "Responses WebSocket transport is disabled; use HTTP",
+      type: "upgrade_required",
+    },
+  });
+  socket.end([
+    "HTTP/1.1 426 Upgrade Required",
+    "Content-Type: application/json",
+    `Content-Length: ${Buffer.byteLength(body)}`,
+    "Sec-WebSocket-Version: 13",
+    "Connection: close",
+    "",
+    body,
+  ].join("\r\n"));
+}
+
+async function proxyNativeEgressRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  targetUrl: string,
+  body: Buffer,
+  operation: string,
+  onResponseHeaders?: (headers: Headers) => void,
+): Promise<void> {
+  try {
+    const upstreamRes = await fetchUpstream(targetUrl, {
+      method: req.method || "POST",
+      headers: localEgressHeaders(req),
+      body: body as any,
+      maxAttempts: 1,
+      timeoutMs: 600_000,
+      operation,
+    });
+    onResponseHeaders?.(upstreamRes.headers);
+    res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
+    if (upstreamRes.body) {
+      // @ts-ignore Node's fetch body is an async iterable at runtime.
+      for await (const chunk of upstreamRes.body) {
+        await writeHttpResponseChunked(res, chunk);
+      }
+    }
+    res.end();
+  } catch (error: any) {
+    const details = upstreamErrorDetails(error);
+    console.error(`[OpenCodex Native Egress] ${operation} failed:`, {
+      ...details,
+      attempts: error?.attempts,
+    });
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: error?.message || "native egress request failed",
+        type: "upstream_unreachable",
+        retryable: Boolean(error?.retryable),
+        attempts: error?.attempts,
+        cause_code: details.code,
+      }));
+    }
+  }
+}
+
+async function handleNativeEgressRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  basePath: string,
+  subagentDisplaySettings: Map<string, NativeSubagentDisplaySettings>,
+  onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
+): Promise<void> {
+  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+  const endpoint = nativeEgressPath(requestUrl.pathname, basePath);
+  if (!endpoint) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "native egress route not found" }));
+    return;
+  }
+  const websocketRequest = req.method === "GET"
+    || req.headers.upgrade?.toLowerCase() === "websocket"
+    || (req.headers.connection || "").toLowerCase().includes("upgrade");
+  if (websocketRequest) {
+    writeNativeEgressFallback(res);
+    return;
+  }
+  if (req.method !== "POST") {
+    res.writeHead(405, { "Content-Type": "application/json", "Allow": "POST" });
+    res.end(JSON.stringify({ error: "native egress only accepts POST requests" }));
+    return;
+  }
+  const body = await readRequestBody(req);
+  let parsedBody: JsonRecord = {};
+  try {
+    const value = JSON.parse(body.toString("utf8"));
+    if (value && typeof value === "object" && !Array.isArray(value)) parsedBody = value as JsonRecord;
+  } catch {
+    // The native endpoint will return the authoritative malformed-body error.
+  }
+  const route = nativeEgressRoute(parsedBody, req.headers);
+  const targetUrl = route === "gateway"
+    ? gatewayUpstreamTarget(requestUrl.pathname, requestUrl.search, basePath)
+    : nativeUpstreamTarget(requestUrl.pathname, requestUrl.search, basePath);
+  console.error(`[OpenCodex Native Egress] ${route} ${endpoint}`);
+  await proxyNativeEgressRequest(
+    req,
+    res,
+    targetUrl,
+    body,
+    `native-${route}-${endpoint.replace(/^\//, "") || "root"}`,
+    route === "gateway" ? (responseHeaders) => {
+      const update = rememberNativeSubagentDisplaySettings(subagentDisplaySettings, parsedBody, req.headers, responseHeaders);
+      if (update) onSubagentDisplaySettings?.(update);
+    } : undefined,
+  );
+}
+
+type NativeEgressRouter = {
+  server: http.Server;
+  port: number;
+  basePath: string;
+  subagentDisplaySettings: Map<string, NativeSubagentDisplaySettings>;
+};
+
+async function startNativeEgressRouter(
+  onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
+): Promise<NativeEgressRouter> {
+  const basePath = `/__opencodex_native_egress_${randomBytes(16).toString("hex")}/v1`;
+  const subagentDisplaySettings = new Map<string, NativeSubagentDisplaySettings>();
+  const server = http.createServer((req, res) => {
+    void handleNativeEgressRequest(req, res, basePath, subagentDisplaySettings, onSubagentDisplaySettings).catch((error) => {
+      console.error(`[OpenCodex Native Egress] request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!res.headersSent) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      }
+    });
+  });
+  server.on("upgrade", (req, socket) => {
+    const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+    if (nativeEgressPath(requestUrl.pathname, basePath)) writeNativeEgressUpgradeFallback(socket);
+    else socket.destroy();
+  });
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("native egress bridge did not receive a local port");
+  }
+  const port = address.port;
+  console.error(`[OpenCodex Native Egress] listening on 127.0.0.1:${port}; gateway target port ${configuredGatewayPort()}`);
+  return { server, port, basePath, subagentDisplaySettings };
+}
+
+export function nativeRuntimeArgs(args: string[], egressPort: number, egressBasePath = "/v1"): string[] {
+  const overrides = [
+    "-c", `openai_base_url=http://127.0.0.1:${egressPort}${egressBasePath}`,
+    // The local bridge is deliberately HTTP-only. Native child metadata is
+    // preserved on the HTTP request and the gateway already handles the 426
+    // fallback. Disable both Responses websocket feature generations so the
+    // native runtime goes straight to HTTP instead of spending its retry
+    // budget on a transport the request bridge cannot inspect.
+    "-c", "features.responses_websockets=false",
+    "-c", "features.responses_websockets_v2=false",
+  ];
+  const appServerIndex = args.indexOf("app-server");
+  if (appServerIndex < 0) return [...overrides, ...args];
+  return [
+    ...args.slice(0, appServerIndex),
+    ...overrides,
+    ...args.slice(appServerIndex),
+  ];
+}
+
 function requestIdKey(value: unknown): string {
   return typeof value === "string" ? value : JSON.stringify(value);
 }
@@ -267,12 +711,32 @@ function passthroughNative(args: string[]): void {
 }
 
 
-function runProviderBridge(): void {
+async function runProviderBridge(): Promise<void> {
   const args = process.argv.slice(2);
   if (!isAppServerInvocation(args)) {
     passthroughNative(args);
     return;
   }
+
+  let applyNativeSubagentDisplaySettings: ((update: NativeSubagentDisplayUpdate) => void) | null = null;
+  const nativeEgress = await startNativeEgressRouter((update) => {
+    const modelProvider = update.model
+      ? (classifyRuntimeModel(update.model) || (update.model.includes("/") ? GATEWAY_PROVIDER : NATIVE_PROVIDER))
+      : GATEWAY_PROVIDER;
+    writeParent({
+      method: "thread/settings/updated",
+      params: {
+        threadId: update.threadId,
+        threadSettings: {
+          ...(update.model ? { model: update.model } : {}),
+          modelProvider,
+          ...(update.effort ? { effort: update.effort } : {}),
+        },
+      },
+    });
+    applyNativeSubagentDisplaySettings?.(update);
+  });
+  const nativeSubagentDisplaySettings = nativeEgress.subagentDisplaySettings;
 
   const runtimeByProvider = new Map<CodexProvider, ProviderRuntime>();
   const runtimes = new Set<ProviderRuntime>();
@@ -467,32 +931,40 @@ function runProviderBridge(): void {
     for (const child of Object.values(record)) rewriteThreadIds(child, physicalId, externalId);
   }
 
-  function decorateThreadModel(value: any, model?: string, provider?: CodexProvider): void {
-    if (!value || typeof value !== "object" || !model) return;
+  function decorateThreadModel(value: any, model?: string, provider?: CodexProvider, effort?: string): void {
+    if (!value || typeof value !== "object" || (!model && !effort)) return;
     if (Array.isArray(value)) {
-      for (const entry of value) decorateThreadModel(entry, model, provider);
+      for (const entry of value) decorateThreadModel(entry, model, provider, effort);
       return;
     }
     const record = value as JsonRecord;
-    const modelProvider = provider || providerForModel(model);
-    if (record.thread && typeof record.thread === "object") {
+    const modelProvider = model ? (provider || providerForModel(model)) : undefined;
+    if (model && record.thread && typeof record.thread === "object") {
       const thread = record.thread as JsonRecord;
       thread.model = model;
       thread.modelProvider = modelProvider;
     }
     if (record.threadSettings && typeof record.threadSettings === "object") {
       const settings = record.threadSettings as JsonRecord;
-      settings.model = model;
-      settings.modelProvider = modelProvider;
+      if (model) {
+        settings.model = model;
+        settings.modelProvider = modelProvider;
+      }
+      if (effort) settings.effort = effort;
+    }
+    if (effort && ("reasoningEffort" in record || "effort" in record)) {
+      if ("reasoningEffort" in record) record.reasoningEffort = effort;
+      if ("effort" in record && !record.threadSettings) record.effort = effort;
     }
     if (
-      typeof record.id === "string"
+      model
+      && typeof record.id === "string"
       && ("model" in record || "modelProvider" in record || "path" in record || "turns" in record || "cwd" in record)
     ) {
       record.model = model;
       record.modelProvider = modelProvider;
     }
-    for (const child of Object.values(record)) decorateThreadModel(child, model, provider);
+    for (const child of Object.values(record)) decorateThreadModel(child, model, provider, effort);
   }
 
   function decorateParentResponse(message: JsonRecord, pending: PendingParentRequest): JsonRecord {
@@ -500,7 +972,9 @@ function runProviderBridge(): void {
     if (pending.externalThreadId && pending.physicalThreadId) {
       rewriteThreadIds(output, pending.physicalThreadId, pending.externalThreadId);
     }
-    if (pending.displayModel) decorateThreadModel(output, pending.displayModel, pending.displayProvider);
+    if (pending.displayModel || pending.displayReasoning) {
+      decorateThreadModel(output, pending.displayModel, pending.displayProvider, pending.displayReasoning);
+    }
     return output;
   }
 
@@ -549,7 +1023,12 @@ function runProviderBridge(): void {
     return items;
   }
 
-  function emitSyntheticSettings(threadId: string, model: string): void {
+  function isUnmaterializedThreadHistoryError(value: unknown): boolean {
+    const message = cleanString(value).toLowerCase();
+    return message.includes("not materialized yet") && message.includes("includeturns");
+  }
+
+  function emitSyntheticSettings(threadId: string, model: string, effort?: string): void {
     writeParent({
       method: "thread/settings/updated",
       params: {
@@ -557,6 +1036,7 @@ function runProviderBridge(): void {
         threadSettings: {
           model,
           modelProvider: providerForModel(model),
+          ...(effort ? { effort } : {}),
         },
       },
     });
@@ -608,6 +1088,24 @@ function runProviderBridge(): void {
       },
     });
   }
+
+  applyNativeSubagentDisplaySettings = (update): void => {
+    if (!update.effort) return;
+    const native = runtimeByProvider.get(NATIVE_PROVIDER);
+    if (!native || native.stopping) return;
+    // Persist the selected effort through the native protocol on the child
+    // thread itself. The synthetic notification above is still useful for
+    // clients that consume bridge notifications directly, but a nested native
+    // app-server may filter that notification before it reaches Desktop.
+    sendInternal(native, "thread/settings/update", {
+      threadId: update.threadId,
+      effort: update.effort,
+    }, (response) => {
+      if (response.error) {
+        console.warn("[OpenCodex Provider Bridge] Could not persist child reasoning display: " + cleanString(response.error.message));
+      }
+    });
+  };
 
   function sendParent(
     runtime: ProviderRuntime,
@@ -672,7 +1170,8 @@ function runProviderBridge(): void {
   }
 
   function spawnRuntime(provider: CodexProvider): ProviderRuntime {
-    const child = spawn(nativeCodexPath(), args, {
+    const childArgs = provider === NATIVE_PROVIDER ? nativeRuntimeArgs(args, nativeEgress.port, nativeEgress.basePath) : args;
+    const child = spawn(nativeCodexPath(), childArgs, {
       env: {
         ...process.env,
         CODEX_CLI_PATH: undefined,
@@ -801,11 +1300,16 @@ function runProviderBridge(): void {
     const nativeId = threadIdFrom(params.threadId || thread.id);
     if (nativeId && isSuppressed(runtime, nativeId)) return null;
     const route = nativeId ? routeForNativeId(nativeId) : null;
-    if (!route) return message;
+    const childDisplay = nativeId ? nativeSubagentDisplaySettings.get(nativeId) : undefined;
+    if (!route && !childDisplay) return message;
     const output = cloneValue(message);
-    rewriteThreadIds(output, route.nativeId, route.externalId);
-    decorateThreadModel(output, route.selectedModel, providerForModel(route.selectedModel));
-    if (message.method === "turn/completed") activeTurns.delete(route.externalId);
+    if (route) rewriteThreadIds(output, route.nativeId, route.externalId);
+    const displayModel = childDisplay?.model || route?.selectedModel;
+    const displayProvider = displayModel ? providerForModel(displayModel) : undefined;
+    if (displayModel || childDisplay?.effort) {
+      decorateThreadModel(output, displayModel, displayProvider, childDisplay?.effort);
+    }
+    if (message.method === "turn/completed" && route) activeTurns.delete(route.externalId);
     return output;
   }
 
@@ -1001,12 +1505,21 @@ function runProviderBridge(): void {
       forwarding: false,
     };
     sendInternal(native, "thread/read", { threadId: route.nativeId, includeTurns: true }, (historyRead) => {
-      if (historyRead.error) {
+      const errorValue = historyRead.error && typeof historyRead.error === "object"
+        ? historyRead.error as JsonRecord
+        : {};
+      const historyError = cleanString(errorValue.message);
+      // A fresh native thread has an id and rollout metadata before its first
+      // user message is written. Native Codex correctly rejects
+      // `includeTurns=true` for that state; it is an empty shared history,
+      // not a failed third-party turn. The current input is mirrored below
+      // through thread/inject_items, which materializes the native thread.
+      if (historyRead.error && !isUnmaterializedThreadHistoryError(historyError)) {
         emitError(parent.id, "Unable to read shared conversation history: " + cleanString(historyRead.error.message));
         return;
       }
       const historyResult = historyRead.result && typeof historyRead.result === "object" ? historyRead.result as JsonRecord : {};
-      const history = historyToResponseItems(historyResult.thread);
+      const history = historyRead.error ? [] : historyToResponseItems(historyResult.thread);
       const gateway = ensureRuntime(GATEWAY_PROVIDER);
       const startParams: JsonRecord = {
         ...(route.settings || {}),
@@ -1233,6 +1746,11 @@ function runProviderBridge(): void {
             entry.model = route.selectedModel;
             entry.modelProvider = providerForModel(route.selectedModel);
           } else {
+            const childDisplay = nativeSubagentDisplaySettings.get(id);
+            if (childDisplay?.model) {
+              entry.model = childDisplay.model;
+              entry.modelProvider = providerForModel(childDisplay.model);
+            }
             const model = modelSlug(entry.model);
             if (providerForModel(model) === GATEWAY_PROVIDER) {
               legacyThreads.set(id, { id, model, path: cleanString(entry.path) || undefined });
@@ -1262,11 +1780,14 @@ function runProviderBridge(): void {
       }
       const native = ensureRuntime(NATIVE_PROVIDER);
       const nextParams = { ...params, threadId: route.nativeId };
+      const childDisplay = nativeSubagentDisplaySettings.get(route.nativeId)
+        || nativeSubagentDisplaySettings.get(route.externalId);
       sendParent(native, message, "thread/read", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
-        displayModel: route.selectedModel,
-        displayProvider: providerForModel(route.selectedModel),
+        displayModel: childDisplay?.model || route.selectedModel,
+        displayProvider: providerForModel(childDisplay?.model || route.selectedModel),
+        displayReasoning: childDisplay?.effort,
       });
     });
   }
@@ -1289,7 +1810,8 @@ function runProviderBridge(): void {
       saveRoute(route);
       if (providerForModel(selected) === GATEWAY_PROVIDER) {
         writeParent({ id: message.id, result: {} });
-        emitSyntheticSettings(route.externalId, selected);
+        const selectedEffort = cleanString(params.effort || params.reasoning_effort || params.reasoning?.effort);
+        emitSyntheticSettings(route.externalId, selected, selectedEffort || undefined);
         return;
       }
       const native = ensureRuntime(NATIVE_PROVIDER);
@@ -1446,6 +1968,7 @@ function runProviderBridge(): void {
   const stop = (): void => {
     bridgeStopping = true;
     for (const runtime of [...runtimes]) stopRuntime(runtime);
+    nativeEgress.server.close();
     setImmediate(() => process.exit(0));
   };
   process.once("SIGTERM", stop);
@@ -1454,4 +1977,9 @@ function runProviderBridge(): void {
 
 const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
 const modulePath = path.resolve(fileURLToPath(import.meta.url));
-if (entryPath === modulePath) runProviderBridge();
+if (entryPath === modulePath) {
+  void runProviderBridge().catch((error) => {
+    console.error(`[OpenCodex Provider Bridge] Startup failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
+}

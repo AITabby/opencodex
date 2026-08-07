@@ -45,7 +45,12 @@ rl.on("line", (line) => {
       send({ id: message.id, result: {} });
       break;
     case "thread/read":
-      if (params.threadId === "legacy-thirdparty") {
+      if (process.env.FAKE_UNMATERIALIZED_THREAD_HISTORY === "1" && params.includeTurns === true) {
+        send({ id: message.id, error: {
+          code: -32001,
+          message: "thread " + params.threadId + " is not materialized yet; includeTurns is unavailable before first user message",
+        } });
+      } else if (params.threadId === "legacy-thirdparty") {
         send({ id: message.id, result: { thread: {
           id: "legacy-thirdparty",
           model: "antigravity/gemini-3.6-flash-medium",
@@ -293,6 +298,81 @@ test("a new thread can begin on Gemini after native thread/start created its rol
     assert.equal(geminiTurn.error, undefined);
     assert.equal(geminiTurn.result.thread.model, "antigravity/gemini-3.6-flash-medium");
     assert.equal(geminiTurn.result.thread.modelProvider, "opencodex");
+  } finally {
+    output.close();
+    bridge.kill("SIGTERM");
+    await once(bridge, "exit").catch(() => {});
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("a fresh native thread with no materialized history can start a third-party turn", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-provider-bridge-unmaterialized-"));
+  const fakeNativePath = join(tempRoot, "fake-native-app-server.mjs");
+  const emptyCatalogPath = join(tempRoot, "empty-catalog.json");
+  const traceFile = join(tempRoot, "trace.jsonl");
+  await writeFile(fakeNativePath, fakeNativeSource, "utf8");
+  await chmod(fakeNativePath, 0o755);
+  await writeFile(emptyCatalogPath, JSON.stringify({ models: [] }), "utf8");
+
+  const bridgePath = fileURLToPath(new URL("../dist/codex-provider-bridge.js", import.meta.url));
+  const bridge = spawn(process.execPath, [bridgePath, "app-server"], {
+    env: {
+      ...process.env,
+      CODEX_CLI_PATH: "",
+      OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
+      OPENCODEX_MODEL_CATALOG_PATH: emptyCatalogPath,
+      FAKE_UNMATERIALIZED_THREAD_HISTORY: "1",
+      FAKE_TRACE_FILE: traceFile,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const messages = [];
+  const output = readline.createInterface({ input: bridge.stdout });
+  output.on("line", (line) => {
+    if (!line.trim()) return;
+    try { messages.push(JSON.parse(line)); } catch {}
+  });
+
+  const send = (message) => bridge.stdin.write(`${JSON.stringify(message)}\n`);
+  try {
+    send({ id: 61, method: "initialize", params: {} });
+    assert.deepEqual(await waitForResponse(messages, 61), { id: 61, result: {} });
+
+    send({ id: 62, method: "thread/start", params: { model: "gpt-5.5" } });
+    assert.equal((await waitForResponse(messages, 62)).error, undefined);
+
+    send({
+      id: 63,
+      method: "thread/settings/update",
+      params: { threadId: "thread-1", model: "antigravity/gemini-3.6-flash-medium" },
+    });
+    assert.deepEqual(await waitForResponse(messages, 63), { id: 63, result: {} });
+
+    send({
+      id: 64,
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        model: null,
+        input: [{ type: "text", text: "first materializing user message", text_elements: [] }],
+      },
+    });
+    const turn = await waitForResponse(messages, 64);
+    assert.equal(turn.error, undefined);
+    assert.equal(turn.result.thread.model, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(turn.result.thread.modelProvider, "opencodex");
+
+    const trace = await waitForTraceEntries(traceFile, (entries) => entries.some((entry) =>
+      entry.runtimeProvider === "openai"
+      && entry.method === "thread/inject_items"
+      && JSON.stringify(entry.params.items).includes("first materializing user message"),
+    ));
+    assert.ok(trace.some((entry) =>
+      entry.runtimeProvider === "openai"
+      && entry.method === "thread/read"
+      && entry.params.includeTurns === true,
+    ));
   } finally {
     output.close();
     bridge.kill("SIGTERM");

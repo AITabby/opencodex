@@ -338,7 +338,7 @@ function nativeCodexExecutablePath(): string {
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
 }
 
-function registerProviderBridgeEnvironment(): boolean {
+function registerProviderBridgeEnvironment(port = Number.parseInt(process.env.OPENCODEX_PORT || "8765", 10)): boolean {
   if (process.platform !== "darwin") return false;
   const bridge = providerBridgePath();
   const nativeCodex = nativeCodexExecutablePath();
@@ -353,6 +353,7 @@ function registerProviderBridgeEnvironment(): boolean {
     execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_NATIVE_CODEX_PATH", nativeCodex], { stdio: "ignore" });
     execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_BRIDGE_PATH", bridge], { stdio: "ignore" });
     execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_SPLIT", "1"], { stdio: "ignore" });
+    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_GATEWAY_PORT", String(Number.isInteger(port) && port > 0 ? port : 8765)], { stdio: "ignore" });
     console.log(`[OpenCodex Gateway] Provider bridge registered for gateway lifecycle: ${bridge}`);
     return true;
   } catch (error: any) {
@@ -363,7 +364,7 @@ function registerProviderBridgeEnvironment(): boolean {
 
 function unregisterProviderBridgeEnvironment(): void {
   if (process.platform !== "darwin") return;
-  for (const variable of ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT"]) {
+  for (const variable of ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT", "OPENCODEX_GATEWAY_PORT"]) {
     try { execFileSync("/bin/launchctl", ["unsetenv", variable], { stdio: "ignore" }); } catch {}
   }
   // This only affects future Desktop launches. The already-running Desktop
@@ -442,6 +443,7 @@ function launchDesktopClient(launchWithCdp: boolean): void {
           CODEX_CLI_PATH: bridge,
           OPENCODEX_NATIVE_CODEX_PATH: nativeCodex,
           OPENCODEX_PROVIDER_SPLIT: "1",
+          OPENCODEX_GATEWAY_PORT: String(Number.parseInt(process.env.OPENCODEX_GATEWAY_PORT || process.env.OPENCODEX_PORT || "8765", 10) || 8765),
         },
       });
       child.once("error", (error) => {
@@ -3040,7 +3042,7 @@ if __name__ == "__main__":
       }, 2000);
       delayedCatalogSync.unref?.();
     }
-    if (registerProviderBridgeEnvironment()) {
+    if (registerProviderBridgeEnvironment(this.port)) {
       const desktopState = desktopAppServerState();
       if (desktopState !== "bridge") {
         this.requestDesktopLaunchAfterGatewayReady();
