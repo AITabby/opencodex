@@ -23,7 +23,7 @@ class StatusBarController {
     popover = NSPopover()
 
     if let button = statusItem.button {
-      button.image = NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: "OpenCodex")
+      button.image = NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: "CodexSplit")
       button.action = #selector(togglePopover)
       button.target = self
     }
@@ -113,7 +113,7 @@ class StatusBarController {
     let menu = NSMenu()
     menu.autoenablesItems = false
 
-    let titleItem = NSMenuItem(title: "OpenCodex", action: nil, keyEquivalent: "")
+    let titleItem = NSMenuItem(title: "CodexSplit", action: nil, keyEquivalent: "")
     titleItem.isEnabled = false
     menu.addItem(titleItem)
 

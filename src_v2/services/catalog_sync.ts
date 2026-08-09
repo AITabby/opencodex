@@ -740,6 +740,32 @@ export class CatalogSyncService {
     }
   }
 
+  /**
+   * Keep only the official/native entries in Codex's derived model cache.
+   *
+   * The durable OpenCodex catalog is intentionally left untouched. This is
+   * the projection used when the Desktop Bridge is switched off: credentials
+   * and selected provider models remain available for a later re-enable, but
+   * native Desktop cannot accidentally expose a third-party slug to the
+   * official OpenAI account.
+   */
+  public static syncNativeModelsToCodexCache(): boolean {
+    try {
+      const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+      if (!fs.existsSync(cachePath)) return false;
+
+      const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
+      if (!Array.isArray(cache.models)) return false;
+
+      cache.models = cache.models.filter((model: any) => isNativeCodexCacheModel(model));
+      fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2), "utf-8");
+      return true;
+    } catch (error: any) {
+      console.warn(`[OpenCodex Catalog] Could not restore native Codex model cache: ${error?.message || error}`);
+      return false;
+    }
+  }
+
   public static getOfficialModels(): any[] {
     try {
       const configPath = codexConfigPath();
@@ -759,34 +785,86 @@ export class CatalogSyncService {
     }
   }
 
-  public static async fetchLiveModels(provider: ProviderConfig): Promise<ProviderModelDescriptor[]> {
-    const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "";
-    if (!rawUrl) return [];
+  /**
+   * Discover the models visible to this exact endpoint and credential.
+   *
+   * This method deliberately does not fall back to provider.models: callers
+   * that are presenting a discovery result must be able to distinguish a
+   * real upstream list from stale manually configured state.
+   */
+  public static async discoverLiveModels(provider: ProviderConfig): Promise<ProviderModelDescriptor[]> {
+    const rawUrl = String((provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "").trim();
+    if (!rawUrl) throw new Error("未配置 Endpoint / Base URL");
 
     const apiKey = CredentialStore.resolveApiKey(provider);
-    const modelsEndpoint = rawUrl.endsWith("/models")
-      ? rawUrl
-      : `${rawUrl.replace(/\/$/, "")}/models`;
+    if (!apiKey || apiKey.endsWith("-cli-auto")) throw new Error("未找到可用于获取模型的 API Key");
 
+    const normalizedUrl = rawUrl
+      .replace(/\/+$/, "")
+      .replace(/\/(?:chat\/completions|responses|messages)$/i, "");
+    const modelsEndpoint = /\/models$/i.test(normalizedUrl)
+      ? normalizedUrl
+      : `${normalizedUrl}/models`;
+    const headers: Record<string, string> = {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+    let response: Response;
+    let responseText = "";
+    try {
+      response = await fetch(modelsEndpoint, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
+      responseText = await response.text();
+    } catch (error: any) {
+      const message = error?.name === "AbortError" || error?.name === "TimeoutError"
+        ? "获取模型超时 (8s)"
+        : (error?.message || "无法连接模型列表接口");
+      throw new Error(`模型列表获取失败：${message}`);
+    }
+
+    if (!response.ok) {
+      const detail = responseText
+        .replace(apiKey, "[redacted]")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 300);
+      throw new Error(`模型列表请求失败 (HTTP ${response.status})${detail ? `：${detail}` : ""}`);
+    }
+
+    let json: any;
+    try {
+      json = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      throw new Error("模型列表接口返回的不是有效 JSON");
+    }
+
+    const modelList = Array.isArray(json)
+      ? json
+      : Array.isArray(json.data)
+        ? json.data
+        : Array.isArray(json.models)
+          ? json.models
+          : [];
+    const seen = new Set<string>();
+    const models = modelList
+      .map((item: any) => normalizeProviderModelDescriptor(item))
+      .filter((item: ProviderModelDescriptor | null): item is ProviderModelDescriptor => {
+        if (!item || seen.has(item.id)) return false;
+        seen.add(item.id);
+        return true;
+      });
+    if (models.length === 0) throw new Error("模型列表接口没有返回可用模型");
+    return models;
+  }
+
+  public static async fetchLiveModels(provider: ProviderConfig): Promise<ProviderModelDescriptor[]> {
     let models: ProviderModelDescriptor[] = [];
     try {
-      const headers: Record<string, string> = { "Content-Type": "application/json" };
-      if (apiKey) {
-        headers["Authorization"] = `Bearer ${apiKey}`;
-      }
-
-      const res = await fetch(modelsEndpoint, { method: "GET", headers, signal: AbortSignal.timeout(5000) });
-      if (res.ok) {
-        const json: any = await res.json();
-        const modelList = Array.isArray(json.data) ? json.data : Array.isArray(json.models) ? json.models : [];
-        if (modelList.length > 0) {
-          models = modelList
-            .map((item: any) => normalizeProviderModelDescriptor(item))
-            .filter((item: ProviderModelDescriptor | null): item is ProviderModelDescriptor => Boolean(item));
-        }
-      }
+      models = await CatalogSyncService.discoverLiveModels(provider);
     } catch {
-      // Fallback to configured models on network error
+      // Metadata refresh may continue using the configured list on network
+      // failure. Interactive discovery uses discoverLiveModels directly.
     }
     if (models.length === 0) {
       models = (Array.isArray(provider.models) ? provider.models : [])

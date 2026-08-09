@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+# Standalone CLI entry point. It keeps the native Codex binary untouched and
+# puts only this CLI process behind OpenCodex's request-level split bridge.
+# Resolve symlinks so ~/.local/bin/codex can point at this entry point without
+# changing how the project root is discovered.
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+  SCRIPT_LINK=$(readlink "$SCRIPT_PATH")
+  case "$SCRIPT_LINK" in
+    /*) SCRIPT_PATH=$SCRIPT_LINK ;;
+    *) SCRIPT_PATH=$SCRIPT_DIR/$SCRIPT_LINK ;;
+  esac
+done
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+PROJECT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+if [ -x "$PROJECT_ROOT/node" ]; then
+  NODE="$PROJECT_ROOT/node"
+else
+  NODE=${OPENCODEX_PROVIDER_BRIDGE_NODE:-node}
+fi
+
+BRIDGE_JS=${OPENCODEX_PROVIDER_BRIDGE_JS:-$PROJECT_ROOT/dist/codex-provider-bridge.js}
+if [ ! -f "$BRIDGE_JS" ]; then
+  echo "OpenCodex CLI bridge is not built: $BRIDGE_JS" >&2
+  echo "Run npm run build first." >&2
+  exit 1
+fi
+
+exec "$NODE" "$BRIDGE_JS" --opencodex-cli "$@"

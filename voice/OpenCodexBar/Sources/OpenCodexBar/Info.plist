@@ -3,14 +3,14 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.opencodex.OpenCodexBar</string>
+    <string>com.aitabby.codexsplit.voicebar</string>
     <key>CFBundleName</key>
-    <string>OpenCodexBar</string>
+    <string>CodexSplit Voice Bar</string>
     <key>CFBundleVersion</key>
-    <string>1.2.3</string>
+    <string>2000001</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.3</string>
+    <string>2.0.0</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>OpenCodexBar requires microphone access for voice command input and transcription.</string>
+    <string>CodexSplit requires microphone access for voice command input and transcription.</string>
 </dict>
 </plist>

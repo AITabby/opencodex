@@ -1,14 +1,14 @@
-# OpenCodex
+# CodexSplit
 
 ### 把 Codex Desktop 变成你的本地 AI 工作台
 
-OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型、模型目录、语音助手、GPT-Live、会话管理和 Agent 工具集中到一个桌面应用中，同时保留 Codex 原生模型、原生登录、Computer Use 与 MCP 的独立运行方式。
+CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型、模型目录、语音助手、GPT-Live、会话管理和 Agent 工具集中到一个桌面应用中，同时保留 Codex 原生模型、原生登录、Computer Use 与 MCP 的独立运行方式。
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases"><img src="https://img.shields.io/github/v/release/AITabby/opencodex?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
-  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/github/stars/AITabby/opencodex?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/opencodex"><img src="https://img.shields.io/badge/macOS-source%20v1.2.0-111111?style=flat-square&logo=apple" alt="macOS source v1.2.0"></a>
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe"><img src="https://img.shields.io/badge/Windows-v1.0.8-0078D6?style=flat-square&logo=windows" alt="Windows v1.0.8"></a>
+  <a href="https://github.com/AITabby/codexsplit/releases"><img src="https://img.shields.io/github/v/release/AITabby/codexsplit?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
+  <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/github/stars/AITabby/codexsplit?style=flat-square" alt="GitHub Stars"></a>
+  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0-beta.1"><img src="https://img.shields.io/badge/macOS-source%20v2.0.0--beta.1-111111?style=flat-square&logo=apple" alt="macOS source v2.0.0-beta.1"></a>
+  <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/badge/Windows-source%20beta.1-0078D6?style=flat-square&logo=windows" alt="Windows source beta.1"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
 
@@ -17,17 +17,17 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.2.0/OpenCodex-1.2.0-arm64.dmg">⬇️ 下载已发布的 OpenCodex v1.2.0（macOS）</a>
+  <a href="https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg">⬇️ 下载 CodexSplit v2.0.0-beta.1（macOS）</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe">🪟 下载 Windows v1.0.8</a>
+  <a href="https://github.com/AITabby/codexsplit">🪟 Windows 源码（安装包后续提供）</a>
   ·
-  <a href="https://github.com/AITabby/opencodex/releases/tag/v1.2.0">查看 Release</a>
+  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0-beta.1">查看 Beta Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
 
 <p align="center">
-  <img src="./assets/dashboard-home.png" alt="OpenCodex 控制中心" width="960">
+  <img src="./assets/dashboard-home.png" alt="CodexSplit 控制中心" width="960">
 </p>
 
 ## 产品截图
@@ -62,11 +62,11 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
   <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
 </p>
 
-> 当前发布版本：macOS Apple Silicon `v1.2.0`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；Windows 为 `v1.0.8`。Linux 版本尚未发布。
+> 当前 Beta：macOS Apple Silicon `v2.0.0-beta.1`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；Windows 先提供同一版本源码，安装包后续发布。Linux 版本尚未发布。
 >
 > `v1.1.2` 在 `v1.1.1` 基础上统一了官方 GPT 与第三方模型的原生 `gpt-image-2` 生图路径，并保留 `gpt-image-1.5` 作为明确兜底；同时 GPT-Live 只在用户主动开启时启动。
 >
-> `v1.1.5` 增加了原生 Codex app-server provider bridge：官方 GPT 由 Codex 原生 OpenAI provider 直连，第三方模型继续通过 `127.0.0.1:8765` 网关；切换 provider 时复用同一个 thread 和 rollout，不改写原生 turn 请求。源码开机项和打包版控制中心会在网关就绪后自动通过 bridge 启动 Desktop；已经独立运行的 Desktop 会在这次接管时重启一次以继承 bridge。bridge 或网关不可用时不启动不安全的第三方路由，只保证原生 GPT 直连。
+> `v1.1.5` 增加了原生 Codex app-server provider bridge：官方 GPT 由 Codex 原生 OpenAI provider 直连，第三方模型继续通过 `127.0.0.1:8765` 网关；切换 provider 时复用同一个 thread 和 rollout，不改写原生 turn 请求。现在 bridge 只在用户已启用第三方模型并明确执行“重启 Codex”时，以进程级环境启动 Desktop；打开 CodexSplit、登录启动项或普通网关重启都不会接管 Desktop。恢复原生会停止 bridge 并以官方路径重新启动 Desktop。
 >
 > `v1.2.0` 增加了 `spawn_agent` 子会话的网关分流边界：网关拥有的 dispatcher 和 native 子会话的外层 bridge 都把子任务送入 `127.0.0.1:8765/v1/responses`，由网关统一执行模型/Profile 路由；native app-server、主会话和原生 provider 路径保持不变。当前已知限制：部分 Desktop 工作树卡片的推理档位显示可能仍为默认“轻度”，不影响网关实际按 Profile 选择的执行档位。
 >
@@ -76,12 +76,12 @@ OpenCodex 是运行在本机的 Codex Desktop 控制中心：把第三方模型�
 
 ## 简体中文
 
-### OpenCodex 是什么？
+### CodexSplit 是什么？
 
-OpenCodex 不替换 Codex Desktop，也不会把官方模型强行改走第三方接口。它在 Codex 旁边提供一个本地网关和控制中心：
+CodexSplit 不替换 Codex Desktop，也不会把官方模型强行改走第三方接口。它在 Codex 旁边提供一个本地网关和控制中心：
 
 - 官方 Codex 模型继续走 Codex 原生路径。
-- 只有用户明确添加或导入的第三方模型才进入 OpenCodex 网关。
+- 只有用户明确添加或导入的第三方模型才进入 CodexSplit 网关。
 - 每个服务商和模型都有独立身份，避免同名模型互相覆盖。
 - 网关只监听本机回环地址，并为管理接口提供本地授权保护。
 
@@ -105,7 +105,7 @@ OpenCodex 不替换 Codex Desktop，也不会把官方模型强行改走第三�
 
 ### 1. 服务商与第三方模型管理
 
-OpenCodex 控制中心提供常用服务商预设，也允许手动添加 OpenAI Compatible 服务：
+CodexSplit 控制中心提供常用服务商预设，也允许手动添加 OpenAI Compatible 服务：
 
 - 常用预设：DeepSeek、Qwen、Z.ai、MiniMax、Kimi。
 - 更多预设：OpenRouter、OpenCode Go、SiliconFlow、火山方舟。
@@ -113,6 +113,10 @@ OpenCodex 控制中心提供常用服务商预设，也允许手动添加 OpenAI
 - 一个服务商可以配置多个模型，支持逐个测试、删除和重新测试。
 - 每个模型可以单独选择 `Chat` 或 `Responses` 协议。
 - 支持模型显示名与实际后端模型名分离，例如 `我的模型=backend-model-id`。
+
+#### 服务商预设来源说明
+
+控制中心里几十个 API 服务商预设的名称、公开 Endpoint 元数据、协议提示和模型 ID，参考了 [CC Switch 的 Codex provider preset 列表](https://github.com/farion1231/cc-switch/blob/main/src/config/codexProviderPresets.ts)。这是公开目录元数据的引用与整理，不是对 CC Switch 的认证、代理、订阅、推广或图标实现的复制。预设列表不代表服务商官方合作或接口必然可用；实际模型、权限、计费和兼容性必须以用户自己的 Endpoint、API Key 和测试结果为准。
 - 服务商命名空间会自动生成，例如 `deepseek/model-name`、`opencode/model-name`，避免不同服务商的同名模型冲突。
 - 模型先进入“待应用模型”列表；测试通过后，重启 Codex 才会写入 Desktop 的模型菜单。
 - 支持批量选择和删除已添加模型。
@@ -142,7 +146,7 @@ OpenCodex 控制中心提供常用服务商预设，也允许手动添加 OpenAI
 
 ### 4. 本机订阅导入
 
-在 macOS 上，OpenCodex 可以检测和导入部分本机桌面/CLI 登录态，并实时获取服务商可用模型：
+在 macOS 上，CodexSplit 可以检测和导入部分本机桌面/CLI 登录态，并实时获取服务商可用模型：
 
 - **Antigravity**：读取本机 OAuth 登录态，并动态获取模型目录。
 - **Grok**：读取 Grok CLI 登录态、刷新令牌并获取模型目录。
@@ -153,7 +157,7 @@ OpenCodex 控制中心提供常用服务商预设，也允许手动添加 OpenAI
 
 ### 5. 网关路由与协议兼容
 
-OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议进行明确路由：
+CodexSplit 网关会根据模型目录中的服务商、后端模型名和协议进行明确路由：
 
 - 原生 Codex Responses 请求继续转发到官方 Codex 后端。
 - 第三方模型可以使用 OpenAI Responses 或 Chat Completions。
@@ -166,9 +170,9 @@ OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议�
 #### v1.1.5 provider 分流与原生会话
 
 - 官方 GPT、o-series 和 Codex 模型由原生 Codex app-server 使用 OpenAI provider 直连，不经过第三方适配器。
-- 第三方模型仍使用 OpenCodex 网关的 `8765` 端口，继续沿用各服务商自己的协议、上下文、工具和压缩能力。
+- 第三方模型仍使用 CodexSplit 网关的 `8765` 端口，继续沿用各服务商自己的协议、上下文、工具和压缩能力。
 - Codex Desktop 的 `turn/start` 不携带 provider，bridge 会在 provider 边界卸载并重新加载同一个 thread，然后原样转发 turn；会话 ID、rollout 路径和登录态仍由原生 Codex 管理。
-- 从 OpenCodex 的“重启 Codex”入口启动 Desktop 才会注入 bridge。手动启动的旧进程不会自动获得这层分流；此时只保证原生 GPT 直连，第三方模型需重新从 OpenCodex 启动 Desktop。
+- 从 CodexSplit 的“重启 Codex”入口启动 Desktop 才会注入 bridge。bridge 是进程级切换，不再通过 launchd 全局 `CODEX_CLI_PATH` 接管其他 Desktop 启动；手动启动的旧进程保持原生路径。需要第三方模型时，必须明确重启进入 bridge 模式；需要原生 Computer Use / Appshot 时，使用“恢复原生 Codex”重新启动官方路径。
 
 ### 6. Computer Use、图像和 MCP
 
@@ -177,7 +181,7 @@ OpenCodex 网关会根据模型目录中的服务商、后端模型名和协议�
 - 第三方模型可以请求桌面操作，再由 Codex 原生执行器执行。
 - 支持屏幕截图、鼠标、键盘和工具结果的连续交互。
 - 针对不同供应商对图片大小、格式和工具结果的限制，网关会做兼容处理。
-- 原生 Codex Computer Use 和 MCP 不会因为启用第三方模型而被删除或替换。
+- CodexSplit 不会安装、禁用或改写官方 Codex Computer Use 和 MCP；恢复原生时只会清理可识别的旧版 CodexSplit 遗留禁用条目，并通过状态接口报告 Desktop / Computer Use 的恢复状态。Desktop 的 bridge/native 是进程级切换，恢复原生后会重新启动官方路径。
 - 支持原生图像生成桥接，图像请求和普通聊天模型路由保持分离。
 - Cursor AgentService 支持工具调用、外部工具结果和连续会话续接。
 
@@ -187,7 +191,7 @@ GPT-Live 用于实时语音沟通和任务安排：
 
 - 进行 Live 对话时，可以随时把当前任务安排给任意已接入且可用的模型执行。
 - 执行模型可以是官方模型，也可以是已经启用并测试通过的第三方模型；不需要固定使用 Live 当前的对话模型。
-- 独立的 GPT-Live 模型选择悬浮球不依赖 OpenCodexBar。
+- 独立的 GPT-Live 模型选择悬浮球不依赖 CodexSplit Voice Bar。
 - 支持在一次任务的连续续接过程中保持正确的模型绑定。
 - 原生 Realtime / WebRTC 通信保留独立路径，第三方网关路由不会覆盖原生 Live。
 
@@ -200,7 +204,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 - 支持“自动分配”“强制选择”和“关闭路由”三种模式；强制模式下，每个子任务使用指定模型。
 - 能力说明和路由规则独立于模型导入目录，重新导入模型不会覆盖已保存的配置。
 
-### 9. 语音助手与 OpenCodexBar
+### 9. 语音助手与 CodexSplit Voice Bar
 
 语音页包含完整的输入、输出和会话设置：
 
@@ -222,7 +226,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 - 短按切换持续监听，或使用长按说话、松手提交。
 - 配置语音使用的模型和语音系统提示。
 - 配置 VAD 静音阈值、结束等待时间和 HUD 动效主题。
-- 通过 OpenCodexBar 提供全局语音栏、麦克风录音、状态胶囊和语音播放。
+- 通过 CodexSplit Voice Bar 提供全局语音栏、麦克风录音、状态胶囊和语音播放。
 - 支持重启 Codex、等待 CDP 就绪并启动语音助手。
 - 提供 `/visualizer` 动效实验室，可预览和切换语音 HUD 主题。
 
@@ -254,7 +258,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 - macOS 上的服务商 Key 使用 Keychain 保存，配置文件只保存引用和非敏感元数据。
 - 网关日志会记录连接、导入、测试和重启状态，但不应包含完整令牌。
 - “重启 Codex”会把待应用模型写入 Desktop 模型目录并重启相关进程。
-- “恢复原生 Codex”会移除第三方模型选择、模型目录和托管配置，但保留服务商身份、Endpoint 和 Key，且不修改原生 Computer Use / MCP。
+- “恢复原生 Codex”会移除第三方模型选择、模型目录和托管配置，保留服务商身份、Endpoint 和 Key；同时停止 bridge、清理旧版 CodexSplit 遗留的禁用 Computer Use 条目、重新启动官方 Desktop，并返回 Desktop / Computer Use 的恢复检查结果，不会改动官方 MCP 配置。
 - 网关包含单实例锁和父进程退出清理，避免重复启动多个网关进程。
 
 ## 使用方式
@@ -262,9 +266,9 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载 [OpenCodex-1.2.0-arm64.dmg](https://github.com/AITabby/opencodex/releases/download/v1.2.0/OpenCodex-1.2.0-arm64.dmg)。
-3. 打开 DMG，把 `OpenCodex.app` 拖入 `Applications`。
-4. 启动 OpenCodex，进入“网关”配置 API Key 或导入本机订阅。
+2. 下载 [CodexSplit-2.0.0-beta.1-arm64.dmg](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)。
+3. 打开 DMG，把 `CodexSplit.app` 拖入 `Applications`。
+4. 启动 CodexSplit，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
 6. 测试通过后点击“重启 Codex（应用模型菜单）”，让模型出现在 Codex Desktop。
 
@@ -272,21 +276,21 @@ DMG 已包含网关所需的独立 Node.js 和语音运行时。普通用户不�
 
 ### Windows 10/11
 
-当前 Windows 发布版本为 `v1.0.8`：
+当前 Windows 先使用与 macOS Beta 相同的 `v2.0.0-beta.1` 源码：
 
 1. 安装 Codex Desktop。
-2. 下载 [OpenCodex-1.0.8-win-x64.exe](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)。
-3. 运行安装程序并启动 OpenCodex。
+2. 在仓库中切换到 `v2.0.0-beta.1`，按源码说明构建 Windows 版本。
+3. Windows 安装包将在 Windows 端功能接入后单独发布。
 
-Windows 版本以对应安装包实际提供的功能为准；当前 macOS 原生订阅导入、OpenCodexBar 和部分 CDP 集成依赖 macOS 桌面环境。
+Windows 版本以对应安装包实际提供的功能为准；当前 macOS 原生订阅导入、CodexSplit Voice Bar 和部分 CDP 集成依赖 macOS 桌面环境。
 
 ### 从源码运行网关
 
 需要 Node.js 和 npm：
 
 ```bash
-git clone https://github.com/AITabby/opencodex.git
-cd opencodex
+git clone https://github.com/AITabby/codexsplit.git
+cd codexsplit
 npm install
 npm run build
 npm start
@@ -308,7 +312,7 @@ npm run build:all
 DMG 产物位于：
 
 ```text
-macos-app/build/OpenCodex-<version>-arm64.dmg
+macos-app/build/CodexSplit-<version>-arm64.dmg
 ```
 
 ### 测试
@@ -328,12 +332,12 @@ Codex Desktop
   └─ 原生 Live / Realtime
           │
           ▼
-OpenCodex App
+CodexSplit App
   ├─ 本地网关与管理 API
   ├─ 第三方模型目录与协议路由
   ├─ 动态推理档位与上下文元数据
   ├─ GPT-Live 模型交接
-  ├─ 语音 STT / TTS / OpenCodexBar
+  ├─ 语音 STT / TTS / CodexSplit Voice Bar
   ├─ 会话浏览、扫描与导入
   └─ 日志、重启、还原与安全控制
           │
@@ -343,21 +347,21 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 ## 项目状态
 
-OpenCodex 正在持续迭代。当前状态：
+CodexSplit 正在持续迭代。当前状态：
 
-- macOS Apple Silicon：`v1.2.0` DMG 与源码已发布，包含 spawn_agent 网关分流。
-- Windows 10/11：`v1.0.8`，安装包已发布。
+- macOS Apple Silicon：`v2.0.0-beta.1` DMG 与完整源码，包含 spawn_agent 网关分流。
+- Windows 10/11：同一 Beta 源码已提供，安装包待 Windows 端接入后发布。
 - Linux：暂未发布桌面安装包。
 
-建议通过 [GitHub Releases](https://github.com/AITabby/opencodex/releases) 获取最新版本，并在提交问题时附上系统版本、OpenCodex 版本、服务商、模型名称和脱敏后的网关日志。
+建议通过 [GitHub Releases](https://github.com/AITabby/codexsplit/releases) 获取最新版本，并在提交问题时附上系统版本、CodexSplit 版本、服务商、模型名称和脱敏后的网关日志。
 
 ## 相关链接
 
-- [GitHub Repository](https://github.com/AITabby/opencodex)
-- [GitHub Issues](https://github.com/AITabby/opencodex/issues)
-- [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download the latest published OpenCodex v1.2.0 DMG for macOS](https://github.com/AITabby/opencodex/releases/download/v1.2.0/OpenCodex-1.2.0-arm64.dmg)
-- [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
+- [GitHub Repository](https://github.com/AITabby/codexsplit)
+- [GitHub Issues](https://github.com/AITabby/codexsplit/issues)
+- [Latest Release](https://github.com/AITabby/codexsplit/releases/latest)
+- [Download CodexSplit v2.0.0-beta.1 DMG for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)
+- [CodexSplit v2.0.0-beta.1 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0-beta.1)
 - [语音助手使用指南](./VOICE_GUIDE.md)
 - [测试流程](./TEST_FLOW.md)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)
@@ -368,13 +372,13 @@ OpenCodex 正在持续迭代。当前状态：
 
 ### A local AI workspace for Codex Desktop
 
-OpenCodex is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
+CodexSplit is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
-Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths. Only models explicitly added or imported by the user are routed through the OpenCodex gateway. The v1.2.0 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed without changing the native app-server.
+Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths by default. Only models explicitly added or imported by the user are routed through the CodexSplit gateway. The Desktop bridge is a process-level switch activated only by an explicit restart after third-party models are enabled; it is not exported through launchd and does not silently replace unrelated native launches. The v2.0.0-beta.1 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed.
 
 ### Screenshots
 
-![OpenCodex control center](./assets/dashboard-home.png)
+![CodexSplit control center](./assets/dashboard-home.png)
 
 ![Provider and model configuration](./assets/screenshots/01-provider-model-config.png)
 
@@ -388,8 +392,8 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: `v1.2.0` DMG and source release with spawn_agent gateway routing.
-- Windows 10/11: `v1.0.8` installer.
+- macOS Apple Silicon: `v2.0.0-beta.1` DMG and complete source release with spawn_agent gateway routing.
+- Windows 10/11: `v2.0.0-beta.1` source release; installer follows in a later Beta.
 - Linux: no desktop package is published yet.
 
 The macOS DMG includes a standalone Node.js runtime and the bundled voice runtime. End users do not need Node.js, npm, Homebrew, or the .NET SDK. The current DMG is not notarized; macOS may require allowing the first launch from **System Settings → Privacy & Security**.
@@ -400,6 +404,7 @@ The macOS DMG includes a standalone Node.js runtime and the bundled voice runtim
 
 - Presets for DeepSeek, Qwen, Z.ai, MiniMax, Kimi, OpenRouter, OpenCode Go, SiliconFlow, and Volcengine.
 - Custom OpenAI-compatible endpoints.
+- The dozens of API provider presets reference public provider metadata from [CC Switch's Codex provider preset list](https://github.com/farion1231/cc-switch/blob/main/src/config/codexProviderPresets.ts). CodexSplit does not copy CC Switch authentication, proxy, subscription, promotion, or icon implementations; presets are not an official partnership or an availability guarantee.
 - Multiple models per provider, per-model connection tests, deletion, and bulk deletion.
 - Per-model Chat or Responses protocol selection.
 - Display aliases separated from backend model IDs.
@@ -425,21 +430,21 @@ On macOS, the dashboard can detect and import available local login states for A
 - Anthropic, Google Gemini, DeepSeek, MiniMax, and OpenAI-compatible adapters.
 - Streaming, reasoning, tool calls, tool results, multi-turn continuations, request decompression, bounded streaming writes, and transient upstream retries.
 - Native GPT compaction is passed through unchanged; third-party compaction is forwarded only when the provider exposes native `/responses/compact`.
-- v1.1.5 provider split: official GPT stays on the native OpenAI app-server provider, while third-party models use `127.0.0.1:8765`. The bridge switches the same native thread before forwarding the original turn, preserving the thread and rollout path. The source login agent and packaged control center automatically launch Desktop through the bridge after the gateway is ready; an already-running Desktop is restarted once during that takeover. If the bridge or gateway is unavailable, unsafe third-party routing is not launched and native GPT remains direct.
-- Native Codex Responses, native Live / Realtime, Computer Use, and MCP remain isolated from third-party routing.
+- v1.1.5 provider split: official GPT stays on the native OpenAI app-server provider, while third-party models use `127.0.0.1:8765`. The bridge switches the same native thread before forwarding the original turn, preserving the thread and rollout path. Bridge launch is now explicit and process-scoped: login startup, CodexSplit startup, and ordinary gateway restarts leave Desktop native. If the bridge or gateway is unavailable, unsafe third-party routing is not launched; Restore Native stops the bridge and relaunches the official path.
+- Native Codex Responses, native Live / Realtime, Computer Use, and MCP are not rewritten by CodexSplit. Native and bridge Desktop modes are explicit process-level states; the dashboard exposes the app-server, launch-environment, and Computer Use MCP recovery status.
 
 #### Computer Use, images, and MCP
 
-Third-party Computer Use requests are connected to the Codex-native executor rather than a fabricated gateway-only tool. Screenshot and tool-result image compatibility, multi-turn tool continuations, native image-generation bridging, and Cursor AgentService tool continuations are supported.
+Third-party Computer Use requests are connected to the Codex-native executor rather than a fabricated gateway-only tool. Screenshot and tool-result image compatibility, multi-turn tool continuations, native image-generation bridging, and Cursor AgentService tool continuations are supported. Restore Native removes only a recognizable disabled legacy CodexSplit Computer Use entry, leaves the official bundled launcher untouched, restarts the official Desktop path, and reports the resulting health state; bridge mode itself remains an explicit process-level switch.
 
 #### GPT-Live and voice
 
 - GPT-Live can assign the current task to any connected and available official or third-party model at any time, without requiring the Live conversation model to perform the work.
-- The independent Live model picker can switch the execution model during a task and does not depend on OpenCodexBar.
+- The independent Live model picker can switch the execution model during a task and does not depend on CodexSplit Voice Bar.
 - STT: local Whisper or OpenAI-compatible / Groq transcription APIs.
 - TTS: Edge TTS, Volcengine / Doubao, MiniMax, MiMo, or OpenAI-compatible TTS APIs.
 - VAD threshold and silence duration, interaction mode, voice prompt, voice model, and HUD theme settings.
-- OpenCodexBar global voice bar, CDP restart flow, and the `/visualizer` theme lab.
+- CodexSplit Voice Bar global voice bar, CDP restart flow, and the `/visualizer` theme lab.
 
 #### Agent routing and model capability directory
 
@@ -468,19 +473,19 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download the latest published [OpenCodex v1.2.0 DMG for Apple Silicon](https://github.com/AITabby/opencodex/releases/download/v1.2.0/OpenCodex-1.2.0-arm64.dmg).
-3. Drag `OpenCodex.app` into `Applications`.
+2. Download the latest published [CodexSplit v2.0.0-beta.1 DMG for Apple Silicon](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg).
+3. Drag `CodexSplit.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 
 #### Windows 10/11
 
-Download and run the [OpenCodex v1.0.8 installer](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe). macOS-specific local subscription, OpenCodexBar, and CDP integrations are not assumed to have full Windows parity.
+The `v2.0.0-beta.1` source is the shared development baseline for Windows. A Windows installer will be attached in a later Beta; macOS-specific local subscription, CodexSplit Voice Bar, and CDP integrations are not assumed to have full Windows parity.
 
 #### From source
 
 ```bash
-git clone https://github.com/AITabby/opencodex.git
-cd opencodex
+git clone https://github.com/AITabby/codexsplit.git
+cd codexsplit
 npm install
 npm run build
 npm start
@@ -490,11 +495,11 @@ Open `http://127.0.0.1:8765/dashboard` after the gateway starts. For the macOS d
 
 ### Links
 
-- [GitHub Repository](https://github.com/AITabby/opencodex)
-- [GitHub Issues](https://github.com/AITabby/opencodex/issues)
-- [Latest Release](https://github.com/AITabby/opencodex/releases/latest)
-- [Download OpenCodex v1.2.0 for macOS](https://github.com/AITabby/opencodex/releases/download/v1.2.0/OpenCodex-1.2.0-arm64.dmg)
-- [Download OpenCodex v1.0.8 for Windows](https://github.com/AITabby/opencodex/releases/download/v1.0.8/OpenCodex-1.0.8-win-x64.exe)
+- [GitHub Repository](https://github.com/AITabby/codexsplit)
+- [GitHub Issues](https://github.com/AITabby/codexsplit/issues)
+- [Latest Release](https://github.com/AITabby/codexsplit/releases/latest)
+- [Download CodexSplit v2.0.0-beta.1 for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)
+- [CodexSplit v2.0.0-beta.1 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0-beta.1)
 - [Voice Assistant Guide](./VOICE_GUIDE.md)
 - [Test Flow](./TEST_FLOW.md)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)

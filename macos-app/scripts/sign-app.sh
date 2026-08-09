@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="${0:A:h}"
 APP_ROOT="${SCRIPT_DIR:h:h}"
-APP_BUNDLE="$APP_ROOT/macos-app/build/OpenCodex.app"
+APP_BUNDLE="$APP_ROOT/macos-app/build/CodexSplit.app"
 IDENTITY="${OPENCODEX_SIGNING_IDENTITY:-}"
 
 if [[ -z "$IDENTITY" ]]; then

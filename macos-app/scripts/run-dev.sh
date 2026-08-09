@@ -6,4 +6,4 @@ APP_ROOT="${SCRIPT_DIR:h:h}"
 cd "$APP_ROOT"
 
 npm run build
-OPENCODEX_DEV_ROOT="$APP_ROOT" swift run --package-path macos-app OpenCodex
+OPENCODEX_DEV_ROOT="$APP_ROOT" swift run --package-path macos-app CodexSplit

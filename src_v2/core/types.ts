@@ -205,6 +205,35 @@ export interface ChatCompletionRequestBody {
 // 3. Provider & Model Architecture Types
 // ══════════════════════════════════════════════
 
+export type ProviderPoolMode = "fixed" | "round_robin" | "failover";
+
+export type ProviderCredentialStatus = "unknown" | "ready" | "expired" | "failed" | "cooldown" | "missing";
+
+export interface ProviderModelTestState {
+  status: "untested" | "connected" | "failed" | "simulated";
+  tested_at?: string;
+  message?: string;
+  protocol?: "chat" | "responses";
+}
+
+/**
+ * Metadata for one API-key credential. The secret itself is never persisted
+ * here; credential_ref points at the macOS Keychain entry.
+ */
+export interface ProviderCredential {
+  id: string;
+  label?: string;
+  credential_ref: string;
+  status?: ProviderCredentialStatus;
+  status_message?: string;
+  status_code?: number;
+  failure_count?: number;
+  cooldown_until?: string;
+  last_checked_at?: string;
+  last_used_at?: string;
+  created_at?: string;
+}
+
 export interface ProviderConfig {
   name: string;
   type?: string;
@@ -212,9 +241,17 @@ export interface ProviderConfig {
   baseUrl: string;
   api_key_env?: string;
   api_key?: string;
+  /** Legacy single-Keychain reference retained for migration compatibility. */
+  credential_ref?: string;
+  /** Multiple API-key credentials for this provider; secrets stay in Keychain. */
+  credentials?: ProviderCredential[];
+  pool_mode?: ProviderPoolMode;
+  active_credential_id?: string;
   models?: string[];
   /** Protocol preference per configured model. Unset entries default to Chat. */
   model_protocols?: Record<string, "chat" | "responses">;
+  /** Last explicit connectivity result per backend model id. */
+  model_test_status?: Record<string, ProviderModelTestState>;
   /**
    * Metadata learned from the provider /models response or a model registry.
    * Keys are the provider's backend model ids, not UI aliases.

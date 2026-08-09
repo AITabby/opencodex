@@ -13,6 +13,7 @@ import {
 import {
   GatewayRouter,
   buildThirdPartyNativeCompactionBody,
+  sanitizeThirdPartyResponsesRequest,
 } from "../dist/server/router.js";
 
 test("native GPT remains transport-only, including child boundaries", () => {
@@ -74,6 +75,33 @@ test("third-party native compaction only translates the backend model", () => {
   assert.equal(compact.previous_response_id, body.previous_response_id);
   assert.equal(compact.prompt_cache_key, body.prompt_cache_key);
   assert.equal(compact.service_tier, body.service_tier);
+});
+
+test("third-party Responses remove gateway routing envelopes but keep provider fields", () => {
+  const sanitized = sanitizeThirdPartyResponsesRequest({
+    model: "provider/model",
+    protocol: "responses",
+    client_metadata: { session_id: "private", turn_id: "private-turn" },
+    session_id: "private",
+    turn_id: "private-turn",
+    request_kind: "turn",
+    reasoning_effort: "high",
+    input: "hello",
+    tools: [{ type: "function", name: "lookup", parameters: { type: "object" } }],
+    stream: true,
+    store: false,
+    include: ["reasoning.encrypted_content"],
+    prompt_cache_key: "keep-me",
+  }, "backend/model", true);
+
+  assert.equal(sanitized.model, "backend/model");
+  for (const field of ["protocol", "client_metadata", "session_id", "turn_id", "request_kind", "reasoning_effort", "stream_options", "include", "prompt_cache_key"]) {
+    assert.equal(sanitized[field], undefined, `internal field leaked: ${field}`);
+  }
+  assert.deepEqual(sanitized.reasoning, { effort: "high" });
+  assert.equal(sanitized.input, "hello");
+  assert.equal(sanitized.tools[0].name, "lookup");
+  assert.equal(sanitized.prompt_cache_key, undefined);
 });
 
 test("third-party routing has no gateway-generated compaction fallback", () => {

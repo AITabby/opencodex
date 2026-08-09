@@ -21,11 +21,13 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(packageScript, /@rpath\/|opt\/homebrew|usr\/local\/\(Cellar\|opt\)/);
   assert.match(packageScript, /OPENCODEX_NODE_BINARY/);
   assert.match(packageScript, /codesign --deep --force --sign - --timestamp=none/);
-  assert.match(packageScript, /--product OpenCodexLivePicker/);
-  assert.match(packageScript, /Resources\/OpenCodexLivePicker/);
+  assert.match(packageScript, /--product CodexSplit/);
+  assert.match(packageScript, /--product CodexSplitLivePicker/);
+  assert.match(packageScript, /Contents\/MacOS\/CodexSplit/);
+  assert.match(packageScript, /Resources\/CodexSplitLivePicker/);
   assert.match(verifyScript, /voice-runtime\/uvx/);
-  assert.match(verifyScript, /src_v2\/assets\/opencodex-logo-compact\.png/);
-  assert.match(verifyScript, /Resources\/OpenCodexLivePicker/);
+  assert.match(verifyScript, /src_v2\/assets\/codexsplit-logo-compact\.png/);
+  assert.match(verifyScript, /Resources\/CodexSplitLivePicker/);
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);
   assert.match(gateway, /useEnergyVAD/);
   assert.match(app, /OPENCODEX_VOICE_RUNTIME_DIR/);
@@ -51,7 +53,7 @@ test("repository build includes the bundled OpenCodexBar source", async () => {
 test("DMG uses a standard Applications drag-install layout", async () => {
   const script = await read("macos-app/scripts/package-dmg.sh");
   assert.match(script, /DMG_STAGING=/);
-  assert.match(script, /cp -R "\$APP_BUNDLE" "\$DMG_STAGING\/OpenCodex\.app"/);
+  assert.match(script, /cp -R "\$APP_BUNDLE" "\$DMG_STAGING\/CodexSplit\.app"/);
   assert.match(script, /ln -s \/Applications "\$DMG_STAGING\/Applications"/);
   assert.match(script, /-srcfolder "\$DMG_STAGING"/);
 });
@@ -68,25 +70,28 @@ test("desktop app publishes the runtime port and uses the embedded voice bar", a
   assert.match(gatewayProcess, /OPENCODEX_VOICE_BAR_PATH/);
   assert.match(gatewayProcess, /gateway_runtime_/);
   assert.match(gatewayProcess, /OPENCODEX_DATA_DIR/);
-  assert.match(gatewayProcess, /OpenCodexLivePicker/);
+  assert.match(gatewayProcess, /CodexSplitLivePicker/);
   assert.match(gatewayProcess, /OPENCODEX_APP_PORT/);
   assert.match(gatewayProcess, /OPENCODEX_ADMIN_TOKEN_PATH/);
-  assert.match(gatewayProcess, /launchctl/);
+  assert.match(gatewayProcess, /sanitizedGatewayEnvironment/);
   assert.match(gatewayProcess, /CODEX_CLI_PATH/);
   assert.match(gatewayProcess, /OPENCODEX_PROVIDER_BRIDGE_PATH/);
-  assert.match(gatewayProcess, /restart_desktop_after_gateway_ready/);
+  assert.doesNotMatch(gatewayProcess, /launchctl/);
+  assert.doesNotMatch(gatewayProcess, /restart_desktop_after_gateway_ready/);
+  assert.doesNotMatch(gatewayProcess, /allowDesktopBridgeTakeover/);
   assert.match(gateway, /buildManagedCodexConfig/);
   assert.match(gateway, /Synchronized managed Codex config to port/);
   assert.match(info, /LSMultipleInstancesProhibited/);
 });
 
-test("login startup exports the provider bridge before launching the gateway", async () => {
+test("login startup leaves native Desktop untouched and clears only legacy bridge state", async () => {
   const startup = await read("startup.sh");
-  assert.match(startup, /launchctl setenv CODEX_CLI_PATH/);
-  assert.match(startup, /launchctl setenv OPENCODEX_NATIVE_CODEX_PATH/);
-  assert.match(startup, /launchctl setenv OPENCODEX_PROVIDER_BRIDGE_PATH/);
-  assert.match(startup, /restart_desktop_after_gateway_ready/);
+  assert.doesNotMatch(startup, /launchctl setenv/);
+  assert.match(startup, /launchctl getenv CODEX_CLI_PATH/);
+  assert.match(startup, /launchctl unsetenv CODEX_CLI_PATH/);
+  assert.doesNotMatch(startup, /: > .*restart_desktop_after_gateway_ready/);
   assert.match(startup, /pm2 start \"\$PROJECT_ROOT\/dist\/server\.js\"/);
+  assert.match(startup, /--no-treekill/);
 });
 
 test("voice streaming deduplicates repeated CDP response snapshots before TTS", async () => {

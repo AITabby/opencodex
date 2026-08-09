@@ -5,8 +5,8 @@ let package = Package(
     name: "OpenCodexMac",
     platforms: [.macOS(.v13)],
     products: [
-        .executable(name: "OpenCodex", targets: ["OpenCodex"]),
-        .executable(name: "OpenCodexLivePicker", targets: ["OpenCodexLivePicker"])
+        .executable(name: "CodexSplit", targets: ["OpenCodex"]),
+        .executable(name: "CodexSplitLivePicker", targets: ["OpenCodexLivePicker"])
     ],
     targets: [
         .executableTarget(

@@ -13,11 +13,19 @@ import { URL } from "node:url";
 
 const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 
+function accountPoolProfileRoot(): string {
+  return path.join(process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"), "chatgpt-accounts");
+}
+
 export type RealtimeProxyOptions = {
   /** The bearer token installed in Codex config for the local gateway. */
   localAdminToken?: string;
   /** Test-only override; production reads the native Codex access token. */
   nativeAccessToken?: string;
+  /** Official account identity selected by the outer OpenCodex egress. */
+  nativeAccountId?: string;
+  /** Replace even a real bearer supplied by native Codex. */
+  forceNativeAccessToken?: boolean;
 };
 
 export type RealtimeUpstream = {
@@ -35,7 +43,37 @@ function headerValue(req: http.IncomingMessage, name: string): string {
   return typeof value === "string" ? value : "";
 }
 
-export function readNativeAccessToken(): string {
+function readAccountPoolAccessToken(accountId: string): string {
+  const normalized = String(accountId || "").trim();
+  if (!normalized || /[^a-zA-Z0-9._-]/.test(normalized)) return "";
+  const root = accountPoolProfileRoot();
+  const candidates = [path.join(root, normalized)];
+  try {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (entry.isDirectory() && !candidates.includes(path.join(root, entry.name))) {
+        candidates.push(path.join(root, entry.name));
+      }
+    }
+  } catch {
+    return "";
+  }
+  for (const profile of candidates) {
+    try {
+      const auth = JSON.parse(fs.readFileSync(path.join(profile, "auth.json"), "utf8"));
+      const profileAccountId = typeof auth?.tokens?.account_id === "string" ? auth.tokens.account_id.trim() : "";
+      if (profileAccountId !== normalized && path.basename(profile) !== normalized) continue;
+      const token = typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
+      if (token) return token;
+    } catch {
+      // An incomplete isolated profile is not a usable credential.
+    }
+  }
+  return "";
+}
+
+export function readNativeAccessToken(accountId = ""): string {
+  const accountToken = readAccountPoolAccessToken(accountId);
+  if (accountToken) return accountToken;
   try {
     const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
     return typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
@@ -94,11 +132,19 @@ export function copyNativeRequestHeaders(req: http.IncomingMessage, options: Rea
   }
 
   const incomingAuthorization = headerValue(req, "authorization");
-  const nativeToken = options.nativeAccessToken || readNativeAccessToken();
-  if (nativeSession && nativeToken && isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken)) {
+  const nativeToken = options.nativeAccessToken || readNativeAccessToken(headerValue(req, "chatgpt-account-id"));
+  const shouldReplaceNativeToken = options.forceNativeAccessToken === true
+    || isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
+  if (nativeSession && nativeToken && shouldReplaceNativeToken) {
     headers.authorization = `Bearer ${nativeToken}`;
-  } else if (isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken)) {
+  } else if (shouldReplaceNativeToken) {
     delete headers.authorization;
+  }
+  if (options.nativeAccountId) {
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "chatgpt-account-id") delete headers[key];
+    }
+    headers["chatgpt-account-id"] = options.nativeAccountId;
   }
   return headers;
 }
@@ -106,7 +152,7 @@ export function copyNativeRequestHeaders(req: http.IncomingMessage, options: Rea
 export function resolveRealtimeUpstream(req: http.IncomingMessage, options: RealtimeProxyOptions = {}): RealtimeUpstream {
   const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
   const incomingAuthorization = headerValue(req, "authorization");
-  const nativeAccessToken = options.nativeAccessToken || readNativeAccessToken();
+  const nativeAccessToken = options.nativeAccessToken || readNativeAccessToken(headerValue(req, "chatgpt-account-id"));
   const localBearer = isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
   const nativeLiveCall = isLiveCallPath(url.pathname)
     && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));

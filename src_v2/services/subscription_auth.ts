@@ -12,6 +12,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { SubscriptionAccountPool, type SubscriptionProvider } from "./subscription_account_pool.js";
 
 const GROK_AUTH_PATH = path.join(os.homedir(), ".grok", "auth.json");
 const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
@@ -87,22 +88,32 @@ function writeJsonSecure(filePath: string, value: unknown): void {
   }
 }
 
-function readGrokSession(): { authData: Record<string, GrokSession>; sessionKey: string; session: GrokSession } | null {
+function readGrokSession(homeDir = path.dirname(GROK_AUTH_PATH)): { authData: Record<string, GrokSession>; sessionKey: string; session: GrokSession; authPath: string } | null {
+  const authPath = path.join(homeDir, "auth.json");
   try {
-    if (!fs.existsSync(GROK_AUTH_PATH)) return null;
-    const authData = JSON.parse(fs.readFileSync(GROK_AUTH_PATH, "utf-8")) as Record<string, GrokSession>;
+    if (!fs.existsSync(authPath)) return null;
+    const authData = JSON.parse(fs.readFileSync(authPath, "utf-8")) as Record<string, GrokSession>;
     const sessionKey = Object.keys(authData).find((key) => {
       const value = authData[key];
       return value && (value.key || value.token || value.access_token || value.refresh_token);
     });
     if (!sessionKey || !authData[sessionKey]) return null;
-    return { authData, sessionKey, session: authData[sessionKey] };
+    return { authData, sessionKey, session: authData[sessionKey], authPath };
   } catch {
     return null;
   }
 }
 
-function readAntigravityAuth(): AntigravityAuth | null {
+function readAntigravityAuth(profileDir?: string): AntigravityAuth | null {
+  if (profileDir) {
+    try {
+      const filePath = path.join(profileDir, "auth.json");
+      if (!fs.existsSync(filePath)) return null;
+      return JSON.parse(fs.readFileSync(filePath, "utf-8")) as AntigravityAuth;
+    } catch {
+      return null;
+    }
+  }
   if (process.platform !== "darwin") return null;
   try {
     const raw = execFileSync("security", [
@@ -129,7 +140,20 @@ function sqlQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
-function readCursorCredentials(): CursorCredentials {
+function readCursorCredentials(profileDir?: string): CursorCredentials {
+  if (profileDir) {
+    try {
+      const filePath = path.join(profileDir, "credentials.json");
+      if (!fs.existsSync(filePath)) return { accessToken: null, refreshToken: null };
+      const value = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
+      return {
+        accessToken: String(value.accessToken || value.access_token || "").trim() || null,
+        refreshToken: String(value.refreshToken || value.refresh_token || "").trim() || null,
+      };
+    } catch {
+      return { accessToken: null, refreshToken: null };
+    }
+  }
   const envToken = String(process.env.CURSOR_API_KEY || "").trim();
   if (envToken) return { accessToken: envToken, refreshToken: null };
   if (process.platform !== "darwin" || !fs.existsSync(CURSOR_STATE_DB)) {
@@ -153,7 +177,11 @@ function readCursorCredentials(): CursorCredentials {
   }
 }
 
-function writeCursorCredentials(accessToken: string, refreshToken: string): void {
+function writeCursorCredentials(accessToken: string, refreshToken: string, profileDir?: string): void {
+  if (profileDir) {
+    writeJsonSecure(path.join(profileDir, "credentials.json"), { accessToken, refreshToken });
+    return;
+  }
   if (!fs.existsSync(CURSOR_STATE_DB)) return;
   const sql = [
     `INSERT OR REPLACE INTO ItemTable(key,value) VALUES('cursorAuth/accessToken',${sqlQuote(accessToken)});`,
@@ -406,7 +434,28 @@ function readClaudeDesktopToken(): ClaudeDesktopToken | null {
   return null;
 }
 
-function writeClaudeDesktopToken(value: ClaudeDesktopToken): void {
+function readClaudeProfileToken(profileDir: string): ClaudeDesktopToken | null {
+  for (const fileName of [".credentials.json", "credentials.json", "claude_desktop_auth.json"]) {
+    try {
+      const filePath = path.join(profileDir, fileName);
+      if (!fs.existsSync(filePath)) continue;
+      const value = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+      const token = normalizeClaudeDesktopToken(value?.claudeAiOauth || value);
+      if (token) return token;
+    } catch {}
+  }
+  return null;
+}
+
+function writeClaudeDesktopToken(value: ClaudeDesktopToken, profileDir?: string): void {
+  if (profileDir) {
+    writeJsonSecure(path.join(profileDir, ".credentials.json"), { claudeAiOauth: {
+      accessToken: value.accessToken,
+      refreshToken: value.refreshToken,
+      expiresAt: value.expiresAt,
+    } });
+    return;
+  }
   writeJsonSecure(CLAUDE_TOKEN_CACHE, value);
 }
 
@@ -459,7 +508,11 @@ function getCursorAuthClientId(): string {
   return CURSOR_AUTH_CLIENT_ID;
 }
 
-function writeAntigravityAuth(auth: AntigravityAuth): void {
+function writeAntigravityAuth(auth: AntigravityAuth, profileDir?: string): void {
+  if (profileDir) {
+    writeJsonSecure(path.join(profileDir, "auth.json"), auth);
+    return;
+  }
   const raw = `${ANTIGRAVITY_KEYCHAIN_PREFIX}${Buffer.from(JSON.stringify(auth), "utf-8").toString("base64")}`;
   execFileSync("security", [
     "add-generic-password",
@@ -531,6 +584,15 @@ export class SubscriptionAuthService {
   private static cursorRefresh: Promise<string | null> | null = null;
   private static claudeRefresh: Promise<string | null> | null = null;
   private static claudeLastAuthFailure = "not_attempted";
+  private static accountPool: SubscriptionAccountPool | null = null;
+
+  public static configureAccountPool(pool: SubscriptionAccountPool): void {
+    this.accountPool = pool;
+  }
+
+  private static selectProfile(provider: SubscriptionProvider): string | null {
+    return this.accountPool?.selectForRequest(provider)?.profile_dir || null;
+  }
 
   public static hasGrokCredential(): boolean {
     return Boolean(readGrokSession());
@@ -541,8 +603,8 @@ export class SubscriptionAuthService {
     return Boolean(auth?.token?.access_token || auth?.token?.refresh_token);
   }
 
-  private static async refreshGrokToken(): Promise<string | null> {
-    const current = readGrokSession();
+  private static async refreshGrokToken(profileDir?: string): Promise<string | null> {
+    const current = readGrokSession(profileDir || undefined);
     if (!current) return null;
     const refreshToken = current.session.refresh_token;
     if (!refreshToken) return null;
@@ -569,19 +631,20 @@ export class SubscriptionAuthService {
       current.session.expires_at = new Date(Date.now() + Number(refreshed.expires_in) * 1000).toISOString();
     }
     current.authData[current.sessionKey] = current.session;
-    writeJsonSecure(GROK_AUTH_PATH, current.authData);
+    writeJsonSecure(current.authPath, current.authData);
     return accessToken;
   }
 
   public static async getGrokAccessToken(forceRefresh = false): Promise<string | null> {
-    const current = readGrokSession();
+    const profileDir = this.selectProfile("grok");
+    const current = readGrokSession(profileDir || undefined) || (profileDir ? null : readGrokSession());
     if (!current) return null;
     const session = current.session;
     const token = session.key || session.token || session.access_token || "";
     if (!forceRefresh && isValidAccessToken(token, session.expires_at)) return token;
 
     if (!this.grokRefresh) {
-      this.grokRefresh = this.refreshGrokToken().finally(() => { this.grokRefresh = null; });
+      this.grokRefresh = this.refreshGrokToken(profileDir || undefined).finally(() => { this.grokRefresh = null; });
     }
     const refreshed = await this.grokRefresh;
     if (refreshed) return refreshed;
@@ -590,8 +653,8 @@ export class SubscriptionAuthService {
     return !forceRefresh && isValidAccessToken(token, session.expires_at) ? token : null;
   }
 
-  private static async refreshAntigravityToken(): Promise<string | null> {
-    const auth = readAntigravityAuth();
+  private static async refreshAntigravityToken(profileDir?: string): Promise<string | null> {
+    const auth = readAntigravityAuth(profileDir || undefined);
     const token = auth?.token;
     if (!token?.refresh_token) return null;
 
@@ -618,12 +681,13 @@ export class SubscriptionAuthService {
     token.expiry = expiry;
     token.expires_at = expiry;
     if (refreshed.refresh_token) token.refresh_token = refreshed.refresh_token;
-    writeAntigravityAuth(auth as AntigravityAuth);
+    writeAntigravityAuth(auth as AntigravityAuth, profileDir || undefined);
     return refreshed.access_token;
   }
 
   public static async getAntigravityAccessToken(forceRefresh = false): Promise<string | null> {
-    const auth = readAntigravityAuth();
+    const profileDir = this.selectProfile("antigravity");
+    const auth = readAntigravityAuth(profileDir || undefined) || (profileDir ? null : readAntigravityAuth());
     const token = auth?.token;
     if (!token) return null;
     const accessToken = token.access_token || "";
@@ -631,7 +695,7 @@ export class SubscriptionAuthService {
     if (!forceRefresh && isValidAccessToken(accessToken, expiry)) return accessToken;
 
     if (!this.antigravityRefresh) {
-      this.antigravityRefresh = this.refreshAntigravityToken().finally(() => { this.antigravityRefresh = null; });
+      this.antigravityRefresh = this.refreshAntigravityToken(profileDir || undefined).finally(() => { this.antigravityRefresh = null; });
     }
     const refreshed = await this.antigravityRefresh;
     if (refreshed) return refreshed;
@@ -679,7 +743,7 @@ export class SubscriptionAuthService {
     }
   }
 
-  private static async refreshClaudeDesktopToken(cached: ClaudeDesktopToken | null): Promise<string | null> {
+  private static async refreshClaudeDesktopToken(cached: ClaudeDesktopToken | null, profileDir?: string): Promise<string | null> {
     if (!cached?.refreshToken) {
       this.claudeLastAuthFailure = "no_cached_refresh_token";
       return null;
@@ -714,7 +778,7 @@ export class SubscriptionAuthService {
         refreshToken: String(refreshed.refresh_token || cached.refreshToken),
         expiresAt: Date.now() + (Number(refreshed.expires_in) || 3600) * 1000,
       };
-      writeClaudeDesktopToken(next);
+      writeClaudeDesktopToken(next, profileDir || undefined);
       return next.accessToken;
     } catch {
       this.claudeLastAuthFailure = "refresh_network_error";
@@ -830,6 +894,22 @@ export class SubscriptionAuthService {
 
   public static async getClaudeAccessToken(forceRefresh = false): Promise<string | null> {
     this.claudeLastAuthFailure = "no_usable_token";
+    const profileDir = this.selectProfile("claude");
+    if (profileDir) {
+      const cached = readClaudeProfileToken(profileDir);
+      if (!forceRefresh && cached && cached.expiresAt - Date.now() > REFRESH_SKEW_MS) {
+        this.claudeLastAuthFailure = "pool_cached_token";
+        return cached.accessToken;
+      }
+      if (!this.claudeRefresh) {
+        this.claudeRefresh = this.refreshClaudeDesktopToken(cached, profileDir)
+          .finally(() => { this.claudeRefresh = null; });
+      }
+      const refreshed = await this.claudeRefresh;
+      if (refreshed) return refreshed;
+      return !forceRefresh && cached && cached.expiresAt > Date.now() ? cached.accessToken : null;
+    }
+
     const apiKey = this.getClaudeApiKey();
     if (apiKey) {
       this.claudeLastAuthFailure = "api_key";
@@ -877,8 +957,40 @@ export class SubscriptionAuthService {
     return readCursorCredentials().accessToken;
   }
 
-  private static async refreshCursorToken(): Promise<string | null> {
-    const credentials = readCursorCredentials();
+  /**
+   * Capture the credential currently owned by the vendor app/CLI into an
+   * isolated account profile. This is the fallback for providers that do not
+   * expose a safe, separate login command; it never returns token material to
+   * the dashboard API.
+   */
+  public static async captureCurrentCredential(provider: SubscriptionProvider, profileDir: string): Promise<void> {
+    fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(profileDir, 0o700); } catch {}
+    if (provider === "grok") {
+      const current = readGrokSession();
+      if (!current) throw new Error("未检测到当前 Grok 登录态，请先登录 Grok");
+      writeJsonSecure(path.join(profileDir, "auth.json"), { [current.sessionKey]: current.session });
+      return;
+    }
+    if (provider === "antigravity") {
+      const current = readAntigravityAuth();
+      if (!current?.token?.access_token && !current?.token?.refresh_token) throw new Error("未检测到当前 Antigravity 登录态，请先登录客户端");
+      writeJsonSecure(path.join(profileDir, "auth.json"), current);
+      return;
+    }
+    if (provider === "cursor") {
+      const current = readCursorCredentials();
+      if (!current.accessToken && !current.refreshToken) throw new Error("未检测到当前 Cursor 登录态，请先登录客户端");
+      writeCursorCredentials(current.accessToken || "", current.refreshToken || "", profileDir);
+      return;
+    }
+    const current = readClaudeDesktopConfigToken() || readClaudeDesktopToken() || this.getClaudeCodeToken();
+    if (!current) throw new Error("未检测到当前 Claude OAuth 登录态，请先登录 Claude / Claude Code");
+    writeClaudeDesktopToken(current, profileDir);
+  }
+
+  private static async refreshCursorToken(profileDir?: string): Promise<string | null> {
+    const credentials = readCursorCredentials(profileDir || undefined);
     if (!credentials.refreshToken) return null;
     const response = await fetch("https://api2.cursor.sh/oauth/token", {
       method: "POST",
@@ -897,18 +1009,19 @@ export class SubscriptionAuthService {
     const refreshed = await response.json() as any;
     const accessToken = String(refreshed.access_token || "").trim();
     if (!accessToken) return null;
-    writeCursorCredentials(accessToken, accessToken);
+    writeCursorCredentials(accessToken, accessToken, profileDir || undefined);
     return accessToken;
   }
 
   public static async getCursorAccessToken(forceRefresh = false): Promise<string | null> {
-    const credentials = readCursorCredentials();
+    const profileDir = this.selectProfile("cursor");
+    const credentials = readCursorCredentials(profileDir || undefined);
     const token = credentials.accessToken;
     if (!token) return null;
     if (!forceRefresh && isValidAccessToken(token, jwtExpiry(token))) return token;
 
     if (!this.cursorRefresh) {
-      this.cursorRefresh = this.refreshCursorToken().finally(() => { this.cursorRefresh = null; });
+      this.cursorRefresh = this.refreshCursorToken(profileDir || undefined).finally(() => { this.cursorRefresh = null; });
     }
     const refreshed = await this.cursorRefresh;
     if (refreshed) return refreshed;

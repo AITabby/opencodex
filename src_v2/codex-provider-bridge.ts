@@ -18,9 +18,11 @@ import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { RequestDecompressor } from "./core/decompressor.js";
+import { isNativeControlPlaneModel } from "./core/model_identity.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
 import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
-import { copyNativeRequestHeaders } from "./server/webrtc_proxy.js";
+import { copyNativeRequestHeaders, readNativeAccessToken } from "./server/webrtc_proxy.js";
+import { ChatGptAccountPool, type ChatGptAccountView } from "./services/chatgpt_account_pool.js";
 
 export type CodexProvider = "openai" | "opencodex";
 
@@ -62,6 +64,7 @@ type ThreadRoute = {
   externalId: string;
   nativeId: string;
   nativePath?: string;
+  retiredNativeIds?: string[];
   selectedModel: string;
   legacySourceId?: string;
   legacySourcePath?: string;
@@ -229,12 +232,177 @@ function normalizeProvider(value: unknown): CodexProvider | null {
   return null;
 }
 
+/**
+ * Only an explicit official quota/rate-limit response is allowed to move a
+ * logical conversation to another ChatGPT account. Transport failures such as
+ * 502, ECONNRESET, timeouts, and generic 400s must stay on the current account
+ * so a temporary network problem cannot silently change login state.
+ */
+export function isOfficialQuotaFailure(value: unknown): boolean {
+  const strings: string[] = [];
+  const statuses: number[] = [];
+  const seen = new Set<object>();
+  const collect = (current: unknown, depth: number): void => {
+    if (depth > 5 || current === null || current === undefined) return;
+    if (typeof current === "string") {
+      strings.push(current);
+      return;
+    }
+    if (typeof current === "number") {
+      if (Number.isFinite(current)) statuses.push(current);
+      return;
+    }
+    if (typeof current !== "object") return;
+    if (seen.has(current as object)) return;
+    seen.add(current as object);
+    if (Array.isArray(current)) {
+      for (const entry of current) collect(entry, depth + 1);
+      return;
+    }
+    for (const [key, child] of Object.entries(current as JsonRecord)) {
+      if (/^(?:status|statusCode|httpStatus)$/i.test(key) && typeof child === "number") {
+        statuses.push(child);
+      }
+      collect(child, depth + 1);
+    }
+  };
+  collect(value, 0);
+  const text = strings.join(" ").toLowerCase();
+  if (statuses.includes(429) || /\b429\b/.test(text)) return true;
+  if (statuses.includes(402) && /(quota|credit|billing|usage|limit)/i.test(text)) return true;
+  if (statuses.includes(403) && /(quota|rate\s*limit|usage\s*limit|too\s+many\s+requests|limit\s+(?:reached|exceeded))/i.test(text)) {
+    return true;
+  }
+  return /insufficient[_\s-]*quota|rate[_\s-]*limit|ratelimit|usage[_\s-]*limit|too\s+many\s+requests|(?:quota|usage|request)\s+limit\s+(?:reached|exceeded)|(?:quota|usage)\s+(?:has\s+been\s+)?exceeded|limit\s+(?:has\s+been\s+)?reached|exceeded\s+(?:your\s+)?(?:current\s+)?(?:quota|usage|limit)|使用上限|额度(?:已)?(?:耗尽|不足)|配额(?:已)?(?:耗尽|不足)|达到(?:了)?(?:使用|额度|配额)?上限|请在[^。\n]{0,80}(?:后|之后)(?:重试|再试)/i.test(text);
+}
+
+export function isHardOfficialQuotaFailure(value: unknown): boolean {
+  let text = "";
+  try {
+    text = typeof value === "string" ? value : JSON.stringify(value) || "";
+  } catch {
+    text = String(value);
+  }
+  return /(insufficient[_\s-]*quota|\bquota\b|usage[_\s-]*limit|\bcredits?\b|\bbilling\b|使用上限|额度(?:已)?(?:耗尽|不足)|配额(?:已)?(?:耗尽|不足)|达到(?:了)?(?:使用|额度|配额)?上限|升级套餐|充值额度)/i.test(text)
+    && !/(rate[_\s-]*limit|ratelimit|too\s+many\s+requests)/i.test(text);
+}
+
+/**
+ * Authentication failures change account health, but are not quota failures.
+ * They mark the isolated profile for re-login so future sessions avoid it;
+ * generic transport errors and model-validation errors stay on the current
+ * account and never trigger account rotation.
+ */
+export function isOfficialAuthFailure(value: unknown): boolean {
+  const text = typeof value === "string"
+    ? value
+    : (() => {
+      try { return JSON.stringify(value) || ""; } catch { return String(value); }
+    })();
+  if (/(?:"?status(?:Code|_code)?"?\s*[:=]\s*)?401\b/i.test(text)) return true;
+  return /\b403\b/i.test(text)
+    && /(unauthori[sz]ed|authentication|auth(?:entication)?\s+required|invalid\s+(?:api\s+)?key|invalid\s+token|token\s+(?:has\s+)?expired|expired\s+token|credential|login\s+required|not\s+authenticated|account\s+(?:is\s+)?(?:disabled|suspended|not\s+authorized))/i.test(text);
+}
+
 type HeaderBag = Record<string, string | string[] | undefined>;
 
 function headerValue(headers: HeaderBag, name: string): string {
   const value = headers[name.toLowerCase()];
   if (Array.isArray(value)) return cleanString(value[0]);
   return cleanString(value);
+}
+
+type OfficialAccountCredential = {
+  localId: string;
+  upstreamId: string;
+  token: string;
+};
+
+/**
+ * Owns only the official upstream credential currently used by Native Egress.
+ *
+ * This is deliberately request/upstream state, not conversation state. The
+ * native app-server keeps its process, thread IDs, history, and response
+ * protocol unchanged while this controller changes the bearer credential at
+ * the HTTP boundary after an explicit official quota response.
+ */
+export class OfficialAccountRouter {
+  private rotationTail: Promise<void> = Promise.resolve();
+
+  public constructor(private readonly pool: ChatGptAccountPool) {}
+
+  private authMetadata(account: ChatGptAccountView): { token: string; upstreamId: string } {
+    try {
+      const auth = JSON.parse(fs.readFileSync(path.join(account.profile_dir, "auth.json"), "utf8"));
+      const token = cleanString(auth?.tokens?.access_token);
+      const upstreamId = cleanString(auth?.tokens?.account_id) || account.id;
+      return { token, upstreamId };
+    } catch {
+      return { token: "", upstreamId: account.id };
+    }
+  }
+
+  private credentialFor(account: ChatGptAccountView | undefined): OfficialAccountCredential | null {
+    if (!account || account.auth_status !== "ready" || !account.enabled) return null;
+    const metadata = this.authMetadata(account);
+    const token = metadata.token || readNativeAccessToken(account.id);
+    if (!token) return null;
+    return {
+      localId: account.id,
+      upstreamId: metadata.upstreamId,
+      token,
+    };
+  }
+
+  /**
+   * Select only the official credential for this upstream request.
+   *
+   * This intentionally has no active-account cache and never reads an
+   * incoming conversation/thread account hint. Fixed mode therefore follows
+   * the current dashboard-selected account on the next request, while
+   * round-robin mode advances for each request independently of sessions.
+   */
+  public credentialForRequest(_req: http.IncomingMessage): OfficialAccountCredential | null {
+    // The account pool is an explicit, independent capability. A Desktop
+    // Bridge process may be running solely for third-party routing; that must
+    // never replace the credential of a truly native GPT request by itself.
+    if (!this.pool.rotationEnabled()) return null;
+    const selected = this.pool.selectForInvocation(process.env.OPENCODEX_CHATGPT_ACCOUNT_ID) || undefined;
+    const credential = this.credentialFor(selected);
+    if (!credential) return null;
+    console.error(`[OpenCodex Official Egress] request account=${credential.localId}`);
+    return credential;
+  }
+
+  public async failover(failedId: string, error: unknown): Promise<OfficialAccountCredential | null> {
+    if (!this.pool.rotationEnabled()) return null;
+    const previous = this.rotationTail;
+    let release: () => void = () => {};
+    this.rotationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      if (!this.pool.automaticFailoverEnabled()) return null;
+
+      if (isHardOfficialQuotaFailure(error)) this.pool.markQuotaFailure(failedId, error);
+      else this.pool.markFailure(failedId, error);
+      const next = this.pool.selectNextAvailable(failedId);
+      const credential = this.credentialFor(next || undefined);
+      if (credential) {
+        console.error(`[OpenCodex Official Egress] quota failover ${failedId} -> ${credential.localId}`);
+      } else {
+        console.error(`[OpenCodex Official Egress] no available account after ${failedId} quota failure`);
+      }
+      return credential;
+    } finally {
+      release();
+    }
+  }
+
+  public markAuthFailure(localId: string, error: unknown): void {
+    this.pool.markAuthFailure(localId, error);
+  }
 }
 
 function turnMetadataFromHeaders(headers: HeaderBag): JsonRecord {
@@ -381,12 +549,35 @@ export function isNativeSubagentRequest(body: unknown, headers: HeaderBag = {}):
   );
 }
 
+function requestModelSlug(body: unknown, headers: HeaderBag): string {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  return modelSlug(value.model || value.model_id)
+    || headerValue(headers, "x-codex-model")
+    || headerValue(headers, "x-model");
+}
+
+export function isNativeControlPlaneRequest(body: unknown, headers: HeaderBag = {}): boolean {
+  return isNativeControlPlaneModel(requestModelSlug(body, headers));
+}
+
 export function nativeEgressRoute(body: unknown, headers: HeaderBag = {}): "native" | "gateway" {
+  if (isNativeControlPlaneRequest(body, headers)) return "native";
   return isNativeSubagentRequest(body, headers) ? "gateway" : "native";
 }
 
 function configuredGatewayPort(): number {
-  const candidates = [process.env.OPENCODEX_GATEWAY_PORT, process.env.OPENCODEX_PORT, "8765"];
+  const candidates: unknown[] = [process.env.OPENCODEX_GATEWAY_PORT, process.env.OPENCODEX_PORT];
+  try {
+    const configPath = cleanString(process.env.OPENCODEX_CODEX_CONFIG_PATH)
+      || path.join(os.homedir(), ".codex", "config.toml");
+    const config = fs.readFileSync(configPath, "utf8");
+    for (const match of config.matchAll(/base_url\s*=\s*["']http:\/\/127\.0\.0\.1:(\d+)\/v1["']/g)) {
+      candidates.push(match[1]);
+    }
+  } catch {
+    // The fixed default remains the safe local gateway fallback.
+  }
+  candidates.push("8765");
   for (const candidate of candidates) {
     const port = Number.parseInt(cleanString(candidate), 10);
     if (Number.isInteger(port) && port > 0 && port <= 65_535) return port;
@@ -406,7 +597,9 @@ function nativeEgressPath(pathname: string, basePath = "/v1"): string {
 }
 
 function nativeUpstreamTarget(pathname: string, search: string, basePath: string): string {
-  return `https://chatgpt.com/backend-api/codex${nativeEgressPath(pathname, basePath)}${search}`;
+  const nativeBase = cleanString(process.env.OPENCODEX_NATIVE_UPSTREAM_BASE_URL).replace(/\/$/, "");
+  const pathValue = `/backend-api/codex${nativeEgressPath(pathname, basePath)}`;
+  return `${nativeBase || "https://chatgpt.com"}${pathValue}${search}`;
 }
 
 function gatewayUpstreamTarget(pathname: string, search: string, basePath: string): string {
@@ -448,13 +641,37 @@ function readRequestBody(req: http.IncomingMessage): Promise<Buffer> {
   });
 }
 
-function localEgressHeaders(req: http.IncomingMessage): Record<string, string> {
-  const headers = copyNativeRequestHeaders(req, {}, true);
+function localEgressHeaders(
+  req: http.IncomingMessage,
+  credential?: OfficialAccountCredential | null,
+): Record<string, string> {
+  const headers = copyNativeRequestHeaders(req, credential ? {
+    nativeAccessToken: credential.token,
+    nativeAccountId: credential.upstreamId,
+    forceNativeAccessToken: true,
+  } : {}, true);
   // The bridge sends the decompressed request bytes. Keep the upstream from
   // trying to decode them a second time and avoid compressed response bodies
   // while streaming back into native Codex.
   headers["accept-encoding"] = "identity";
   return headers;
+}
+
+async function readBufferedResponse(response: Response): Promise<Buffer> {
+  try {
+    return Buffer.from(await response.arrayBuffer());
+  } catch {
+    return Buffer.alloc(0);
+  }
+}
+
+function writeBufferedResponse(
+  res: http.ServerResponse,
+  response: Response,
+  body: Buffer,
+): void {
+  res.writeHead(response.status, copySafeResponseHeaders(response.headers));
+  res.end(body);
 }
 
 function writeNativeEgressFallback(res: http.ServerResponse): void {
@@ -497,26 +714,58 @@ async function proxyNativeEgressRequest(
   targetUrl: string,
   body: Buffer,
   operation: string,
+  transport: "undici" | "node_https" = "undici",
   onResponseHeaders?: (headers: Headers) => void,
+  accountRouter?: OfficialAccountRouter,
 ): Promise<void> {
   try {
-    const upstreamRes = await fetchUpstream(targetUrl, {
-      method: req.method || "POST",
-      headers: localEgressHeaders(req),
-      body: body as any,
-      maxAttempts: 1,
-      timeoutMs: 600_000,
-      operation,
-    });
-    onResponseHeaders?.(upstreamRes.headers);
-    res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
-    if (upstreamRes.body) {
-      // @ts-ignore Node's fetch body is an async iterable at runtime.
-      for await (const chunk of upstreamRes.body) {
-        await writeHttpResponseChunked(res, chunk);
+    let credential = accountRouter?.credentialForRequest(req) || null;
+    while (true) {
+      const upstreamRes = await fetchUpstream(targetUrl, {
+        method: req.method || "POST",
+        headers: localEgressHeaders(req, credential),
+        body: body as any,
+        // Retry only pre-response connection failures. fetchUpstream returns as
+        // soon as headers arrive, so streaming responses are never replayed.
+        maxAttempts: 3,
+        timeoutMs: 600_000,
+        operation,
+        transport,
+      });
+
+      // Only official error responses are inspected here. A successful stream
+      // is passed through immediately; once output starts it is not replayed.
+      if (accountRouter && credential && upstreamRes.status >= 400) {
+        const errorBody = await readBufferedResponse(upstreamRes);
+        const errorValue = {
+          status: upstreamRes.status,
+          body: errorBody.toString("utf8"),
+        };
+        if (isOfficialAuthFailure(errorValue)) {
+          accountRouter.markAuthFailure(credential.localId, errorValue);
+        }
+        if (isOfficialQuotaFailure(errorValue)) {
+          const next = await accountRouter.failover(credential.localId, errorValue);
+          if (next) {
+            credential = next;
+            continue;
+          }
+        }
+        writeBufferedResponse(res, upstreamRes, errorBody);
+        return;
       }
+
+      onResponseHeaders?.(upstreamRes.headers);
+      res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
+      if (upstreamRes.body) {
+        // @ts-ignore Node's fetch body is an async iterable at runtime.
+        for await (const chunk of upstreamRes.body) {
+          await writeHttpResponseChunked(res, chunk);
+        }
+      }
+      res.end();
+      return;
     }
-    res.end();
   } catch (error: any) {
     const details = upstreamErrorDetails(error);
     console.error(`[OpenCodex Native Egress] ${operation} failed:`, {
@@ -540,6 +789,7 @@ async function handleNativeEgressRequest(
   req: http.IncomingMessage,
   res: http.ServerResponse,
   basePath: string,
+  accountRouter: OfficialAccountRouter,
   subagentDisplaySettings: Map<string, NativeSubagentDisplaySettings>,
   onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
 ): Promise<void> {
@@ -581,10 +831,14 @@ async function handleNativeEgressRequest(
     targetUrl,
     body,
     `native-${route}-${endpoint.replace(/^\//, "") || "root"}`,
+    // Account takeover is an HTTP-header concern; keep the original upstream
+    // transport so enabling the pool cannot change native connection behavior.
+    "undici",
     route === "gateway" ? (responseHeaders) => {
       const update = rememberNativeSubagentDisplaySettings(subagentDisplaySettings, parsedBody, req.headers, responseHeaders);
       if (update) onSubagentDisplaySettings?.(update);
     } : undefined,
+    route === "native" ? accountRouter : undefined,
   );
 }
 
@@ -595,13 +849,20 @@ type NativeEgressRouter = {
   subagentDisplaySettings: Map<string, NativeSubagentDisplaySettings>;
 };
 
+type CliEgressRouter = {
+  server: http.Server;
+  port: number;
+  basePath: string;
+};
+
 async function startNativeEgressRouter(
+  accountRouter: OfficialAccountRouter,
   onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
 ): Promise<NativeEgressRouter> {
   const basePath = `/__opencodex_native_egress_${randomBytes(16).toString("hex")}/v1`;
   const subagentDisplaySettings = new Map<string, NativeSubagentDisplaySettings>();
   const server = http.createServer((req, res) => {
-    void handleNativeEgressRequest(req, res, basePath, subagentDisplaySettings, onSubagentDisplaySettings).catch((error) => {
+    void handleNativeEgressRequest(req, res, basePath, accountRouter, subagentDisplaySettings, onSubagentDisplaySettings).catch((error) => {
       console.error(`[OpenCodex Native Egress] request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -635,6 +896,189 @@ async function startNativeEgressRouter(
   const port = address.port;
   console.error(`[OpenCodex Native Egress] listening on 127.0.0.1:${port}; gateway target port ${configuredGatewayPort()}`);
   return { server, port, basePath, subagentDisplaySettings };
+}
+
+/**
+ * Route a standalone CLI request without changing the native CLI's provider
+ * configuration. The CLI sends every request to this short-lived local HTTP
+ * bridge; official models leave through the native ChatGPT backend, while
+ * provider-owned models enter the OpenCodex gateway.
+ */
+export function cliEgressRoute(body: unknown, headers: HeaderBag = {}): "native" | "gateway" {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const selectedModel = modelSlug(
+    value.model
+      || value.model_id
+      || headerValue(headers, "x-codex-model")
+      || headerValue(headers, "x-model"),
+  );
+  return classifyRuntimeModel(selectedModel) === GATEWAY_PROVIDER ? "gateway" : "native";
+}
+
+function cliEgressHeaders(
+  req: http.IncomingMessage,
+  credential?: OfficialAccountCredential | null,
+): Record<string, string> {
+  const headers = copyNativeRequestHeaders(req, credential ? {
+    nativeAccessToken: credential.token,
+    nativeAccountId: credential.upstreamId,
+    forceNativeAccessToken: true,
+  } : {}, true);
+  headers["accept-encoding"] = "identity";
+  return headers;
+}
+
+async function proxyCliEgressRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  targetUrl: string,
+  body: Buffer,
+  operation: string,
+  transport: "undici" | "node_https" = "undici",
+  accountRouter?: OfficialAccountRouter,
+): Promise<void> {
+  try {
+    const method = req.method || "GET";
+    let credential = accountRouter?.credentialForRequest(req) || null;
+    while (true) {
+      const upstreamRes = await fetchUpstream(targetUrl, {
+        method,
+        headers: cliEgressHeaders(req, credential),
+        body: method === "GET" || method === "HEAD" ? undefined : body as any,
+        // Official CLI requests use the same direct ChatGPT upstream as the
+        // native desktop path; tolerate transient TLS/socket resets there too.
+        maxAttempts: 3,
+        timeoutMs: 600_000,
+        operation,
+        transport,
+      });
+      if (accountRouter && credential && upstreamRes.status >= 400) {
+        const errorBody = await readBufferedResponse(upstreamRes);
+        const errorValue = {
+          status: upstreamRes.status,
+          body: errorBody.toString("utf8"),
+        };
+        if (isOfficialAuthFailure(errorValue)) {
+          accountRouter.markAuthFailure(credential.localId, errorValue);
+        }
+        if (isOfficialQuotaFailure(errorValue)) {
+          const next = await accountRouter.failover(credential.localId, errorValue);
+          if (next) {
+            credential = next;
+            continue;
+          }
+        }
+        writeBufferedResponse(res, upstreamRes, errorBody);
+        return;
+      }
+
+      res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
+      if (upstreamRes.body) {
+        // @ts-ignore Node's fetch body is an async iterable at runtime.
+        for await (const chunk of upstreamRes.body) {
+          await writeHttpResponseChunked(res, chunk);
+        }
+      }
+      res.end();
+      return;
+    }
+  } catch (error: any) {
+    const details = upstreamErrorDetails(error);
+    console.error(`[OpenCodex CLI Egress] ${operation} failed:`, {
+      ...details,
+      attempts: error?.attempts,
+    });
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: error?.message || "CLI egress request failed",
+        type: "upstream_unreachable",
+        retryable: Boolean(error?.retryable),
+        attempts: error?.attempts,
+        cause_code: details.code,
+      }));
+    }
+  }
+}
+
+async function handleCliEgressRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  basePath: string,
+  accountRouter: OfficialAccountRouter,
+): Promise<void> {
+  const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
+  const endpoint = nativeEgressPath(requestUrl.pathname, basePath);
+  if (!endpoint) {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "CLI egress route not found" }));
+    return;
+  }
+  const websocketRequest = req.headers.upgrade?.toLowerCase() === "websocket"
+    || (req.headers.connection || "").toLowerCase().includes("upgrade");
+  if (websocketRequest) {
+    writeNativeEgressFallback(res);
+    return;
+  }
+
+  const body = req.method === "GET" || req.method === "HEAD" ? Buffer.alloc(0) : await readRequestBody(req);
+  let parsedBody: JsonRecord = {};
+  try {
+    const value = JSON.parse(body.toString("utf8"));
+    if (value && typeof value === "object" && !Array.isArray(value)) parsedBody = value as JsonRecord;
+  } catch {
+    // Let the selected upstream return the authoritative malformed-body error.
+  }
+  const route = cliEgressRoute(parsedBody, req.headers);
+  const targetUrl = route === "gateway"
+    ? gatewayUpstreamTarget(requestUrl.pathname, requestUrl.search, basePath)
+    : nativeUpstreamTarget(requestUrl.pathname, requestUrl.search, basePath);
+  console.error(`[OpenCodex CLI Egress] ${route} ${endpoint} model=${modelSlug(parsedBody.model) || "(default)"}`);
+  await proxyCliEgressRequest(
+    req,
+    res,
+    targetUrl,
+    body,
+    `cli-${route}-${endpoint.replace(/^\//, "") || "root"}`,
+    // The CLI account router also changes only the credential, not transport.
+    "undici",
+    route === "native" ? accountRouter : undefined,
+  );
+}
+
+async function startCliEgressRouter(accountRouter: OfficialAccountRouter): Promise<CliEgressRouter> {
+  const basePath = "/v1";
+  const server = http.createServer((req, res) => {
+    void handleCliEgressRequest(req, res, basePath, accountRouter).catch((error) => {
+      console.error(`[OpenCodex CLI Egress] request failed: ${error instanceof Error ? error.message : String(error)}`);
+      if (!res.headersSent) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+      }
+    });
+  });
+  server.on("upgrade", (_req, socket) => writeNativeEgressUpgradeFallback(socket));
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = (): void => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(0, "127.0.0.1");
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("CLI egress bridge did not receive a local port");
+  }
+  const port = address.port;
+  console.error(`[OpenCodex CLI Egress] listening on 127.0.0.1:${port}; gateway target port ${configuredGatewayPort()}`);
+  return { server, port, basePath };
 }
 
 export function nativeRuntimeArgs(args: string[], egressPort: number, egressBasePath = "/v1"): string[] {
@@ -694,6 +1138,17 @@ function nativeCodexPath(): string {
     || "/Applications/ChatGPT.app/Contents/Resources/codex";
 }
 
+function nativeCliPath(): string {
+  const candidates = [
+    cleanString(process.env.OPENCODEX_NATIVE_CLI_PATH),
+    cleanString(process.env.OPENCODEX_NATIVE_CODEX_PATH),
+    path.join(os.homedir(), ".codex", "packages", "standalone", "current", "bin", "codex"),
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+  ].filter(Boolean);
+  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).mode & 0o111) || nativeCodexPath();
+}
+
 function isAppServerInvocation(args: string[]): boolean {
   const index = args.indexOf("app-server");
   return index >= 0 && args[index + 1] !== "daemon";
@@ -710,6 +1165,56 @@ function passthroughNative(args: string[]): void {
   });
 }
 
+async function runCliProviderBridge(args: string[]): Promise<void> {
+  const accountPool = new ChatGptAccountPool();
+  accountPool.refreshUsageInBackground();
+  const accountRouter = new OfficialAccountRouter(accountPool);
+  const cliEgress = await startCliEgressRouter(accountRouter);
+  const configuredAccounts = accountPool.listAccounts();
+  if (configuredAccounts.length > 0) console.error("[OpenCodex CLI Egress] official account pool is managed at the HTTP egress");
+  const nativeEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    CODEX_CLI_PATH: undefined,
+    OPENCODEX_PROVIDER_BRIDGE_PATH: undefined,
+    OPENCODEX_PROVIDER_SPLIT: undefined,
+    OPENCODEX_PROVIDER_BRIDGE_RUNTIME: undefined,
+  };
+  const native = spawn(nativeCliPath(), nativeRuntimeArgs(args, cliEgress.port, cliEgress.basePath), {
+    env: nativeEnv,
+    stdio: "inherit",
+  });
+
+  let finished = false;
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (!native.killed) native.kill(signal);
+  };
+  const closeEgress = async (): Promise<void> => {
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    try {
+      cliEgress.server.closeAllConnections?.();
+      await new Promise<void>((resolve) => cliEgress.server.close(() => resolve()));
+    } catch {
+      // The child process result remains authoritative when cleanup races exit.
+    }
+  };
+  const finish = async (code: number | null, signal: NodeJS.Signals | null, error?: Error): Promise<void> => {
+    if (finished) return;
+    finished = true;
+    if (error) console.error(`[OpenCodex CLI Egress] native CLI failed: ${error.message}`);
+    await closeEgress();
+    process.exitCode = signal ? 1 : (code ?? 1);
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
+  native.once("error", (error) => {
+    void finish(1, null, error);
+  });
+  native.once("exit", (code, signal) => {
+    void finish(code, signal);
+  });
+}
+
 
 async function runProviderBridge(): Promise<void> {
   const args = process.argv.slice(2);
@@ -718,8 +1223,11 @@ async function runProviderBridge(): Promise<void> {
     return;
   }
 
+  const accountPool = new ChatGptAccountPool();
+  accountPool.refreshUsageInBackground();
+  const accountRouter = new OfficialAccountRouter(accountPool);
   let applyNativeSubagentDisplaySettings: ((update: NativeSubagentDisplayUpdate) => void) | null = null;
-  const nativeEgress = await startNativeEgressRouter((update) => {
+  const nativeEgress = await startNativeEgressRouter(accountRouter, (update) => {
     const modelProvider = update.model
       ? (classifyRuntimeModel(update.model) || (update.model.includes("/") ? GATEWAY_PROVIDER : NATIVE_PROVIDER))
       : GATEWAY_PROVIDER;
@@ -745,7 +1253,11 @@ async function runProviderBridge(): Promise<void> {
   const legacyThreads = new Map<string, LegacyThread>();
   const pendingMigrations = new Map<string, Array<(route: ThreadRoute | null, error?: string) => void>>();
   const gatewayTurns = new Map<string, GatewayTurn>();
-  const activeTurns = new Map<string, { provider: CodexProvider; physicalThreadId: string }>();
+  const activeTurns = new Map<string, {
+    provider: CodexProvider;
+    physicalThreadId: string;
+    outputStarted: boolean;
+  }>();
   const pendingSelectedModels = new Map<string, string>();
   const suppressedNotifications = new Map<string, number>();
   const routes = loadThreadRoutes();
@@ -774,16 +1286,23 @@ async function runProviderBridge(): Promise<void> {
         if (!entry || typeof entry !== "object") continue;
         const value = entry as JsonRecord;
         const externalId = cleanString(value.externalId);
-        const nativeId = cleanString(value.nativeId);
-        if (!externalId || !nativeId) continue;
+        const savedNativeId = cleanString(value.nativeId);
+        if (!externalId) continue;
+        const nativeId = externalId.startsWith("019") || externalId.startsWith("thread-") ? externalId : (savedNativeId || externalId);
         result.set(externalId, {
           externalId,
           nativeId,
           nativePath: cleanString(value.nativePath) || undefined,
+          retiredNativeIds: Array.isArray(value.retiredNativeIds)
+            ? value.retiredNativeIds.map(cleanString).filter(Boolean).slice(-16)
+            : undefined,
           selectedModel: cleanString(value.selectedModel) || nativeDefaultModel(),
           legacySourceId: cleanString(value.legacySourceId) || undefined,
           legacySourcePath: cleanString(value.legacySourcePath) || undefined,
           legacyModel: cleanString(value.legacyModel) || undefined,
+          settings: value.settings && typeof value.settings === "object" && !Array.isArray(value.settings)
+            ? cloneValue(value.settings as JsonRecord)
+            : undefined,
         });
       }
     } catch {}
@@ -800,17 +1319,19 @@ async function runProviderBridge(): Promise<void> {
           externalId: route.externalId,
           nativeId: route.nativeId,
           nativePath: route.nativePath,
+          retiredNativeIds: route.retiredNativeIds,
           selectedModel: route.selectedModel,
           legacySourceId: route.legacySourceId,
           legacySourcePath: route.legacySourcePath,
           legacyModel: route.legacyModel,
+          settings: route.settings,
         };
       }
       const tempFile = file + "." + process.pid + ".tmp";
       fs.writeFileSync(tempFile, JSON.stringify({ version: 1, threads }, null, 2), { mode: 0o600 });
       fs.renameSync(tempFile, file);
     } catch (error) {
-      console.warn("[OpenCodex Provider Bridge] Could not persist session routes: " + (error instanceof Error ? error.message : String(error)));
+      console.warn("[CodexSplit Provider Bridge] Could not persist session routes: " + (error instanceof Error ? error.message : String(error)));
     }
   }
 
@@ -886,6 +1407,13 @@ async function runProviderBridge(): Promise<void> {
       if (route.nativeId === nativeId) return route;
     }
     return null;
+  }
+
+  function isRetiredNativeId(nativeId: string): boolean {
+    for (const route of routes.values()) {
+      if (route.retiredNativeIds?.includes(nativeId)) return true;
+    }
+    return false;
   }
 
   function emitError(id: unknown, message: string, code = -32001): void {
@@ -975,6 +1503,11 @@ async function runProviderBridge(): Promise<void> {
     if (pending.displayModel || pending.displayReasoning) {
       decorateThreadModel(output, pending.displayModel, pending.displayProvider, pending.displayReasoning);
     }
+    const resultObj = (output.result && typeof output.result === "object") ? (output.result as JsonRecord) : null;
+    const threadObj = (resultObj && resultObj.thread && typeof resultObj.thread === "object") ? (resultObj.thread as JsonRecord) : null;
+    if (threadObj && Array.isArray(threadObj.turns) && threadObj.turns.length > 0) {
+      threadObj.status = { type: "loaded" };
+    }
     return output;
   }
 
@@ -1021,6 +1554,13 @@ async function runProviderBridge(): Promise<void> {
       }
     }
     return items;
+  }
+
+  function historyWithoutCurrentInput(history: JsonRecord[], currentInput: JsonRecord[]): JsonRecord[] {
+    if (!history.length || !currentInput.length) return history;
+    const tail = history.slice(-currentInput.length);
+    if (JSON.stringify(tail) !== JSON.stringify(currentInput)) return history;
+    return history.slice(0, -currentInput.length);
   }
 
   function isUnmaterializedThreadHistoryError(value: unknown): boolean {
@@ -1091,7 +1631,8 @@ async function runProviderBridge(): Promise<void> {
 
   applyNativeSubagentDisplaySettings = (update): void => {
     if (!update.effort) return;
-    const native = runtimeByProvider.get(NATIVE_PROVIDER);
+    const route = routeForNativeId(update.threadId);
+    const native = ensureRuntime(NATIVE_PROVIDER);
     if (!native || native.stopping) return;
     // Persist the selected effort through the native protocol on the child
     // thread itself. The synthetic notification above is still useful for
@@ -1102,7 +1643,7 @@ async function runProviderBridge(): Promise<void> {
       effort: update.effort,
     }, (response) => {
       if (response.error) {
-        console.warn("[OpenCodex Provider Bridge] Could not persist child reasoning display: " + cleanString(response.error.message));
+        console.warn("[CodexSplit Provider Bridge] Could not persist child reasoning display: " + cleanString(response.error.message));
       }
     });
   };
@@ -1152,7 +1693,9 @@ async function runProviderBridge(): Promise<void> {
     failRuntime(runtime, "Codex " + runtime.provider + " app-server stopped");
     if (!runtime.child.killed) runtime.child.kill("SIGTERM");
     runtimes.delete(runtime);
-    if (runtimeByProvider.get(runtime.provider) === runtime) runtimeByProvider.delete(runtime.provider);
+    if (runtimeByProvider.get(runtime.provider) === runtime) {
+      runtimeByProvider.delete(runtime.provider);
+    }
   }
 
   function consumeOutput(runtime: ProviderRuntime, chunk: Buffer | string): void {
@@ -1171,6 +1714,9 @@ async function runProviderBridge(): Promise<void> {
 
   function spawnRuntime(provider: CodexProvider): ProviderRuntime {
     const childArgs = provider === NATIVE_PROVIDER ? nativeRuntimeArgs(args, nativeEgress.port, nativeEgress.basePath) : args;
+    // Official account rotation happens at Native Egress. Never create a
+    // second native app-server for account rotation; that would split the
+    // native conversation store.
     const child = spawn(nativeCodexPath(), childArgs, {
       env: {
         ...process.env,
@@ -1187,21 +1733,23 @@ async function runProviderBridge(): Promise<void> {
     child.stderr.pipe(process.stderr);
     child.once("error", (error) => {
       if (!runtime.stopping) {
-        console.error("[OpenCodex Provider Bridge] " + provider + " app-server failed: " + error.message);
+        console.error("[CodexSplit Provider Bridge] " + provider + " app-server failed: " + error.message);
         failRuntime(runtime, "Codex " + provider + " app-server failed: " + error.message);
       }
     });
     child.once("exit", (code, signal) => {
       outputBuffers.delete(runtime);
       runtimes.delete(runtime);
-      if (runtimeByProvider.get(provider) === runtime) runtimeByProvider.delete(provider);
+      if (runtimeByProvider.get(provider) === runtime) {
+        runtimeByProvider.delete(provider);
+      }
       if (!runtime.stopping && !bridgeStopping) {
         failRuntime(runtime, "Codex " + provider + " app-server exited (" + (signal || code || "unknown") + ")");
       }
     });
     const initializeId = "opencodex-provider-initialize-" + (++internalRequestCounter);
     const initializeParams = lastInitializeParams || {
-      clientInfo: { name: "OpenCodex Provider Bridge", version: "1.1.5" },
+      clientInfo: { name: "CodexSplit Provider Bridge", version: "2.0.0-beta.1" },
       capabilities: { experimentalApi: true, requestAttestation: true },
     };
     pendingRequests.set(requestKey(runtime, initializeId), {
@@ -1242,6 +1790,72 @@ async function runProviderBridge(): Promise<void> {
     return existing && !existing.stopping ? existing : spawnRuntime(provider);
   }
 
+  function nativeRuntimeForRoute(route?: ThreadRoute): ProviderRuntime {
+    // Conversation routes always use the shared native runtime. Account IDs
+    // are selected only at the official HTTP Egress boundary.
+    return ensureRuntime(NATIVE_PROVIDER);
+  }
+
+  function nativeTurnPending(
+    parent: JsonRecord,
+    params: JsonRecord,
+    route: ThreadRoute,
+    selected: string,
+    runtime: ProviderRuntime,
+    physicalThreadId: string,
+  ): PendingParentRequest {
+    return {
+      kind: "parent",
+      id: parent.id,
+      method: "turn/start",
+      params,
+      runtime,
+      externalThreadId: route.externalId,
+      physicalThreadId,
+      displayModel: selected,
+      displayProvider: NATIVE_PROVIDER,
+    };
+  }
+
+  // A quota response is retried by OfficialAccountRouter at the HTTP Egress
+  // boundary. Native app-server account failover is intentionally absent:
+  // changing an account must never create, migrate, or replace a thread.
+
+  function sendNativeTurnAttempt(
+    parent: JsonRecord,
+    originalParams: JsonRecord,
+    route: ThreadRoute,
+    selected: string,
+    native: ProviderRuntime,
+    physicalThreadId: string,
+  ): void {
+    const nextParams = stripRequestProvider({ ...originalParams, threadId: physicalThreadId, model: selected });
+    activeTurns.set(route.externalId, {
+      provider: NATIVE_PROVIDER,
+      physicalThreadId,
+      outputStarted: false,
+    });
+    sendParent(native, parent, "turn/start", nextParams, {
+      externalThreadId: route.externalId,
+      physicalThreadId,
+      displayModel: selected,
+      displayProvider: NATIVE_PROVIDER,
+      onResponse: (response) => {
+        if (response.error) {
+          activeTurns.delete(route.externalId);
+        }
+        return decorateParentResponse(response, nativeTurnPending(
+          parent,
+          nextParams,
+          route,
+          selected,
+          native,
+          physicalThreadId,
+        ));
+      },
+    });
+  }
+
   function finishGatewayTurn(turn: GatewayTurn, completed: JsonRecord): void {
     const finish = () => {
       if (turn.physicalThreadId) gatewayTurns.delete(turn.physicalThreadId);
@@ -1258,7 +1872,7 @@ async function runProviderBridge(): Promise<void> {
     const native = ensureRuntime(NATIVE_PROVIDER);
     sendInternal(native, "thread/inject_items", { threadId: turn.nativeThreadId, items }, (response) => {
       if (response.error) {
-        console.warn("[OpenCodex Provider Bridge] Could not mirror third-party reply: " + cleanString(response.error.message));
+        console.warn("[CodexSplit Provider Bridge] Could not mirror third-party reply: " + cleanString(response.error.message));
       }
       finish();
     }, turn.nativeThreadId);
@@ -1299,9 +1913,28 @@ async function runProviderBridge(): Promise<void> {
     const thread = params.thread && typeof params.thread === "object" ? params.thread as JsonRecord : {};
     const nativeId = threadIdFrom(params.threadId || thread.id);
     if (nativeId && isSuppressed(runtime, nativeId)) return null;
+    if (nativeId && isRetiredNativeId(nativeId)) return null;
     const route = nativeId ? routeForNativeId(nativeId) : null;
     const childDisplay = nativeId ? nativeSubagentDisplaySettings.get(nativeId) : undefined;
     if (!route && !childDisplay) return message;
+    if (route) {
+      const active = activeTurns.get(route.externalId);
+      if (active && active.physicalThreadId === nativeId) {
+        const method = cleanString(message.method);
+        const item = params.item && typeof params.item === "object" ? params.item as JsonRecord : {};
+        const itemType = cleanString(item.type).toLowerCase();
+        const itemRole = cleanString(item.role).toLowerCase();
+        const assistantItem = itemRole === "assistant"
+          || itemType === "agentmessage"
+          || itemType === "functioncall"
+          || itemType === "computercall"
+          || itemType === "computer_call"
+          || itemType === "computer_call_output";
+        if (method.startsWith("response/") || method.startsWith("rawResponseItem/") || assistantItem) {
+          active.outputStarted = true;
+        }
+      }
+    }
     const output = cloneValue(message);
     if (route) rewriteThreadIds(output, route.nativeId, route.externalId);
     const displayModel = childDisplay?.model || route?.selectedModel;
@@ -1309,7 +1942,9 @@ async function runProviderBridge(): Promise<void> {
     if (displayModel || childDisplay?.effort) {
       decorateThreadModel(output, displayModel, displayProvider, childDisplay?.effort);
     }
-    if (message.method === "turn/completed" && route) activeTurns.delete(route.externalId);
+    if (message.method === "turn/completed" && route) {
+      activeTurns.delete(route.externalId);
+    }
     return output;
   }
 
@@ -1494,7 +2129,7 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function beginGatewayTurn(parent: JsonRecord, params: JsonRecord, route: ThreadRoute, model: string): void {
-    const native = ensureRuntime(NATIVE_PROVIDER);
+    const native = nativeRuntimeForRoute(route);
     const turn: GatewayTurn = {
       externalThreadId: route.externalId,
       nativeThreadId: route.nativeId,
@@ -1545,7 +2180,11 @@ async function runProviderBridge(): Promise<void> {
         const runTurn = (): void => {
           turn.forwarding = true;
           gatewayTurns.set(gatewayId, turn);
-          activeTurns.set(route.externalId, { provider: GATEWAY_PROVIDER, physicalThreadId: gatewayId });
+          activeTurns.set(route.externalId, {
+            provider: GATEWAY_PROVIDER,
+            physicalThreadId: gatewayId,
+            outputStarted: false,
+          });
           const turnParams = stripRequestProvider({ ...params, threadId: gatewayId, model });
           sendParent(gateway, parent, "turn/start", turnParams, {
             externalThreadId: route.externalId,
@@ -1650,7 +2289,7 @@ async function runProviderBridge(): Promise<void> {
       route.selectedModel = selected;
       rememberSettings(route, params);
       saveRoute(route);
-      const native = ensureRuntime(NATIVE_PROVIDER);
+      const native = nativeRuntimeForRoute(route);
       const nextParams: JsonRecord = {
         ...stripRequestProvider(params),
         ...(route.settings || {}),
@@ -1681,7 +2320,7 @@ async function runProviderBridge(): Promise<void> {
         return;
       }
       const selected = selectedModel(params, route);
-      const native = ensureRuntime(NATIVE_PROVIDER);
+      const native = nativeRuntimeForRoute(route);
       const nextParams = {
         ...stripRequestProvider(params),
         ...(route.settings || {}),
@@ -1721,50 +2360,86 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function handleThreadList(message: JsonRecord, params: JsonRecord): void {
-    const native = ensureRuntime(NATIVE_PROVIDER);
     const nextParams = normalizeThreadListParams(params);
-    sendParent(native, message, "thread/list", nextParams, {
-      onResponse: (response) => {
-        if (response.error) return response;
-        const output = cloneValue(response);
-        const result = output.result && typeof output.result === "object" ? output.result as JsonRecord : {};
-        const data = Array.isArray(result.data) ? result.data : [];
-        const hiddenLegacy = new Set<string>();
-        for (const route of routes.values()) {
-          if (route.legacySourceId && route.legacySourceId !== route.nativeId) hiddenLegacy.add(route.legacySourceId);
-        }
-        const visible: JsonRecord[] = [];
-        const seen = new Set<string>();
-        for (const rawEntry of data) {
-          if (!rawEntry || typeof rawEntry !== "object") continue;
-          const entry = cloneValue(rawEntry as JsonRecord);
-          const id = threadIdFrom(entry.id);
-          if (hiddenLegacy.has(id)) continue;
-          const route = routeForNativeId(id);
-          if (route) {
-            entry.id = route.externalId;
-            entry.model = route.selectedModel;
-            entry.modelProvider = providerForModel(route.selectedModel);
-          } else {
-            const childDisplay = nativeSubagentDisplaySettings.get(id);
-            if (childDisplay?.model) {
-              entry.model = childDisplay.model;
-              entry.modelProvider = providerForModel(childDisplay.model);
-            }
-            const model = modelSlug(entry.model);
-            if (providerForModel(model) === GATEWAY_PROVIDER) {
-              legacyThreads.set(id, { id, model, path: cleanString(entry.path) || undefined });
-            }
+    const runtimes = new Map<string, ProviderRuntime>();
+    runtimes.set("default", ensureRuntime(NATIVE_PROVIDER));
+
+    const project = (response: JsonRecord): JsonRecord => {
+      const output = cloneValue(response);
+      if (output.error) return output;
+      const result = output.result && typeof output.result === "object" ? output.result as JsonRecord : {};
+      const data = Array.isArray(result.data) ? result.data : [];
+      const hiddenLegacy = new Set<string>();
+      for (const route of routes.values()) {
+        if (route.legacySourceId && route.legacySourceId !== route.nativeId) hiddenLegacy.add(route.legacySourceId);
+      }
+      const visible: JsonRecord[] = [];
+      for (const rawEntry of data) {
+        if (!rawEntry || typeof rawEntry !== "object") continue;
+        const entry = cloneValue(rawEntry as JsonRecord);
+        const id = threadIdFrom(entry.id);
+        if (hiddenLegacy.has(id)) continue;
+        const route = routeForNativeId(id);
+        if (route) {
+          entry.id = route.externalId;
+          entry.model = route.selectedModel;
+          entry.modelProvider = NATIVE_PROVIDER;
+        } else {
+          const childDisplay = nativeSubagentDisplaySettings.get(id);
+          if (childDisplay?.model) {
+            entry.model = childDisplay.model;
+            entry.modelProvider = providerForModel(childDisplay.model);
           }
-          if (!entry.id || seen.has(entry.id)) continue;
-          seen.add(entry.id);
+          const model = modelSlug(entry.model);
+          if (providerForModel(model) === GATEWAY_PROVIDER) {
+            legacyThreads.set(id, { id, model, path: cleanString(entry.path) || undefined });
+          }
+        }
+        if (entry.id) visible.push(entry);
+      }
+      result.data = visible;
+      output.result = result;
+      return output;
+    };
+
+    const responses: JsonRecord[] = [];
+    let remaining = runtimes.size;
+    const finish = (): void => {
+      if (remaining > 0) return;
+      const projected = responses.map(project);
+      const firstError = projected.find((response) => response.error);
+      const successful = projected.filter((response) => !response.error);
+      if (!successful.length) {
+        const error = firstError?.error && typeof firstError.error === "object" ? firstError.error as JsonRecord : {};
+        emitError(message.id, cleanString(error.message) || "Unable to list conversations");
+        return;
+      }
+      const output = cloneValue(successful[0]);
+      const result = output.result && typeof output.result === "object" ? output.result as JsonRecord : {};
+      const seen = new Set<string>();
+      const visible: JsonRecord[] = [];
+      for (const response of successful) {
+        const responseResult = response.result && typeof response.result === "object" ? response.result as JsonRecord : {};
+        for (const entry of Array.isArray(responseResult.data) ? responseResult.data : []) {
+          const id = threadIdFrom(entry?.id);
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
           visible.push(entry);
         }
-        result.data = visible;
-        output.result = result;
-        return output;
-      },
-    });
+      }
+      result.data = visible;
+      output.id = message.id;
+      output.result = result;
+      writeParent(output);
+    };
+
+    for (const runtime of runtimes.values()) {
+      sendInternal(runtime, "thread/list", nextParams, (response) => {
+        responses.push(response);
+        remaining -= 1;
+        finish();
+      });
+    }
   }
 
   function handleThreadRead(message: JsonRecord, params: JsonRecord): void {
@@ -1778,15 +2453,15 @@ async function runProviderBridge(): Promise<void> {
         emitError(message.id, error || "Unable to resolve conversation");
         return;
       }
-      const native = ensureRuntime(NATIVE_PROVIDER);
-      const nextParams = { ...params, threadId: route.nativeId };
+      const native = nativeRuntimeForRoute(route);
+      const nextParams = { includeTurns: true, ...params, threadId: route.nativeId };
       const childDisplay = nativeSubagentDisplaySettings.get(route.nativeId)
         || nativeSubagentDisplaySettings.get(route.externalId);
       sendParent(native, message, "thread/read", nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
-        displayModel: childDisplay?.model || route.selectedModel,
-        displayProvider: providerForModel(childDisplay?.model || route.selectedModel),
+        displayModel: nativeDefaultModel(),
+        displayProvider: NATIVE_PROVIDER,
         displayReasoning: childDisplay?.effort,
       });
     });
@@ -1808,13 +2483,14 @@ async function runProviderBridge(): Promise<void> {
       pendingSelectedModels.set(route.externalId, selected);
       rememberSettings(route, params);
       saveRoute(route);
-      if (providerForModel(selected) === GATEWAY_PROVIDER) {
+      const isOfficialNativeModel = selected === "gpt-5.5" || selected === "gpt-5.4" || selected === "gpt-5.4-mini" || selected === "gpt-4o" || selected.startsWith("openai/");
+      if (!isOfficialNativeModel || providerForModel(selected) === GATEWAY_PROVIDER) {
         writeParent({ id: message.id, result: {} });
         const selectedEffort = cleanString(params.effort || params.reasoning_effort || params.reasoning?.effort);
         emitSyntheticSettings(route.externalId, selected, selectedEffort || undefined);
         return;
       }
-      const native = ensureRuntime(NATIVE_PROVIDER);
+      const native = nativeRuntimeForRoute(route);
       const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId, model: selected };
       sendParent(native, message, "thread/settings/update", nextParams, {
         externalThreadId: route.externalId,
@@ -1844,29 +2520,8 @@ async function runProviderBridge(): Promise<void> {
         beginGatewayTurn(message, params, route, selected);
         return;
       }
-      const native = ensureRuntime(NATIVE_PROVIDER);
-      const nextParams = stripRequestProvider({ ...params, threadId: route.nativeId, model: selected });
-      activeTurns.set(route.externalId, { provider: NATIVE_PROVIDER, physicalThreadId: route.nativeId });
-      sendParent(native, message, "turn/start", nextParams, {
-        externalThreadId: route.externalId,
-        physicalThreadId: route.nativeId,
-        displayModel: selected,
-        displayProvider: NATIVE_PROVIDER,
-        onResponse: (response) => {
-          if (response.error) activeTurns.delete(route.externalId);
-          return decorateParentResponse(response, {
-            kind: "parent",
-            id: message.id,
-            method: "turn/start",
-            params: nextParams,
-            runtime: native,
-            externalThreadId: route.externalId,
-            physicalThreadId: route.nativeId,
-            displayModel: selected,
-            displayProvider: NATIVE_PROVIDER,
-          });
-        },
-      });
+      const native = nativeRuntimeForRoute(route);
+      sendNativeTurnAttempt(message, params, route, selected, native, route.nativeId);
     });
   }
 
@@ -1891,13 +2546,13 @@ async function runProviderBridge(): Promise<void> {
         emitError(message.id, error || "Unable to resolve conversation");
         return;
       }
-      const native = ensureRuntime(NATIVE_PROVIDER);
+      const native = nativeRuntimeForRoute(route);
       const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId };
       sendParent(native, message, method, nextParams, {
         externalThreadId: route.externalId,
         physicalThreadId: route.nativeId,
-        displayModel: route.selectedModel,
-        displayProvider: providerForModel(route.selectedModel),
+        displayModel: nativeDefaultModel(),
+        displayProvider: NATIVE_PROVIDER,
       });
     });
     return true;
@@ -1961,7 +2616,7 @@ async function runProviderBridge(): Promise<void> {
       try {
         handleParentMessage(JSON.parse(line) as JsonRecord);
       } catch (error) {
-        console.error("[OpenCodex Provider Bridge] Invalid parent message: " + (error instanceof Error ? error.message : String(error)));
+        console.error("[CodexSplit Provider Bridge] Invalid parent message: " + (error instanceof Error ? error.message : String(error)));
       }
     }
   });
@@ -1978,8 +2633,13 @@ async function runProviderBridge(): Promise<void> {
 const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
 const modulePath = path.resolve(fileURLToPath(import.meta.url));
 if (entryPath === modulePath) {
-  void runProviderBridge().catch((error) => {
-    console.error(`[OpenCodex Provider Bridge] Startup failed: ${error instanceof Error ? error.message : String(error)}`);
+  const entryArgs = process.argv.slice(2);
+  const cliBridgeInvocation = entryArgs[0] === "--opencodex-cli";
+  const run = cliBridgeInvocation
+    ? runCliProviderBridge(entryArgs.slice(1))
+    : runProviderBridge();
+  void run.catch((error) => {
+    console.error(`[CodexSplit Provider Bridge] Startup failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   });
 }

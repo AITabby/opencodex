@@ -4,10 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="${0:A:h}"
 APP_ROOT="${SCRIPT_DIR:h:h}"
 PACKAGE_ROOT="$APP_ROOT/macos-app"
-APP_BUNDLE="$PACKAGE_ROOT/build/OpenCodex.app"
+APP_BUNDLE="$PACKAGE_ROOT/build/CodexSplit.app"
 cd "$APP_ROOT"
 VERSION="$(node -p 'require("./package.json").version')"
-DMG_PATH="$PACKAGE_ROOT/build/OpenCodex-${VERSION}-arm64.dmg"
+DMG_PATH="$PACKAGE_ROOT/build/CodexSplit-${VERSION}-arm64.dmg"
 PROFILE="${OPENCODEX_NOTARY_PROFILE:-}"
 
 if [[ -z "$PROFILE" ]]; then
