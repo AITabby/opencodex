@@ -396,8 +396,9 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
 
   const restartBlock = gateway.slice(restartStart, restartEnd);
   assert.match(restartBlock, /const launchMode = resolveDesktopRestartMode\(/);
+  assert.match(restartBlock, /thirdPartyModelsConfigured \? null : readDesktopModePreference\(\)/);
   assert.match(restartBlock, /writeDesktopModePreference\(launchMode\)/);
-  assert.match(restartBlock, /third_party_models_exposed: bridgeActive && hasThirdPartyModels\(providers, catalog\)/);
+  assert.match(restartBlock, /third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured/);
   assert.match(restartBlock, /requestDesktopLaunchAfterGatewayReady\(launchMode\);\s*stopDesktopClients\(\);/);
   assert.ok(
     restartBlock.indexOf("stopDesktopClients();") < restartBlock.indexOf('execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex", "--no-treekill"]'),
@@ -416,6 +417,22 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
     gateway,
     /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);/,
   );
+});
+
+test("native restore persists native mode and returns without waiting for Desktop reconnect", async () => {
+  const gateway = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");
+  const resetStart = gateway.indexOf('url.pathname === "/api/reset"');
+  const resetEnd = gateway.indexOf('res.writeHead(404', resetStart);
+  assert.ok(resetStart >= 0 && resetEnd > resetStart);
+  const resetBlock = gateway.slice(resetStart, resetEnd);
+  assert.match(resetBlock, /syncNativeModelsToCodexCache\(\)/);
+  assert.match(resetBlock, /writeDesktopModePreference\("native"\)/);
+  assert.match(resetBlock, /desktopCompatibilityHealth\("native", false\)/);
+  assert.match(resetBlock, /pending: verification\.app_server !== "native"/);
+  assert.match(resetBlock, /stopDesktopClients\(\)/);
+  assert.match(resetBlock, /repairNativeRolloutsAsync\(\)/);
+  assert.doesNotMatch(resetBlock, /repairNativeRollouts\(\);/);
+  assert.doesNotMatch(resetBlock, /await waitForDesktopAppServer\("native"\)/);
 });
 
 test("new provider models promote an unset mode while explicit Bridge or native preferences remain durable", () => {

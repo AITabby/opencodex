@@ -233,6 +233,20 @@ test("dashboard exposes an explicit Desktop Bridge switch below the compact subs
   assert.match(text, /waitForDesktopMode\(result&&result\.mode\|\|expectedMode\)/);
 });
 
+test("dashboard distinguishes imported subscription models from Bridge exposure", async () => {
+  const text = await source();
+  assert.match(text, /imported=Boolean\(info\.imported\|\|info\.active\)/);
+  assert.match(text, /已导入 · 等待 Bridge/);
+  assert.match(text, /模型目录已建立，开启 Bridge 后可用/);
+  assert.match(text, /imported\|\|detected/);
+});
+
+test("dashboard colors provider status by model addition rather than Bridge state", async () => {
+  const text = await source();
+  assert.match(text, /statusText=credentialIssues\?String\(credentialIssues\)\+' 个 Key 异常':hasActiveModels\?'已配置':credentialCount\?'已保存'/);
+  assert.match(text, /statusClass=credentialIssues\?'error':\(hasActiveModels\?'good':''\)/);
+});
+
 test("dashboard refreshes subscription status after every model deletion path", async () => {
   const text = await source();
   assert.match(text, /post\('\/api\/models\/delete',\{id:id\}\);await syncDashboardState\(\)/);

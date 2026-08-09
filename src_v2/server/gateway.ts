@@ -1553,6 +1553,73 @@ function repairNativeRollouts(): number {
   return repaired;
 }
 
+/**
+ * The rollout tree can be multiple gigabytes on a real Desktop install.
+ * Keep the native-mode safety repair, but yield between files so a mode
+ * change does not block the gateway's HTTP event loop.
+ */
+async function repairNativeRolloutsAsync(): Promise<number> {
+  const roots = [
+    path.join(os.homedir(), ".codex", "sessions"),
+    path.join(os.homedir(), ".codex", "archived_sessions"),
+  ];
+  let repaired = 0;
+
+  for (const rolloutPath of roots.flatMap(listRolloutFiles)) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    let contents: string;
+    try {
+      contents = await fs.promises.readFile(rolloutPath, "utf-8");
+    } catch {
+      continue;
+    }
+
+    // Let the response and status polling run before parsing the next file.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    let records: any[];
+    try {
+      records = contents
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+    } catch {
+      continue;
+    }
+
+    let changed = false;
+    for (const record of records) {
+      if (normalizeStoredFunctionCallId(record)) changed = true;
+    }
+
+    const sanitized = records.filter((record) => {
+      if (isGatewayReasoningItem(record) || isForeignResponsesReasoningItem(record)) {
+        changed = true;
+        return false;
+      }
+      return true;
+    });
+    if (changed) {
+      try {
+        await fs.promises.writeFile(
+          rolloutPath,
+          sanitized.map((record) => JSON.stringify(record)).join("\n") + "\n",
+          "utf-8",
+        );
+        repaired++;
+      } catch (error: any) {
+        console.error("[OpenCodex V2] Could not repair native rollout " + rolloutPath + ": " + error.message);
+      }
+    }
+  }
+
+  if (repaired > 0) {
+    console.log("[OpenCodex V2] Repaired " + repaired + " native rollout(s) in the background.");
+  }
+  return repaired;
+}
+
 export class CodexBridgeServer {
   private port: number;
   private server: http.Server | null = null;
@@ -4698,7 +4765,7 @@ if __name__ == "__main__":
 
           const imports = readSubscriptionImports(this.dataDir);
 
-          const oauthStatus = (provider: SubscriptionProvider, detected: boolean, active: boolean, test: any) => {
+          const oauthStatus = (provider: SubscriptionProvider, detected: boolean, imported: boolean, active: boolean, test: any) => {
             const pool = this.subscriptionAccountPool.describe(provider);
             const pendingLogin = this.subscriptionAccountLogin.getPending(provider);
             const accountCount = pool.accounts.length || (detected ? 1 : 0);
@@ -4720,7 +4787,8 @@ if __name__ == "__main__":
               capture_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].capture_supported,
               login_in_progress: Boolean(pendingLogin),
               ...(pendingLogin ? { login_flow_id: pendingLogin.id } : {}),
-              active,
+              imported: Boolean(imported),
+              active: Boolean(active),
               test_status: test?.last_test_status || "untested",
               test_message: test?.last_test_message || "",
             };
@@ -4744,10 +4812,10 @@ if __name__ == "__main__":
               ...desktopHealth,
               process_scoped_bridge: true,
             },
-            antigravity: oauthStatus("antigravity", hasAntigravity, isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity"), imports.antigravity),
-            grok: oauthStatus("grok", hasGrok, isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"), imports.grok),
-            claude: oauthStatus("claude", hasClaude, hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"), imports.claude),
-            cursor: oauthStatus("cursor", hasCursor, hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"), imports.cursor),
+            antigravity: oauthStatus("antigravity", hasAntigravity, hasCatalogModelsForProvider(catalogModels, "antigravity"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity"), imports.antigravity),
+            grok: oauthStatus("grok", hasGrok, hasCatalogModelsForProvider(catalogModels, "grok"), isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"), imports.grok),
+            claude: oauthStatus("claude", hasClaude, hasCatalogModelsForProvider(catalogModels, "claude"), hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"), imports.claude),
+            cursor: oauthStatus("cursor", hasCursor, hasCatalogModelsForProvider(catalogModels, "cursor"), hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"), imports.cursor),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
@@ -7063,10 +7131,11 @@ if __name__ == "__main__":
               try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
             }
             const providers = CredentialStore.loadProviders();
+            const thirdPartyModelsConfigured = hasThirdPartyModels(providers, catalog);
             const launchMode = resolveDesktopRestartMode(
               providers,
               catalog,
-              readDesktopModePreference(),
+              thirdPartyModelsConfigured ? null : readDesktopModePreference(),
             );
             // Persist the effective mode before stopping Desktop. In
             // particular, a newly added provider model must promote a stale
@@ -7102,7 +7171,7 @@ if __name__ == "__main__":
                 ? "已检测到第三方模型，Desktop Bridge 将随重启自动开启。"
                 : "Desktop 将以原生模式重新启动。",
               mode: launchMode,
-              third_party_models_exposed: bridgeActive && hasThirdPartyModels(providers, catalog),
+              third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured,
             }));
 
             setTimeout(() => {
@@ -7540,20 +7609,47 @@ if __name__ == "__main__":
             if (fs.existsSync(catalogPath)) {
               fs.writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
             }
-            CatalogSyncService.syncCustomModelsToCodexCache();
+            CatalogSyncService.syncNativeModelsToCodexCache();
+
+            clearOwnedProviderBridgeLaunchEnvironment();
+            // Native restore is an explicit user choice. Persist it before
+            // relaunching so the next status poll cannot select Bridge again
+            // from the old preference while Desktop is restarting.
+            writeDesktopModePreference("native");
+            // Stop the current mode now, but do not launch Desktop until the
+            // rollout safety repair has finished in the background.
+            stopDesktopClients();
+            // Do not hold the HTTP request open while Desktop reconnects. The
+            // dashboard can show the selected native mode immediately and poll
+            // the actual process state independently.
+            const verification = desktopCompatibilityHealth("native", false);
+
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              status: "success",
+              gateway_active: false,
+              mode: "native",
+              pending: verification.app_server !== "native",
+              message: verification.app_server === "native"
+                ? "已恢复原生 Codex。"
+                : "已切换到原生模式，Desktop 正在重启。",
+              verification,
+            }));
 
             // Third-party V2 responses used to emit local rs_* reasoning items.
             // Remove those persisted records before the native desktop client
-            // sends this thread back to chatgpt.com.
-            repairNativeRollouts();
-
-            clearOwnedProviderBridgeLaunchEnvironment();
-            restartDesktopClients(true, "native");
-            await waitForDesktopAppServer("native");
-            const verification = desktopCompatibilityHealth("native");
-
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", gateway_active: false, verification }));
+            // sends this thread back to chatgpt.com. This is intentionally
+            // outside the request path because the rollout tree may be huge.
+            void (async () => {
+              try {
+                await repairNativeRolloutsAsync();
+              } catch (error: any) {
+                console.error("[CodexSplit Gateway] Background native rollout repair failed: " + error.message);
+              }
+              if (readDesktopModePreference() === "native" && desktopAppServerState() === "absent") {
+                launchDesktopClient(true, "native");
+              }
+            })();
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
