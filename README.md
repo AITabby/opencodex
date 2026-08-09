@@ -4,6 +4,8 @@
 
 CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型、模型目录、语音助手、GPT-Live、会话管理和 Agent 工具集中到一个桌面应用中，同时保留 Codex 原生模型、原生登录、Computer Use 与 MCP 的独立运行方式。
 
+> **项目更名说明**：CodexSplit 是原 `OpenCodex` 项目的延续与正式更名版本。从 `v2.0.0-beta.1` 起，产品、源码发布和 GitHub 仓库统一使用 CodexSplit；仓库地址已更新为 [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit)。历史提交、旧版 tag、部分内部目录与兼容标识仍可能出现 `OpenCodex`，这些属于历史或兼容信息，不是另一个项目。原仓库的提交历史和 Stars 也会保留在更名后的仓库中。
+
 <p align="center">
   <a href="https://github.com/AITabby/codexsplit/releases"><img src="https://img.shields.io/github/v/release/AITabby/codexsplit?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/github/stars/AITabby/codexsplit?style=flat-square" alt="GitHub Stars"></a>
@@ -32,34 +34,28 @@ CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型
 
 ## 产品截图
 
-### 第三方模型配置与协议选择
+### 第三方模型配置与上游模型发现
 
 <p align="center">
-  <img src="./assets/screenshots/01-provider-model-config.png" alt="配置第三方模型并选择 Chat 或 Responses 协议" width="960">
+  <img src="./assets/screenshots/01-provider-model-config.png" alt="配置第三方模型并发现上游模型" width="960">
 </p>
 
-### 语音栏与 GPT-Live 执行模型选择
+### GPT 账号池与账号轮换
 
 <p align="center">
-  <img src="./assets/screenshots/02-voice-gpt-live.png" alt="语音栏设置与 GPT-Live 执行模型选择" width="960">
+  <img src="./assets/screenshots/02-gpt-account-pool.png" alt="GPT 账号池与账号轮换" width="960">
 </p>
 
-### 扫描并导入本机 Agent 会话
+### 网关与第三方模型管理
 
 <p align="center">
-  <img src="./assets/screenshots/03-agent-session-scan.png" alt="本机 Agent 会话扫描结果" width="960">
+  <img src="./assets/screenshots/03-gateway.png" alt="网关与第三方模型管理" width="960">
 </p>
 
-### 按服务商管理待应用模型
+### CodexSplit 语音栏
 
 <p align="center">
-  <img src="./assets/screenshots/04-model-catalog.png" alt="第三方模型目录与服务商命名空间" width="960">
-</p>
-
-### Agent 路由与模型能力目录
-
-<p align="center">
-  <img src="./assets/screenshots/05-agent-routing.png" alt="Agent 路由与模型能力目录" width="960">
+  <img src="./assets/screenshots/04-voice-bar.png" alt="CodexSplit 语音栏" width="960">
 </p>
 
 > 当前 Beta：macOS Apple Silicon `v2.0.0-beta.1`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；Windows 先提供同一版本源码，安装包后续发布。Linux 版本尚未发布。
@@ -374,21 +370,21 @@ CodexSplit 正在持续迭代。当前状态：
 
 CodexSplit is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
+> **Project rename**: CodexSplit is the continuation and official rename of the original `OpenCodex` project. Starting with `v2.0.0-beta.1`, the product, source releases, and GitHub repository use the CodexSplit name; the repository is now [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit). Historical commits, older tags, internal paths, and compatibility identifiers may still contain `OpenCodex`; those are historical or compatibility references, not a separate project. The original commit history and GitHub stars remain with the renamed repository.
+
 Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths by default. Only models explicitly added or imported by the user are routed through the CodexSplit gateway. The Desktop bridge is a process-level switch activated only by an explicit restart after third-party models are enabled; it is not exported through launchd and does not silently replace unrelated native launches. The v2.0.0-beta.1 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed.
 
 ### Screenshots
 
 ![CodexSplit control center](./assets/dashboard-home.png)
 
-![Provider and model configuration](./assets/screenshots/01-provider-model-config.png)
+![Provider and upstream model discovery](./assets/screenshots/01-provider-model-config.png)
 
-![Voice and GPT-Live](./assets/screenshots/02-voice-gpt-live.png)
+![GPT account pool and account rotation](./assets/screenshots/02-gpt-account-pool.png)
 
-![Agent session scanning](./assets/screenshots/03-agent-session-scan.png)
+![Gateway and third-party model management](./assets/screenshots/03-gateway.png)
 
-![Enabled model catalog](./assets/screenshots/04-model-catalog.png)
-
-![Agent routing and model capability directory](./assets/screenshots/05-agent-routing.png)
+![CodexSplit Voice Bar](./assets/screenshots/04-voice-bar.png)
 
 ### Current releases
 
