@@ -271,8 +271,17 @@ DMG 已包含网关所需的独立 Node.js 和语音运行时。普通用户不�
 当前 Windows 先使用与 macOS Beta 相同的 `v2.0.0-beta.1` 源码：
 
 1. 安装 Codex Desktop。
-2. 在仓库中切换到 `v2.0.0-beta.1`，按源码说明构建 Windows 版本。
-3. Windows 安装包将在 Windows 端功能接入后单独发布。
+2. 安装 Node.js 20 或更高版本。
+3. 在 PowerShell 中执行：
+
+   ```powershell
+   npm ci
+   npm run build
+   npm test
+   ```
+
+   网关构建使用跨平台 Node.js 文件操作，不需要 Git Bash、WSL 或 macOS 的 Unix 命令。
+4. Windows 安装包将在 Windows 端功能接入后单独发布。
 
 Windows 版本以对应安装包实际提供的功能为准；当前 macOS 原生订阅导入、CodexSplit Voice Bar 和部分 CDP 集成依赖 macOS 桌面环境。
 
@@ -385,6 +394,8 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 - macOS Apple Silicon: `v2.0.0-beta.1` DMG and complete source release with spawn_agent gateway routing.
 - Windows 10/11: `v2.0.0-beta.1` source release; installer follows in a later Beta.
 - Linux: no desktop package is published yet.
+
+For a Windows source build, install Node.js 20 or newer and run `npm ci`, `npm run build`, and `npm test` from PowerShell. The gateway build uses Node.js file operations and does not require Git Bash, WSL, or macOS Unix commands. The Swift voice companion and macOS desktop package remain macOS-only.
 
 The macOS DMG includes a standalone Node.js runtime and the bundled voice runtime. End users do not need Node.js, npm, Homebrew, or the .NET SDK. The current DMG is not notarized; macOS may require allowing the first launch from **System Settings → Privacy & Security**.
 
