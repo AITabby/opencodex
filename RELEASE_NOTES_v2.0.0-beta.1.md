@@ -46,7 +46,7 @@ git checkout v2.0.0-beta.1
 
 ## English
 
-## Included
+### Included
 
 - CodexSplit source tree at tag `v2.0.0-beta.1`.
 - macOS Apple Silicon package: `CodexSplit-2.0.0-beta.1-arm64.dmg`.
@@ -62,7 +62,7 @@ CodexSplit does not copy CC Switch authentication, proxy, subscription,
 promotion, or icon implementations, and the catalog is not an official
 partnership or a guarantee of provider availability.
 
-## Windows development
+### Windows development
 
 Windows can clone the repository and check out the same Beta tag:
 
@@ -75,7 +75,7 @@ git checkout v2.0.0-beta.1
 The Windows installer is not attached to this first Beta. It will be added in
 a later Beta after the Windows app packaging work is integrated.
 
-## Known release limits
+### Known release limits
 
 - The macOS DMG is an arm64 local Ad-hoc build and is not notarized.
 - macOS-specific subscription import, Voice Bar, and CDP integrations do not

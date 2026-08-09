@@ -29,7 +29,7 @@ API Key 服务商与 OAuth 本机订阅是两类不同配置：API Key 服务商
 
 ## English
 
-## CC Switch provider catalog metadata
+### CC Switch provider catalog metadata
 
 CodexSplit includes a curated set of neutral provider metadata derived from
 CC Switch's Codex provider preset source:
@@ -51,7 +51,7 @@ The imported entries are catalog-only. Availability, billing, model access,
 and protocol compatibility must be verified with the user's own endpoint and
 API key before use.
 
-## Provider icons
+### Provider icons
 
 Known provider brands use the public Simple Icons CDN by slug. Providers
 without a matching Simple Icons slug use a favicon derived from their preset
@@ -60,7 +60,7 @@ The icon URLs are display-only and are not used for authentication or routing.
 
 Simple Icons source: <https://github.com/simple-icons/simple-icons>
 
-## Authentication terminology
+### Authentication terminology
 
 CodexSplit uses a strict two-way distinction:
 
