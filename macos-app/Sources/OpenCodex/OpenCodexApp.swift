@@ -15,7 +15,7 @@ final class OpenCodexAppDelegate: NSObject, NSApplicationDelegate {
         // Dock/app icon again; without this, the app stays running with no
         // visible window and appears to require a force quit.
         if let window = sender.windows.first(where: { window in
-            window.canBecomeKey && (window.title == "OpenCodex" || window.identifier?.rawValue == "main")
+            window.canBecomeKey && (window.title == "CodexSplit" || window.identifier?.rawValue == "main")
         }) ?? sender.windows.first(where: { $0.canBecomeKey }) {
             window.makeKeyAndOrderFront(nil)
         }
@@ -30,7 +30,7 @@ struct OpenCodexApp: App {
     @StateObject private var gateway = GatewayProcess()
 
     var body: some Scene {
-        Window("OpenCodex", id: "main") {
+        Window("CodexSplit", id: "main") {
             RootView(gateway: gateway)
                 .frame(minWidth: 980, minHeight: 680)
                 .task {
@@ -43,7 +43,7 @@ struct OpenCodexApp: App {
         .defaultSize(width: 430, height: 245)
         .commands {
             CommandGroup(replacing: .appInfo) {
-                Button("关于 OpenCodex") {
+                Button("关于 CodexSplit") {
                     NSApplication.shared.orderFrontStandardAboutPanel(nil)
                 }
             }
@@ -76,14 +76,14 @@ struct RootView: View {
 
     private var startupView: some View {
         VStack(spacing: 18) {
-            if let logoURL = Bundle.module.url(forResource: "OpenCodex-icon-source", withExtension: "png"),
+            if let logoURL = Bundle.module.url(forResource: "CodexSplit-icon-source", withExtension: "png"),
                let logo = NSImage(contentsOf: logoURL) {
                 Image(nsImage: logo)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 112, height: 112)
             }
-            Text("OpenCodex")
+            Text("CodexSplit")
                 .font(.system(size: 32, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white)
 

@@ -21,6 +21,23 @@ import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndSt
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 import { CatalogSyncService } from "../services/catalog_sync.js";
+import { CredentialStore } from "../services/credential_store.js";
+
+export class ProviderCredentialError extends Error {
+  public readonly statusCode: number;
+  public readonly credentialId: string;
+
+  constructor(message: string, statusCode: number, credentialId: string) {
+    super(message);
+    this.name = "ProviderCredentialError";
+    this.statusCode = statusCode;
+    this.credentialId = credentialId;
+  }
+}
+
+function shouldRotateProviderCredential(statusCode: number): boolean {
+  return statusCode === 401 || statusCode === 403 || statusCode === 408 || statusCode === 429 || statusCode >= 500;
+}
 
 export interface GatewaySubagentDispatchCall {
   id: string;
@@ -97,9 +114,48 @@ function responsesCompactionEndpointForProvider(providerUrl: string): string {
  * the provider must perform the compaction and return its native item.
  */
 export function buildThirdPartyNativeCompactionBody(body: any, upstreamModel: string): any {
-  const upstreamBody = { ...(body || {}), model: upstreamModel };
-  // `protocol` is a gateway catalog hint, not an upstream Responses field.
-  delete upstreamBody.protocol;
+  return sanitizeThirdPartyResponsesRequest(body, upstreamModel);
+}
+
+/**
+ * The Desktop request is also the gateway's routing envelope. Native OpenAI
+ * accepts the envelope's client metadata, but an ordinary Responses upstream
+ * must receive only provider-facing fields. Keep this boundary explicit so
+ * internal routing state cannot turn a minimal model test into a 400 during a
+ * real turn.
+ */
+export function sanitizeThirdPartyResponsesRequest(body: any, upstreamModel?: string, stripOptionalHints = false): any {
+  const upstreamBody = { ...(body || {}) };
+  if (upstreamModel) upstreamBody.model = upstreamModel;
+  for (const field of [
+    "protocol",
+    "client_metadata",
+    "session_id",
+    "turn_id",
+    "conversation_id",
+    "request_kind",
+    "agent_profile_id",
+    "profile_id",
+    "subagent_profile_id",
+    "child_profile_id",
+    "parent_task_id",
+    "preserve_reasoning_effort",
+    "stream_options",
+  ]) delete upstreamBody[field];
+  // Optional native-cache/reasoning transport hints are not needed for an
+  // ordinary third-party turn. Keep them for provider-owned compaction, where
+  // preserving the native cache key can be meaningful, but omit them from the
+  // regular OpenCode-compatible request path.
+  if (stripOptionalHints) {
+    delete upstreamBody.include;
+    delete upstreamBody.prompt_cache_key;
+  }
+  // Responses uses the nested reasoning object. The legacy field is useful
+  // to the Chat transformer but is not part of the Responses request shape.
+  if (!upstreamBody.reasoning && upstreamBody.reasoning_effort) {
+    upstreamBody.reasoning = { effort: upstreamBody.reasoning_effort };
+  }
+  delete upstreamBody.reasoning_effort;
   return upstreamBody;
 }
 
@@ -361,25 +417,26 @@ async function proxyThirdPartyResponses(
   subagentDispatcher: GatewaySubagentDispatcher | null = null,
   subagentContext: GatewaySubagentDispatchContext = {},
   providerName = "",
+  allowCredentialFailover = true,
+  credentialId = "",
 ): Promise<"handled" | "fallback"> {
   const targetUrl = responsesEndpointForProvider(providerUrl);
   const optimized = await optimizeThirdPartyComputerUseImages(reqBody);
+  const sanitizedBody = sanitizeThirdPartyResponsesRequest(optimized.body, upstreamModel, true);
   const upstreamBody = {
-    ...optimized.body,
-    model: upstreamModel,
+    ...sanitizedBody,
     ...(isSubagentRequest
-      ? { tools: stripSubagentRuntimeTools(optimized.body?.tools) }
+      ? { tools: stripSubagentRuntimeTools(sanitizedBody?.tools) }
       : subagentDispatcher
         ? {
           tools: [
-            ...(Array.isArray(optimized.body?.tools) ? optimized.body.tools : []),
+            ...(Array.isArray(sanitizedBody?.tools) ? sanitizedBody.tools : []),
             buildGatewaySubagentResponseTool(),
           ].filter((tool: any, index: number, list: any[]) => list.findIndex((candidate) => String(candidate?.name || candidate?.function?.name || "") === String(tool?.name || tool?.function?.name || "")) === index),
-          ...(optimized.body?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
+          ...(sanitizedBody?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
         }
         : {}),
   };
-  delete upstreamBody.protocol;
   if (optimized.stats.optimized || optimized.stats.deduplicated) {
     console.info(
       `[OpenCodex Computer Use] optimized third-party Responses screenshots ` +
@@ -407,8 +464,15 @@ async function proxyThirdPartyResponses(
         CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errorText);
       }
       if (isResponsesUnsupported(upstreamRes.status, errorText)) {
-        console.warn(`[OpenCodex Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
+        console.warn(`[CodexSplit Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
         return "fallback";
+      }
+      if (allowCredentialFailover && credentialId && shouldRotateProviderCredential(upstreamRes.status)) {
+        throw new ProviderCredentialError(
+          `Provider API Key 请求失败（HTTP ${upstreamRes.status}）：${errorText.slice(0, 800)}`,
+          upstreamRes.status,
+          credentialId,
+        );
       }
       const responseHeaders: Record<string, string> = { "Content-Type": "application/json" };
       res.writeHead(upstreamRes.status, responseHeaders);
@@ -471,6 +535,7 @@ async function proxyThirdPartyResponses(
     res.end();
     return "handled";
   } catch (err: any) {
+    if (err instanceof ProviderCredentialError) throw err;
     const details = upstreamErrorDetails(err);
     console.error(`[CodexBridge V2] Native third-party Responses proxy error:`, {
       ...details,
@@ -684,7 +749,125 @@ export class GatewayRouter {
     }
   }
 
+  private async emitProviderCredentialFailure(
+    reqBody: any,
+    upstreamModel: string,
+    responseModel: string,
+    res: http.ServerResponse,
+    message: string,
+  ): Promise<void> {
+    if (res.writableEnded) return;
+    const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
+    const write = async (payload: any) => {
+      if (!res.writableEnded) await writeSseData(res, payload);
+    };
+    if (!res.headersSent) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no",
+      });
+    }
+    const engine = new ResponsesStreamEngine(upstreamModel, reqBody?.client_metadata?.turn_id, { responseModel: selectedResponseModel });
+    await engine.start(write);
+    const now = Math.floor(Date.now() / 1000);
+    const failedResponse = {
+      id: engine.getResponseId(),
+      object: "response",
+      created_at: now,
+      completed_at: now,
+      status: "failed",
+      model: selectedResponseModel,
+      output: [],
+      error: { code: "provider_credential_unavailable", message },
+    };
+    await write({ type: "response.failed", response: failedResponse });
+    await write({ type: "response.done", response: failedResponse });
+    if (!res.writableEnded) {
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  }
+
   public async handleResponses(
+    reqBody: any,
+    upstreamModel: string,
+    apiKey: string,
+    providerUrl: string,
+    res: http.ServerResponse,
+    providerName = "",
+    nativeImageHeaders: Record<string, string> = {},
+    responseModel = "",
+    isSubagentRequest = false,
+    credentialId = "",
+  ): Promise<void> {
+    let selectedApiKey = String(apiKey || "");
+    let selectedCredentialId = String(credentialId || "");
+    if (providerName && !selectedApiKey) {
+      const provider = CredentialStore.loadProviders().find((item: any) =>
+        String(item?.name || "").trim().toLowerCase() === String(providerName).trim().toLowerCase()
+        || String(item?.preset_id || "").trim().toLowerCase() === String(providerName).trim().toLowerCase(),
+      ) as any;
+      if (provider) {
+        const resolved = CredentialStore.resolveApiKeyWithCredential(provider);
+        selectedApiKey = resolved.apiKey;
+        selectedCredentialId = resolved.id || selectedCredentialId;
+        if (!selectedApiKey && !selectedCredentialId) {
+          const credentials = CredentialStore.getProviderCredentialsPublic(provider);
+          selectedCredentialId = credentials.find((credential: any) => credential.active)?.id || credentials[0]?.id || "";
+        }
+      }
+    }
+
+    try {
+      if (!selectedApiKey && selectedCredentialId) {
+        throw new ProviderCredentialError("没有可用的 API Key；当前凭证可能已失效或已从 Keychain 移除", 401, selectedCredentialId);
+      }
+      const completed = await this.handleResponsesOnce(
+        reqBody,
+        upstreamModel,
+        selectedApiKey,
+        providerUrl,
+        res,
+        providerName,
+        nativeImageHeaders,
+        responseModel,
+        isSubagentRequest,
+        selectedCredentialId,
+        true,
+      );
+      if (completed && selectedCredentialId) CredentialStore.markProviderCredentialSuccess(providerName, selectedCredentialId);
+    } catch (error: any) {
+      if (!(error instanceof ProviderCredentialError) || !selectedCredentialId || res.headersSent || res.writableEnded) throw error;
+      CredentialStore.markProviderCredentialFailure(providerName, selectedCredentialId, error.statusCode, error.message);
+      const next = CredentialStore.selectNextApiKeyCredential(providerName, selectedCredentialId);
+      if (next && next.id !== selectedCredentialId) {
+        console.warn(`[CodexSplit Provider] credential failover provider=${providerName} failed=${selectedCredentialId} next=${next.id}`);
+        return this.handleResponses(
+          reqBody,
+          upstreamModel,
+          next.apiKey,
+          providerUrl,
+          res,
+          providerName,
+          nativeImageHeaders,
+          responseModel,
+          isSubagentRequest,
+          next.id,
+        );
+      }
+      await this.emitProviderCredentialFailure(
+        reqBody,
+        upstreamModel,
+        responseModel,
+        res,
+        `${error.message}；没有其他可用 API Key，请在 Provider 设置中检测或移除失效凭证。`,
+      );
+    }
+  }
+
+  private async handleResponsesOnce(
     reqBody: any,
     upstreamModel: string,
     apiKey: string,
@@ -694,7 +877,9 @@ export class GatewayRouter {
   nativeImageHeaders: Record<string, string> = {},
   responseModel = "",
   isSubagentRequest = false,
-): Promise<void> {
+  credentialId = "",
+  allowCredentialFailover = true,
+): Promise<boolean> {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
     const cursorHistoryId = cursorHistoryKey(reqBody);
@@ -729,8 +914,10 @@ export class GatewayRouter {
           parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
         },
         providerName,
+        allowCredentialFailover,
+        credentialId,
       );
-      if (nativeResult === "handled") return;
+      if (nativeResult === "handled") return true;
       // The configured Responses endpoint is unavailable; use the existing
       // Chat compatibility conversion for this request.
       reqBody = { ...reqBody, protocol: "chat" };
@@ -891,7 +1078,7 @@ export class GatewayRouter {
     }
 
     console.info(
-      `[OpenCodex Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
+      `[CodexSplit Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
       `messages=${Array.isArray(finalPayloadBody?.messages) ? finalPayloadBody.messages.length : 0} ` +
       `tools=${Array.isArray(finalPayloadBody?.tools) ? finalPayloadBody.tools.map((tool: any) => tool?.function?.name || tool?.name).filter(Boolean).join(",") || "(none)" : "(none)"} ` +
       `tool_images=${hasChatToolImages(finalPayloadBody)} ` +
@@ -1164,7 +1351,7 @@ export class GatewayRouter {
         if (isConsoleGoToolImageRejection(response.status, initialErrorText, finalPayloadBody)) {
           const fallbackPayloadBody = stripChatToolImages(finalPayloadBody);
           console.warn(
-            `[OpenCodex Provider] retrying Chat request without tool images provider=${providerName || "provider"} model=${upstreamModel}`,
+            `[CodexSplit Provider] retrying Chat request without tool images provider=${providerName || "provider"} model=${upstreamModel}`,
           );
           const fallbackResponse = await fetchUpstream(finalTargetUrl, {
             method: "POST",
@@ -1189,7 +1376,7 @@ export class GatewayRouter {
           const normalizedPayload = normalizeXiaomiChatToolHistory(finalPayloadBody);
           const fallbackPayloadBody = stripChatToolImages(normalizedPayload);
           console.warn(
-            `[OpenCodex Provider] retrying MiMo Chat continuation with text-only tool results provider=${providerName || "provider"} model=${upstreamModel}`,
+            `[CodexSplit Provider] retrying MiMo Chat continuation with text-only tool results provider=${providerName || "provider"} model=${upstreamModel}`,
           );
           const fallbackResponse = await fetchUpstream(finalTargetUrl, {
             method: "POST",
@@ -1212,10 +1399,17 @@ export class GatewayRouter {
       }
 
       if (!response.ok || !response.body) {
-        res.flushHeaders();
         const errText = firstAuthErrorText && (response.status === 401 || response.status === 403)
           ? firstAuthErrorText
           : preReadErrorText ?? await response.text();
+        if (allowCredentialFailover && credentialId && shouldRotateProviderCredential(response.status)) {
+          throw new ProviderCredentialError(
+            `Provider API Key 请求失败（HTTP ${response.status}）：${errText.slice(0, 800)}`,
+            response.status,
+            credentialId,
+          );
+        }
+        res.flushHeaders();
         if (response.status === 400) {
           // A provider validation enum is authoritative capability metadata.
           // Record it for the next model-picker refresh, but never silently
@@ -1232,7 +1426,7 @@ export class GatewayRouter {
         }
 
         if (isGrokModel && (response.status === 401 || response.status === 403 || errText.includes("Incorrect API key") || errText.includes("bad-credentials"))) {
-          msg = "Grok 本机登录凭证已失效/撤销，请在终端运行 \"grok login\" 重新登录，或在 OpenCodex 控制面板保存 x.AI API Key。";
+          msg = "Grok 本机登录凭证已失效/撤销，请在终端运行 \"grok login\" 重新登录，或在 CodexSplit 控制面板保存 x.AI API Key。";
         }
         if (isClaudeModel && (response.status === 401 || response.status === 403 || errText.includes("invalid_api_key") || errText.includes("authentication_error"))) {
           const claudeFailure = SubscriptionAuthService.getClaudeAuthFailure();
@@ -1240,10 +1434,10 @@ export class GatewayRouter {
             ? "已读取 Claude 登录态，但 Claude Code 订阅要求 Pro 或 Max 套餐。"
             : claudeFailure.startsWith("authorize_http_403")
               ? "已读取 Claude 登录态，但 Claude 上游拒绝了订阅授权；请确认账号套餐或配置 Anthropic API Key。"
-              : "Claude API 凭证未找到或已失效。若使用的是 Console API 请在 OpenCodex 控制面板配置 Anthropic API Key，或运行 \"claude login\" 重新认证。";
+              : "Claude API 凭证未找到或已失效。若使用的是 Console API 请在 CodexSplit 控制面板配置 Anthropic API Key，或运行 \"claude login\" 重新认证。";
         }
         if (isCursorModel && (response.status === 401 || response.status === 403 || response.status === 404)) {
-          msg = "Cursor 本地凭证未生效或目标接口响应异常，请在 Cursor 软件中重新登录账户，或在 OpenCodex 中配置相关 API Key。";
+          msg = "Cursor 本地凭证未生效或目标接口响应异常，请在 Cursor 软件中重新登录账户，或在 CodexSplit 中配置相关 API Key。";
         }
         if (isCursorModel && response.status === 415) {
           msg = "Cursor 上游拒绝了协议格式（415）。请确认网关使用的是原始 protobuf 请求和 Connect 流式响应，而不是把请求再次封装成流式帧。";
@@ -1259,7 +1453,7 @@ export class GatewayRouter {
         // though no model response or tool call ever arrived.
         await emitFailedResponse(msg);
         res.end();
-        return;
+        return false;
       }
 
       res.flushHeaders();
@@ -1519,7 +1713,7 @@ export class GatewayRouter {
           // response for an empty stream.
           if (providerDataObserved && engine.hasOutput()) {
             console.warn(
-              `[OpenCodex Provider] upstream stream ended after valid output ` +
+              `[CodexSplit Provider] upstream stream ended after valid output ` +
               `without a terminal event provider=${providerName || "provider"} model=${upstreamModel}`,
             );
             providerStreamCompleted = true;
@@ -1703,7 +1897,9 @@ export class GatewayRouter {
         res.write("data: [DONE]\n\n");
         res.end();
       }
+      return true;
     } catch (err: any) {
+      if (err instanceof ProviderCredentialError) throw err;
       clearTimeout(timeoutId);
       controller.abort();
       const upstreamDetails = upstreamErrorDetails(err);
@@ -1717,7 +1913,7 @@ export class GatewayRouter {
       const detailMsg = isCursorModel && /outdated|deprecated|upgrade/i.test(String(err.message || ""))
         ? "Cursor 上游已拒绝当前客户端协议：本机 Cursor 版本已被判定为过旧。请先从 Cursor 官网更新/重新下载 Cursor（设置会保留），再重试；这不是免费套餐限制。"
         : err.message === "fetch failed"
-        ? `无法连接服务商接口${causeText}${attemptsText}：网络连接或 TLS 握手失败。请在 OpenCodex 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
+        ? `无法连接服务商接口${causeText}${attemptsText}：网络连接或 TLS 握手失败。请在 CodexSplit 控制面板检查该服务商 Endpoint / Base URL 是否填写正确。`
         : err.message;
       if (!res.headersSent) {
         res.writeHead(200, {
@@ -1735,6 +1931,7 @@ export class GatewayRouter {
         res.write("data: [DONE]\n\n");
         res.end();
       }
+      return false;
     }
   }
 }

@@ -1,4 +1,6 @@
 import { Agent, fetch as undiciFetch, setGlobalDispatcher } from "undici";
+import https from "node:https";
+import { Readable } from "node:stream";
 
 const DEFAULT_ATTEMPTS = 3;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -63,6 +65,8 @@ export type UpstreamFetchOptions = RequestInit & {
   retryDelayMs?: number;
   /** Injection point for unit tests. */
   fetchImpl?: typeof fetch;
+  /** Select the transport for a provider lane. */
+  transport?: "undici" | "node_https";
 };
 
 export class UpstreamFetchError extends Error {
@@ -151,6 +155,56 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Official ChatGPT transport.
+ *
+ * Keep this lane independent from the pooled undici dispatcher. macOS packet
+ * tunnel clients can give the native Codex process and Node/undici different
+ * socket behavior even though both target the same official host. The native
+ * HTTPS client keeps HTTP/1.1 streaming semantics and opens a fresh socket.
+ */
+function nodeHttpsFetch(rawTarget: string, init: RequestInit = {}): Promise<Response> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(rawTarget);
+    if (target.protocol !== "https:") {
+      reject(new Error(`node_https transport only supports https targets: ${target.protocol}`));
+      return;
+    }
+
+    const headers = new Headers(init.headers || {});
+    headers.delete("host");
+    const requestHeaders: Record<string, string> = {};
+    headers.forEach((value, key) => { requestHeaders[key] = value; });
+    const method = String(init.method || "GET").toUpperCase();
+    const request = https.request(target, {
+      method,
+      headers: requestHeaders,
+      // Do not reuse a socket that may have been retired by a packet tunnel.
+      agent: false,
+      signal: init.signal,
+    }, (response) => {
+      const body = Readable.toWeb(response) as unknown as ReadableStream<Uint8Array>;
+      resolve(new Response(body, {
+        status: response.statusCode || 0,
+        statusText: response.statusMessage || "",
+        headers: response.headers as HeadersInit,
+      }));
+    });
+
+    request.once("error", reject);
+    const body = init.body;
+    if (body === undefined || body === null || method === "GET" || method === "HEAD") {
+      request.end();
+      return;
+    }
+    if (typeof body === "string" || Buffer.isBuffer(body) || body instanceof Uint8Array) {
+      request.end(body);
+      return;
+    }
+    request.destroy(new Error("node_https transport received a non-replayable request body"));
+  });
+}
+
 export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOptions = {}): Promise<Response> {
   const target = new URL(rawTarget).toString();
   const displayTarget = safeTarget(target);
@@ -162,7 +216,8 @@ export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOpt
   // undici's fetch as well; Node's built-in fetch may use a different
   // embedded undici version and rejects this Agent with `invalid
   // onRequestStart method` before any network request is sent.
-  const fetchImpl = options.fetchImpl || (undiciFetch as unknown as typeof fetch);
+  const fetchImpl = options.fetchImpl
+    || (options.transport === "node_https" ? nodeHttpsFetch : (undiciFetch as unknown as typeof fetch));
   const replayableBody = isReplayableBody(options.body);
   const requestInit: RequestInit = { ...options };
   delete (requestInit as any).operation;
@@ -170,6 +225,7 @@ export async function fetchUpstream(rawTarget: string, options: UpstreamFetchOpt
   delete (requestInit as any).timeoutMs;
   delete (requestInit as any).retryDelayMs;
   delete (requestInit as any).fetchImpl;
+  delete (requestInit as any).transport;
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {

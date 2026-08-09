@@ -1,10 +1,10 @@
 {
-  "name": "opencodex",
-  "version": "1.2.0",
-  "description": "OpenCodex - The Unified Codex Desktop Unlocker, Custom Model Gateway & Computer Use Router",
+  "name": "codexsplit",
+  "version": "2.0.0-beta.1",
+  "description": "CodexSplit - The local Codex model routing gateway, provider workspace and Computer Use companion",
   "type": "module",
   "scripts": {
-    "build": "rm -rf dist && tsc && mv dist/server.js dist/gateway-entry.js && printf 'import \"./gateway-entry.js\";\\n' > dist/server.js && cp scripts/codex-provider-bridge dist/codex-provider-bridge && chmod +x dist/codex-provider-bridge",
+    "build": "rm -rf dist && tsc && mv dist/server.js dist/gateway-entry.js && printf 'import \"./gateway-entry.js\";\\n' > dist/server.js && cp scripts/codex-provider-bridge dist/codex-provider-bridge && cp scripts/opencodex-codex dist/opencodex-codex && chmod +x dist/codex-provider-bridge dist/opencodex-codex",
     "build:all": "./scripts/build-all.sh",
     "test": "npm run build && node --test test/*.test.mjs",
     "start": "node dist/server.js",

@@ -16,7 +16,7 @@ test("gateway is loopback-only and protects admin APIs", async () => {
 
 test("provider and voice APIs never return plaintext credentials", async () => {
   const [source, store] = await Promise.all([gateway(), credentials()]);
-  assert.match(source, /const \{ api_key: _apiKey/);
+  assert.match(source, /const \{\s*api_key: _apiKey/);
   assert.match(source, /api_key_configured/);
   assert.match(source, /maskVoiceSettings/);
   assert.match(store, /OpenCodex Provider Credential/);

@@ -28,7 +28,7 @@ test("V2 server starts and answers healthcheck cleanly", async () => {
     });
 
     assert.equal(json.status, "ok");
-    assert.equal(json.name, "CodexBridge Engine V2");
+    assert.equal(json.name, "CodexSplit Engine V2");
   } finally {
     await server.stop();
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;

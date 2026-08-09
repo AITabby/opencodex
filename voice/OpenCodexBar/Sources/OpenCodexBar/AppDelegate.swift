@@ -71,10 +71,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
     _ = AXIsProcessTrustedWithOptions(options)
     
-    // The native OpenCodex.app owns the gateway lifecycle. Do not start a
+    // The native CodexSplit.app owns the gateway lifecycle. Do not start a
     // second default-port sidecar when its published runtime is available.
     if GatewayLocator.hasPublishedRuntime {
-      log("[App] Using the published OpenCodex gateway runtime.")
+      log("[App] Using the published CodexSplit gateway runtime.")
     } else {
       let p = Process()
       p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
@@ -237,7 +237,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     if let p = proxyProcess, p.isRunning {
       p.terminate()
-      log("[App] Terminated local OpenCodex proxy server.")
+      log("[App] Terminated local CodexSplit proxy server.")
     }
     if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
     if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }

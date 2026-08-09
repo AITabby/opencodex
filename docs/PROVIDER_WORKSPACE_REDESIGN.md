@@ -1,20 +1,31 @@
 # Provider Workspace redesign
 
 This document records the product and engineering boundary for the macOS
-Provider Workspace introduced in this release. It is intentionally separate
-from the native Codex and Computer Use paths.
+Provider Workspace introduced in v1.0.2. CodexSplit is an independently
+developed codebase. During an intermediate design phase, we reviewed public
+provider-management products to compare product organization and architecture
+ideas. The decisions below describe CodexSplit's own implementation boundary.
 
-## Evidence reviewed
+## Design notes
 
-| Source | Finding | Decision in OpenCodex |
+These notes describe the product and architecture decisions implemented in
+this repository. They do not enumerate external projects or implementation
+dependencies.
+
+| Design concern | CodexSplit decision |
+| --- | --- |
+| Provider identity and capability metadata | The V2 catalog and adapter layers under `src_v2` keep provider identity, protocol, authentication paths and model capabilities as data rather than special-case routing branches. |
+| Provider workspace organization | `src_v2/services/dashboard.ts` provides a macOS Provider Workspace with a rail, detail panel, route map and safety checks. |
+| Usage and quota truthfulness | The UI never invents quota. It shows a real meter only after a verified official integration is added. |
+
+## CodexSplit local constraints
+
+| Local CodexSplit issue | Constraint | Decision in CodexSplit |
 | --- | --- | --- |
-| [lidge-jun/opencodex provider registry](https://github.com/lidge-jun/opencodex/blob/main/src/providers/registry.ts) | A provider needs a typed identity, protocol, authentication modes, per-model capability metadata and UI preset. | Added the V2 catalog and adapter layers under `src_v2`; presets are data, not special-case routing branches. |
-| [lidge-jun provider workspace](https://github.com/lidge-jun/opencodex/tree/main/gui/src/components/provider-workspace) | Provider selection, authentication, models and usage need one work area rather than a generic JSON form. | Rebuilt `src_v2/services/dashboard.ts` as a macOS Provider Workspace with a rail, detail panel, route map and safety checks. |
-| [lidge-jun quota handling](https://github.com/lidge-jun/opencodex/blob/main/src/providers/quota.ts) | Usage data can be stale, unofficial or account-specific. | UI never invents quota. It shows a real meter only after a verified official integration is added. |
-| [Issue #14](https://github.com/AITabby/opencodex/issues/14) | A gateway must not damage the desktop client or leave it in a broken state. | Provider changes are explicit; the interface makes native and gateway routes separate. |
-| [Issue #9](https://github.com/AITabby/opencodex/issues/9) | A model that does not emit a tool call must not look like a successful tool turn. | Tool-bearing Responses turns prefer `tool_choice: "required"`; a provider that rejects it is retried safely, while a text-only result is emitted as `response.failed` with `no_tool_emitted` rather than `response.completed`. |
-| [Issue #8](https://github.com/AITabby/opencodex/issues/8) | Desktop-owned state must not be casually rewritten. | The new provider flow never edits Codex history/index state. |
-| [Issue #10](https://github.com/AITabby/opencodex/issues/10) | macOS permission state must be refreshed rather than assumed. | Computer Use stays outside Provider Workspace; its status is not modified by provider actions. |
+| [Issue #14](https://github.com/AITabby/codexsplit/issues/14) | A gateway must not damage the desktop client or leave it in a broken state. | Provider changes are explicit; the interface makes native and gateway routes separate. |
+| [Issue #9](https://github.com/AITabby/codexsplit/issues/9) | A model that does not emit a tool call must not look like a successful tool turn. | Tool-bearing Responses turns prefer `tool_choice: "required"`; a provider that rejects it is retried safely, while a text-only result is emitted as `response.failed` with `no_tool_emitted` rather than `response.completed`. |
+| [Issue #8](https://github.com/AITabby/codexsplit/issues/8) | Desktop-owned state must not be casually rewritten. | The new provider flow never edits Codex history/index state. |
+| [Issue #10](https://github.com/AITabby/codexsplit/issues/10) | macOS permission state must be refreshed rather than assumed. | Computer Use stays outside Provider Workspace; its status is not modified by provider actions. |
 
 ## What is now implemented
 
@@ -28,7 +39,7 @@ from the native Codex and Computer Use paths.
    `credential_ref`; old plaintext credentials are retained only as legacy
    compatibility until a provider is saved again.
 4. Explicit, user-triggered connection testing. No provider endpoint is
-   contacted when OpenCodex starts or while merely browsing the catalogue.
+   contacted when CodexSplit starts or while merely browsing the catalogue.
 5. A local `mock://opencodex` provider so model metadata and tool-call setup can
    be exercised on a machine with no subscription account.
 6. Atomic writes for `providers.json`, a provider deletion flow, and automatic

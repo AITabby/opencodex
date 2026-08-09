@@ -11,7 +11,7 @@ if [[ ! -f "$VOICE_ROOT/Package.swift" ]]; then
 fi
 
 cd "$APP_ROOT"
-print "Building OpenCodex gateway..."
+print "Building CodexSplit gateway..."
 npm run build
 
 print "Building embedded OpenCodexBar voice companion..."

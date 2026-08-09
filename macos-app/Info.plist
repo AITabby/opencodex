@@ -3,27 +3,27 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>OpenCodex</string>
+	<string>CodexSplit</string>
 	<key>CFBundleExecutable</key>
-	<string>OpenCodex</string>
+	<string>CodexSplit</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.aitabby.opencodex</string>
+	<string>com.aitabby.codexsplit</string>
 	<key>CFBundleIconFile</key>
-	<string>OpenCodex.icns</string>
+	<string>CodexSplit.icns</string>
 	<key>CFBundleName</key>
-	<string>OpenCodex</string>
+	<string>CodexSplit</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.0</string>
+	<string>2.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>1.2.0</string>
+	<string>2000001</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>OpenCodex 需要麦克风权限以使用语音栏。</string>
+	<string>CodexSplit 需要麦克风权限以使用语音栏。</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<!-- The gateway owns one local port and one background process per user. -->

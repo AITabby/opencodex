@@ -15,12 +15,13 @@ import { promisify } from "node:util";
 import { GatewayRouter, type GatewaySubagentDispatchCall, type GatewaySubagentDispatchContext, type GatewaySubagentDispatchResult } from "./router.js";
 import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
+import { isNativeControlPlaneModel } from "../core/model_identity.js";
 import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
-import { ProviderConfig } from "../core/types.js";
+import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isLiveModelPickerEntryVisible, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel, orderOfficialModelsFirst } from "../services/live_model_picker.js";
@@ -28,6 +29,11 @@ import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from 
 import { AgentProfileStore } from "../services/agent_profile_store.js";
 import { TaskRouter, extractTaskText } from "../services/task_router.js";
 import { SubagentOrchestrator } from "../services/subagent_orchestrator.js";
+import { ChatGptAccountPool } from "../services/chatgpt_account_pool.js";
+import { ChatGptAccountLoginService } from "../services/chatgpt_account_auth.js";
+import { SubscriptionAccountPool, SUBSCRIPTION_ACCOUNT_PROVIDERS, type SubscriptionProvider } from "../services/subscription_account_pool.js";
+import { SUBSCRIPTION_LOGIN_CAPABILITIES, SubscriptionAccountLoginService } from "../services/subscription_account_auth.js";
+import { API_PROVIDER_PRESETS } from "../services/provider_presets.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -66,6 +72,10 @@ type GatewaySubagentTurn = {
  */
 export function isNativeCodexPassthrough(modelIsNative: boolean, _isSubagent: boolean): boolean {
   return modelIsNative;
+}
+
+export function shouldResolveSubagentRoute(isSubagentRequest: boolean, isNativeControlPlaneRequest: boolean): boolean {
+  return isSubagentRequest && !isNativeControlPlaneRequest;
 }
 
 function requestHeader(req: http.IncomingMessage | undefined, name: string): string {
@@ -152,12 +162,57 @@ export function codexConfigPath(): string {
   return configured || path.join(os.homedir(), ".codex", "config.toml");
 }
 
+/**
+ * Remove the disabled Computer Use table written by older OpenCodex builds.
+ *
+ * The official bundled launcher lives under
+ * ~/.codex/plugins/cache/openai-bundled and must remain untouched. The legacy
+ * entry we own is identifiable by the old `Codex Computer Use.app` path (or
+ * an explicit OpenCodex Computer Use path) together with a disabled flag.
+ */
+export function stripOwnedLegacyComputerUseConfig(content: string): string {
+  const source = String(content || "");
+  if (!source) return source;
+
+  const newline = source.includes("\r\n") ? "\r\n" : "\n";
+  const lines = source.split(/\r?\n/);
+  const output: string[] = [];
+  const computerUseHeader = /^\s*\[mcp_servers\.(?:computer-use|"computer-use"|'computer-use')\]\s*$/i;
+  const tableHeader = /^\s*\[[^\]]+\]\s*$/;
+  let removed = false;
+
+  for (let index = 0; index < lines.length;) {
+    if (!computerUseHeader.test(lines[index])) {
+      output.push(lines[index]);
+      index += 1;
+      continue;
+    }
+
+    let end = index + 1;
+    while (end < lines.length && !tableHeader.test(lines[end])) end += 1;
+    const block = lines.slice(index, end).join("\n");
+    const isOwnedLegacyPath = /(?:Codex Computer Use\.app|OpenCodex[^\n]*computer[-_ ]?use)/i.test(block);
+    const isDisabled = /(?:enabled\s*=\s*(?:false|0)|disabled\s*=\s*(?:true|1))/i.test(block);
+    if (isOwnedLegacyPath && isDisabled) {
+      removed = true;
+      index = end;
+      continue;
+    }
+
+    output.push(...lines.slice(index, end));
+    index = end;
+  }
+
+  return removed ? output.join(newline) : source;
+}
+
 export function stripManagedCodexConfig(content: string): string {
   let cleaned = content || "";
   cleaned = cleaned.replace(/# >>> opencodex managed >>>[\s\S]*?# <<< opencodex managed (?:>>>|<<<)\r?\n?/gi, "");
   cleaned = cleaned.replace(/^\s*model_catalog_json\s*=.*$\r?\n?/gm, "");
   cleaned = cleaned.replace(/^\s*openai_base_url\s*=.*$\r?\n?/gm, "");
   cleaned = cleaned.replace(/^\s*\[model_providers\.opencodex\][\s\S]*?(?=\n\s*\[|\n\s*# >>>|$)/gm, "");
+  cleaned = stripOwnedLegacyComputerUseConfig(cleaned);
   return cleaned.trim();
 }
 
@@ -185,7 +240,7 @@ export function buildManagedCodexConfig(
   // making the gateway the global default hides native history whenever the
   // Desktop client is not yet attached to the bridge.
   const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\n# <<< opencodex managed >>>\n`;
-  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "OpenCodex"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
+  const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "CodexSplit"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
 
@@ -307,6 +362,70 @@ const DESKTOP_PROCESS_NAMES = [
     "Codex Helper (GPU)", "SkyComputerUseClient", "SkyComputerUseService"
 ];
 
+export type DesktopLaunchMode = "native" | "bridge";
+
+// This marker is only the hand-off between the explicit "restart Codex"
+// action and the next gateway process. It must not survive long enough for a
+// later manual gateway restart to relaunch Desktop by accident. PM2 is also
+// configured with --no-treekill so gateway lifecycle commands cannot kill the
+// detached Desktop/Bridge process tree.
+export const DESKTOP_RESTART_MARKER_MAX_AGE_MS = 60_000;
+
+export function isFreshDesktopRestartMarker(
+  contents: string,
+  now = Date.now(),
+  maxAgeMs = DESKTOP_RESTART_MARKER_MAX_AGE_MS,
+): boolean {
+  const requestedAt = Number.parseInt(String(contents || "").split(/\r?\n/, 3)[1] || "", 10);
+  if (!Number.isFinite(requestedAt) || requestedAt <= 0) return false;
+  const age = now - requestedAt;
+  return age >= 0 && age <= maxAgeMs;
+}
+
+const PROVIDER_BRIDGE_ENV_NAMES = [
+  "CODEX_CLI_PATH",
+  "OPENCODEX_NATIVE_CODEX_PATH",
+  "OPENCODEX_PROVIDER_BRIDGE_PATH",
+  "OPENCODEX_PROVIDER_SPLIT",
+  "OPENCODEX_PROVIDER_BRIDGE_RUNTIME",
+  "OPENCODEX_GATEWAY_PORT",
+] as const;
+
+/**
+ * Build the environment for the Desktop process itself.
+ *
+ * The bridge is deliberately process-scoped. A launchd-wide CODEX_CLI_PATH
+ * changes unrelated ChatGPT/Codex launches and can break native Computer Use
+ * and MCP, so it must never be used as the provider switch.
+ */
+export function buildDesktopLaunchEnvironment(
+  baseEnvironment: NodeJS.ProcessEnv,
+  mode: DesktopLaunchMode,
+  bridgePath = "",
+  nativeCodexPath = "",
+  gatewayPort = 8765,
+): NodeJS.ProcessEnv {
+  const environment = { ...baseEnvironment };
+  for (const name of PROVIDER_BRIDGE_ENV_NAMES) delete environment[name];
+
+  if (mode === "bridge") {
+    if (!bridgePath || !nativeCodexPath) {
+      throw new Error("Provider bridge launch requires both bridge and native Codex paths");
+    }
+    environment.CODEX_CLI_PATH = bridgePath;
+    environment.OPENCODEX_NATIVE_CODEX_PATH = nativeCodexPath;
+    environment.OPENCODEX_PROVIDER_BRIDGE_PATH = bridgePath;
+    environment.OPENCODEX_PROVIDER_SPLIT = "1";
+    environment.OPENCODEX_GATEWAY_PORT = String(Number.isInteger(gatewayPort) && gatewayPort > 0 ? gatewayPort : 8765);
+  } else if (nativeCodexPath) {
+    // Explicitly override a stale CODEX_CLI_PATH inherited from an older
+    // OpenCodex release when restoring the official Desktop path.
+    environment.CODEX_CLI_PATH = nativeCodexPath;
+  }
+
+  return environment;
+}
+
 function stopDesktopClients(): void {
   for (const processName of DESKTOP_PROCESS_NAMES) {
     try { execFileSync("killall", ["-9", processName], { stdio: "ignore" }); } catch {}
@@ -338,43 +457,79 @@ function nativeCodexExecutablePath(): string {
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
 }
 
-function registerProviderBridgeEnvironment(port = Number.parseInt(process.env.OPENCODEX_PORT || "8765", 10)): boolean {
-  if (process.platform !== "darwin") return false;
-  const bridge = providerBridgePath();
-  const nativeCodex = nativeCodexExecutablePath();
-  if (!bridge || !nativeCodex) {
-    console.warn("[OpenCodex Gateway] Provider bridge startup skipped: bridge or native Codex executable is unavailable.");
-    return false;
-  }
+function launchctlEnvironmentValue(name: string): string {
+  if (process.platform !== "darwin") return "";
   try {
-    // Keep the bridge lifecycle owned by the gateway itself. This covers a
-    // direct `pm2 start opencodex` as well as the login/DMG startup paths.
-    execFileSync("/bin/launchctl", ["setenv", "CODEX_CLI_PATH", bridge], { stdio: "ignore" });
-    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_NATIVE_CODEX_PATH", nativeCodex], { stdio: "ignore" });
-    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_BRIDGE_PATH", bridge], { stdio: "ignore" });
-    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_PROVIDER_SPLIT", "1"], { stdio: "ignore" });
-    execFileSync("/bin/launchctl", ["setenv", "OPENCODEX_GATEWAY_PORT", String(Number.isInteger(port) && port > 0 ? port : 8765)], { stdio: "ignore" });
-    console.log(`[OpenCodex Gateway] Provider bridge registered for gateway lifecycle: ${bridge}`);
-    return true;
-  } catch (error: any) {
-    console.warn(`[OpenCodex Gateway] Could not register provider bridge with launchd: ${error?.message || error}`);
-    return false;
+    return execFileSync("/bin/launchctl", ["getenv", name], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
   }
 }
 
-function unregisterProviderBridgeEnvironment(): void {
-  if (process.platform !== "darwin") return;
-  for (const variable of ["CODEX_CLI_PATH", "OPENCODEX_NATIVE_CODEX_PATH", "OPENCODEX_PROVIDER_BRIDGE_PATH", "OPENCODEX_PROVIDER_SPLIT", "OPENCODEX_GATEWAY_PORT"]) {
-    try { execFileSync("/bin/launchctl", ["unsetenv", variable], { stdio: "ignore" }); } catch {}
+function looksLikeOpenCodexBridge(value: string): boolean {
+  return /(?:^|\/)codex-provider-bridge(?:\.js)?$/.test(String(value || "").trim());
+}
+
+function hasOwnedProviderBridgeLaunchEnvironment(): boolean {
+  if (process.platform !== "darwin") return false;
+  return looksLikeOpenCodexBridge(launchctlEnvironmentValue("CODEX_CLI_PATH"))
+    || looksLikeOpenCodexBridge(launchctlEnvironmentValue("OPENCODEX_PROVIDER_BRIDGE_PATH"));
+}
+
+function hasOwnedProviderBridgeProcessEnvironment(): boolean {
+  return looksLikeOpenCodexBridge(process.env.CODEX_CLI_PATH)
+    || looksLikeOpenCodexBridge(process.env.OPENCODEX_PROVIDER_BRIDGE_PATH);
+}
+
+/**
+ * Remove only legacy OpenCodex launchd state. New code never creates this
+ * state, but old installations may still have it. The ownership check avoids
+ * deleting an unrelated tool's CODEX_CLI_PATH.
+ */
+export function clearOwnedProviderBridgeLaunchEnvironment(): boolean {
+  const processOwned = hasOwnedProviderBridgeProcessEnvironment();
+  const launchOwned = hasOwnedProviderBridgeLaunchEnvironment();
+  if (!processOwned && !launchOwned) return false;
+
+  if (processOwned) {
+    for (const variable of PROVIDER_BRIDGE_ENV_NAMES) delete process.env[variable];
   }
-  // This only affects future Desktop launches. The already-running Desktop
-  // and its provider bridge remain open, so native GPT can keep using the
-  // official path while third-party requests fail closed until the gateway
-  // is started again.
-  console.log("[OpenCodex Gateway] Provider bridge detached from future launches; existing Desktop was left running.");
+
+  if (launchOwned) {
+    for (const variable of PROVIDER_BRIDGE_ENV_NAMES) {
+      try { execFileSync("/bin/launchctl", ["unsetenv", variable], { stdio: "ignore" }); } catch {}
+    }
+  }
+  console.log("[CodexSplit Gateway] Cleared legacy OpenCodex bridge process/launch environment; future Desktop launches remain native by default.");
+  return true;
 }
 
 type DesktopAppServerState = "bridge" | "native" | "absent";
+type ComputerUseMcpState = "official" | "legacy" | "missing" | "unknown" | "not_checked";
+
+export function resolveDesktopBridgeStatus(
+  desiredMode: DesktopLaunchMode,
+  activeMode: DesktopAppServerState,
+  configuredThirdPartyModels: boolean,
+  bridgeConfigured: boolean,
+  officialAccountRotationReady: boolean,
+): {
+  bridge_enabled: boolean;
+  third_party_models_exposed: boolean;
+  official_account_rotation_active: boolean;
+  needs_bridge: boolean;
+} {
+  const bridgeActive = activeMode === "bridge";
+  return {
+    bridge_enabled: bridgeActive,
+    third_party_models_exposed: bridgeActive && configuredThirdPartyModels,
+    official_account_rotation_active: bridgeActive && officialAccountRotationReady,
+    needs_bridge: bridgeConfigured && desiredMode === "bridge" && !bridgeActive,
+  };
+}
 
 function desktopAppServerState(): DesktopAppServerState {
   try {
@@ -386,6 +541,73 @@ function desktopAppServerState(): DesktopAppServerState {
     return "native";
   } catch {}
   return "absent";
+}
+
+function computerUseMcpState(): ComputerUseMcpState {
+  if (process.platform !== "darwin") return "unknown";
+
+  const codex = nativeCodexExecutablePath();
+  if (!codex) return "unknown";
+  try {
+    const output = execFileSync(codex, ["mcp", "list"], {
+      encoding: "utf-8",
+      timeout: 5000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    const text = String(output || "");
+    if (/Codex Computer Use\.app|OpenCodex[^\n]*computer[-_ ]?use/i.test(text)) return "legacy";
+    if (/openai-bundled[\\/]computer-use[\\/].*computer-use-client-launcher/i.test(text)) return "official";
+    if (/computer[-_ ]use/i.test(text)) return "unknown";
+    return "missing";
+  } catch {
+    return "unknown";
+  }
+}
+
+function desktopCompatibilityHealth(expectedMode: DesktopLaunchMode, checkComputerUse = true): {
+  app_server: DesktopAppServerState;
+  launch_environment: "clean" | "open_codex_bridge" | "other" | "unknown";
+  computer_use_mcp: ComputerUseMcpState;
+  healthy: boolean | null;
+} {
+  const appServer = desktopAppServerState();
+  const launchEnvironment = process.platform !== "darwin"
+    ? "unknown"
+    : hasOwnedProviderBridgeLaunchEnvironment()
+      ? "open_codex_bridge"
+      : launchctlEnvironmentValue("CODEX_CLI_PATH")
+        ? "other"
+        : "clean";
+  // `codex mcp list` can take several seconds on a healthy macOS install
+  // because it enumerates bundled launchers. Keep ordinary dashboard status
+  // requests shallow; explicit mode changes and native reset verification use
+  // the deeper check by leaving this flag enabled.
+  const computerUse = expectedMode === "native" && checkComputerUse ? computerUseMcpState() : "not_checked";
+  const healthy = appServer === "absent"
+    ? null
+    : expectedMode === "native"
+      ? appServer === "native" && launchEnvironment !== "open_codex_bridge" && computerUse !== "legacy"
+      : appServer === "bridge" && launchEnvironment !== "open_codex_bridge";
+  return {
+    app_server: appServer,
+    launch_environment: launchEnvironment,
+    computer_use_mcp: computerUse,
+    healthy,
+  };
+}
+
+async function waitForDesktopAppServer(
+  expectedMode: DesktopLaunchMode,
+  timeoutMs = expectedMode === "bridge" ? 45_000 : 30_000,
+): Promise<DesktopAppServerState> {
+  const deadline = Date.now() + timeoutMs;
+  let state = desktopAppServerState();
+  while (Date.now() < deadline) {
+    if (state === expectedMode) return state;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    state = desktopAppServerState();
+  }
+  return state;
 }
 
 function desktopBundleExecutable(bundlePath: string): string {
@@ -427,33 +649,134 @@ function desktopApplicationExecutable(): string {
   return "";
 }
 
-function launchDesktopClient(launchWithCdp: boolean): void {
+function configuredDesktopLaunchMode(): DesktopLaunchMode {
+  const preferredMode = readDesktopModePreference();
+  if (preferredMode) return preferredMode;
+  try {
+    const configPath = codexConfigPath();
+    if (fs.existsSync(configPath) && fs.readFileSync(configPath, "utf-8").includes("opencodex managed")) {
+      return "bridge";
+    }
+  } catch {}
+  const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+  let catalog: any = { models: [] };
+  try {
+    if (fs.existsSync(catalogPath)) catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
+  } catch {}
+  const accountPool = new ChatGptAccountPool();
+  return desktopBridgeConfigured(
+    CredentialStore.loadProviders(),
+    catalog,
+    isOfficialAccountRotationReady(accountPool),
+  ) ? "bridge" : "native";
+}
+
+/**
+ * A normal Codex restart must never leave newly selected provider models on
+ * the native OpenAI process when the user has not explicitly chosen a mode.
+ * Once the user has chosen native or Bridge, that choice is durable and a
+ * gateway restart must not silently change it.
+ *
+ * `preferredMode` is kept separate from `configuredDesktopLaunchMode()` so an
+ * old managed config cannot accidentally re-enable a stale Bridge, while an
+ * explicit manual Bridge choice can still be used for official GPT account
+ * rotation when no third-party model is present.
+ */
+export function resolveDesktopRestartMode(
+  providers: ProviderConfig[] = [],
+  catalog: any = {},
+  preferredMode: DesktopLaunchMode | null = null,
+): DesktopLaunchMode {
+  if (preferredMode === "native" || preferredMode === "bridge") return preferredMode;
+  if (hasThirdPartyModels(providers, catalog)) return "bridge";
+  return "native";
+}
+
+function desktopModePreferencePath(
+  dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"),
+): string {
+  return path.join(dataDir, "desktop_mode.json");
+}
+
+function readDesktopModePreference(): DesktopLaunchMode | null {
+  try {
+    const value = JSON.parse(fs.readFileSync(desktopModePreferencePath(), "utf-8"));
+    return value?.mode === "native" || value?.mode === "bridge" ? value.mode : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeDesktopModePreference(mode: DesktopLaunchMode): void {
+  const filePath = desktopModePreferencePath();
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  fs.writeFileSync(temporaryPath, `${JSON.stringify({ mode, updated_at: new Date().toISOString() })}\n`, {
+    encoding: "utf-8",
+    mode: 0o600,
+  });
+  fs.renameSync(temporaryPath, filePath);
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+}
+
+function desktopBridgeRuntimeAvailable(): boolean {
+  if (process.platform !== "darwin") return true;
+  return Boolean(providerBridgePath() && nativeCodexExecutablePath() && desktopApplicationExecutable());
+}
+
+function launchDesktopClient(
+  launchWithCdp: boolean,
+  mode: DesktopLaunchMode = configuredDesktopLaunchMode(),
+): void {
   if (!launchWithCdp) return;
 
   const bridge = providerBridgePath();
   const nativeCodex = nativeCodexExecutablePath();
   const appExecutable = desktopApplicationExecutable();
-  if (bridge && nativeCodex && process.platform === "darwin" && appExecutable) {
+  if (mode === "bridge" && bridge && nativeCodex && process.platform === "darwin" && appExecutable) {
     try {
       const child = spawn(appExecutable, ["--remote-debugging-port=8315"], {
         detached: true,
         stdio: "ignore",
-        env: {
-          ...process.env,
-          CODEX_CLI_PATH: bridge,
-          OPENCODEX_NATIVE_CODEX_PATH: nativeCodex,
-          OPENCODEX_PROVIDER_SPLIT: "1",
-          OPENCODEX_GATEWAY_PORT: String(Number.parseInt(process.env.OPENCODEX_GATEWAY_PORT || process.env.OPENCODEX_PORT || "8765", 10) || 8765),
-        },
+        env: buildDesktopLaunchEnvironment(
+          process.env,
+          "bridge",
+          bridge,
+          nativeCodex,
+          Number.parseInt(process.env.OPENCODEX_GATEWAY_PORT || process.env.OPENCODEX_PORT || "8765", 10),
+        ),
       });
       child.once("error", (error) => {
-        console.warn(`[OpenCodex Gateway] Provider bridge desktop launch failed: ${error?.message || error}`);
+        console.warn(`[CodexSplit Gateway] Provider bridge desktop launch failed: ${error?.message || error}`);
       });
       child.unref();
-      console.log(`[OpenCodex Gateway] Launched Desktop with provider bridge: ${bridge}`);
+      console.log(`[CodexSplit Gateway] Launched Desktop with provider bridge: ${bridge}`);
       return;
     } catch (error: any) {
-      console.warn(`[OpenCodex Gateway] Provider bridge launch failed; keeping native-only desktop fallback: ${error?.message || error}`);
+      console.warn(`[CodexSplit Gateway] Provider bridge desktop launch failed: ${error?.message || error}`);
+    }
+  }
+
+  if (mode === "bridge") {
+    console.warn("[CodexSplit Gateway] Third-party routing is enabled but the provider bridge is unavailable; refusing a native fallback that could misroute provider-owned models.");
+    return;
+  }
+
+  if (process.platform === "darwin" && appExecutable) {
+    try {
+      const child = spawn(appExecutable, ["--remote-debugging-port=8315"], {
+        detached: true,
+        stdio: "ignore",
+        env: buildDesktopLaunchEnvironment(process.env, "native", "", nativeCodex),
+      });
+      child.once("error", (error) => {
+        console.warn(`[CodexSplit Gateway] Native Desktop launch failed: ${error?.message || error}`);
+      });
+      child.unref();
+      console.log(`[CodexSplit Gateway] Launched Desktop through the native Codex path: ${nativeCodex || "default"}`);
+      return;
+    } catch (error: any) {
+      console.warn(`[CodexSplit Gateway] Native Desktop launch failed; trying LaunchServices: ${error?.message || error}`);
     }
   }
 
@@ -462,11 +785,15 @@ function launchDesktopClient(launchWithCdp: boolean): void {
   // send a third-party slug to the native ChatGPT account and reproduce the
   // user-visible unsupported-model error. Refuse that unsafe fallback.
   if (process.platform === "darwin") {
+    if (mode === "native" && hasOwnedProviderBridgeLaunchEnvironment()) {
+      console.warn("[CodexSplit Gateway] Legacy OpenCodex launch environment is still present; refusing an unscoped native LaunchServices fallback.");
+      return;
+    }
     const configPath = codexConfigPath();
     let managed = false;
     try { managed = fs.readFileSync(configPath, "utf-8").includes("opencodex managed"); } catch {}
     if (managed && (!bridge || !nativeCodex || !appExecutable)) {
-      console.warn("[OpenCodex Gateway] Managed third-party routing is active but the provider bridge is unavailable; refusing an unbridged Desktop launch.");
+      console.warn("[CodexSplit Gateway] Managed third-party routing is active but the provider bridge is unavailable; refusing an unbridged Desktop launch.");
       return;
     }
   }
@@ -475,16 +802,19 @@ function launchDesktopClient(launchWithCdp: boolean): void {
     try {
       execFileSync("open", ["-a", application, "--args", "--remote-debugging-port=8315"], { stdio: "ignore" });
       if (!bridge || !nativeCodex) {
-        console.warn("[OpenCodex Gateway] Desktop provider bridge is unavailable; native GPT remains direct, while third-party models wait for the bridge and gateway.");
+        console.warn("[CodexSplit Gateway] Desktop provider bridge is unavailable; native GPT remains direct, while third-party models wait for the bridge and gateway.");
       }
       return;
     } catch {}
   }
 }
 
-function restartDesktopClients(launchWithCdp: boolean): void {
+function restartDesktopClients(
+  launchWithCdp: boolean,
+  mode: DesktopLaunchMode = configuredDesktopLaunchMode(),
+): void {
   stopDesktopClients();
-  launchDesktopClient(launchWithCdp);
+  launchDesktopClient(launchWithCdp, mode);
 }
 
 function maskVoiceSettings(settings: any): any {
@@ -516,6 +846,89 @@ function recordProviderTest(providerName: string, status: ProviderTestStatus, me
   provider.last_test_at = new Date().toISOString();
   provider.last_test_message = message.slice(0, 500);
   CredentialStore.saveProviders(providers);
+}
+
+function providerModelTestKey(provider: any, model: string): string {
+  const requested = String(model || "").trim();
+  if (!requested) return "";
+  const requestedKey = requested.toLowerCase();
+  const configured = Array.isArray(provider?.models)
+    ? provider.models.find((entry: any) => {
+      const raw = String(entry || "").trim();
+      const { slug, backendModel } = splitConfiguredModel(entry);
+      return [raw, slug, backendModel].filter(Boolean).some((value) => String(value).trim().toLowerCase() === requestedKey);
+    })
+    : undefined;
+  const { backendModel } = splitConfiguredModel(configured || requested);
+  return String(backendModel || requested).trim();
+}
+
+/** Keep explicit model tests only for models that are still configured with the same protocol. */
+function pruneProviderModelTestStatus(
+  provider: any,
+  models: string[] = Array.isArray(provider?.models) ? provider.models : [],
+  protocols: Record<string, unknown> | undefined = provider?.model_protocols,
+): void {
+  const previous = provider?.model_test_status;
+  if (!previous || typeof previous !== "object" || Array.isArray(previous)) {
+    delete provider?.model_test_status;
+    return;
+  }
+  const configured = new Map<string, { key: string; protocol: ModelProtocol }>();
+  for (const model of Array.isArray(models) ? models : []) {
+    const raw = String(model || "").trim();
+    const { slug, backendModel } = splitConfiguredModel(model);
+    if (!backendModel) continue;
+    const protocol = protocolForConfiguredModel(model, protocols);
+    for (const candidate of [raw, slug, backendModel]) {
+      const normalized = String(candidate || "").trim().toLowerCase();
+      if (normalized) configured.set(normalized, { key: backendModel, protocol });
+    }
+  }
+  const next: Record<string, ProviderModelTestState> = {};
+  for (const [rawKey, rawState] of Object.entries(previous)) {
+    if (!rawState || typeof rawState !== "object") continue;
+    const match = configured.get(String(rawKey).trim().toLowerCase());
+    if (!match) continue;
+    const state = rawState as ProviderModelTestState;
+    if (state.protocol && state.protocol !== match.protocol) continue;
+    next[match.key] = state;
+  }
+  if (Object.keys(next).length > 0) provider.model_test_status = next;
+  else delete provider.model_test_status;
+}
+
+function recordProviderModelTest(
+  providerName: string,
+  model: string,
+  protocol: ModelProtocol,
+  status: ProviderTestStatus,
+  message: string,
+): ProviderModelTestState | undefined {
+  const name = String(providerName || "").trim().toLowerCase();
+  const requestedModel = String(model || "").trim();
+  if (!name || !requestedModel) return undefined;
+  const providers = CredentialStore.loadProviders();
+  const provider = providers.find((item: any) =>
+    String(item?.name || "").trim().toLowerCase() === name
+    || String(item?.preset_id || "").trim().toLowerCase() === name,
+  ) as any;
+  if (!provider) return undefined;
+  const key = providerModelTestKey(provider, requestedModel);
+  if (!key) return undefined;
+  const state: ProviderModelTestState = {
+    status,
+    tested_at: new Date().toISOString(),
+    message: String(message || "").slice(0, 500),
+    protocol,
+  };
+  provider.model_test_status = {
+    ...(provider.model_test_status && typeof provider.model_test_status === "object" ? provider.model_test_status : {}),
+    [key]: state,
+  };
+  pruneProviderModelTestStatus(provider);
+  CredentialStore.saveProviders(providers);
+  return state;
 }
 
 type SubscriptionImportState = {
@@ -580,6 +993,19 @@ export function hasThirdPartyModels(providers: ProviderConfig[] = [], catalog: a
   );
   if (providerHasModels) return true;
   return Array.isArray(catalog?.models) && catalog.models.some((model: any) => Boolean(catalogModelOwner(model)));
+}
+
+function desktopBridgeConfigured(
+  providers: ProviderConfig[] = [],
+  catalog: any = {},
+  accountRotationReady = isOfficialAccountRotationReady(),
+): boolean {
+  return hasThirdPartyModels(providers, catalog) || accountRotationReady;
+}
+
+function isOfficialAccountRotationReady(pool = new ChatGptAccountPool()): boolean {
+  return pool.rotationEnabled()
+    && pool.listAccounts().some((account) => account.auth_status === "ready" && account.enabled);
 }
 
 function normalizeNamespace(value: string): string {
@@ -1142,6 +1568,10 @@ export class CodexBridgeServer {
   private readonly agentProfileStore: AgentProfileStore;
   private readonly taskRouter: TaskRouter;
   private readonly subagentOrchestrator: SubagentOrchestrator;
+  private readonly chatgptAccountPool: ChatGptAccountPool;
+  private readonly chatgptAccountLogin: ChatGptAccountLoginService;
+  private readonly subscriptionAccountPool: SubscriptionAccountPool;
+  private readonly subscriptionAccountLogin: SubscriptionAccountLoginService;
   private subagentRouteBindings = new Map<string, SubagentRouteBinding>();
   private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
@@ -1157,6 +1587,11 @@ export class CodexBridgeServer {
     this.agentProfileStore = new AgentProfileStore(this.dataDir);
     this.taskRouter = new TaskRouter(this.agentProfileStore);
     this.subagentOrchestrator = new SubagentOrchestrator(this.dataDir);
+    this.chatgptAccountPool = new ChatGptAccountPool(this.dataDir);
+    this.chatgptAccountLogin = new ChatGptAccountLoginService(this.chatgptAccountPool);
+    this.subscriptionAccountPool = new SubscriptionAccountPool(this.dataDir);
+    this.subscriptionAccountLogin = new SubscriptionAccountLoginService(this.subscriptionAccountPool);
+    SubscriptionAuthService.configureAccountPool(this.subscriptionAccountPool);
     this.router.setSubagentDispatcher((calls, context) => this.dispatchThirdPartySubagents(calls, context));
     this.config.providers = CredentialStore.loadProviders();
   }
@@ -1501,31 +1936,176 @@ export class CodexBridgeServer {
     return this.realtimeActiveUntil > Date.now();
   }
 
-  private requestDesktopLaunchAfterGatewayReady(): void {
+  private requestDesktopLaunchAfterGatewayReady(mode: DesktopLaunchMode): void {
     fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(this.desktopRestartMarkerPath, `${Date.now()}\n`, { encoding: "utf-8", mode: 0o600 });
+    fs.writeFileSync(this.desktopRestartMarkerPath, `${mode}\n${Date.now()}\n`, { encoding: "utf-8", mode: 0o600 });
     try { fs.chmodSync(this.desktopRestartMarkerPath, 0o600); } catch {}
   }
 
+  private pendingDesktopLaunchMode(): DesktopLaunchMode | null {
+    if (!fs.existsSync(this.desktopRestartMarkerPath)) return null;
+    try {
+      const firstLine = fs.readFileSync(this.desktopRestartMarkerPath, "utf-8").split(/\r?\n/, 1)[0].trim();
+      return firstLine === "native" || firstLine === "bridge" ? firstLine : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Apply an explicit Desktop routing mode without changing the durable
+   * provider credentials/catalog. Bridge mode projects provider models into
+   * Codex's cache; native mode removes only that derived projection.
+   */
+  private async applyDesktopLaunchMode(mode: DesktopLaunchMode): Promise<{
+    mode: DesktopLaunchMode;
+    configured: boolean;
+    bridge_configured: boolean;
+    bridge_available: boolean;
+    official_account_rotation_enabled: boolean;
+    app_server: DesktopAppServerState;
+    health: ReturnType<typeof desktopCompatibilityHealth>;
+  }> {
+    const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    let catalog: any = { models: [] };
+    if (fs.existsSync(catalogPath)) {
+      try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
+    }
+    const configured = hasThirdPartyModels(CredentialStore.loadProviders(), catalog);
+    const officialAccountRotationEnabled = this.chatgptAccountPool.rotationEnabled();
+    const officialAccountRotationReady = isOfficialAccountRotationReady(this.chatgptAccountPool);
+    const bridgeConfigured = desktopBridgeConfigured(
+      CredentialStore.loadProviders(),
+      catalog,
+      officialAccountRotationReady,
+    );
+    if (mode === "bridge" && process.platform === "darwin" && (
+      !providerBridgePath()
+      || !nativeCodexExecutablePath()
+      || !desktopApplicationExecutable()
+    )) {
+      throw new Error("Desktop Bridge 运行时不完整，未切换模式；当前仍保持原生 Desktop");
+    }
+    if (mode === "bridge") {
+      // Rebuild a missing/partial derived catalog from the durable provider
+      // selections before pointing Desktop at it.
+      if (!Array.isArray(catalog.models)) catalog.models = [];
+      preserveOfficialModels(catalog);
+      fs.mkdirSync(path.dirname(catalogPath), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), { encoding: "utf-8", mode: 0o600 });
+      try { fs.chmodSync(catalogPath, 0o600); } catch {}
+    }
+
+    const configPath = codexConfigPath();
+    let content = "";
+    try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+    const nextConfig = buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, mode === "bridge");
+    fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(configPath, nextConfig, "utf-8");
+    writeDesktopModePreference(mode);
+
+    if (mode === "bridge") {
+      CatalogSyncService.syncCustomModelsToCodexCache();
+    } else {
+      CatalogSyncService.syncNativeModelsToCodexCache();
+      clearOwnedProviderBridgeLaunchEnvironment();
+      repairNativeRollouts();
+    }
+
+    restartDesktopClients(true, mode);
+    let appServer = await waitForDesktopAppServer(mode);
+    if (mode === "bridge" && process.platform === "darwin" && appServer !== "bridge") {
+      console.warn(`[CodexSplit Gateway] Desktop Bridge was not detected after the first launch (state=${appServer}); retrying once while keeping Bridge selected.`);
+      restartDesktopClients(true, mode);
+      appServer = await waitForDesktopAppServer(mode);
+    }
+    if (mode === "bridge" && process.platform === "darwin" && appServer !== "bridge") {
+      // Keep the user's explicit Bridge choice and the durable third-party
+      // catalog. Falling back to native here silently removes provider models
+      // from Desktop and can send a provider-owned slug to OpenAI. If the app
+      // relauncher briefly brought up a native process, stop it and leave the
+      // Desktop absent until Bridge can be started safely.
+      console.warn(`[CodexSplit Gateway] Desktop Bridge is still unavailable after retry (state=${appServer}); keeping Bridge selected and preserving third-party models.`);
+      if (appServer === "native") {
+        stopDesktopClients();
+        appServer = desktopAppServerState();
+      }
+    }
+    return {
+      mode,
+      configured,
+      bridge_configured: bridgeConfigured,
+      bridge_available: desktopBridgeRuntimeAvailable(),
+      official_account_rotation_enabled: officialAccountRotationEnabled,
+      app_server: appServer,
+      health: desktopCompatibilityHealth(mode),
+    };
+  }
+
+  private reconcilePreferredBridgeAfterGatewayReady(): void {
+    if (readDesktopModePreference() !== "bridge") return;
+    if (desktopAppServerState() === "bridge") {
+      console.log("[CodexSplit Gateway] Desktop Bridge is already attached; gateway restart leaves the existing Desktop untouched.");
+      return;
+    }
+    if (!desktopBridgeRuntimeAvailable()) {
+      console.warn("[CodexSplit Gateway] Bridge preference is active, but the Desktop Bridge runtime is unavailable; leaving Desktop untouched.");
+      return;
+    }
+    const launchTimer = setTimeout(() => {
+      if (readDesktopModePreference() !== "bridge" || desktopAppServerState() === "bridge") return;
+      restartDesktopClients(true, "bridge");
+      console.log("[CodexSplit Gateway] Gateway is ready; restored the selected Desktop Bridge mode after restart.");
+      const verifyTimer = setTimeout(() => {
+        if (readDesktopModePreference() === "bridge" && desktopAppServerState() !== "bridge") {
+          console.warn("[CodexSplit Gateway] Desktop Bridge did not attach after gateway restart; the selected Bridge mode is being preserved for the next retry.");
+        }
+      }, 3000);
+      verifyTimer.unref?.();
+    }, 500);
+    launchTimer.unref?.();
+  }
+
   private launchDesktopAfterGatewayReadyIfRequested(): void {
-    if (!fs.existsSync(this.desktopRestartMarkerPath)) return;
+    if (!fs.existsSync(this.desktopRestartMarkerPath)) {
+      this.reconcilePreferredBridgeAfterGatewayReady();
+      return;
+    }
+    let markerContents = "";
+    try {
+      markerContents = fs.readFileSync(this.desktopRestartMarkerPath, "utf-8");
+    } catch {
+      return;
+    }
+    if (!isFreshDesktopRestartMarker(markerContents)) {
+      try { fs.unlinkSync(this.desktopRestartMarkerPath); } catch {}
+      console.log("[CodexSplit Gateway] Ignored an expired Desktop restart marker; ordinary gateway restarts leave Desktop untouched.");
+      return;
+    }
+    let mode: DesktopLaunchMode = "bridge";
+    try {
+      const firstLine = markerContents.split(/\r?\n/, 1)[0].trim();
+      if (firstLine === "native" || firstLine === "bridge") mode = firstLine;
+    } catch {}
     try {
       fs.unlinkSync(this.desktopRestartMarkerPath);
     } catch (error: any) {
-      console.warn(`[OpenCodex Gateway] Could not consume desktop restart marker: ${error?.message || error}`);
+      console.warn(`[CodexSplit Gateway] Could not consume desktop restart marker: ${error?.message || error}`);
       return;
     }
 
     const launchTimer = setTimeout(() => {
-      if (desktopAppServerState() === "bridge") {
-        console.log("[OpenCodex Gateway] Desktop is already attached to the provider bridge; skipped Desktop restart.");
+      if (mode === "bridge" && configuredDesktopLaunchMode() !== "bridge") {
+        console.log("[CodexSplit Gateway] Ignored a stale bridge takeover marker because neither third-party routing nor official account rotation is enabled.");
         return;
       }
-      // A native app-server cannot receive CODEX_CLI_PATH retroactively. Only
-      // this one-time takeover path restarts Desktop; ordinary gateway
-      // start/stop cycles leave an already-bridged Desktop untouched.
-      restartDesktopClients(true);
-      console.log("[OpenCodex Gateway] Gateway is ready; launched Desktop through the provider bridge after model catalog initialization.");
+      const expectedState = mode === "bridge" ? "bridge" : "native";
+      if (desktopAppServerState() === expectedState) {
+        console.log(`[CodexSplit Gateway] Desktop is already in ${mode} mode; skipped Desktop restart.`);
+        return;
+      }
+      restartDesktopClients(true, mode);
+      console.log(`[CodexSplit Gateway] Gateway is ready; launched Desktop in explicit ${mode} mode after model catalog initialization.`);
     }, 500);
     launchTimer.unref?.();
   }
@@ -1600,7 +2180,9 @@ export class CodexBridgeServer {
     const configured = String(process.env.OPENCODEX_LIVE_PICKER_PATH || "").trim();
     const candidates = [
       configured,
+      path.join(process.cwd(), "macos-app", ".build", "out", "Products", "Release", "CodexSplitLivePicker"),
       path.join(process.cwd(), "macos-app", ".build", "out", "Products", "Release", "OpenCodexLivePicker"),
+      path.join(process.cwd(), "macos-app", ".build", "arm64-apple-macosx", "release", "CodexSplitLivePicker"),
       path.join(process.cwd(), "macos-app", ".build", "arm64-apple-macosx", "release", "OpenCodexLivePicker"),
     ].filter(Boolean);
     return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
@@ -2118,7 +2700,7 @@ export class CodexBridgeServer {
       "Cache-Control": "no-store",
       "WWW-Authenticate": "Bearer"
     });
-    res.end(JSON.stringify({ error: "OpenCodex admin authentication required" }));
+    res.end(JSON.stringify({ error: "CodexSplit admin authentication required" }));
     return false;
   }
 
@@ -2304,6 +2886,7 @@ export class CodexBridgeServer {
   private isNativeCatalogModel(rawModelName: string): boolean {
     const requested = this.stripReasoningSuffix(rawModelName).toLowerCase();
     if (!requested) return false;
+    if (isNativeControlPlaneModel(requested)) return true;
     const catalog = this.readImportedModelCatalog();
     const importedNative = catalog.some((entry: any) => {
       const owner = catalogModelOwner(entry);
@@ -2339,9 +2922,12 @@ export class CodexBridgeServer {
         // does not include Node's Buffer type even though fetch accepts it at
         // runtime.
         body: requestBody as any,
-        maxAttempts: 1,
+        // Retry only before response headers arrive; streaming native output
+        // is never replayed by fetchUpstream.
+        maxAttempts: 3,
         timeoutMs: 600_000,
         operation: endpoint === "responses" ? "native-responses" : "native-responses-compact",
+        transport: "node_https",
       });
       const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
@@ -2382,9 +2968,12 @@ export class CodexBridgeServer {
         // The native Images API request body is forwarded unchanged after the
         // gateway removes transport compression, just like native Responses.
         body: body as any,
-        maxAttempts: 1,
+        // Native image requests use the same bounded pre-response retry policy
+        // as native Responses requests.
+        maxAttempts: 3,
         timeoutMs: 600_000,
         operation: "native-images",
+        transport: "node_https",
       });
       const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
@@ -2959,6 +3548,10 @@ if __name__ == "__main__":
       this.port = overridePort;
     }
     this.acquireServerLock();
+    // Older releases exported the bridge through launchd. Remove only that
+    // owned legacy state; the current gateway never registers a global
+    // CODEX_CLI_PATH during ordinary startup.
+    clearOwnedProviderBridgeLaunchEnvironment();
     try {
       this.ensurePythonScripts();
     } catch (error) {
@@ -2968,19 +3561,43 @@ if __name__ == "__main__":
     const configPath = codexConfigPath();
     let managedConfig = "";
     try { managedConfig = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+    const cleanedLegacyComputerUseConfig = stripOwnedLegacyComputerUseConfig(managedConfig);
+    if (cleanedLegacyComputerUseConfig !== managedConfig) {
+      try {
+        fs.writeFileSync(configPath, cleanedLegacyComputerUseConfig, "utf-8");
+        managedConfig = cleanedLegacyComputerUseConfig;
+        console.log("[CodexSplit Gateway] Removed the disabled legacy OpenCodex Computer Use MCP entry; the official bundled launcher was left untouched.");
+      } catch (err: any) {
+        console.warn(`[CodexSplit Gateway] Could not remove the legacy Computer Use MCP entry: ${err?.message || err}`);
+      }
+    }
     const startupCatalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
     let startupCatalog: any = { models: [] };
     if (fs.existsSync(startupCatalogPath)) {
       try { startupCatalog = JSON.parse(fs.readFileSync(startupCatalogPath, "utf-8")); } catch {}
     }
-    const startupHasThirdPartyModels = hasThirdPartyModels(CredentialStore.loadProviders(), startupCatalog);
-    if (managedConfig.includes("opencodex managed") && !startupHasThirdPartyModels) {
+    const startupProviders = CredentialStore.loadProviders();
+    const startupBridgeConfigured = desktopBridgeConfigured(
+      startupProviders,
+      startupCatalog,
+      isOfficialAccountRotationReady(this.chatgptAccountPool),
+    );
+    const pendingLaunchMode = this.pendingDesktopLaunchMode();
+    const existingDesktopMode = desktopAppServerState();
+    const preferredDesktopMode = readDesktopModePreference();
+    const keepManagedDesktopRouting = preferredDesktopMode === "native"
+      ? false
+      : pendingLaunchMode === "bridge"
+        || existingDesktopMode === "bridge"
+        || preferredDesktopMode === "bridge";
+    if (managedConfig.includes("opencodex managed") && !keepManagedDesktopRouting) {
       try {
         managedConfig = buildCodexRoutingConfig(managedConfig, this.port, this.adminToken, startupCatalogPath, false);
         fs.writeFileSync(configPath, managedConfig, "utf-8");
-        console.log("[OpenCodex Gateway] Removed stale managed routing; native Codex remains active because no third-party models are selected.");
+        CatalogSyncService.syncNativeModelsToCodexCache();
+        console.log(`[CodexSplit Gateway] Removed managed routing; native Codex remains active because no durable Desktop Bridge mode is active (${startupBridgeConfigured ? "Bridge is not selected" : "Bridge has no configured workload"}).`);
       } catch (err: any) {
-        console.warn(`[OpenCodex Gateway] Could not remove stale managed routing: ${err?.message || err}`);
+        console.warn(`[CodexSplit Gateway] Could not remove stale managed routing: ${err?.message || err}`);
       }
     }
     // Native mode deliberately leaves the imported catalog untouched. In
@@ -2997,10 +3614,10 @@ if __name__ == "__main__":
         const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
         if (synchronizedConfig !== managedConfig) {
           fs.writeFileSync(configPath, synchronizedConfig, "utf-8");
-          console.log(`[OpenCodex Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
+          console.log(`[CodexSplit Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
         }
       } catch (err: any) {
-        console.warn(`[OpenCodex Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
+        console.warn(`[CodexSplit Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
       }
       const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
       let catalog: any = { models: [] };
@@ -3019,7 +3636,7 @@ if __name__ == "__main__":
         } catch (err: any) {
           // A read-only test/container home must not prevent the gateway from
           // starting. The next writable start will persist the repair.
-          console.warn(`[OpenCodex Gateway] Could not persist model catalog repair: ${err?.message || err}`);
+          console.warn(`[CodexSplit Gateway] Could not persist model catalog repair: ${err?.message || err}`);
         }
       }
       // Preserve/restore the provider catalog first, then mirror the final
@@ -3042,14 +3659,8 @@ if __name__ == "__main__":
       }, 2000);
       delayedCatalogSync.unref?.();
     }
-    if (registerProviderBridgeEnvironment(this.port)) {
-      const desktopState = desktopAppServerState();
-      if (desktopState !== "bridge") {
-        this.requestDesktopLaunchAfterGatewayReady();
-      } else {
-        console.log("[OpenCodex Gateway] Desktop is already attached to the provider bridge; gateway startup will not restart it.");
-      }
-    }
+    // Desktop launch mode is an explicit user action. Starting or restarting
+    // the gateway alone must never kill or relaunch ChatGPT/Codex.
     return new Promise(async (resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
@@ -3072,7 +3683,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexBridge Engine V2", version: "1.2.0", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexSplit Engine V2", version: "2.0.0-beta.1", opencodex: true }));
           return;
         }
 
@@ -3113,6 +3724,7 @@ if __name__ == "__main__":
               maxAttempts: 1,
               timeoutMs: 120_000,
               operation: realtimeUpstream.nativeSession ? "realtime-native-http" : "realtime-api-http",
+              transport: realtimeUpstream.nativeSession ? "node_https" : "undici",
             });
 
             const respHeaders: Record<string, string> = {};
@@ -3198,11 +3810,15 @@ if __name__ == "__main__":
             const body = request.body;
             const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
             const requestedModelBeforeRouting = this.stripReasoningSuffix(String(body?.model || ""));
-            const nativeModelRequest = Boolean(requestedModelBeforeRouting)
-              && this.isNativeCatalogModel(requestedModelBeforeRouting);
+            const nativeControlPlaneRequest = isNativeControlPlaneModel(requestedModelBeforeRouting);
+            const nativeModelRequest = nativeControlPlaneRequest || (Boolean(requestedModelBeforeRouting)
+              && this.isNativeCatalogModel(requestedModelBeforeRouting));
+            const resolveSubagentRoute = shouldResolveSubagentRoute(isSubagentRequest, nativeControlPlaneRequest);
+            const subagentRoute = resolveSubagentRoute
+              ? this.chooseSubagentRoute(body, req)
+              : null;
             const nativePassthroughTurn = isNativeCodexPassthrough(nativeModelRequest, isSubagentRequest);
-            const subagentRoute = isSubagentRequest ? this.chooseSubagentRoute(body, req) : null;
-            if (isSubagentRequest && !subagentRoute) {
+            if (resolveSubagentRoute && !subagentRoute) {
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({
                 error: "No available subagent route was selected by the gateway",
@@ -3294,7 +3910,9 @@ if __name__ == "__main__":
               return;
             }
 
-            const apiKey = CredentialStore.resolveApiKey(provider);
+            const resolvedCredential = CredentialStore.resolveApiKeyWithCredential(provider);
+            const apiKey = resolvedCredential.apiKey;
+            const credentialId = resolvedCredential.id;
             const rawUrl = (provider as any).baseUrl || (provider as any).base_url || (provider as any).url || "https://opencode.ai/zen/go/v1";
             const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
             const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
@@ -3324,6 +3942,7 @@ if __name__ == "__main__":
               nativeImageHeaders,
               requestedModel,
               isSubagentRequest,
+              credentialId,
             );
             if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
           } catch (err: any) {
@@ -3346,6 +3965,122 @@ if __name__ == "__main__":
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ active }));
+          return;
+        }
+
+        // Official ChatGPT account-pool control plane. Account metadata and
+        // isolated CODEX_HOME directories are managed here; access tokens stay
+        // inside each native Codex profile and are never returned by the API.
+        if (req.method === "GET" && url.pathname === "/api/chatgpt-accounts") {
+          const forceUsageRefresh = url.searchParams.get("refresh") === "1";
+          const accounts = await this.chatgptAccountPool.listAccountsWithUsage(forceUsageRefresh);
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({
+            accounts,
+            settings: this.chatgptAccountPool.getSettings(),
+          }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/chatgpt-accounts") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const account = this.chatgptAccountPool.createAccount(body || {});
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ account }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const chatgptLoginPathMatch = url.pathname.match(/^\/api\/chatgpt-accounts\/([^/]+)\/login$/);
+        if (chatgptLoginPathMatch && req.method === "POST") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const login = this.chatgptAccountLogin.start(
+              decodeURIComponent(chatgptLoginPathMatch[1]),
+              body?.reauth === true,
+            );
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ login }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const chatgptLoginStatusPathMatch = url.pathname.match(/^\/api\/chatgpt-accounts\/([^/]+)\/login-status$/);
+        if (chatgptLoginStatusPathMatch && req.method === "GET") {
+          try {
+            const login = this.chatgptAccountLogin.status(
+              decodeURIComponent(chatgptLoginStatusPathMatch[1]),
+              url.searchParams.get("flow_id") || undefined,
+            );
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ login }));
+          } catch (err: any) {
+            res.writeHead(404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const chatgptLoginCancelPathMatch = url.pathname.match(/^\/api\/chatgpt-accounts\/([^/]+)\/login-cancel$/);
+        if (chatgptLoginCancelPathMatch && req.method === "POST") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const login = this.chatgptAccountLogin.cancel(
+              decodeURIComponent(chatgptLoginCancelPathMatch[1]),
+              body?.flow_id || url.searchParams.get("flow_id") || undefined,
+            );
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ login }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if ((req.method === "GET" || req.method === "POST") && url.pathname === "/api/chatgpt-accounts/settings") {
+          try {
+            if (req.method === "POST") {
+              const body = await this.parseJsonBody(req);
+              const settings = this.chatgptAccountPool.saveSettings(body || {});
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify(settings));
+            } else {
+              res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+              res.end(JSON.stringify(this.chatgptAccountPool.getSettings()));
+            }
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const chatgptAccountPathMatch = url.pathname.match(/^\/api\/chatgpt-accounts\/([^/]+)$/);
+        if (chatgptAccountPathMatch && req.method === "PUT") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const account = this.chatgptAccountPool.updateAccount(decodeURIComponent(chatgptAccountPathMatch[1]), body || {});
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ account }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (chatgptAccountPathMatch && req.method === "DELETE") {
+          const removed = this.chatgptAccountPool.removeAccount(decodeURIComponent(chatgptAccountPathMatch[1]));
+          res.writeHead(removed ? 200 : 404, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(removed || { error: "ChatGPT 账号不存在" }));
           return;
         }
 
@@ -3533,19 +4268,8 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/providers/presets") {
-          const presets = [
-            { id: "deepseek", label: "DeepSeek", defaultBaseUrl: "https://api.deepseek.com/", iconSlug: "deepseek", models: [{ id: "deepseek-v4-flash" }, { id: "deepseek-v4-pro" }] },
-            { id: "qwen", label: "通义千问 (Qwen)", defaultBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", iconSlug: "qwen", models: [{ id: "qwen-max" }, { id: "qwen-plus" }] },
-            { id: "minimax", label: "MiniMax", defaultBaseUrl: "https://api.minimaxi.com/v1", iconSlug: "minimax", models: [{ id: "minimax-m3" }] },
-            { id: "kimi", label: "Kimi (Moonshot)", defaultBaseUrl: "https://api.moonshot.cn/v1", iconSlug: "kimi", models: [{ id: "moonshot-v1-8k" }] },
-            { id: "custom", label: "自定义兼容接口", defaultBaseUrl: "", iconSlug: "", models: [] },
-            { id: "openrouter", label: "OpenRouter", defaultBaseUrl: "https://openrouter.ai/api/v1", iconSlug: "openrouter", models: [{ id: "anthropic/claude-3.5-sonnet" }] },
-            { id: "opencode-go", label: "OpenCode Go", defaultBaseUrl: "https://opencode.ai/zen/go/v1", iconSlug: "", models: [{ id: "opencode-go-pro" }] },
-            { id: "siliconflow", label: "SiliconFlow (硅基流动)", defaultBaseUrl: "https://api.siliconflow.cn/v1", iconSlug: "", models: [{ id: "deepseek-ai/DeepSeek-V3" }] },
-            { id: "volcengine", label: "火山方舟 (Volcengine)", defaultBaseUrl: "https://ark.cn-beijing.volces.com/api/v3", iconSlug: "", models: [{ id: "ep-20241201-xxxx" }] }
-          ];
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ presets }));
+          res.end(JSON.stringify({ presets: API_PROVIDER_PRESETS }));
           return;
         }
 
@@ -3571,6 +4295,7 @@ if __name__ == "__main__":
             {
               id: "antigravity",
               name: "antigravity",
+              auth_mode: "oauth",
               status: hasCatalogModelsForProvider(catalogModels, "antigravity") ? "configured" : "not_configured",
               test_status: subscriptionImports.antigravity?.last_test_status || "untested",
               credential_storage: "keychain",
@@ -3579,6 +4304,7 @@ if __name__ == "__main__":
             {
               id: "grok",
               name: "grok",
+              auth_mode: "oauth",
               status: hasCatalogModelsForProvider(catalogModels, "grok") ? "configured" : "not_configured",
               test_status: subscriptionImports.grok?.last_test_status || "untested",
               credential_storage: "keychain",
@@ -3587,6 +4313,7 @@ if __name__ == "__main__":
             {
               id: "claude",
               name: "claude",
+              auth_mode: "oauth",
               status: hasCatalogModelsForProvider(catalogModels, "claude") ? "configured" : "not_configured",
               test_status: subscriptionImports.claude?.last_test_status || "untested",
               credential_storage: "none",
@@ -3595,7 +4322,8 @@ if __name__ == "__main__":
           ];
 
           const apiProviders = CredentialStore.loadProviders().map((p: any) => {
-            const hasApiKey = Boolean(CredentialStore.resolveApiKey(p));
+            const publicCredentials = CredentialStore.getProviderCredentialsPublic(p);
+            const hasApiKey = Boolean(CredentialStore.resolveApiKey(p)) || publicCredentials.some((credential: any) => credential.status !== "missing");
             // providers.json is the durable source of the selected model
             // list. The catalog is a derived view and may be stale after
             // Codex refreshes its native cache during a restart.
@@ -3604,15 +4332,30 @@ if __name__ == "__main__":
 
             const status = hasActiveModel || hasApiKey ? "configured" : "not_configured";
 
-            const { api_key: _apiKey, api_key_env: _apiKeyEnv, refresh_token: _refreshToken, ...safeProvider } = p;
+            const {
+              api_key: _apiKey,
+              api_key_env: _apiKeyEnv,
+              refresh_token: _refreshToken,
+              credential_ref: _credentialRef,
+              credentials: _credentials,
+              ...safeProvider
+            } = p;
             return {
               ...safeProvider,
               models: effectiveModels,
               id: p.name,
+              auth_mode: "api_key",
               api_key_configured: hasApiKey,
+              credential_count: publicCredentials.length,
+              pool_mode: CredentialStore.getProviderPoolMode(p),
+              pool_supported: true,
+              active_credential_id: p.active_credential_id || publicCredentials.find((credential: any) => credential.active)?.id || "",
+              credentials: publicCredentials,
               status,
               test_status: p.last_test_status || "untested",
-              credential_storage: hasApiKey ? (p.credential_ref ? "keychain" : "local-secure-store") : "none",
+              credential_storage: hasApiKey
+                ? ((p.credential_ref || (Array.isArray(p.credentials) && p.credentials.some((credential: any) => String(credential?.credential_ref || "").startsWith("keychain:")))) ? "keychain" : "local-secure-store")
+                : "none",
               active_models: effectiveModels.map((m: string) => {
                 const raw = String(m);
                 const alias = raw.includes("=") ? raw.split("=")[0] : raw.includes("->") ? raw.split("->")[0] : raw;
@@ -3688,6 +4431,10 @@ if __name__ == "__main__":
               provider.model_protocols = selectedModelProtocols;
             }
 
+            // Model-specific connectivity results are valid only while the
+            // same backend model and protocol remain configured.
+            pruneProviderModelTestStatus(provider, provider.models, provider.model_protocols);
+
             // Saving or changing configuration invalidates the previous connectivity result.
             provider.last_test_status = "untested";
             delete provider.last_test_at;
@@ -3761,27 +4508,140 @@ if __name__ == "__main__":
               fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
               // Enable or remove the managed block according to the final
-              // selected-model state. Saving credentials alone must not route
-              // native Codex traffic through the gateway.
+              // selected-model state, but preserve an explicitly disabled
+              // Desktop Bridge. Saving credentials/models while Bridge is off
+              // must not expose a third-party slug to native Codex.
               const configPath = codexConfigPath();
+              const bridgeConfiguredAfterSave = desktopBridgeConfigured(
+                providers,
+                catalog,
+                isOfficialAccountRotationReady(this.chatgptAccountPool),
+              );
+              let bridgeActive = false;
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
+                bridgeActive = content.includes("opencodex managed") && bridgeConfiguredAfterSave;
                 fs.writeFileSync(
                   configPath,
-                  buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasThirdPartyModels(providers, catalog)),
+                  buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
                   "utf-8",
                 );
               }
+              if (!bridgeConfiguredAfterSave) writeDesktopModePreference("native");
               // The catalog file is the source of truth, but Codex's desktop
               // picker reads its local model cache on the next launch. Keep
               // the cache in sync at the same moment the provider is saved.
-              CatalogSyncService.syncCustomModelsToCodexCache();
+              if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
+              else CatalogSyncService.syncNativeModelsToCodexCache();
             }
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "success", provider }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/cli-bridge/accounts") {
+          const requestedProvider = url.searchParams.get("provider") || "";
+          const providerList = requestedProvider
+            ? [requestedProvider]
+            : [...SUBSCRIPTION_ACCOUNT_PROVIDERS];
+          const providers: Record<string, any> = {};
+          for (const providerName of providerList) {
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(providerName)) continue;
+            const provider = providerName as SubscriptionProvider;
+            const pendingLogin = this.subscriptionAccountLogin.getPending(provider);
+            providers[provider] = {
+              ...this.subscriptionAccountPool.describe(provider),
+              capabilities: SUBSCRIPTION_LOGIN_CAPABILITIES[provider],
+              login_in_progress: Boolean(pendingLogin),
+              ...(pendingLogin ? { login_flow_id: pendingLogin.id } : {}),
+            };
+          }
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ providers }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/cli-bridge/accounts/login") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const provider = String(body?.provider || "").trim().toLowerCase() as SubscriptionProvider;
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(provider)) throw new Error("OAuth Provider 不受支持");
+            const result = this.subscriptionAccountLogin.startLogin(provider, body?.label);
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify(result));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/cli-bridge/accounts/capture") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const provider = String(body?.provider || "").trim().toLowerCase() as SubscriptionProvider;
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(provider)) throw new Error("OAuth Provider 不受支持");
+            const result = await this.subscriptionAccountLogin.captureCurrent(provider, body?.label);
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify(result));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const subscriptionLoginStatusPathMatch = url.pathname.match(/^\/api\/cli-bridge\/accounts\/login-status\/([^/]+)$/);
+        if (subscriptionLoginStatusPathMatch && req.method === "GET") {
+          const login = this.subscriptionAccountLogin.getFlow(decodeURIComponent(subscriptionLoginStatusPathMatch[1]));
+          res.writeHead(login ? 200 : 404, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(login ? { login } : { error: "OAuth 登录流程不存在" }));
+          return;
+        }
+
+        const subscriptionLoginCancelPathMatch = url.pathname.match(/^\/api\/cli-bridge\/accounts\/login-cancel\/([^/]+)$/);
+        if (subscriptionLoginCancelPathMatch && req.method === "POST") {
+          const cancelled = this.subscriptionAccountLogin.cancelLogin(decodeURIComponent(subscriptionLoginCancelPathMatch[1]));
+          res.writeHead(cancelled ? 200 : 404, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(cancelled ? { cancelled: true } : { error: "OAuth 登录流程不存在或已结束" }));
+          return;
+        }
+
+        const subscriptionSettingsPathMatch = url.pathname.match(/^\/api\/cli-bridge\/accounts\/([^/]+)\/settings$/);
+        if (subscriptionSettingsPathMatch && (req.method === "GET" || req.method === "POST")) {
+          try {
+            const provider = decodeURIComponent(subscriptionSettingsPathMatch[1]) as SubscriptionProvider;
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(provider)) throw new Error("OAuth Provider 不受支持");
+            const settings = req.method === "POST"
+              ? this.subscriptionAccountPool.saveSettings(provider, await this.parseJsonBody(req))
+              : this.subscriptionAccountPool.getSettings(provider);
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify(settings));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        const subscriptionAccountPathMatch = url.pathname.match(/^\/api\/cli-bridge\/accounts\/([^/]+)\/([^/]+)$/);
+        if (subscriptionAccountPathMatch && (req.method === "PUT" || req.method === "DELETE")) {
+          try {
+            const provider = decodeURIComponent(subscriptionAccountPathMatch[1]) as SubscriptionProvider;
+            const accountId = decodeURIComponent(subscriptionAccountPathMatch[2]);
+            if (!(SUBSCRIPTION_ACCOUNT_PROVIDERS as readonly string[]).includes(provider)) throw new Error("OAuth Provider 不受支持");
+            const result = req.method === "PUT"
+              ? { account: this.subscriptionAccountPool.updateAccount(provider, accountId, await this.parseJsonBody(req)) }
+              : this.subscriptionAccountPool.removeAccount(provider, accountId);
+            res.writeHead(result ? 200 : 404, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(result || { error: "OAuth 账号不存在" }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
           }
           return;
@@ -3809,37 +4669,147 @@ if __name__ == "__main__":
           const hasGrok = hasGrokCredential();
           const hasClaude = hasClaudeCredential();
           const hasCursor = hasCursorCredential();
+          const configuredThirdPartyModels = hasThirdPartyModels(
+            CredentialStore.loadProviders(),
+            { models: catalogModels },
+          );
+          const officialAccountRotationEnabled = this.chatgptAccountPool.rotationEnabled();
+          const officialAccountRotationReady = officialAccountRotationEnabled
+            && this.chatgptAccountPool.listAccounts().some((account) => account.auth_status === "ready" && account.enabled);
+          const bridgeConfigured = desktopBridgeConfigured(
+            CredentialStore.loadProviders(),
+            { models: catalogModels },
+            officialAccountRotationReady,
+          );
+          // Bridge mode is an independent Desktop process preference. The
+          // gateway's managed-config flag only says whether the local egress
+          // is configured; it must not decide whether Bridge is on or off.
+          const preferredDesktopMode = readDesktopModePreference();
+          const desktopLaunchMode: DesktopLaunchMode = preferredDesktopMode || configuredDesktopLaunchMode();
+          const desktopHealth = desktopCompatibilityHealth(desktopLaunchMode, false);
+          const activeDesktopMode: DesktopAppServerState = desktopHealth.app_server;
+          const desktopBridgeStatus = resolveDesktopBridgeStatus(
+            desktopLaunchMode,
+            activeDesktopMode,
+            configuredThirdPartyModels,
+            bridgeConfigured,
+            officialAccountRotationReady,
+          );
 
           const imports = readSubscriptionImports(this.dataDir);
 
+          const oauthStatus = (provider: SubscriptionProvider, detected: boolean, active: boolean, test: any) => {
+            const pool = this.subscriptionAccountPool.describe(provider);
+            const pendingLogin = this.subscriptionAccountLogin.getPending(provider);
+            const accountCount = pool.accounts.length || (detected ? 1 : 0);
+            return {
+              auth_mode: "oauth",
+              detected: Boolean(detected || pool.accounts.some((account) => account.auth_status === "ready")),
+              account_count: accountCount,
+              pool_mode: pool.settings.mode,
+              pool_supported: true,
+              accounts: pool.accounts.map((account) => ({
+                id: account.id,
+                label: account.label,
+                enabled: account.enabled,
+                auth_status: account.auth_status,
+                last_used_at: account.last_used_at,
+                last_error: account.last_error,
+              })),
+              login_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].login_supported,
+              capture_supported: SUBSCRIPTION_LOGIN_CAPABILITIES[provider].capture_supported,
+              login_in_progress: Boolean(pendingLogin),
+              ...(pendingLogin ? { login_flow_id: pendingLogin.id } : {}),
+              active,
+              test_status: test?.last_test_status || "untested",
+              test_message: test?.last_test_message || "",
+            };
+          };
           const status = {
-            antigravity: {
-              detected: hasAntigravity,
-              active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity"),
-              test_status: imports.antigravity?.last_test_status || "untested",
-              test_message: imports.antigravity?.last_test_message || ""
+            desktop: {
+              launch_mode: desktopLaunchMode,
+              desired_mode: desktopLaunchMode,
+              mode_preference: preferredDesktopMode,
+              configured: configuredThirdPartyModels,
+              bridge_configured: bridgeConfigured,
+              bridge_available: desktopBridgeRuntimeAvailable(),
+              active_mode: activeDesktopMode,
+              bridge_enabled: desktopBridgeStatus.bridge_enabled,
+              third_party_models_exposed: desktopBridgeStatus.third_party_models_exposed,
+              official_account_rotation_enabled: officialAccountRotationEnabled,
+              official_account_rotation_ready: officialAccountRotationReady,
+              official_account_rotation_active: desktopBridgeStatus.official_account_rotation_active,
+              required_mode: desktopLaunchMode,
+              needs_bridge: desktopBridgeStatus.needs_bridge,
+              ...desktopHealth,
+              process_scoped_bridge: true,
             },
-            grok: {
-              detected: hasGrok,
-              active: isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"),
-              test_status: imports.grok?.last_test_status || "untested",
-              test_message: imports.grok?.last_test_message || ""
-            },
-            claude: {
-              detected: hasClaude,
-              active: hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"),
-              test_status: imports.claude?.last_test_status || "untested",
-              test_message: imports.claude?.last_test_message || ""
-            },
-            cursor: {
-              detected: hasCursor,
-              active: hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"),
-              test_status: imports.cursor?.last_test_status || "untested",
-              test_message: imports.cursor?.last_test_message || ""
-            }
+            antigravity: oauthStatus("antigravity", hasAntigravity, isGatewayActive && hasCatalogModelsForProvider(catalogModels, "antigravity"), imports.antigravity),
+            grok: oauthStatus("grok", hasGrok, isGatewayActive && hasCatalogModelsForProvider(catalogModels, "grok"), imports.grok),
+            claude: oauthStatus("claude", hasClaude, hasClaude && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "claude"), imports.claude),
+            cursor: oauthStatus("cursor", hasCursor, hasCursor && isGatewayActive && hasCatalogModelsForProvider(catalogModels, "cursor"), imports.cursor),
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(status));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/desktop-mode") {
+          if (this.gatewayRestartInProgress) {
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Desktop mode change already in progress", retryable: true }));
+            return;
+          }
+
+          let mode: DesktopLaunchMode;
+          try {
+            const body = await this.parseJsonBody(req);
+            if (body?.mode !== "native" && body?.mode !== "bridge") {
+              throw new Error("Desktop Bridge 模式只能是 native 或 bridge");
+            }
+            mode = body.mode;
+          } catch (error: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: error?.message || "无效的 Desktop 模式" }));
+            return;
+          }
+
+          this.gatewayRestartInProgress = true;
+          try {
+            const result = await this.applyDesktopLaunchMode(mode);
+            const status = result.health.healthy === false
+              ? "warning"
+              : result.app_server === mode
+                ? "success"
+                : "pending";
+            const message = mode === "bridge"
+              ? result.app_server === "bridge"
+                ? "Desktop Bridge 已开启，第三方模型现在走 CodexSplit 网关。"
+                : "已写入 Bridge 配置，Desktop 仍在等待桥接进程启动。"
+              : result.app_server === "native"
+                ? "Desktop Bridge 已关闭，Desktop 已恢复官方原生模型。"
+                : "已写入原生配置，Desktop 仍在等待启动。";
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({
+              status,
+              message,
+              mode: result.mode,
+              configured: result.configured,
+              bridge_configured: result.bridge_configured,
+              bridge_available: result.bridge_available,
+              official_account_rotation_enabled: result.official_account_rotation_enabled,
+              desktop: {
+                active_mode: result.app_server,
+                bridge_enabled: result.app_server === "bridge" && mode === "bridge",
+                ...result.health,
+              },
+            }));
+          } catch (error: any) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: error?.message || "Desktop 模式切换失败" }));
+          } finally {
+            this.gatewayRestartInProgress = false;
+          }
           return;
         }
 
@@ -3902,17 +4872,28 @@ if __name__ == "__main__":
             fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
             // CLI imports add provider-owned models, so managed routing is
-            // enabled only when the final catalog actually contains one.
+            // preserved only when the Desktop Bridge was already enabled and
+            // the final catalog actually contains one. Importing while the
+            // Bridge is off must keep native Desktop safe.
             const configPath = codexConfigPath();
+            const bridgeConfiguredAfterImport = desktopBridgeConfigured(
+              CredentialStore.loadProviders(),
+              catalog,
+              isOfficialAccountRotationReady(this.chatgptAccountPool),
+            );
+            let bridgeActive = false;
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
+              bridgeActive = content.includes("opencodex managed") && bridgeConfiguredAfterImport;
               fs.writeFileSync(
                 configPath,
-                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasThirdPartyModels(CredentialStore.loadProviders(), catalog)),
+                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
                 "utf-8",
               );
             }
-            CatalogSyncService.syncCustomModelsToCodexCache();
+            if (!bridgeConfiguredAfterImport) writeDesktopModePreference("native");
+            if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
+            else CatalogSyncService.syncNativeModelsToCodexCache();
 
             recordSubscriptionImport(this.dataDir, String(cli));
 
@@ -3921,6 +4902,202 @@ if __name__ == "__main__":
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        // API-key pool management. Secrets are written to Keychain by
+        // CredentialStore; only masked metadata crosses this HTTP boundary.
+        if (req.method === "POST" && url.pathname === "/api/providers/credentials/add") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
+            const apiKey = String(body.api_key || body.apiKey || "").trim();
+            if (!requestedProviderName || !apiKey) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "缺少 Provider 或 API Key" }));
+              return;
+            }
+            const providers = CredentialStore.loadProviders();
+            const provider = providers.find((item: any) =>
+              String(item?.name || "").trim().toLowerCase() === requestedProviderName
+              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
+            ) as any;
+            if (!provider) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "请先保存这个 Provider 的 Endpoint 和模型，再添加第二个 API Key" }));
+              return;
+            }
+            CredentialStore.addApiKeyCredential(providers, provider.name, apiKey, String(body.label || ""));
+            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({
+              status: "success",
+              credential: refreshed ? CredentialStore.getProviderCredentialsPublic(refreshed).slice(-1)[0] : undefined,
+              credentials: refreshed ? CredentialStore.getProviderCredentialsPublic(refreshed) : [],
+              pool_mode: refreshed ? CredentialStore.getProviderPoolMode(refreshed) : "fixed",
+            }));
+          } catch (err: any) {
+            res.writeHead(500, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/providers/credentials/remove") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
+            const credentialId = String(body.credential_id || body.credentialId || "").trim();
+            if (!requestedProviderName || !credentialId) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "缺少 Provider 或凭证 ID" }));
+              return;
+            }
+            const providers = CredentialStore.loadProviders();
+            const provider = providers.find((item: any) =>
+              String(item?.name || "").trim().toLowerCase() === requestedProviderName
+              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
+            ) as any;
+            if (!provider) throw new Error("没有找到这个 Provider");
+            CredentialStore.removeApiKeyCredential(providers, provider.name, credentialId);
+            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({
+              status: "success",
+              credentials: refreshed ? CredentialStore.getProviderCredentialsPublic(refreshed) : [],
+              pool_mode: refreshed ? CredentialStore.getProviderPoolMode(refreshed) : "fixed",
+            }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/providers/credentials/policy") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
+            const providers = CredentialStore.loadProviders();
+            const provider = providers.find((item: any) =>
+              String(item?.name || "").trim().toLowerCase() === requestedProviderName
+              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
+            ) as any;
+            if (!provider) throw new Error("没有找到这个 Provider");
+            CredentialStore.setProviderPoolPolicy(
+              providers,
+              provider.name,
+              String(body.pool_mode || body.mode || "fixed") as any,
+              String(body.active_credential_id || body.activeCredentialId || "").trim(),
+            );
+            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({
+              status: "success",
+              pool_mode: refreshed ? CredentialStore.getProviderPoolMode(refreshed) : "fixed",
+              active_credential_id: refreshed?.active_credential_id || "",
+            }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/providers/credentials/test") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
+            const credentialId = String(body.credential_id || body.credentialId || "").trim();
+            const providers = CredentialStore.loadProviders();
+            const provider = providers.find((item: any) =>
+              String(item?.name || "").trim().toLowerCase() === requestedProviderName
+              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
+            ) as any;
+            if (!provider || !credentialId) throw new Error("缺少 Provider 或凭证 ID");
+            const selected = CredentialStore.resolveApiKeyCredential(provider, credentialId);
+            if (!selected?.apiKey) {
+              CredentialStore.markProviderCredentialFailure(provider.name, credentialId, 401, "Keychain 中没有找到该 API Key");
+              throw new Error("Keychain 中没有找到该 API Key");
+            }
+            const testProvider: any = {
+              ...provider,
+              api_key: selected.apiKey,
+              credential_ref: undefined,
+              credentials: [],
+            };
+            try {
+              const models = await CatalogSyncService.discoverLiveModels(testProvider);
+              CredentialStore.markProviderCredentialSuccess(provider.name, credentialId);
+              const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+              res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+              res.end(JSON.stringify({
+                status: "connected",
+                message: `Key 可用，已返回 ${models.length} 个模型`,
+                credential: refreshed && CredentialStore.getProviderCredentialsPublic(refreshed).find((item: any) => item.id === credentialId),
+              }));
+            } catch (error: any) {
+              const message = String(error?.message || "API Key 检测失败");
+              const statusMatch = message.match(/HTTP\s+(\d{3})/i);
+              const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
+              CredentialStore.markProviderCredentialFailure(provider.name, credentialId, statusCode, message);
+              const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+              res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+              res.end(JSON.stringify({
+                status: "failed",
+                message,
+                credential: refreshed && CredentialStore.getProviderCredentialsPublic(refreshed).find((item: any) => item.id === credentialId),
+              }));
+            }
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ status: "failed", error: err.message }));
+          }
+          return;
+        }
+
+        // Discover the live model directory for one endpoint/key pair without
+        // persisting the credential or changing the selected provider models.
+        if (req.method === "POST" && url.pathname === "/api/providers/discover-models") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const requestedProviderName = String(body.name || body.preset_id || "custom").trim().toLowerCase();
+            const presetId = String(body.preset_id || requestedProviderName).trim().toLowerCase();
+            let baseUrl = String(body.base_url || body.baseUrl || "").trim();
+            let apiKey = String(body.api_key || body.apiKey || "").trim();
+
+            let found: any;
+            try {
+              found = CredentialStore.loadProviders().find((p: any) => p.name === requestedProviderName || p.name === presetId || p.preset_id === presetId);
+              if (found) {
+                baseUrl = baseUrl || String(found.baseUrl || found.base_url || "");
+                apiKey = apiKey || String(CredentialStore.resolveApiKey(found) || "");
+              }
+            } catch {}
+
+            if (!baseUrl) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "缺少 Endpoint / Base URL" }));
+              return;
+            }
+            if (!apiKey || apiKey.endsWith("-cli-auto")) {
+              res.writeHead(400, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "未找到 API Key，请先填写或保存 API Key" }));
+              return;
+            }
+
+            const models = await CatalogSyncService.discoverLiveModels({
+              name: found?.name || requestedProviderName || "discovery",
+              preset_id: presetId,
+              baseUrl,
+              api_key: apiKey,
+            });
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ status: "connected", models, count: models.length }));
+          } catch (err: any) {
+            res.writeHead(502, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ status: "failed", error: err?.message || "模型列表获取失败" }));
           }
           return;
         }
@@ -3938,23 +5115,37 @@ if __name__ == "__main__":
             const protocol = body.protocol === "responses" ? "responses" : "chat";
             let baseUrl = String(body.base_url || body.baseUrl || "").trim();
             let apiKey = String(body.api_key || body.apiKey || "").trim();
+            let foundProvider: any;
 
             try {
-              const found = CredentialStore.loadProviders().find((p: any) => p.name === presetId || p.preset_id === presetId);
-              if (found) {
-                baseUrl = baseUrl || String((found as any).baseUrl || (found as any).base_url || "");
-                apiKey = apiKey || String(CredentialStore.resolveApiKey(found) || "");
+              foundProvider = CredentialStore.loadProviders().find((p: any) =>
+                String(p?.name || "").trim().toLowerCase() === presetId
+                || String(p?.preset_id || "").trim().toLowerCase() === presetId,
+              );
+              if (foundProvider) {
+                baseUrl = baseUrl || String(foundProvider.baseUrl || foundProvider.base_url || "");
+                apiKey = apiKey || String(CredentialStore.resolveApiKey(foundProvider) || "");
               }
             } catch {}
 
+            const finishModelTest = (
+              status: ProviderTestStatus,
+              message: string,
+              httpStatus = 200,
+            ): void => {
+              const modelTest = foundProvider
+                ? recordProviderModelTest(foundProvider.name, model, protocol, status, message)
+                : undefined;
+              res.writeHead(httpStatus, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+              res.end(JSON.stringify({ status, message, ...(modelTest ? { model_test: modelTest } : {}) }));
+            };
+
             if (!presetId || !model || !baseUrl) {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "failed", message: "缺少服务商、Endpoint 或模型名称" }));
+              finishModelTest("failed", "缺少服务商、Endpoint 或模型名称", 400);
               return;
             }
             if (!apiKey || apiKey === "grok-cli-auto" || apiKey === "antigravity-cli-auto") {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "failed", message: "未找到 API Key，请先填写或保存 API Key" }));
+              finishModelTest("failed", "未找到 API Key，请先填写或保存 API Key", 400);
               return;
             }
 
@@ -3979,18 +5170,15 @@ if __name__ == "__main__":
               clearTimeout(timer);
               if (!testRes.ok) {
                 const detail = responseText.replace(/\s+/g, " ").trim().slice(0, 600);
-                res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ status: "failed", message: `${protocol === "responses" ? "Responses" : "Chat"} 测试失败 (HTTP ${testRes.status})${detail ? `：${detail}` : ""}` }));
+                finishModelTest("failed", `${protocol === "responses" ? "Responses" : "Chat"} 测试失败 (HTTP ${testRes.status})${detail ? `：${detail}` : ""}`);
                 return;
               }
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "connected", message: `${protocol === "responses" ? "Responses" : "Chat"} 测试成功，模型已返回响应` }));
+              finishModelTest("connected", `${protocol === "responses" ? "Responses" : "Chat"} 测试成功，模型已返回响应`);
               return;
             } catch (netErr: any) {
               clearTimeout(timer);
               const message = netErr?.name === "AbortError" ? "模型测试超时 (20s)" : (netErr?.message || "模型测试网络失败");
-              res.writeHead(200, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ status: "failed", message: `模型测试失败：${message}` }));
+              finishModelTest("failed", `模型测试失败：${message}`);
               return;
             }
           } catch (err: any) {
@@ -4006,22 +5194,32 @@ if __name__ == "__main__":
             const providerName = String(body.name || body.preset_id || "").trim().toLowerCase();
             let baseUrl = body.base_url || body.baseUrl;
             let apiKey = body.api_key || body.apiKey;
+            let foundProvider: any;
+            let selectedCredentialId = "";
 
             const finishTest = (status: ProviderTestStatus, message: string) => {
               if (providerName === "antigravity" || providerName === "grok" || providerName === "claude" || providerName === "cursor") {
                 recordSubscriptionTest(this.dataDir, providerName, status, message);
               } else {
                 recordProviderTest(providerName, status, message);
+                if (foundProvider && selectedCredentialId) {
+                  const statusMatch = message.match(/HTTP\s+(\d{3})/i);
+                  const statusCode = statusMatch ? Number(statusMatch[1]) : status === "connected" ? 200 : 0;
+                  if (status === "connected") CredentialStore.markProviderCredentialSuccess(foundProvider.name, selectedCredentialId);
+                  else CredentialStore.markProviderCredentialFailure(foundProvider.name, selectedCredentialId, statusCode, message);
+                }
               }
               res.writeHead(200, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ status, message }));
             };
 
             try {
-              const found = CredentialStore.loadProviders().find((p: any) => p.name === providerName || p.preset_id === providerName);
-              if (found) {
-                baseUrl = baseUrl || (found as any).baseUrl || (found as any).base_url;
-                apiKey = apiKey || CredentialStore.resolveApiKey(found);
+              foundProvider = CredentialStore.loadProviders().find((p: any) => p.name === providerName || p.preset_id === providerName);
+              if (foundProvider) {
+                baseUrl = baseUrl || (foundProvider as any).baseUrl || (foundProvider as any).base_url;
+                const resolved = CredentialStore.resolveApiKeyWithCredential(foundProvider);
+                apiKey = apiKey || resolved.apiKey;
+                selectedCredentialId = resolved.id;
               }
             } catch {}
 
@@ -5864,17 +7062,29 @@ if __name__ == "__main__":
             if (fs.existsSync(catalogPath)) {
               try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
             }
-            const hasModels = hasThirdPartyModels(CredentialStore.loadProviders(), catalog);
+            const providers = CredentialStore.loadProviders();
+            const launchMode = resolveDesktopRestartMode(
+              providers,
+              catalog,
+              readDesktopModePreference(),
+            );
+            // Persist the effective mode before stopping Desktop. In
+            // particular, a newly added provider model must promote a stale
+            // native preference to Bridge for this restart and all later
+            // restarts.
+            writeDesktopModePreference(launchMode);
+            const bridgeActive = launchMode === "bridge";
 
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
               fs.writeFileSync(
                 configPath,
-                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, hasModels),
+                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
                 "utf-8",
               );
-              CatalogSyncService.syncCustomModelsToCodexCache();
-              console.log(`[OpenCodex Gateway] Applied ${hasModels ? "managed gateway" : "native"} Codex routing before restart.`);
+              if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
+              else CatalogSyncService.syncNativeModelsToCodexCache();
+              console.log(`[CodexSplit Gateway] Applied ${bridgeActive ? "managed gateway" : "native"} Codex routing before restart.`);
             }
 
             // Codex reads model_catalog_json only when the desktop process
@@ -5882,36 +7092,51 @@ if __name__ == "__main__":
             // new gateway launch it after startup has repaired the catalog.
             // Launching it here races the PM2 restart and makes native-only
             // models appear permanently until another manual restart.
-            this.requestDesktopLaunchAfterGatewayReady();
+            this.requestDesktopLaunchAfterGatewayReady(launchMode);
             stopDesktopClients();
 
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", message: "桌面端与网关服务正在重新启动..." }));
+            res.end(JSON.stringify({
+              status: "success",
+              message: bridgeActive
+                ? "已检测到第三方模型，Desktop Bridge 将随重启自动开启。"
+                : "Desktop 将以原生模式重新启动。",
+              mode: launchMode,
+              third_party_models_exposed: bridgeActive && hasThirdPartyModels(providers, catalog),
+            }));
 
             setTimeout(() => {
               try {
-                execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex"], { stdio: "ignore" });
+                execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex", "--no-treekill"], { stdio: "ignore" });
               } catch {
                 // Keep the current gateway usable if PM2 is unavailable. The
                 // old process already has the final config/catalog, so it is
                 // safe to consume the marker and relaunch the desktop here.
                 try { fs.unlinkSync(this.desktopRestartMarkerPath); } catch {}
-                launchDesktopClient(true);
+                launchDesktopClient(true, launchMode);
                 this.gatewayRestartInProgress = false;
               }
             }, 300);
             return;
           } catch (err: any) {
             this.gatewayRestartInProgress = false;
-            console.error("[OpenCodex Gateway] Restart error:", err?.message);
+            console.error("[CodexSplit Gateway] Restart error:", err?.message);
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "success", message: "桌面端与网关服务正在重新启动..." }));
           return;
         }
 
-        if (req.method === "GET" && (url.pathname === "/assets/opencodex-logo.png" || url.pathname === "/assets/opencodex-logo-compact.png")) {
-          const logoFile = url.pathname.endsWith("-compact.png") ? "opencodex-logo-compact.png" : "opencodex-logo.png";
+        if (req.method === "GET" && [
+          "/assets/codexsplit-logo.png",
+          "/assets/codexsplit-logo-compact.png",
+          "/assets/opencodex-logo.png",
+          "/assets/opencodex-logo-compact.png",
+        ].includes(url.pathname)) {
+          const isCodexSplitLogo = url.pathname.startsWith("/assets/codexsplit-logo");
+          const logoFile = url.pathname.endsWith("-compact.png")
+            ? (isCodexSplitLogo ? "codexsplit-logo-compact.png" : "opencodex-logo-compact.png")
+            : (isCodexSplitLogo ? "codexsplit-logo.png" : "opencodex-logo.png");
           const possiblePaths = [
             path.join(process.cwd(), "src_v2", "assets", logoFile),
             path.join(process.cwd(), "dist", "src_v2", "assets", logoFile),
@@ -6032,6 +7257,7 @@ if __name__ == "__main__":
                   if (slug) nextProtocols[slug] = protocolForConfiguredModel(model, provider.model_protocols);
                 }
                 provider.model_protocols = nextProtocols;
+                pruneProviderModelTestStatus(provider, provider.models, provider.model_protocols);
                 providersChanged = true;
               }
             }
@@ -6052,16 +7278,25 @@ if __name__ == "__main__":
                 });
                 preserveOfficialModels(catalog);
                 fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
-                CatalogSyncService.syncCustomModelsToCodexCache();
               }
             }
-            const gatewayActive = hasThirdPartyModels(providers, catalog);
-            if (!gatewayActive) {
-              const configPath = codexConfigPath();
-              if (fs.existsSync(configPath)) {
-                const content = fs.readFileSync(configPath, "utf-8");
-                fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
-              }
+            const configPath = codexConfigPath();
+            let content = "";
+            try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+            const bridgeConfiguredAfterDelete = desktopBridgeConfigured(
+              providers,
+              catalog,
+              isOfficialAccountRotationReady(this.chatgptAccountPool),
+            );
+            if (!bridgeConfiguredAfterDelete) writeDesktopModePreference("native");
+            const gatewayActive = content.includes("opencodex managed")
+              && configuredDesktopLaunchMode() === "bridge"
+              && bridgeConfiguredAfterDelete;
+            fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive), "utf-8");
+            if (gatewayActive) {
+              CatalogSyncService.syncCustomModelsToCodexCache();
+            } else {
+              CatalogSyncService.syncNativeModelsToCodexCache();
             }
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ status: "success", deleted: ids, gateway_active: gatewayActive }));
@@ -6092,17 +7327,26 @@ if __name__ == "__main__":
                   );
                   preserveOfficialModels(catalog);
                   fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
-                  CatalogSyncService.syncCustomModelsToCodexCache();
                 }
               } catch {}
             }
-            const gatewayActive = hasThirdPartyModels(providers, catalog);
-            if (!gatewayActive) {
-              const configPath = codexConfigPath();
-              if (fs.existsSync(configPath)) {
-                const content = fs.readFileSync(configPath, "utf-8");
-                fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, false), "utf-8");
-              }
+            const configPath = codexConfigPath();
+            let content = "";
+            try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
+            const bridgeConfiguredAfterDelete = desktopBridgeConfigured(
+              providers,
+              catalog,
+              isOfficialAccountRotationReady(this.chatgptAccountPool),
+            );
+            if (!bridgeConfiguredAfterDelete) writeDesktopModePreference("native");
+            const gatewayActive = content.includes("opencodex managed")
+              && configuredDesktopLaunchMode() === "bridge"
+              && bridgeConfiguredAfterDelete;
+            fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive), "utf-8");
+            if (gatewayActive) {
+              CatalogSyncService.syncCustomModelsToCodexCache();
+            } else {
+              CatalogSyncService.syncNativeModelsToCodexCache();
             }
 
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -6303,10 +7547,13 @@ if __name__ == "__main__":
             // sends this thread back to chatgpt.com.
             repairNativeRollouts();
 
-            restartDesktopClients(true);
+            clearOwnedProviderBridgeLaunchEnvironment();
+            restartDesktopClients(true, "native");
+            await waitForDesktopAppServer("native");
+            const verification = desktopCompatibilityHealth("native");
 
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", gateway_active: false }));
+            res.end(JSON.stringify({ status: "success", gateway_active: false, verification }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
@@ -6995,7 +8242,12 @@ if __name__ == "__main__":
 
   public stop(): Promise<void> {
     return new Promise((resolve) => {
-      unregisterProviderBridgeEnvironment();
+      // Stopping the gateway must not change Desktop Bridge state. The Bridge
+      // keeps official GPT on the native OpenAI egress and can remain alive
+      // while third-party requests simply have no gateway to reach. Legacy
+      // launchd cleanup belongs to startup or an explicit native-mode switch,
+      // never to ordinary gateway shutdown.
+      this.chatgptAccountLogin.stopAll();
       this.stopLivePickerOverlay();
       if (this.server) {
         this.server.close(() => {

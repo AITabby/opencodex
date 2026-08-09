@@ -1,16 +1,20 @@
-# OpenCodexBar 🍏🔊
+# CodexSplit Voice Bar 🍏🔊
 
 [English](#english) | [简体中文](#简体中文)
 
 ---
 
 <p align="center">
-  <img src="preview_voice.png" alt="OpenCodexBar Widescreen Visualizer" width="800">
+  <img src="preview_voice.png" alt="CodexSplit Voice Bar Widescreen Visualizer" width="800">
 </p>
 
 # English
 
-**OpenCodexBar** is the premium, lightweight macOS companion client for **OpenCodex**. Running neatly in your macOS Status Bar, it provides global system-wide voice command hotkeys, real-time Audio-Reactive VAD, and a stunning widescreen Camera Notch visualizer HUD with full Mac Intelligence styling.
+**CodexSplit Voice Bar** is the lightweight macOS companion client for **CodexSplit**. Running neatly in your macOS Status Bar, it provides global system-wide voice command hotkeys, real-time Audio-Reactive VAD, and a widescreen Camera Notch visualizer HUD with Mac Intelligence styling.
+
+The Swift package target and embedded executable keep the historical
+`OpenCodexBar` identifier in this Beta for local compatibility; the public
+component name is CodexSplit Voice Bar.
 
 ## 🌟 Key Features
 
@@ -34,13 +38,13 @@
 ### Prerequisites
 * macOS 12.0+ (Apple Silicon or Intel)
 * Xcode Command Line Tools installed (Swift compiler `swiftc` / SPM)
-* **OpenCodex** Node.js server running in the background (`http://localhost:8765`)
+* **CodexSplit** Node.js gateway running in the background (`http://localhost:8765`)
 
 ### Quick Build & Run
 
 ```bash
-git clone https://github.com/AITabby/opencodex-bar.git
-cd opencodex-bar
+git clone https://github.com/AITabby/codexsplit.git
+cd codexsplit/voice/OpenCodexBar
 swift build -c release
 open .build/*/release/OpenCodexBar
 ```
@@ -49,7 +53,7 @@ open .build/*/release/OpenCodexBar
 
 # 简体中文
 
-**OpenCodexBar** 是 **OpenCodex** 的高颜值、轻量级 macOS 原生系统菜单栏（Status Bar）伴侣应用。它为您提供系统级的全局语音指令热键、麦克风分贝联动、实时 VAD 停顿检测，以及一个极其惊艳的顶部流光刘海视觉舱（Notch Visualizer HUD）。
+**CodexSplit Voice Bar** 是 **CodexSplit** 的轻量级 macOS 原生系统菜单栏（Status Bar）伴侣应用。它提供系统级的全局语音指令热键、麦克风分贝联动、实时 VAD 停顿检测，以及顶部流光刘海视觉舱（Notch Visualizer HUD）。
 
 ## 🌟 核心特性
 
@@ -73,13 +77,13 @@ open .build/*/release/OpenCodexBar
 ### 运行环境
 * macOS 12.0+ (支持 Apple Silicon M系列芯片 / Intel芯片)
 * 系统已安装 Xcode Command Line Tools (支持 `swift` 编译指令)
-* 本地已启动 **OpenCodex** 服务端网关 (`http://localhost:8765`)
+* 本地已启动 **CodexSplit** 服务端网关 (`http://localhost:8765`)
 
 ### 快速构建
 
 ```bash
-git clone https://github.com/AITabby/opencodex-bar.git
-cd opencodex-bar
+git clone https://github.com/AITabby/codexsplit.git
+cd codexsplit/voice/OpenCodexBar
 swift build -c release
 open .build/*/release/OpenCodexBar
 ```
