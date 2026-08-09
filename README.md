@@ -28,10 +28,6 @@ CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
 
-<p align="center">
-  <img src="./assets/dashboard-home.png" alt="CodexSplit 控制中心" width="960">
-</p>
-
 ## 产品截图
 
 ### 第三方模型配置与上游模型发现
@@ -375,8 +371,6 @@ CodexSplit is a local control center for Codex Desktop. It brings third-party mo
 Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths by default. Only models explicitly added or imported by the user are routed through the CodexSplit gateway. The Desktop bridge is a process-level switch activated only by an explicit restart after third-party models are enabled; it is not exported through launchd and does not silently replace unrelated native launches. The v2.0.0-beta.1 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed.
 
 ### Screenshots
-
-![CodexSplit control center](./assets/dashboard-home.png)
 
 ![Provider and upstream model discovery](./assets/screenshots/01-provider-model-config.png)
 
