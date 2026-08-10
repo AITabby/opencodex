@@ -21,7 +21,7 @@ import { isNativeControlPlaneModel } from "./core/model_identity.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
 import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
 import { normalizeLegacyTurnInput } from "./services/image_input.js";
-import { bindResponseAbort, linkAbortSignal } from "./services/request_lifecycle.js";
+import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "./services/request_lifecycle.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, nativeLiveCallTarget, normalizeNativeLiveCallBody, readNativeAccessToken } from "./server/webrtc_proxy.js";
 import { ChatGptAccountPool, type ChatGptAccountView } from "./services/chatgpt_account_pool.js";
 import { APP_VERSION } from "./version.js";
@@ -150,6 +150,7 @@ const RUNTIME_RESTART_MAX_DELAY_MS = 5_000;
 const RUNTIME_HEALTHY_RESET_MS = 15_000;
 const MAX_RUNTIME_RECOVERY_ATTEMPTS = 3;
 const TURN_INTERRUPT_WATCHDOG_MS = 8_000;
+const EGRESS_STREAM_IDLE_TIMEOUT_MS = 600_000;
 const RECOVERABLE_RUNTIME_METHODS = new Set([
   "thread/list",
   "thread/read",
@@ -1201,6 +1202,7 @@ async function proxyNativeEgressRequest(
       // is passed through immediately; once output starts it is not replayed.
       if (accountRouter && credential && upstreamRes.status >= 400) {
         const errorBody = await readBufferedResponse(upstreamRes);
+        if (requestController.signal.aborted) return;
         const errorValue = {
           status: upstreamRes.status,
           body: errorBody.toString("utf8"),
@@ -1231,9 +1233,21 @@ async function proxyNativeEgressRequest(
       }
       res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
       if (upstreamRes.body) {
-        // @ts-ignore Node's fetch body is an async iterable at runtime.
-        for await (const chunk of upstreamRes.body) {
-          await writeHttpResponseChunked(res, chunk);
+        const reader = upstreamRes.body.getReader();
+        try {
+          while (true) {
+            const result = await readWithAbortAndTimeout(
+              () => reader.read(),
+              requestController.signal,
+              EGRESS_STREAM_IDLE_TIMEOUT_MS,
+              "Native Egress response stream was idle for too long",
+              () => { void reader.cancel(); },
+            );
+            if (result.done) break;
+            await writeHttpResponseChunked(res, result.value);
+          }
+        } finally {
+          reader.releaseLock();
         }
       }
       res.end();
@@ -1245,7 +1259,9 @@ async function proxyNativeEgressRequest(
       ...details,
       attempts: error?.attempts,
     });
-    if (!requestController.signal.aborted && !res.headersSent && !res.destroyed) {
+    if (requestController.signal.aborted) {
+      if (!res.writableEnded && !res.destroyed) res.end();
+    } else if (!res.headersSent && !res.destroyed) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: error?.message || "native egress request failed",
@@ -1461,6 +1477,17 @@ async function proxyCliEgressRequest(
   transport: "undici" | "node_https" = "undici",
   accountRouter?: OfficialAccountRouter,
 ): Promise<void> {
+  const responseAbort = bindResponseAbort(res);
+  const requestController = new AbortController();
+  const onRequestAbort = (): void => {
+    requestController.abort(new DOMException("CLI egress request was aborted", "AbortError"));
+  };
+  if (req.aborted) onRequestAbort();
+  else {
+    req.once("aborted", onRequestAbort);
+    req.once("error", onRequestAbort);
+  }
+  const unlinkResponseAbort = linkAbortSignal(responseAbort.signal, requestController);
   try {
     const method = req.method || "GET";
     let credential = accountRouter?.credentialForRequest(req) || null;
@@ -1475,9 +1502,12 @@ async function proxyCliEgressRequest(
         timeoutMs: 600_000,
         operation,
         transport,
+        signal: requestController.signal,
       });
+      if (requestController.signal.aborted) return;
       if (accountRouter && credential && upstreamRes.status >= 400) {
         const errorBody = await readBufferedResponse(upstreamRes);
+        if (requestController.signal.aborted) return;
         const errorValue = {
           status: upstreamRes.status,
           body: errorBody.toString("utf8"),
@@ -1498,9 +1528,21 @@ async function proxyCliEgressRequest(
 
       res.writeHead(upstreamRes.status, copySafeResponseHeaders(upstreamRes.headers));
       if (upstreamRes.body) {
-        // @ts-ignore Node's fetch body is an async iterable at runtime.
-        for await (const chunk of upstreamRes.body) {
-          await writeHttpResponseChunked(res, chunk);
+        const reader = upstreamRes.body.getReader();
+        try {
+          while (true) {
+            const result = await readWithAbortAndTimeout(
+              () => reader.read(),
+              requestController.signal,
+              EGRESS_STREAM_IDLE_TIMEOUT_MS,
+              "CLI Egress response stream was idle for too long",
+              () => { void reader.cancel(); },
+            );
+            if (result.done) break;
+            await writeHttpResponseChunked(res, result.value);
+          }
+        } finally {
+          reader.releaseLock();
         }
       }
       res.end();
@@ -1512,7 +1554,9 @@ async function proxyCliEgressRequest(
       ...details,
       attempts: error?.attempts,
     });
-    if (!res.headersSent) {
+    if (requestController.signal.aborted) {
+      if (!res.writableEnded && !res.destroyed) res.end();
+    } else if (!res.headersSent) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: error?.message || "CLI egress request failed",
@@ -1522,6 +1566,11 @@ async function proxyCliEgressRequest(
         cause_code: details.code,
       }));
     }
+  } finally {
+    unlinkResponseAbort();
+    responseAbort.cleanup();
+    req.off("aborted", onRequestAbort);
+    req.off("error", onRequestAbort);
   }
 }
 

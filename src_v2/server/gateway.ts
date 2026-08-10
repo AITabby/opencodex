@@ -3588,6 +3588,8 @@ export class CodexBridgeServer {
       : typeof body === "string"
         ? body
         : JSON.stringify(body);
+    const localAbort = requestSignal ? null : bindRequestResponseAbort(req, res);
+    const effectiveSignal = requestSignal || localAbort?.signal;
 
     try {
       const upstreamRes = await fetchUpstream(targetUrl, {
@@ -3603,7 +3605,7 @@ export class CodexBridgeServer {
         timeoutMs: 600_000,
         operation: endpoint === "responses" ? "native-responses" : "native-responses-compact",
         transport: "node_https",
-        signal: requestSignal,
+        signal: effectiveSignal,
       });
       const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
@@ -3613,7 +3615,7 @@ export class CodexBridgeServer {
           while (true) {
             const result = await readWithAbortAndTimeout(
               () => reader.read(),
-              requestSignal,
+              effectiveSignal,
               120_000,
               "原生 Responses 流超过 120 秒没有新数据，已自动结束",
               () => { void reader.cancel(); },
@@ -3632,7 +3634,7 @@ export class CodexBridgeServer {
         ...details,
         attempts: err?.attempts,
       });
-      if (requestSignal?.aborted) {
+      if (effectiveSignal?.aborted) {
         if (!res.writableEnded && !res.destroyed) res.end();
       } else if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
@@ -3644,12 +3646,15 @@ export class CodexBridgeServer {
           cause_code: details.code,
         }));
       }
+    } finally {
+      localAbort?.cleanup();
     }
   }
 
   private async proxyNativeImages(req: http.IncomingMessage, body: Buffer, res: http.ServerResponse): Promise<void> {
     const nativeImagesEndpoint = "https://chatgpt.com/backend-api/codex/images/generations";
     const forwardHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
+    const requestAbort = bindRequestResponseAbort(req, res);
 
     try {
       const upstreamRes = await fetchUpstream(nativeImagesEndpoint, {
@@ -3664,13 +3669,26 @@ export class CodexBridgeServer {
         timeoutMs: 600_000,
         operation: "native-images",
         transport: "node_https",
+        signal: requestAbort.signal,
       });
       const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
       if (upstreamRes.body) {
-        // @ts-ignore Node's fetch body is an async iterable at runtime.
-        for await (const chunk of upstreamRes.body) {
-          await writeHttpResponseChunked(res, chunk);
+        const reader = upstreamRes.body.getReader();
+        try {
+          while (true) {
+            const result = await readWithAbortAndTimeout(
+              () => reader.read(),
+              requestAbort.signal,
+              120_000,
+              "原生图片响应流超过 120 秒没有新数据，已自动结束",
+              () => { void reader.cancel(); },
+            );
+            if (result.done) break;
+            await writeHttpResponseChunked(res, result.value);
+          }
+        } finally {
+          reader.releaseLock();
         }
       }
       res.end();
@@ -3680,7 +3698,9 @@ export class CodexBridgeServer {
         ...details,
         attempts: err?.attempts,
       });
-      if (!res.headersSent) {
+      if (requestAbort.signal.aborted) {
+        if (!res.writableEnded && !res.destroyed) res.end();
+      } else if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           error: err.message,
@@ -3690,6 +3710,8 @@ export class CodexBridgeServer {
           cause_code: details.code,
         }));
       }
+    } finally {
+      requestAbort.cleanup();
     }
   }
 
