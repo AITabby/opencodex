@@ -751,9 +751,10 @@ function sanitizeThirdPartySseEvent(
 }
 
 async function pipeFilteredThirdPartyResponses(
-  body: AsyncIterable<Uint8Array>,
+  body: ReadableStream<Uint8Array>,
   res: http.ServerResponse,
   responseModel = "",
+  signal?: AbortSignal,
 ): Promise<void> {
   const decoder = new TextDecoder();
   const blockedReasoningIds = new Set<string>();
@@ -769,9 +770,22 @@ async function pipeFilteredThirdPartyResponses(
     }
   };
 
-  for await (const chunk of body) {
-    buffer += decoder.decode(chunk, { stream: true });
-    await flush();
+  const reader = body.getReader();
+  try {
+    while (true) {
+      const result = await readWithAbortAndTimeout(
+        () => reader.read(),
+        signal,
+        THIRD_PARTY_RESPONSES_IDLE_TIMEOUT_MS,
+        "第三方 Responses 流读取超时，已结束本次请求",
+        () => { void reader.cancel(); },
+      );
+      if (result.done) break;
+      buffer += decoder.decode(result.value, { stream: true });
+      await flush();
+    }
+  } finally {
+    reader.releaseLock();
   }
   buffer += decoder.decode();
   await flush(true);
@@ -1344,6 +1358,7 @@ export class GatewayRouter {
     apiKey: string,
     providerUrl: string,
     res: http.ServerResponse,
+    requestSignal?: AbortSignal,
   ): Promise<"handled" | "unsupported"> {
     // Keep the native compact request shape identical to the native GPT lane.
     // Only the provider backend model name is translated; the provider owns
@@ -1359,6 +1374,7 @@ export class GatewayRouter {
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(upstreamBody),
+        signal: requestSignal,
         maxAttempts: 1,
         timeoutMs: 120_000,
         operation: "native-third-party-responses-compact",
@@ -1379,8 +1395,7 @@ export class GatewayRouter {
       res.writeHead(upstreamRes.status, responseHeaders);
       const contentType = upstreamRes.headers.get("content-type") || "";
       if (contentType.toLowerCase().includes("text/event-stream")) {
-        // @ts-ignore Node's fetch body is an async iterable at runtime.
-        await pipeFilteredThirdPartyResponses(upstreamRes.body, res, responseModel);
+        await pipeFilteredThirdPartyResponses(upstreamRes.body, res, responseModel, requestSignal);
       } else {
         const raw = await upstreamRes.text();
         try {
@@ -2332,18 +2347,14 @@ export class GatewayRouter {
       const decoder = new TextDecoder();
       let buffer = "";
 
-      const readWithTimeout = (timeoutMs = 600000): Promise<ReadableStreamReadResult<Uint8Array>> => {
-        return new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error(`Stream read timeout (${Math.round(timeoutMs / 1000)}s)`)), timeoutMs);
-          reader.read().then((result) => {
-            clearTimeout(timer);
-            resolve(result);
-          }, (error) => {
-            clearTimeout(timer);
-            reject(error);
-          });
-        });
-      };
+      const readWithTimeout = (timeoutMs = 600000): Promise<ReadableStreamReadResult<Uint8Array>> =>
+        readWithAbortAndTimeout(
+          () => reader.read(),
+          controller.signal,
+          timeoutMs,
+          `Stream read timeout (${Math.round(timeoutMs / 1000)}s)`,
+          () => { void reader.cancel(); },
+        );
 
       let providerStreamCompleted = false;
       let providerDataObserved = false;
@@ -2693,16 +2704,14 @@ export class GatewayRouter {
         let nextOutputObserved = false;
         const previousMessageText = engine.getMessageText();
         const previousToolCallIds = new Set(engine.getToolCallIds());
-        const nextReadWithTimeout = (timeoutMs: number): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error(`主模型子代理续答流读取超时（${Math.ceil(timeoutMs / 1000)}s）`)), timeoutMs);
-          nextReader.read().then((result) => {
-            clearTimeout(timer);
-            resolve(result);
-          }, (error) => {
-            clearTimeout(timer);
-            reject(error);
-          });
-        });
+        const nextReadWithTimeout = (timeoutMs: number): Promise<ReadableStreamReadResult<Uint8Array>> =>
+          readWithAbortAndTimeout(
+            () => nextReader.read(),
+            controller.signal,
+            timeoutMs,
+            `主模型子代理续答流读取超时（${Math.ceil(timeoutMs / 1000)}s）`,
+            () => { void nextReader.cancel(); },
+          );
         const processContinuationLine = async (line: string): Promise<void> => {
           const trimmed = line.trim();
           if (!trimmed.startsWith("data:")) return;

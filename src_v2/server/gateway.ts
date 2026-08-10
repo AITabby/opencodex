@@ -1858,6 +1858,10 @@ export class CodexBridgeServer {
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
   private activeLiveRequests = new Map<string, ActiveLiveRequest>();
+  // Durable subagent status is not enough to stop a live HTTP turn. Keep the
+  // actual request controllers by task id so the dashboard cancel action can
+  // abort the provider stream, child tool, and native egress boundary.
+  private activeSubagentRequests = new Map<string, Set<AbortController>>();
   private livePickerOverlayProcess: ReturnType<typeof spawn> | null = null;
   // The floating picker is an opt-in runtime surface. A gateway restart must
   // never resurrect the previous process-level toggle from disk.
@@ -2044,6 +2048,7 @@ export class CodexBridgeServer {
     }, SUBAGENT_CHILD_TOTAL_TIMEOUT_MS);
     timeoutId.unref?.();
     const unlinkParentAbort = linkAbortSignal(signal, childController);
+    const releaseSubagentRequest = this.registerSubagentRequest(taskId, childController);
     try {
       let childInput: any = message;
       const childHistory: any[] = [];
@@ -2123,6 +2128,7 @@ export class CodexBridgeServer {
     } finally {
       clearTimeout(timeoutId);
       unlinkParentAbort();
+      releaseSubagentRequest();
     }
   }
 
@@ -2322,6 +2328,34 @@ export class CodexBridgeServer {
     this.resetLiveModelPicker();
     console.warn(`[OpenCodex Realtime] ${reason}; cancelled=${cancelled}`);
     return { cancelled, reset: true };
+  }
+
+  private registerSubagentRequest(taskId: unknown, controller: AbortController): () => void {
+    const key = String(taskId || "").trim();
+    if (!key) return () => {};
+    const requests = this.activeSubagentRequests.get(key) || new Set<AbortController>();
+    requests.add(controller);
+    this.activeSubagentRequests.set(key, requests);
+    return () => {
+      const current = this.activeSubagentRequests.get(key);
+      if (!current) return;
+      current.delete(controller);
+      if (current.size === 0) this.activeSubagentRequests.delete(key);
+    };
+  }
+
+  private cancelSubagentRequest(taskId: unknown, reason = "Subagent task cancelled"): number {
+    const key = String(taskId || "").trim();
+    if (!key) return 0;
+    const requests = this.activeSubagentRequests.get(key);
+    if (!requests || requests.size === 0) return 0;
+    let cancelled = 0;
+    for (const controller of requests) {
+      if (controller.signal.aborted) continue;
+      cancelled += 1;
+      controller.abort(new DOMException(reason, "AbortError"));
+    }
+    return cancelled;
   }
 
   private isRealtimeActive(): boolean {
@@ -3759,14 +3793,21 @@ export class CodexBridgeServer {
     // A Responses-capable third-party provider owns its own compaction. The
     // gateway only translates the backend model name and forwards the native
     // compact request. There is intentionally no summary or envelope fallback.
-    const nativeCompaction = await this.router.proxyNativeThirdPartyCompaction(
-      { ...body, model: upstreamModel, protocol },
-      upstreamModel,
-      requestedModel,
-      apiKey,
-      rawUrl,
-      res,
-    );
+    const requestAbort = bindRequestResponseAbort(req, res);
+    let nativeCompaction: "handled" | "unsupported";
+    try {
+      nativeCompaction = await this.router.proxyNativeThirdPartyCompaction(
+        { ...body, model: upstreamModel, protocol },
+        upstreamModel,
+        requestedModel,
+        apiKey,
+        rawUrl,
+        res,
+        requestAbort.signal,
+      );
+    } finally {
+      requestAbort.cleanup();
+    }
     if (nativeCompaction === "unsupported" && !res.headersSent) {
       res.writeHead(501, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -4363,6 +4404,8 @@ export class CodexBridgeServer {
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
           let subagentTaskId = "";
           let liveRequestAbort: RequestResponseAbortBinding | null = null;
+          let subagentRequestAbort: RequestResponseAbortBinding | null = null;
+          let releaseSubagentRequest: (() => void) | null = null;
           let releaseLiveRequest: (() => void) | null = null;
           try {
             const request = await this.parseJsonRequest(req);
@@ -4428,6 +4471,17 @@ export class CodexBridgeServer {
               ? null
               : await this.chooseLiveWorkRoute(body, liveRequestAbort?.signal);
             subagentTaskId = subagentRoute?.task_id || "";
+            if (subagentTaskId) {
+              // A native child turn can be stopped either by the parent HTTP
+              // response closing or by the dashboard task-cancel endpoint.
+              // Bind both actions to the same controller before entering the
+              // provider/native response path.
+              subagentRequestAbort = liveRequestAbort || bindRequestResponseAbort(req, res);
+              releaseSubagentRequest = this.registerSubagentRequest(
+                subagentTaskId,
+                subagentRequestAbort.controller,
+              );
+            }
             const selectedWorkRoute = liveWorkRoute || subagentRoute;
             let effectiveBody = body;
             if (selectedWorkRoute) {
@@ -4479,7 +4533,13 @@ export class CodexBridgeServer {
                 // allowed here.
                 if (subagentTaskId) res.setHeader("x-opencodex-subagent-egress", "openai-native");
                 const nativeRawBody = effectiveBody === body ? request.rawBody : undefined;
-                await this.proxyNativeResponses(req, nativeRawBody ?? effectiveBody, res, "responses", liveRequestAbort?.signal);
+                await this.proxyNativeResponses(
+                  req,
+                  nativeRawBody ?? effectiveBody,
+                  res,
+                  "responses",
+                  liveRequestAbort?.signal || subagentRequestAbort?.signal,
+                );
                 if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
                 return;
               }
@@ -4528,7 +4588,7 @@ export class CodexBridgeServer {
               credentialId,
               adapterName,
               subagentOrigin === "gpt-live" ? "gpt-live" : "main-agent",
-              liveRequestAbort?.signal,
+              liveRequestAbort?.signal || subagentRequestAbort?.signal,
             );
             if (subagentTaskId) {
               if (responseResult.completed) this.subagentOrchestrator.complete(subagentTaskId, responseResult.output);
@@ -4542,6 +4602,10 @@ export class CodexBridgeServer {
             }
           }
           finally {
+            releaseSubagentRequest?.();
+            if (subagentRequestAbort && subagentRequestAbort !== liveRequestAbort) {
+              subagentRequestAbort.cleanup();
+            }
             releaseLiveRequest?.();
             liveRequestAbort?.cleanup();
           }
@@ -4907,9 +4971,19 @@ export class CodexBridgeServer {
 
         const agentTaskPathMatch = url.pathname.match(/^\/api\/agent-tasks\/([^/]+)\/cancel$/);
         if (agentTaskPathMatch && req.method === "POST") {
-          const task = this.subagentOrchestrator.requestCancel(decodeURIComponent(agentTaskPathMatch[1]));
+          const taskId = decodeURIComponent(agentTaskPathMatch[1]);
+          const task = this.subagentOrchestrator.requestCancel(taskId);
+          const cancelled = this.cancelSubagentRequest(taskId, "子代理任务已取消");
           res.writeHead(task ? 200 : 404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(task ? { task, note: "已记录取消请求；原生 Desktop 子任务是否立即停止由 Desktop 生命周期决定" } : { error: "子任务不存在" }));
+          res.end(JSON.stringify(task
+            ? {
+              task,
+              cancelled,
+              note: cancelled > 0
+                ? "已中止运行中的请求和工具流"
+                : "任务已记录取消；当前没有可由网关直接中止的活动请求",
+            }
+            : { error: "子任务不存在" }));
           return;
         }
 
