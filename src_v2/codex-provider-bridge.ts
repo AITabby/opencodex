@@ -784,12 +784,12 @@ export function isNativeSubagentRequest(body: unknown, headers: HeaderBag = {}):
       || headerMetadata.subagent_source
       || headerValue(headers, "x-codex-subagent-source"),
   ).toLowerCase();
-  return Boolean(
+  // `subagent_origin` describes where a child came from; it is not itself a
+  // child marker. Native GPT-Live can carry that source on the parent Live
+  // turn, and routing that parent through the provider gateway drops the
+  // native realtime/text lifecycle. Require an actual child boundary first.
+  const explicitChildMarker = Boolean(
     subagentHeader
-    || subagentOrigin === "gpt-live"
-    || subagentOrigin === "gpt_live"
-    || subagentOrigin === "realtime"
-    || subagentOrigin === "realtime_voice"
     || headerMetadata.thread_source === "subagent"
     || headerMetadata.subagent_kind
     || headerValue(headers, "x-codex-parent-thread-id")
@@ -798,6 +798,28 @@ export function isNativeSubagentRequest(body: unknown, headers: HeaderBag = {}):
     || metadata.thread_source === "subagent"
     || value.thread_source === "subagent"
     || value.source?.subagent === true,
+  );
+  if (explicitChildMarker) return true;
+
+  // Some GPT-Live child revisions expose only the Live origin plus the
+  // request-scoped child override/task identity. Preserve that compatible
+  // shape, but never let the origin alone move the native parent.
+  const liveChildIdentity = Boolean(
+    value.model_override
+    || metadata.model_override
+    || value.subagent_task_id
+    || metadata.subagent_task_id
+    || metadata.subagentTaskId
+    || value.child_thread_id
+    || value.subagent_thread_id
+    || metadata.child_thread_id
+    || metadata.subagent_thread_id,
+  );
+  return liveChildIdentity && (
+    subagentOrigin === "gpt-live"
+    || subagentOrigin === "gpt_live"
+    || subagentOrigin === "realtime"
+    || subagentOrigin === "realtime_voice"
   );
 }
 

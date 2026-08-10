@@ -87,6 +87,17 @@ test("standalone CLI keeps official requests native and sends provider-owned mod
       model_override: "antigravity/gemini-3.6-flash-medium",
     },
   }), "gateway");
+  // The Live source marker can also be present on the native parent turn.
+  // Without an actual child marker/override it must stay on native Egress so
+  // the native realtime transcript remains attached to the Live conversation.
+  assert.equal(isNativeSubagentRequest({
+    model: "gpt-5.5",
+    client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
+  }), false);
+  assert.equal(cliEgressRoute({
+    model: "gpt-5.5",
+    client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
+  }), "native");
 });
 
 test("account failover only recognizes official quota and rate-limit responses", () => {
