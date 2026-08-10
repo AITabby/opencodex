@@ -164,6 +164,7 @@ test("a native V1 Live sideband at /v1/realtime uses the API Realtime path", () 
   assert.equal(upstream.nativeSession, true);
   assert.equal(upstream.targetUrl, "https://api.openai.com/v1/realtime?call_id=rtc_v1_sideband");
   assert.equal(upstream.headers.authorization, "Bearer native-token");
+  assert.equal(upstream.headers["openai-alpha"], "quicksilver=v2");
 });
 
 test("a native V3 Live sideband preserves the live path and alpha header", () => {

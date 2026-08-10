@@ -21,6 +21,7 @@ import { isNativeControlPlaneModel } from "./core/model_identity.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked } from "./services/http_stream.js";
 import { fetchUpstream, upstreamErrorDetails } from "./services/upstream_fetch.js";
 import { normalizeLegacyTurnInput } from "./services/image_input.js";
+import { bindResponseAbort, linkAbortSignal } from "./services/request_lifecycle.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, nativeLiveCallTarget, normalizeNativeLiveCallBody, readNativeAccessToken } from "./server/webrtc_proxy.js";
 import { ChatGptAccountPool, type ChatGptAccountView } from "./services/chatgpt_account_pool.js";
 import { APP_VERSION } from "./version.js";
@@ -148,6 +149,7 @@ const RUNTIME_RESTART_BASE_DELAY_MS = 100;
 const RUNTIME_RESTART_MAX_DELAY_MS = 5_000;
 const RUNTIME_HEALTHY_RESET_MS = 15_000;
 const MAX_RUNTIME_RECOVERY_ATTEMPTS = 3;
+const TURN_INTERRUPT_WATCHDOG_MS = 8_000;
 const RECOVERABLE_RUNTIME_METHODS = new Set([
   "thread/list",
   "thread/read",
@@ -1112,7 +1114,10 @@ function proxyNativeLiveUpgrade(
     nativeAccountId: credential?.upstreamId || undefined,
     forceNativeAccessToken: Boolean(credential),
     forceNativeSession: true,
-    nativeLiveSideband: normalizeNativeLiveEndpoint(endpoint).startsWith("/live"),
+    nativeLiveSideband: ["/realtime", "/live"].some((prefix) => {
+      const normalizedEndpoint = normalizeNativeLiveEndpoint(endpoint);
+      return normalizedEndpoint === prefix || normalizedEndpoint.startsWith(`${prefix}/`);
+    }),
   });
 }
 
@@ -1127,6 +1132,17 @@ async function proxyNativeEgressRequest(
   accountRouter?: OfficialAccountRouter,
   requestPreparation?: NativeEgressRequestPreparation,
 ): Promise<void> {
+  const responseAbort = bindResponseAbort(res);
+  const requestController = new AbortController();
+  const onRequestAbort = (): void => {
+    requestController.abort(new DOMException("Native egress request was aborted", "AbortError"));
+  };
+  if (req.aborted) onRequestAbort();
+  else {
+    req.once("aborted", onRequestAbort);
+    req.once("error", onRequestAbort);
+  }
+  const unlinkResponseAbort = linkAbortSignal(responseAbort.signal, requestController);
   try {
     let credential = accountRouter?.credentialForRequest(req) || null;
     while (true) {
@@ -1143,6 +1159,7 @@ async function proxyNativeEgressRequest(
         timeoutMs: requestPreparation?.timeoutMs ?? 600_000,
         operation,
         transport,
+        signal: requestController.signal,
       });
 
       // Only official error responses are inspected here. A successful stream
@@ -1193,7 +1210,7 @@ async function proxyNativeEgressRequest(
       ...details,
       attempts: error?.attempts,
     });
-    if (!res.headersSent) {
+    if (!requestController.signal.aborted && !res.headersSent && !res.destroyed) {
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: error?.message || "native egress request failed",
@@ -1203,6 +1220,11 @@ async function proxyNativeEgressRequest(
         cause_code: details.code,
       }));
     }
+  } finally {
+    unlinkResponseAbort();
+    responseAbort.cleanup();
+    req.off("aborted", onRequestAbort);
+    req.off("error", onRequestAbort);
   }
 }
 
@@ -1791,6 +1813,7 @@ async function runProviderBridge(): Promise<void> {
     physicalThreadId: string;
     outputStarted: boolean;
     parentTurnId?: string;
+    interruptTimer?: ReturnType<typeof setTimeout>;
   }>();
   const subagentEventPollers = new Map<string, SubagentEventPoller>();
   const gatewayPort = configuredGatewayPort();
@@ -2640,10 +2663,36 @@ async function runProviderBridge(): Promise<void> {
   function clearRuntimeState(runtime: ProviderRuntime): void {
     for (const [externalId, active] of activeTurns) {
       if (active.provider === runtime.provider) {
+        if (active.interruptTimer) clearTimeout(active.interruptTimer);
         activeTurns.delete(externalId);
         stopSubagentEventPolling(externalId);
       }
     }
+  }
+
+  function clearActiveTurn(externalId: string): void {
+    const active = activeTurns.get(externalId);
+    if (active?.interruptTimer) clearTimeout(active.interruptTimer);
+    activeTurns.delete(externalId);
+  }
+
+  function scheduleTurnInterruptWatchdog(externalId: string, active: {
+    provider: CodexProvider;
+    physicalThreadId: string;
+    outputStarted: boolean;
+    parentTurnId?: string;
+    interruptTimer?: ReturnType<typeof setTimeout>;
+  }): void {
+    if (active.interruptTimer) clearTimeout(active.interruptTimer);
+    active.interruptTimer = setTimeout(() => {
+      if (activeTurns.get(externalId) !== active) return;
+      const runtime = runtimeByProvider.get(active.provider);
+      if (!runtime || runtime.stopping) return;
+      const reason = `Codex ${active.provider} turn/interrupt 超时，已重启共享运行时以释放其他会话`;
+      console.error(`[CodexSplit Provider Bridge] ${reason} thread=${externalId}`);
+      restartRuntime(runtime, reason);
+    }, TURN_INTERRUPT_WATCHDOG_MS);
+    active.interruptTimer.unref?.();
   }
 
   function canRecoverAfterRuntimeFailure(pending: PendingRequest): boolean {
@@ -2930,7 +2979,7 @@ async function runProviderBridge(): Promise<void> {
       displayProvider: NATIVE_PROVIDER,
       onResponse: (response) => {
         if (response.error) {
-          activeTurns.delete(route.externalId);
+          clearActiveTurn(route.externalId);
           if (selectedProvider === GATEWAY_PROVIDER) failedProviderRoutes.add(route.externalId);
         } else if (selectedProvider === GATEWAY_PROVIDER) {
           failedProviderRoutes.delete(route.externalId);
@@ -2997,9 +3046,9 @@ async function runProviderBridge(): Promise<void> {
     if (displayModel || childDisplay?.effort) {
       decorateThreadModel(output, displayModel, displayProvider, childDisplay?.effort);
     }
-    if (message.method === "turn/completed" && route) {
+    if (["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled"].includes(message.method) && route) {
       drainSubagentEventPolling(route.externalId);
-      activeTurns.delete(route.externalId);
+      clearActiveTurn(route.externalId);
     }
     return output;
   }
@@ -3673,6 +3722,7 @@ async function runProviderBridge(): Promise<void> {
       externalThreadId: externalId,
       physicalThreadId: active.physicalThreadId,
     });
+    if (method === "turn/interrupt") scheduleTurnInterruptWatchdog(externalId, active);
     return true;
   }
 

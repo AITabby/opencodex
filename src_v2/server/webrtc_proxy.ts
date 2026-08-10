@@ -244,7 +244,10 @@ export function resolveRealtimeUpstream(req: http.IncomingMessage, options: Real
     targetPath,
     nativeSession,
     nativeLiveCall,
-    headers: copyNativeRequestHeaders(req, options, nativeSession),
+    headers: copyNativeRequestHeaders(req, {
+      ...options,
+      nativeLiveSideband: options.nativeLiveSideband || nativeLiveSideband,
+    }, nativeSession),
   };
 }
 

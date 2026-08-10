@@ -28,6 +28,7 @@ import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from 
 import { CatalogSyncService, getProviderModelVisionCapability } from "../services/catalog_sync.js";
 import { CredentialStore } from "../services/credential_store.js";
 import { resolveSubscriptionTransport } from "../services/provider_transports.js";
+import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
 
 export class ProviderCredentialError extends Error {
   public readonly statusCode: number;
@@ -74,7 +75,7 @@ export async function emitGatewayResponsesFailure(
   upstreamModel: string,
   responseModel = "",
 ): Promise<void> {
-  if (res.writableEnded) return;
+  if (res.writableEnded || res.destroyed) return;
   if (!res.headersSent) {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -85,7 +86,7 @@ export async function emitGatewayResponsesFailure(
   }
   const selectedResponseModel = String(responseModel || requestBody?.model || upstreamModel).trim() || upstreamModel;
   const write = async (payload: any) => {
-    if (!res.writableEnded) await writeSseData(res, payload);
+    if (!res.writableEnded && !res.destroyed) await writeSseData(res, payload);
   };
   const engine = new ResponsesStreamEngine(
     upstreamModel,
@@ -110,7 +111,7 @@ export async function emitGatewayResponsesFailure(
   await write({ type: "response.failed", response: failedResponse });
   await write({ type: "response.completed", response: failedResponse });
   await write({ type: "response.done", response: failedResponse });
-  if (!res.writableEnded) {
+  if (!res.writableEnded && !res.destroyed) {
     res.write("data: [DONE]\n\n");
     res.end();
   }
@@ -333,6 +334,7 @@ async function preprocessKnownTextOnlyImages(
   providerName: string,
   nativeHeaders: Record<string, string>,
   res: http.ServerResponse,
+  requestSignal?: AbortSignal,
 ): Promise<{ requestBody: any; failed: boolean }> {
   requestBody = normalizeLegacyImageRequestBody(requestBody);
   const visionCapability = configuredProviderVisionCapability(providerName, upstreamModel);
@@ -342,6 +344,7 @@ async function preprocessKnownTextOnlyImages(
 
   const vision = await analyzeNativeVisionOnce(requestBody, nativeHeaders, {
     providerApiKey: apiKey,
+    signal: requestSignal,
     allowNetwork: hasNativeVisionImagesInCurrentTurn(requestBody),
   });
   if (vision.error) {
@@ -401,6 +404,7 @@ export interface GatewayResponsesResult {
 export type GatewaySubagentDispatcher = (
   calls: GatewaySubagentDispatchCall[],
   context: GatewaySubagentDispatchContext,
+  signal?: AbortSignal,
 ) => Promise<GatewaySubagentDispatchResult[]>;
 
 
@@ -415,6 +419,7 @@ const PROVIDER_TEXT_IDLE_TIMEOUT_MS = 30_000;
 // An upstream that opens an empty SSE response must not keep the native
 // Desktop turn pending until a later user message wakes the session up.
 const PROVIDER_EMPTY_IDLE_TIMEOUT_MS = 45_000;
+const THIRD_PARTY_RESPONSES_IDLE_TIMEOUT_MS = 45_000;
 const MAX_CURSOR_SESSION_MESSAGES = 40;
 const MAX_CURSOR_SESSION_CACHE_ENTRIES = 100;
 const cursorSessionHistory = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
@@ -834,7 +839,10 @@ function collectResponseFunctionCall(
   if (call) calls.set(call.call_id, call);
 }
 
-async function collectThirdPartyResponsesBody(response: Response): Promise<CollectedThirdPartyResponses> {
+async function collectThirdPartyResponsesBody(
+  response: Response,
+  signal?: AbortSignal,
+): Promise<CollectedThirdPartyResponses> {
   const calls = new Map<string, GatewaySubagentDispatchCall>();
   const events: string[] = [];
   let responseObject: any;
@@ -879,21 +887,33 @@ async function collectThirdPartyResponsesBody(response: Response): Promise<Colle
 
   const decoder = new TextDecoder();
   let buffer = "";
-  // @ts-ignore Node's fetch body is an async iterable at runtime.
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true });
-    const chunks = buffer.split(/\r?\n\r?\n/);
-    buffer = chunks.pop() || "";
-    for (const event of chunks) {
-      if (!event.trim()) continue;
-      events.push(event);
-      observe(event);
+  const reader = response.body.getReader();
+  try {
+    while (true) {
+      const readResult = await readWithAbortAndTimeout(
+        () => reader.read(),
+        signal,
+        THIRD_PARTY_RESPONSES_IDLE_TIMEOUT_MS,
+        "第三方 Responses 流读取超时，已结束本次请求",
+        () => { void reader.cancel(); },
+      );
+      if (readResult.done) break;
+      buffer += decoder.decode(readResult.value, { stream: true });
+      const chunks = buffer.split(/\r?\n\r?\n/);
+      buffer = chunks.pop() || "";
+      for (const event of chunks) {
+        if (!event.trim()) continue;
+        events.push(event);
+        observe(event);
+      }
     }
-  }
-  buffer += decoder.decode();
-  if (buffer.trim()) {
-    events.push(buffer);
-    observe(buffer);
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      events.push(buffer);
+      observe(buffer);
+    }
+  } finally {
+    reader.releaseLock();
   }
   return { events, response: responseObject, calls: Array.from(calls.values()) };
 }
@@ -948,6 +968,7 @@ async function proxyThirdPartyResponses(
   allowCredentialFailover = true,
   credentialId = "",
   nativeImageHeaders: Record<string, string> = {},
+  requestSignal?: AbortSignal,
 ): Promise<"handled" | "failed" | "fallback"> {
   // The native Desktop app-server may encode a user screenshot as
   // `[Image: data:image/...;base64,...]` inside an input_text item. Convert
@@ -962,6 +983,7 @@ async function proxyThirdPartyResponses(
     providerName,
     nativeImageHeaders,
     res,
+    requestSignal,
   );
   if (preprocessed.failed) return "failed";
   reqBody = preprocessed.requestBody;
@@ -1004,6 +1026,7 @@ async function proxyThirdPartyResponses(
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify(upstreamBody),
+      signal: requestSignal,
       maxAttempts: 1,
       timeoutMs: 120_000,
       operation: "native-third-party-responses",
@@ -1017,6 +1040,7 @@ async function proxyThirdPartyResponses(
         // bridge; ordinary provider auth/outage errors never do.
         const vision = await analyzeNativeVisionOnce(reqBody, nativeImageHeaders, {
           providerApiKey: apiKey,
+          signal: requestSignal,
           allowNetwork: hasNativeVisionImagesInCurrentTurn(reqBody),
         });
         if (vision.error) {
@@ -1046,6 +1070,7 @@ async function proxyThirdPartyResponses(
             Authorization: `Bearer ${apiKey}`,
           },
           body: JSON.stringify(upstreamBody),
+          signal: requestSignal,
           maxAttempts: 1,
           timeoutMs: 120_000,
           operation: "native-third-party-responses-vision-fallback",
@@ -1086,12 +1111,12 @@ async function proxyThirdPartyResponses(
     }
 
     let responseForHeaders = upstreamRes;
-    let collected: CollectedThirdPartyResponses = await collectThirdPartyResponsesBody(upstreamRes);
+    let collected: CollectedThirdPartyResponses = await collectThirdPartyResponsesBody(upstreamRes, requestSignal);
     let continuationRound = 0;
     while (subagentDispatcher && !isSubagentRequest && collected.calls.length > 0) {
       continuationRound += 1;
       if (continuationRound > 8) throw new Error("第三方主模型连续调度子代理超过 8 轮，已停止继续递归");
-      const results = await subagentDispatcher(collected.calls, subagentContext);
+      const results = await subagentDispatcher(collected.calls, subagentContext, requestSignal);
       if (results.length > 0 && results.every((result) => Boolean(result.error))) {
         const details = results.map((result) => result.error).filter(Boolean).join("；");
         throw new Error(`子代理调度失败，已停止主模型重试：${details || "没有可用的子代理结果"}`);
@@ -1104,6 +1129,7 @@ async function proxyThirdPartyResponses(
           Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(continuationBody),
+        signal: requestSignal,
         maxAttempts: 1,
         timeoutMs: 120_000,
         operation: "native-third-party-responses-subagent-continuation",
@@ -1116,7 +1142,7 @@ async function proxyThirdPartyResponses(
         throw new Error(`第三方主模型子代理续答失败（HTTP ${continuationResponse.status}）：${errorText.slice(0, 800)}`);
       }
       responseForHeaders = continuationResponse;
-      collected = await collectThirdPartyResponsesBody(continuationResponse);
+      collected = await collectThirdPartyResponsesBody(continuationResponse, requestSignal);
     }
 
     // A fetch body existing is not the same as a completed Responses turn.
@@ -1445,9 +1471,12 @@ export class GatewayRouter {
   credentialId = "",
   adapterName = "",
   subagentSource: GatewaySubagentDispatchContext["source"] = "main-agent",
+  requestSignal?: AbortSignal,
 ): Promise<GatewayResponsesResult> {
     let selectedApiKey = String(apiKey || "");
     let selectedCredentialId = String(credentialId || "");
+    const responseAbort = requestSignal ? null : bindResponseAbort(res);
+    const effectiveRequestSignal = requestSignal || responseAbort?.signal;
     if (providerName && !selectedApiKey) {
       const provider = CredentialStore.loadProviders().find((item: any) =>
         String(item?.name || "").trim().toLowerCase() === String(providerName).trim().toLowerCase()
@@ -1482,6 +1511,7 @@ export class GatewayRouter {
         true,
         adapterName,
         subagentSource,
+        effectiveRequestSignal,
       );
       if (completed.completed && selectedCredentialId) CredentialStore.markProviderCredentialSuccess(providerName, selectedCredentialId);
       return completed;
@@ -1504,6 +1534,7 @@ export class GatewayRouter {
             next.id,
             adapterName,
             subagentSource,
+            effectiveRequestSignal,
           );
         }
         await this.emitProviderCredentialFailure(
@@ -1519,7 +1550,7 @@ export class GatewayRouter {
       // Keep unexpected failures on the same per-turn Responses contract.
       // The outer HTTP handler must not turn an image/tool failure into a raw
       // JSON 400 that leaves the native app-server waiting for turn/done.
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !res.destroyed) {
         const message = error instanceof Error ? error.message : String(error || "第三方请求失败");
         console.error(`[CodexBridge V2] Responses request failed before a terminal response: ${message}`);
         await emitGatewayResponsesFailure(
@@ -1532,6 +1563,8 @@ export class GatewayRouter {
         return { completed: false, output: "" };
       }
       throw error;
+    } finally {
+      responseAbort?.cleanup();
     }
   }
 
@@ -1549,6 +1582,7 @@ export class GatewayRouter {
   allowCredentialFailover = true,
   adapterName = "",
   subagentSource: GatewaySubagentDispatchContext["source"] = "main-agent",
+  requestSignal?: AbortSignal,
   ): Promise<GatewayResponsesResult> {
     reqBody = normalizeLegacyImageRequestBody(reqBody);
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
@@ -1561,6 +1595,7 @@ export class GatewayRouter {
       providerName,
       nativeImageHeaders,
       res,
+      requestSignal,
     );
     if (preprocessed.failed) return { completed: false, output: "" };
     reqBody = preprocessed.requestBody;
@@ -1601,6 +1636,7 @@ export class GatewayRouter {
         allowCredentialFailover,
         credentialId,
         nativeImageHeaders,
+        requestSignal,
       );
       if (nativeResult === "handled") return { completed: true, output: "" };
       if (nativeResult === "failed") return { completed: false, output: "" };
@@ -1636,6 +1672,7 @@ export class GatewayRouter {
       providerName,
       nativeImageHeaders,
       res,
+      requestSignal,
     );
     if (preprocessedChat.failed) return { completed: false, output: "" };
     chatBody = preprocessedChat.requestBody;
@@ -1918,10 +1955,11 @@ export class GatewayRouter {
     res.socket?.setNoDelay(true);
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 600000);
-
+    const timeoutId = setTimeout(() => controller.abort(new DOMException("Provider turn timeout", "TimeoutError")), 600000);
+    timeoutId.unref?.();
+    const unlinkParentAbort = linkAbortSignal(requestSignal, controller);
     const writeSse = async (payload: any) => {
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !res.destroyed) {
         await writeSseData(res, payload);
       }
     };
@@ -2154,8 +2192,6 @@ export class GatewayRouter {
           }
         }
       }
-
-      clearTimeout(timeoutId);
 
       // Some legacy Chat gateways accept ordinary tool text but reject a
       // multimodal tool result with a generic Console Go 400. A screenshot
@@ -2793,7 +2829,7 @@ export class GatewayRouter {
           backend_model: upstreamModel,
           parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
           source: subagentSource,
-        });
+        }, controller.signal);
         if (results.length > 0 && results.every((result) => Boolean(result.error))) {
           const details = results.map((result) => result.error).filter(Boolean).join("；");
           throw new Error(`子代理调度失败，已停止主模型重试：${details || "没有可用的子代理结果"}`);
@@ -2863,7 +2899,6 @@ export class GatewayRouter {
       return { completed: true, output: engine.getMessageText().trim() };
     } catch (err: any) {
       if (err instanceof ProviderCredentialError) throw err;
-      clearTimeout(timeoutId);
       controller.abort();
       const upstreamDetails = upstreamErrorDetails(err);
       console.error(`[CodexBridge V2] Stream error for ${finalTargetUrl}:`, {
@@ -2902,7 +2937,7 @@ export class GatewayRouter {
           "X-Accel-Buffering": "no",
         });
       }
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !res.destroyed) {
         // A transport failure is also a failed Responses turn, regardless of
         // whether the provider failed before headers or during its stream.
         // Never synthesize assistant text or response.completed here.
@@ -2914,6 +2949,9 @@ export class GatewayRouter {
         res.end();
       }
       return { completed: false, output: "" };
+    } finally {
+      clearTimeout(timeoutId);
+      unlinkParentAbort();
     }
   }
 }

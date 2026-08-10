@@ -36,6 +36,7 @@ import { SubscriptionAccountPool, SUBSCRIPTION_ACCOUNT_PROVIDERS, type Subscript
 import { SUBSCRIPTION_LOGIN_CAPABILITIES, SubscriptionAccountLoginService } from "../services/subscription_account_auth.js";
 import { API_PROVIDER_PRESETS } from "../services/provider_presets.js";
 import { SUBSCRIPTION_TRANSPORTS } from "../services/provider_transports.js";
+import { linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
 import { APP_VERSION } from "../version.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -48,6 +49,8 @@ function isResponsesCompactionPath(pathname: string): boolean {
 }
 const SUBAGENT_ROUTE_BINDING_TTL_MS = 30 * 60 * 1000;
 const MAX_SUBAGENT_ROUTE_BINDINGS = 256;
+const SUBAGENT_CHILD_TOTAL_TIMEOUT_MS = 120_000;
+const SUBAGENT_CHILD_IDLE_TIMEOUT_MS = 45_000;
 const execFileAsync = promisify(execFile);
 type SubagentRouteBinding = {
   expiresAt: number;
@@ -1828,7 +1831,7 @@ export class CodexBridgeServer {
     this.subscriptionAccountPool = new SubscriptionAccountPool(this.dataDir);
     this.subscriptionAccountLogin = new SubscriptionAccountLoginService(this.subscriptionAccountPool);
     SubscriptionAuthService.configureAccountPool(this.subscriptionAccountPool);
-    this.router.setSubagentDispatcher((calls, context) => this.dispatchThirdPartySubagents(calls, context));
+    this.router.setSubagentDispatcher((calls, context, signal) => this.dispatchThirdPartySubagents(calls, context, signal));
     this.config.providers = CredentialStore.loadProviders();
   }
 
@@ -1871,7 +1874,7 @@ export class CodexBridgeServer {
     return requested;
   }
 
-  private async executeGatewaySubagentWorkerTool(call: GatewaySubagentWorkerCall): Promise<string> {
+  private async executeGatewaySubagentWorkerTool(call: GatewaySubagentWorkerCall, signal?: AbortSignal): Promise<string> {
     let args: any = {};
     try {
       args = call.arguments ? JSON.parse(call.arguments) : {};
@@ -1906,6 +1909,7 @@ export class CodexBridgeServer {
             cwd: workdir,
             timeout: 120_000,
             maxBuffer: 4 * 1024 * 1024,
+            signal,
           });
           return JSON.stringify({
             command,
@@ -1931,14 +1935,16 @@ export class CodexBridgeServer {
   private async dispatchThirdPartySubagents(
     calls: GatewaySubagentDispatchCall[],
     context: GatewaySubagentDispatchContext,
+    signal?: AbortSignal,
   ): Promise<GatewaySubagentDispatchResult[]> {
-    return Promise.all(calls.map((call, index) => this.dispatchThirdPartySubagent(call, context, index)));
+    return Promise.all(calls.map((call, index) => this.dispatchThirdPartySubagent(call, context, index, signal)));
   }
 
   private async dispatchThirdPartySubagent(
     call: GatewaySubagentDispatchCall,
     context: GatewaySubagentDispatchContext,
     index: number,
+    signal?: AbortSignal,
   ): Promise<GatewaySubagentDispatchResult> {
     let argumentsValue: any = {};
     try {
@@ -1986,6 +1992,12 @@ export class CodexBridgeServer {
       },
     };
 
+    const childController = new AbortController();
+    const timeoutId = setTimeout(() => {
+      childController.abort(new DOMException("子代理执行超过 120 秒，已自动结束", "TimeoutError"));
+    }, SUBAGENT_CHILD_TOTAL_TIMEOUT_MS);
+    timeoutId.unref?.();
+    const unlinkParentAbort = linkAbortSignal(signal, childController);
     try {
       let childInput: any = message;
       const childHistory: any[] = [];
@@ -2000,13 +2012,13 @@ export class CodexBridgeServer {
             "x-codex-subagent-source": context.source === "gpt-live" ? "gpt-live" : "desktop",
           },
           body: JSON.stringify({ ...childBody, input: childInput }),
-          signal: AbortSignal.timeout(600_000),
+          signal: childController.signal,
         });
         if (!childResponse.ok) {
           const errorText = await childResponse.text();
           throw new Error(`子代理 HTTP ${childResponse.status}: ${errorText.slice(0, 800)}`);
         }
-        const turn = await this.readGatewaySubagentOutput(childResponse);
+        const turn = await this.readGatewaySubagentOutput(childResponse, childController.signal);
         if (turn.error) throw new Error(turn.error);
         if (turn.tool_calls.length === 0) {
           if (!turn.output) throw new Error("子代理没有返回文本结果");
@@ -2040,7 +2052,7 @@ export class CodexBridgeServer {
             : {}),
         })));
         const toolResults = await Promise.all(turn.tool_calls.map((workerCall) =>
-          this.executeGatewaySubagentWorkerTool(workerCall)
+          this.executeGatewaySubagentWorkerTool(workerCall, childController.signal)
         ));
         childHistory.push(...turn.tool_calls.map((workerCall, resultIndex) => ({
           type: "function_call_output",
@@ -2062,10 +2074,13 @@ export class CodexBridgeServer {
         output: "",
         error: messageText,
       };
+    } finally {
+      clearTimeout(timeoutId);
+      unlinkParentAbort();
     }
   }
 
-  private async readGatewaySubagentOutput(response: Response): Promise<GatewaySubagentTurn> {
+  private async readGatewaySubagentOutput(response: Response, signal?: AbortSignal): Promise<GatewaySubagentTurn> {
     const decoder = new TextDecoder();
     let buffer = "";
     let text = "";
@@ -2135,12 +2150,24 @@ export class CodexBridgeServer {
     };
 
     if (!response.body) throw new Error("子代理没有返回响应流");
-    // @ts-ignore Node's fetch body is an async iterable at runtime.
-    for await (const chunk of response.body) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const events = buffer.split(/\r?\n\r?\n/);
-      buffer = events.pop() || "";
-      for (const event of events) consume(event);
+    const reader = response.body.getReader();
+    try {
+      while (true) {
+        const result = await readWithAbortAndTimeout(
+          () => reader.read(),
+          signal,
+          SUBAGENT_CHILD_IDLE_TIMEOUT_MS,
+          "子代理响应流超过 45 秒没有新数据，已自动结束",
+          () => { void reader.cancel(); },
+        );
+        if (result.done) break;
+        buffer += decoder.decode(result.value, { stream: true });
+        const events = buffer.split(/\r?\n\r?\n/);
+        buffer = events.pop() || "";
+        for (const event of events) consume(event);
+      }
+    } finally {
+      reader.releaseLock();
     }
     buffer += decoder.decode();
     if (buffer.trim()) consume(buffer);
