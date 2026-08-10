@@ -36,7 +36,7 @@ import { SubscriptionAccountPool, SUBSCRIPTION_ACCOUNT_PROVIDERS, type Subscript
 import { SUBSCRIPTION_LOGIN_CAPABILITIES, SubscriptionAccountLoginService } from "../services/subscription_account_auth.js";
 import { API_PROVIDER_PRESETS } from "../services/provider_presets.js";
 import { SUBSCRIPTION_TRANSPORTS } from "../services/provider_transports.js";
-import { linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
+import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
 import { APP_VERSION } from "../version.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -57,6 +57,18 @@ type SubagentRouteBinding = {
   route: { model: string; reasoning_effort?: string; profile_id?: string; reason?: string; task_id?: string };
 };
 type SubagentOrigin = "desktop" | "gpt-live";
+
+type ActiveLiveRequest = {
+  controller: AbortController;
+  keys: Set<string>;
+  startedAt: number;
+};
+
+type RequestResponseAbortBinding = {
+  controller: AbortController;
+  signal: AbortSignal;
+  cleanup: () => void;
+};
 
 type GatewaySubagentWorkerCall = {
   id: string;
@@ -101,6 +113,39 @@ function requestTurnMetadata(req: http.IncomingMessage | undefined): Record<stri
   } catch {
     return {};
   }
+}
+
+/**
+ * A Live turn crosses two local HTTP boundaries before it reaches a provider:
+ * native Codex -> egress -> gateway. Bind both sides to one signal so closing
+ * either boundary releases the provider stream instead of leaving the shared
+ * native runtime waiting for a later user message.
+ */
+function bindRequestResponseAbort(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): RequestResponseAbortBinding {
+  const controller = new AbortController();
+  const responseAbort = bindResponseAbort(res);
+  const onAbort = (): void => {
+    controller.abort(new DOMException("Live request was aborted", "AbortError"));
+  };
+  if (req.aborted) onAbort();
+  else {
+    req.once("aborted", onAbort);
+    req.once("error", onAbort);
+  }
+  const unlinkResponseAbort = linkAbortSignal(responseAbort.signal, controller);
+  return {
+    controller,
+    signal: controller.signal,
+    cleanup: () => {
+      unlinkResponseAbort();
+      responseAbort.cleanup();
+      req.off("aborted", onAbort);
+      req.off("error", onAbort);
+    },
+  };
 }
 
 // The native bridge needs the actual child thread identity in addition to the
@@ -1812,6 +1857,7 @@ export class CodexBridgeServer {
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
+  private activeLiveRequests = new Map<string, ActiveLiveRequest>();
   private livePickerOverlayProcess: ReturnType<typeof spawn> | null = null;
   // The floating picker is an opt-in runtime surface. A gateway restart must
   // never resurrect the previous process-level toggle from disk.
@@ -2198,6 +2244,84 @@ export class CodexBridgeServer {
 
   private markRealtimeActive(): void {
     this.realtimeActiveUntil = Date.now() + 15 * 60 * 1000;
+  }
+
+  private liveRequestKeys(body: any, req?: http.IncomingMessage): Set<string> {
+    const metadata = body?.client_metadata && typeof body.client_metadata === "object"
+      ? body.client_metadata
+      : {};
+    const headerMetadata = requestTurnMetadata(req);
+    const values = [
+      body?.thread_id,
+      body?.conversation_id,
+      body?.session_id,
+      body?.call_id,
+      body?.realtime_session_id,
+      metadata.child_thread_id,
+      metadata.subagent_thread_id,
+      metadata.thread_id,
+      metadata.conversation_id,
+      metadata.session_id,
+      metadata.call_id,
+      metadata.realtime_session_id,
+      headerMetadata.child_thread_id,
+      headerMetadata.subagent_thread_id,
+      headerMetadata.thread_id,
+      headerMetadata.conversation_id,
+      headerMetadata.session_id,
+      headerMetadata.call_id,
+      headerMetadata.realtime_session_id,
+      requestHeader(req, "thread-id"),
+      requestHeader(req, "session-id"),
+      requestHeader(req, "x-codex-call-id"),
+      requestHeader(req, "x-realtime-session-id"),
+    ]
+      .map((value) => String(value || "").trim())
+      .filter((value) => value && value !== "__active__");
+    return new Set(values);
+  }
+
+  private registerLiveRequest(
+    body: any,
+    req: http.IncomingMessage | undefined,
+    controller: AbortController,
+  ): () => void {
+    const id = randomUUID();
+    const entry: ActiveLiveRequest = {
+      controller,
+      keys: this.liveRequestKeys(body, req),
+      startedAt: Date.now(),
+    };
+    this.activeLiveRequests.set(id, entry);
+    return () => {
+      if (this.activeLiveRequests.get(id) === entry) this.activeLiveRequests.delete(id);
+    };
+  }
+
+  /**
+   * Close the entire Live scope. A native Live socket can close without a
+   * matching Responses request id, so the default is deliberately scoped to
+   * Live requests only rather than trying to cancel arbitrary desktop turns.
+   */
+  private cancelLiveSession(reason = "Live session closed", keys: unknown[] = []): { cancelled: number; reset: boolean } {
+    const requestedKeys = new Set(
+      keys.map((value) => String(value || "").trim()).filter(Boolean),
+    );
+    let cancelled = 0;
+    for (const [id, entry] of this.activeLiveRequests) {
+      if (requestedKeys.size > 0 && !Array.from(requestedKeys).some((key) => entry.keys.has(key))) continue;
+      this.activeLiveRequests.delete(id);
+      cancelled += 1;
+      try {
+        entry.controller.abort(new DOMException(reason, "AbortError"));
+      } catch {
+        // An already-aborted controller is still a successful cancellation.
+      }
+    }
+    this.realtimeActiveUntil = 0;
+    this.resetLiveModelPicker();
+    console.warn(`[OpenCodex Realtime] ${reason}; cancelled=${cancelled}`);
+    return { cancelled, reset: true };
   }
 
   private isRealtimeActive(): boolean {
@@ -2916,7 +3040,10 @@ export class CodexBridgeServer {
     return selectedRoute;
   }
 
-  private async chooseLiveWorkRoute(body: any): Promise<{ model: string; reasoning_effort?: string; profile_id?: string; reason?: string } | null> {
+  private async chooseLiveWorkRoute(
+    body: any,
+    requestSignal?: AbortSignal,
+  ): Promise<{ model: string; reasoning_effort?: string; profile_id?: string; reason?: string } | null> {
     if (!this.isRealtimeActive()) {
       this.activeLiveModel = null;
       this.liveModelBindings.clear();
@@ -3023,19 +3150,38 @@ export class CodexBridgeServer {
 
     const requestId = randomUUID();
     const selected = await new Promise<string>((resolve) => {
+      let settled = false;
+      const finish = (value: string): void => {
+        if (settled) return;
+        settled = true;
+        requestSignal?.removeEventListener("abort", onAbort);
+        resolve(value);
+      };
       const timer = setTimeout(() => {
         this.liveModelPickerWaiters.delete(requestId);
-        resolve("");
+        finish("");
       }, LIVE_MODEL_PICKER_TIMEOUT_MS);
+      const onAbort = (): void => {
+        clearTimeout(timer);
+        this.liveModelPickerWaiters.delete(requestId);
+        finish("");
+      };
+      if (requestSignal?.aborted) {
+        onAbort();
+        return;
+      }
+      requestSignal?.addEventListener("abort", onAbort, { once: true });
       this.liveModelPickerWaiters.set(requestId, {
         requestId,
         sessionKey,
         models,
         createdAt: now,
-        resolve,
+        resolve: finish,
         timer,
       });
     });
+
+    if (requestSignal?.aborted) return null;
 
     if (selected) {
       this.bindLiveModel(selected, sessionKey);
@@ -3425,7 +3571,13 @@ export class CodexBridgeServer {
     return readOfficialModelMap().has(requested);
   }
 
-  private async proxyNativeResponses(req: http.IncomingMessage, body: any | Buffer, res: http.ServerResponse, endpoint = "responses"): Promise<void> {
+  private async proxyNativeResponses(
+    req: http.IncomingMessage,
+    body: any | Buffer,
+    res: http.ServerResponse,
+    endpoint = "responses",
+    requestSignal?: AbortSignal,
+  ): Promise<void> {
     const nativeResponsesEndpoint = "https://chatgpt.com/backend-api/codex/responses";
     const targetUrl = endpoint === "responses"
       ? nativeResponsesEndpoint
@@ -3451,13 +3603,26 @@ export class CodexBridgeServer {
         timeoutMs: 600_000,
         operation: endpoint === "responses" ? "native-responses" : "native-responses-compact",
         transport: "node_https",
+        signal: requestSignal,
       });
       const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
       res.writeHead(upstreamRes.status, responseHeaders);
       if (upstreamRes.body) {
-        // @ts-ignore Node's fetch body is an async iterable at runtime.
-        for await (const chunk of upstreamRes.body) {
-          await writeHttpResponseChunked(res, chunk);
+        const reader = upstreamRes.body.getReader();
+        try {
+          while (true) {
+            const result = await readWithAbortAndTimeout(
+              () => reader.read(),
+              requestSignal,
+              120_000,
+              "原生 Responses 流超过 120 秒没有新数据，已自动结束",
+              () => { void reader.cancel(); },
+            );
+            if (result.done) break;
+            await writeHttpResponseChunked(res, result.value);
+          }
+        } finally {
+          reader.releaseLock();
         }
       }
       res.end();
@@ -3467,7 +3632,9 @@ export class CodexBridgeServer {
         ...details,
         attempts: err?.attempts,
       });
-      if (!res.headersSent) {
+      if (requestSignal?.aborted) {
+        if (!res.writableEnded && !res.destroyed) res.end();
+      } else if (!res.headersSent) {
         res.writeHead(502, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           error: err.message,
@@ -4050,6 +4217,7 @@ export class CodexBridgeServer {
           if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
           const realtimeUpstream = resolveRealtimeUpstream(req, { localAdminToken: this.adminToken });
           const targetUrl = realtimeUpstream.targetUrl;
+          const requestAbort = bindRequestResponseAbort(req, res);
 
           try {
             const rawBody = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await this.parseRawBuffer(req) : undefined;
@@ -4075,6 +4243,7 @@ export class CodexBridgeServer {
               timeoutMs: 120_000,
               operation: realtimeUpstream.nativeSession ? "realtime-native-http" : "realtime-api-http",
               transport: realtimeUpstream.nativeSession ? "node_https" : "undici",
+              signal: requestAbort.signal,
             });
 
             const respHeaders: Record<string, string> = {};
@@ -4084,9 +4253,21 @@ export class CodexBridgeServer {
 
             res.writeHead(upstreamRes.status, respHeaders);
             if (upstreamRes.body) {
-              // @ts-ignore
-              for await (const chunk of upstreamRes.body) {
-                res.write(chunk);
+              const reader = upstreamRes.body.getReader();
+              try {
+                while (true) {
+                  const result = await readWithAbortAndTimeout(
+                    () => reader.read(),
+                    requestAbort.signal,
+                    120_000,
+                    "Realtime HTTP 流超过 120 秒没有新数据，已自动结束",
+                    () => { void reader.cancel(); },
+                  );
+                  if (result.done) break;
+                  res.write(result.value);
+                }
+              } finally {
+                reader.releaseLock();
               }
             }
             res.end();
@@ -4096,7 +4277,9 @@ export class CodexBridgeServer {
               ...details,
               attempts: err?.attempts,
             });
-            if (!res.headersSent) {
+            if (requestAbort.signal.aborted) {
+              if (!res.writableEnded && !res.destroyed) res.end();
+            } else if (!res.headersSent) {
               res.writeHead(502, { "Content-Type": "application/json" });
               res.end(JSON.stringify({
                 error: err.message,
@@ -4106,6 +4289,8 @@ export class CodexBridgeServer {
                 cause_code: details.code,
               }));
             }
+          } finally {
+            requestAbort.cleanup();
           }
           return;
         }
@@ -4155,11 +4340,19 @@ export class CodexBridgeServer {
         // 3. V2 Core: Responses API (/v1/responses)
         if (req.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
           let subagentTaskId = "";
+          let liveRequestAbort: RequestResponseAbortBinding | null = null;
+          let releaseLiveRequest: (() => void) | null = null;
           try {
             const request = await this.parseJsonRequest(req);
             const body = request.body;
             const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
             const subagentOrigin = this.subagentOrigin(body, req);
+            const liveRequestCandidate = subagentOrigin === "gpt-live"
+              || (this.isRealtimeActive() && isLikelyLiveWorkRequest(body));
+            if (liveRequestCandidate) {
+              liveRequestAbort = bindRequestResponseAbort(req, res);
+              releaseLiveRequest = this.registerLiveRequest(body, req, liveRequestAbort.controller);
+            }
             const requestedModelBeforeRouting = this.stripReasoningSuffix(String(body?.model || ""));
             const nativeControlPlaneRequest = isNativeControlPlaneModel(requestedModelBeforeRouting);
             const nativeModelRequest = nativeControlPlaneRequest || (Boolean(requestedModelBeforeRouting)
@@ -4211,7 +4404,7 @@ export class CodexBridgeServer {
               && !isToolContinuation(body);
             const liveWorkRoute = isSubagentRequest || (nativePassthroughTurn && !nativeLiveModelIntentTurn)
               ? null
-              : await this.chooseLiveWorkRoute(body);
+              : await this.chooseLiveWorkRoute(body, liveRequestAbort?.signal);
             subagentTaskId = subagentRoute?.task_id || "";
             const selectedWorkRoute = liveWorkRoute || subagentRoute;
             let effectiveBody = body;
@@ -4264,7 +4457,7 @@ export class CodexBridgeServer {
                 // allowed here.
                 if (subagentTaskId) res.setHeader("x-opencodex-subagent-egress", "openai-native");
                 const nativeRawBody = effectiveBody === body ? request.rawBody : undefined;
-                await this.proxyNativeResponses(req, nativeRawBody ?? effectiveBody, res);
+                await this.proxyNativeResponses(req, nativeRawBody ?? effectiveBody, res, "responses", liveRequestAbort?.signal);
                 if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
                 return;
               }
@@ -4313,6 +4506,7 @@ export class CodexBridgeServer {
               credentialId,
               adapterName,
               subagentOrigin === "gpt-live" ? "gpt-live" : "main-agent",
+              liveRequestAbort?.signal,
             );
             if (subagentTaskId) {
               if (responseResult.completed) this.subagentOrchestrator.complete(subagentTaskId, responseResult.output);
@@ -4324,6 +4518,10 @@ export class CodexBridgeServer {
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: err.message }));
             }
+          }
+          finally {
+            releaseLiveRequest?.();
+            liveRequestAbort?.cleanup();
           }
           return;
         }
@@ -4518,6 +4716,27 @@ export class CodexBridgeServer {
           this.resetLiveModelPicker();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true, reset: true }));
+          return;
+        }
+
+        // Native Live's WebSocket close is outside the JSON/Responses
+        // request that carried the third-party work. The local egress calls
+        // this endpoint when that socket closes so the provider stream and
+        // the Live model binding are released together.
+        if (req.method === "POST" && url.pathname === "/api/live-session/cancel") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const keys = Array.isArray(body?.keys) ? body.keys : [];
+            const result = this.cancelLiveSession(
+              String(body?.reason || "Live session closed"),
+              keys,
+            );
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ ok: true, ...result }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
           return;
         }
 
@@ -8291,7 +8510,10 @@ export class CodexBridgeServer {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
         if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
           if (url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
-          handleWebRtcProxy(req, socket, head, { localAdminToken: this.adminToken });
+          handleWebRtcProxy(req, socket, head, {
+            localAdminToken: this.adminToken,
+            onClose: () => this.cancelLiveSession("native Live WebSocket closed"),
+          });
           return;
         }
 

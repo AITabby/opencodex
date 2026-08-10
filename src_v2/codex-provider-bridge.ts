@@ -893,6 +893,36 @@ function providerBridgeAdminToken(): string {
   return "";
 }
 
+/**
+ * The native Live socket is owned by the local egress, while third-party Live
+ * work is owned by the gateway's Responses handler. Notify the gateway when
+ * the socket closes so it can abort only the Live-scoped provider requests.
+ */
+async function notifyGatewayLiveClosed(callId = ""): Promise<void> {
+  const token = providerBridgeAdminToken();
+  if (!token) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 1_500);
+  try {
+    await fetch(`http://127.0.0.1:${configuredGatewayPort()}/api/live-session/cancel`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        reason: `native Live WebSocket closed${callId ? ` call=${callId}` : ""}`,
+      }),
+      signal: controller.signal,
+    });
+  } catch {
+    // The gateway may already be restarting. The native socket close remains
+    // authoritative and the next gateway start resets Live state as well.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function nativeEgressPath(pathname: string, basePath = "/v1"): string {
   const pathValue = pathname || "/";
   if (basePath !== "/v1") {
@@ -1098,6 +1128,7 @@ function proxyNativeLiveUpgrade(
   endpoint: string,
   accountRouter: OfficialAccountRouter,
   liveBindings: NativeLiveAccountBindings,
+  onLiveClosed?: (callId: string) => void,
 ): void {
   const requestUrl = req.url || "/";
   const requestCallId = nativeLiveUpgradeCallId(req, endpoint);
@@ -1118,6 +1149,10 @@ function proxyNativeLiveUpgrade(
       const normalizedEndpoint = normalizeNativeLiveEndpoint(endpoint);
       return normalizedEndpoint === prefix || normalizedEndpoint.startsWith(`${prefix}/`);
     }),
+    onClose: (reason) => {
+      console.error(`[OpenCodex Native Egress] native-live websocket closed${callId ? ` call=${callId}` : ""}: ${reason}`);
+      onLiveClosed?.(callId);
+    },
   });
 }
 
@@ -1343,6 +1378,7 @@ type CliEgressRouter = {
 async function startNativeEgressRouter(
   accountRouter: OfficialAccountRouter,
   onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
+  onLiveClosed?: (callId: string) => void,
 ): Promise<NativeEgressRouter> {
   const basePath = `/__opencodex_native_egress_${randomBytes(16).toString("hex")}/v1`;
   const liveBindings = new NativeLiveAccountBindings();
@@ -1360,7 +1396,7 @@ async function startNativeEgressRouter(
     const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     const endpoint = nativeEgressPath(requestUrl.pathname, basePath);
     if (isNativeLiveUpgradeEndpoint(endpoint)) {
-      proxyNativeLiveUpgrade(req, socket, head, endpoint, accountRouter, liveBindings);
+      proxyNativeLiveUpgrade(req, socket, head, endpoint, accountRouter, liveBindings, onLiveClosed);
     } else if (endpoint) {
       writeNativeEgressUpgradeFallback(socket);
     }
@@ -1548,6 +1584,7 @@ async function handleCliEgressRequest(
           const headers = localEgressHeaders(req, credential);
           const normalizedBody = normalizeNativeLiveCallBody(body, headers["content-type"] || "");
           headers["content-type"] = "application/json";
+          headers["openai-alpha"] = "quicksilver=v2";
           return { headers, body: normalizedBody };
         },
         onResponseBody: (responseBody, credential, response) => {
@@ -1569,7 +1606,10 @@ async function handleCliEgressRequest(
   );
 }
 
-async function startCliEgressRouter(accountRouter: OfficialAccountRouter): Promise<CliEgressRouter> {
+async function startCliEgressRouter(
+  accountRouter: OfficialAccountRouter,
+  onLiveClosed?: (callId: string) => void,
+): Promise<CliEgressRouter> {
   const basePath = "/v1";
   const liveBindings = new NativeLiveAccountBindings();
   const server = http.createServer((req, res) => {
@@ -1585,7 +1625,7 @@ async function startCliEgressRouter(accountRouter: OfficialAccountRouter): Promi
     const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
     const endpoint = nativeEgressPath(requestUrl.pathname, basePath);
     if (isNativeLiveUpgradeEndpoint(endpoint)) {
-      proxyNativeLiveUpgrade(req, socket, head, endpoint, accountRouter, liveBindings);
+      proxyNativeLiveUpgrade(req, socket, head, endpoint, accountRouter, liveBindings, onLiveClosed);
     } else {
       writeNativeEgressUpgradeFallback(socket);
     }
@@ -1714,7 +1754,9 @@ async function runCliProviderBridge(args: string[]): Promise<void> {
   // must not start an unrelated official-network worker during every native
   // app-server launch; account-pool selection can use the last cached view.
   const accountRouter = new OfficialAccountRouter(accountPool);
-  const cliEgress = await startCliEgressRouter(accountRouter);
+  const cliEgress = await startCliEgressRouter(accountRouter, (callId) => {
+    void notifyGatewayLiveClosed(callId);
+  });
   const configuredAccounts = accountPool.listAccounts();
   if (configuredAccounts.length > 0) console.error("[OpenCodex CLI Egress] official account pool is managed at the HTTP egress");
   const nativeEnv: NodeJS.ProcessEnv = {
@@ -1799,6 +1841,8 @@ async function runProviderBridge(): Promise<void> {
       },
     });
     applyNativeSubagentDisplaySettings?.(update);
+  }, (callId) => {
+    void notifyGatewayLiveClosed(callId);
   });
   const nativeSubagentDisplaySettings = nativeEgress.subagentDisplaySettings;
 

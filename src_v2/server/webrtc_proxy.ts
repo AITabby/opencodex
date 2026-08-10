@@ -36,6 +36,8 @@ export type RealtimeProxyOptions = {
   forceNativeSession?: boolean;
   /** Add the native V3 Live sideband protocol header at the local egress. */
   nativeLiveSideband?: boolean;
+  /** Called once when the local or upstream Live socket closes. */
+  onClose?: (reason: string) => void;
 };
 
 export type RealtimeUpstream = {
@@ -304,6 +306,12 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
   // Desktop parser drop subsequent child/realtime lifecycle messages.
   console.error(`[OpenCodex WebRTC Proxy] Proxying ${upstream.nativeSession ? "native ChatGPT" : "API"} WebSocket signal to wss://${upstream.targetHost}${target.pathname}${target.search}`);
 
+  let closeNotified = false;
+  const notifyClose = (reason: string): void => {
+    if (closeNotified) return;
+    closeNotified = true;
+    options.onClose?.(reason);
+  };
   const targetSocket = tls.connect({
     host: upstream.targetHost,
     port: 443,
@@ -338,15 +346,19 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
 
   targetSocket.on("error", (err) => {
     console.error(`[OpenCodex WebRTC Proxy Error] ${err.message}`);
+    notifyClose(`upstream websocket error: ${err.message}`);
     try { socket.destroy(); } catch {}
   });
   targetSocket.on("close", () => {
+    notifyClose("upstream websocket closed");
     try { socket.destroy(); } catch {}
   });
-  socket.on("error", () => {
+  socket.on("error", (err: Error) => {
+    notifyClose(`local websocket error: ${err.message}`);
     try { targetSocket.destroy(); } catch {}
   });
   socket.on("close", () => {
+    notifyClose("local websocket closed");
     try { targetSocket.destroy(); } catch {}
   });
 }
