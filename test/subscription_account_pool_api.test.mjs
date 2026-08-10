@@ -28,8 +28,10 @@ test("OAuth account-pool endpoints expose pool state without credentials", async
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-oauth-account-api-"));
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
   const previousConfigPath = process.env.OPENCODEX_CODEX_CONFIG_PATH;
+  const previousGrokAuthDir = process.env.OPENCODEX_GROK_AUTH_DIR;
   process.env.OPENCODEX_DATA_DIR = dataDir;
   process.env.OPENCODEX_CODEX_CONFIG_PATH = path.join(dataDir, "config.toml");
+  process.env.OPENCODEX_GROK_AUTH_DIR = path.join(dataDir, "grok");
   const port = 8893;
   const server = new CodexBridgeServer(port);
   let started = false;
@@ -67,6 +69,8 @@ test("OAuth account-pool endpoints expose pool state without credentials", async
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;
     if (previousConfigPath === undefined) delete process.env.OPENCODEX_CODEX_CONFIG_PATH;
     else process.env.OPENCODEX_CODEX_CONFIG_PATH = previousConfigPath;
+    if (previousGrokAuthDir === undefined) delete process.env.OPENCODEX_GROK_AUTH_DIR;
+    else process.env.OPENCODEX_GROK_AUTH_DIR = previousGrokAuthDir;
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });

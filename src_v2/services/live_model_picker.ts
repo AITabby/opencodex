@@ -248,6 +248,86 @@ function modelAliases(models: string[]): Map<string, Set<string>> {
   return aliasOwners;
 }
 
+/**
+ * Resolve aliases that point at the same backend model through more than one
+ * namespace. The catalog can expose a provider-owned model alongside an
+ * `opencode/...` compatibility alias. A spoken provider name such as
+ * “DeepSeek” should select the provider-owned entry; if several providers
+ * expose the same spoken family, the first catalog candidate is a stable
+ * automatic fallback unless the user names a vendor.
+ */
+function resolveAmbiguousModelCandidates(
+  matchedModels: Set<string>,
+  matchedAliases: Set<string>,
+  text: string,
+): string {
+  const candidates = Array.from(matchedModels);
+  if (candidates.length === 1) return candidates[0];
+  if (candidates.length === 0) return "";
+
+  const aliases = new Set(Array.from(matchedAliases, (alias) => normalizeModelText(alias)));
+  const compactText = compactModelText(text);
+  const providerAliases = (provider: string): string[] => {
+    const normalized = normalizeModelText(provider);
+    const variants = new Set([normalized, normalized.replace(/\s+/g, "")]);
+    if (normalized === "opencode" || normalized === "opencode go") {
+      variants.add("open code");
+      variants.add("opencode");
+    }
+    for (const brand of SPEECH_PROVIDER_BRANDS[normalized] || []) variants.add(brand);
+    return Array.from(variants).filter(Boolean);
+  };
+  const candidateProvider = (candidate: string): string => {
+    const slash = candidate.indexOf("/");
+    return slash > 0 ? normalizeModelText(candidate.slice(0, slash)) : "";
+  };
+  const providerIsModelBrand = (candidate: string, provider: string): boolean => {
+    const slash = candidate.indexOf("/");
+    if (slash <= 0) return false;
+    return compactModelText(candidate.slice(slash + 1)).startsWith(compactModelText(provider));
+  };
+  // A provider name that is present in the text but was not itself the model
+  // alias is an explicit vendor qualifier, for example “OpenCode DeepSeek”.
+  // Prefer that qualifier before the generic brand alias is resolved.
+  const explicitProviderMatches = candidates.filter((candidate) => {
+    const provider = candidateProvider(candidate);
+    if (!provider) return false;
+    const variants = providerAliases(provider);
+    const mentioned = variants.some((variant) => compactText.includes(compactModelText(variant)));
+    const isGenericBrandAlias = providerIsModelBrand(candidate, provider)
+      && variants.some((variant) => aliases.has(normalizeModelText(variant)));
+    return mentioned && !isGenericBrandAlias;
+  });
+  if (explicitProviderMatches.length === 1) return explicitProviderMatches[0];
+
+  const providerMatches = candidates.filter((candidate) => {
+    const provider = candidateProvider(candidate);
+    return Boolean(provider) && aliases.has(provider);
+  });
+  if (providerMatches.length === 1) return providerMatches[0];
+
+  // If all matches are only namespace variants of one backend model, prefer
+  // the provider-owned namespace over the OpenCode compatibility namespace.
+  // Do not apply this to different backend IDs that merely share a brand.
+  const backendModels = new Set(candidates.map((candidate) => {
+    const slash = candidate.indexOf("/");
+    return normalizeModelText(slash >= 0 ? candidate.slice(slash + 1) : candidate);
+  }));
+  if (backendModels.size === 1) {
+    const providerOwned = candidates.filter((candidate) => {
+      const slash = candidate.indexOf("/");
+      if (slash <= 0) return true;
+      const provider = normalizeModelText(candidate.slice(0, slash));
+      return provider !== "opencode" && provider !== "opencode go";
+    });
+    if (providerOwned.length === 1) return providerOwned[0];
+  }
+  // The user asked for a model family, not a catalog-internal namespace.
+  // Keep the choice deterministic when several providers expose that family;
+  // a later explicit vendor mention can still override this binding.
+  return candidates[0] || "";
+}
+
 function expandedIndexFromCompact(value: string, compactOffset: number): number {
   if (compactOffset < 0) return -1;
   let seen = 0;
@@ -290,6 +370,7 @@ function extractModelFromText(text: string, models: string[]): string {
   if (!text) return "";
   let bestAliasLength = 0;
   const matchedModels = new Set<string>();
+  const matchedAliases = new Set<string>();
   const compactText = compactModelText(text);
   for (const [alias, candidates] of modelAliases(models)) {
     let offset = text.indexOf(alias);
@@ -303,17 +384,19 @@ function extractModelFromText(text: string, models: string[]): string {
         if (matchLength > bestAliasLength) {
           bestAliasLength = matchLength;
           matchedModels.clear();
+          matchedAliases.clear();
         }
         if (matchLength < bestAliasLength) {
           offset = text.indexOf(alias, offset + Math.max(alias.length, 1));
           continue;
         }
         for (const candidate of candidates) matchedModels.add(candidate);
+        matchedAliases.add(alias);
       }
       offset = compactMatch ? -1 : text.indexOf(alias, offset + alias.length);
     }
   }
-  return matchedModels.size === 1 ? Array.from(matchedModels)[0] : "";
+  return resolveAmbiguousModelCandidates(matchedModels, matchedAliases, text);
 }
 
 export function normalizeRealtimeWorkModel(value: unknown): string {
@@ -324,11 +407,17 @@ export function normalizeRealtimeWorkModel(value: unknown): string {
 export function liveModelSessionKey(body: any): string {
   const metadata = body?.client_metadata || {};
   return String(
-    metadata.session_id ||
+    metadata.child_thread_id ||
+    metadata.subagent_thread_id ||
+    body?.child_thread_id ||
+    body?.subagent_thread_id ||
+    // A child can inherit the parent's session_id while its thread_id is the
+    // actual Live worker identity. Keep concurrent child bindings separate.
     metadata.thread_id ||
+    body?.thread_id ||
+    metadata.session_id ||
     metadata.conversation_id ||
     body?.session_id ||
-    body?.thread_id ||
     body?.conversation_id ||
     "__active__",
   ).trim() || "__active__";

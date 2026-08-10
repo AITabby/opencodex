@@ -12,6 +12,7 @@ import os from "node:os";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { spawn, execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { GatewayRouter, type GatewaySubagentDispatchCall, type GatewaySubagentDispatchContext, type GatewaySubagentDispatchResult } from "./router.js";
 import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
@@ -34,6 +35,8 @@ import { ChatGptAccountLoginService } from "../services/chatgpt_account_auth.js"
 import { SubscriptionAccountPool, SUBSCRIPTION_ACCOUNT_PROVIDERS, type SubscriptionProvider } from "../services/subscription_account_pool.js";
 import { SUBSCRIPTION_LOGIN_CAPABILITIES, SubscriptionAccountLoginService } from "../services/subscription_account_auth.js";
 import { API_PROVIDER_PRESETS } from "../services/provider_presets.js";
+import { SUBSCRIPTION_TRANSPORTS } from "../services/provider_transports.js";
+import { APP_VERSION } from "../version.js";
 
 const MAX_REQUEST_BYTES = 64 * 1024 * 1024;
 const MASKED_CREDENTIAL = "••••••••";
@@ -50,6 +53,7 @@ type SubagentRouteBinding = {
   expiresAt: number;
   route: { model: string; reasoning_effort?: string; profile_id?: string; reason?: string; task_id?: string };
 };
+type SubagentOrigin = "desktop" | "gpt-live";
 
 type GatewaySubagentWorkerCall = {
   id: string;
@@ -96,6 +100,41 @@ function requestTurnMetadata(req: http.IncomingMessage | undefined): Record<stri
   }
 }
 
+// The native bridge needs the actual child thread identity in addition to the
+// gateway task id. The task id is an orchestration record and is not always the
+// id that Desktop uses for its thread/settings state. Keep this extraction in
+// one place so normal Desktop children and GPT-Live children use the same
+// identity precedence.
+function requestSubagentThreadId(body: any, req: http.IncomingMessage | undefined): string {
+  const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object"
+    ? body.client_metadata
+    : {};
+  const headerMetadata = requestTurnMetadata(req);
+  const parentIds = new Set([
+    body?.parent_thread_id,
+    body?.parent_task_id,
+    bodyMetadata.parent_thread_id,
+    bodyMetadata.parentThreadId,
+    bodyMetadata.parent_task_id,
+    headerMetadata.parent_thread_id,
+    headerMetadata.parent_task_id,
+    requestHeader(req, "x-codex-parent-thread-id"),
+  ].map((value) => String(value || "").trim()).filter(Boolean));
+  const candidates = [
+    body?.child_thread_id,
+    body?.subagent_thread_id,
+    bodyMetadata.child_thread_id,
+    bodyMetadata.subagent_thread_id,
+    bodyMetadata.thread_id,
+    headerMetadata.child_thread_id,
+    headerMetadata.subagent_thread_id,
+    headerMetadata.thread_id,
+    requestHeader(req, "thread-id"),
+    body?.thread_id,
+  ].map((value) => String(value || "").trim()).filter(Boolean);
+  return candidates.find((value) => !parentIds.has(value)) || "";
+}
+
 function requestKind(body: any, req: http.IncomingMessage | undefined, headerMetadata: Record<string, any>): string {
   const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
   return String(
@@ -109,6 +148,13 @@ function requestKind(body: any, req: http.IncomingMessage | undefined, headerMet
 
 function normalizeModelProtocol(value: unknown): ModelProtocol {
   return String(value || "").trim().toLowerCase() === "responses" ? "responses" : "chat";
+}
+
+function normalizeAdapterName(value: unknown): ProviderConfig["adapter"] | undefined {
+  const normalized = String(value || "").trim().toLowerCase();
+  return ["openai", "deepseek", "minimax", "anthropic", "google"].includes(normalized)
+    ? normalized as ProviderConfig["adapter"]
+    : undefined;
 }
 
 function splitConfiguredModel(value: unknown): { slug: string; backendModel: string } {
@@ -157,9 +203,79 @@ function buildModelProtocolMap(
   return result;
 }
 
+export function codexHomeDir(): string {
+  const configured = String(process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME || "").trim();
+  return configured || path.join(os.homedir(), ".codex");
+}
+
+export function opencodexDataDir(): string {
+  const configured = String(process.env.OPENCODEX_DATA_DIR || "").trim();
+  return configured || path.join(os.homedir(), ".opencodex");
+}
+
 export function codexConfigPath(): string {
   const configured = String(process.env.OPENCODEX_CODEX_CONFIG_PATH || "").trim();
-  return configured || path.join(os.homedir(), ".codex", "config.toml");
+  return configured || path.join(codexHomeDir(), "config.toml");
+}
+
+export function writePrivateTextFile(filePath: string, content: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(filePath, content, { encoding: "utf-8", mode: 0o600 });
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+}
+
+function chooseRolloutBackupPath(filePath: string): string {
+  const stablePath = `${filePath}.bak`;
+  if (!fs.existsSync(stablePath)) return stablePath;
+  return `${filePath}.bak-${Date.now()}-${randomBytes(4).toString("hex")}`;
+}
+
+function writeRolloutAtomically(filePath: string, content: string): void {
+  const originalMode = fs.statSync(filePath).mode & 0o777;
+  const backupPath = chooseRolloutBackupPath(filePath);
+  fs.copyFileSync(filePath, backupPath);
+  try { fs.chmodSync(backupPath, 0o600); } catch {}
+
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(temporaryPath, "w", originalMode);
+    fs.writeFileSync(fd, content, { encoding: "utf-8" });
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(temporaryPath, filePath);
+    try { fs.chmodSync(filePath, originalMode); } catch {}
+  } finally {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    try { if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath); } catch {}
+  }
+}
+
+async function writeRolloutAtomicallyAsync(filePath: string, content: string): Promise<void> {
+  const originalMode = (await fs.promises.stat(filePath)).mode & 0o777;
+  const backupPath = chooseRolloutBackupPath(filePath);
+  await fs.promises.copyFile(filePath, backupPath);
+  try { await fs.promises.chmod(backupPath, 0o600); } catch {}
+
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  let handle: fs.promises.FileHandle | null = null;
+  try {
+    handle = await fs.promises.open(temporaryPath, "w", originalMode);
+    await handle.writeFile(content, "utf-8");
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await fs.promises.rename(temporaryPath, filePath);
+    try { await fs.promises.chmod(filePath, originalMode); } catch {}
+  } finally {
+    if (handle) {
+      try { await handle.close(); } catch {}
+    }
+    try { await fs.promises.unlink(temporaryPath); } catch {}
+  }
 }
 
 /**
@@ -232,7 +348,7 @@ export function buildManagedCodexConfig(
   content: string,
   port: number,
   adminToken: string,
-  catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json")
+  catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json")
 ): string {
   const preserved = stripManagedCodexConfig(content);
   // Keep the global default on native OpenAI. The provider bridge explicitly
@@ -363,6 +479,7 @@ const DESKTOP_PROCESS_NAMES = [
 ];
 
 export type DesktopLaunchMode = "native" | "bridge";
+export type DesktopRestartIntent = "normal" | "apply_models";
 
 // This marker is only the hand-off between the explicit "restart Codex"
 // action and the next gateway process. It must not survive long enough for a
@@ -509,6 +626,18 @@ export function clearOwnedProviderBridgeLaunchEnvironment(): boolean {
 
 type DesktopAppServerState = "bridge" | "native" | "absent";
 type ComputerUseMcpState = "official" | "legacy" | "missing" | "unknown" | "not_checked";
+type DesktopLaunchActivity = {
+  mode: DesktopLaunchMode;
+  expiresAt: number;
+};
+
+// A gateway restart can leave a short overlap between the old process's
+// relaunch timer and the new process's startup reconciliation. Keep ordinary
+// relaunch requests from killing a Desktop that is already being brought up
+// in the selected mode. Explicit mode changes pass force=true and are allowed
+// to supersede the in-flight launch.
+let desktopLaunchActivity: DesktopLaunchActivity | null = null;
+const DESKTOP_LAUNCH_GUARD_MS = 45_000;
 
 export function resolveDesktopBridgeStatus(
   desiredMode: DesktopLaunchMode,
@@ -527,7 +656,10 @@ export function resolveDesktopBridgeStatus(
     bridge_enabled: bridgeActive,
     third_party_models_exposed: bridgeActive && configuredThirdPartyModels,
     official_account_rotation_active: bridgeActive && officialAccountRotationReady,
-    needs_bridge: bridgeConfigured && desiredMode === "bridge" && !bridgeActive,
+    // Bridge is a durable Desktop transport boundary. Third-party models and
+    // official-account rotation are workloads carried by it, not conditions
+    // for keeping the Bridge process alive.
+    needs_bridge: desiredMode === "bridge" && !bridgeActive,
   };
 }
 
@@ -652,23 +784,10 @@ function desktopApplicationExecutable(): string {
 function configuredDesktopLaunchMode(): DesktopLaunchMode {
   const preferredMode = readDesktopModePreference();
   if (preferredMode) return preferredMode;
-  try {
-    const configPath = codexConfigPath();
-    if (fs.existsSync(configPath) && fs.readFileSync(configPath, "utf-8").includes("opencodex managed")) {
-      return "bridge";
-    }
-  } catch {}
-  const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
-  let catalog: any = { models: [] };
-  try {
-    if (fs.existsSync(catalogPath)) catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
-  } catch {}
-  const accountPool = new ChatGptAccountPool();
-  return desktopBridgeConfigured(
-    CredentialStore.loadProviders(),
-    catalog,
-    isOfficialAccountRotationReady(accountPool),
-  ) ? "bridge" : "native";
+  // Bridge is the normal Desktop transport even when no third-party model
+  // has been configured yet. The user can explicitly select native through
+  // the mode switch or the native-restore action.
+  return "bridge";
 }
 
 /**
@@ -686,14 +805,22 @@ export function resolveDesktopRestartMode(
   providers: ProviderConfig[] = [],
   catalog: any = {},
   preferredMode: DesktopLaunchMode | null = null,
+  intent: DesktopRestartIntent = "normal",
 ): DesktopLaunchMode {
+  // Applying a newly configured third-party model is an explicit request to
+  // expose that model in Desktop. It must promote a previously native
+  // Desktop to Bridge for this restart; otherwise the optimistic switch can
+  // briefly show Bridge and then be overwritten by the persisted native mode.
+  if (intent === "apply_models") return "bridge";
   if (preferredMode === "native" || preferredMode === "bridge") return preferredMode;
-  if (hasThirdPartyModels(providers, catalog)) return "bridge";
-  return "native";
+  // Do not infer the Bridge lifecycle from the current model catalog. It also
+  // owns official GPT account rotation and remains selected with an empty
+  // third-party catalog.
+  return "bridge";
 }
 
 function desktopModePreferencePath(
-  dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"),
+  dataDir = opencodexDataDir(),
 ): string {
   return path.join(dataDir, "desktop_mode.json");
 }
@@ -701,17 +828,25 @@ function desktopModePreferencePath(
 function readDesktopModePreference(): DesktopLaunchMode | null {
   try {
     const value = JSON.parse(fs.readFileSync(desktopModePreferencePath(), "utf-8"));
-    return value?.mode === "native" || value?.mode === "bridge" ? value.mode : null;
+    if (value?.mode === "bridge") return "bridge";
+    if (value?.mode === "native") {
+      // Releases before the durable Bridge boundary wrote `native` while
+      // merely removing the last third-party model. That was not an explicit
+      // user choice, so migrate that legacy state back to the always-on
+      // Bridge. New native writes carry explicit=true.
+      return value?.explicit === true ? "native" : "bridge";
+    }
+    return null;
   } catch {
     return null;
   }
 }
 
-function writeDesktopModePreference(mode: DesktopLaunchMode): void {
+function writeDesktopModePreference(mode: DesktopLaunchMode, explicit = true): void {
   const filePath = desktopModePreferencePath();
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify({ mode, updated_at: new Date().toISOString() })}\n`, {
+  fs.writeFileSync(temporaryPath, `${JSON.stringify({ mode, explicit, updated_at: new Date().toISOString() })}\n`, {
     encoding: "utf-8",
     mode: 0o600,
   });
@@ -812,9 +947,33 @@ function launchDesktopClient(
 function restartDesktopClients(
   launchWithCdp: boolean,
   mode: DesktopLaunchMode = configuredDesktopLaunchMode(),
+  force = false,
 ): void {
+  const now = Date.now();
+  if (!force && desktopLaunchActivity && desktopLaunchActivity.expiresAt > now) {
+    console.log(`[CodexSplit Gateway] Skipped duplicate Desktop ${mode} launch; ${desktopLaunchActivity.mode} launch is already in progress.`);
+    return;
+  }
+
+  const activity: DesktopLaunchActivity = {
+    mode,
+    expiresAt: now + DESKTOP_LAUNCH_GUARD_MS,
+  };
+  desktopLaunchActivity = activity;
   stopDesktopClients();
   launchDesktopClient(launchWithCdp, mode);
+
+  const releaseWhenSettled = () => {
+    if (desktopLaunchActivity !== activity) return;
+    if (desktopAppServerState() === mode || Date.now() >= activity.expiresAt) {
+      desktopLaunchActivity = null;
+      return;
+    }
+    const timer = setTimeout(releaseWhenSettled, 1000);
+    timer.unref?.();
+  };
+  const timer = setTimeout(releaseWhenSettled, 1000);
+  timer.unref?.();
 }
 
 function maskVoiceSettings(settings: any): any {
@@ -1128,7 +1287,7 @@ function isOfficialCachedModel(model: any): boolean {
 
 function readOfficialModelMap(): Map<string, any> {
   const official = new Map<string, any>();
-  const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+  const cachePath = path.join(codexHomeDir(), "models_cache.json");
   try {
     const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
     for (const model of Array.isArray(cache.models) ? cache.models : []) {
@@ -1446,6 +1605,16 @@ function listRolloutFiles(root: string): string[] {
   return result;
 }
 
+/**
+ * Compatibility export for older callers. Native Codex owns the local
+ * rollout files and SQLite catalog; gateway lifecycle events must never
+ * synthesize or rewrite that state.
+ */
+export function syncProviderMirrorThreadsToNativeCatalog(options: { unarchiveArchived?: boolean } = {}): number {
+  void options;
+  return 0;
+}
+
 function readLogTail(filePath: string, maxBytes = 256 * 1024): string[] {
   if (!fs.existsSync(filePath)) return [];
   let fd: number | null = null;
@@ -1484,13 +1653,6 @@ function isGatewayReasoningItem(record: any): boolean {
   return legacyGatewayId || v2GatewayId || importedThinking;
 }
 
-function isForeignResponsesReasoningItem(record: any): boolean {
-  const payload = record?.type === "response_item" ? record.payload : record;
-  if (!payload || payload.type !== "reasoning") return false;
-  const id = typeof payload.id === "string" ? payload.id : "";
-  return Boolean(id) && !isNativeResponsesReasoningId(id);
-}
-
 function normalizeStoredFunctionCallId(record: any): boolean {
   const payload = record?.type === "response_item" ? record.payload : record;
   if (!payload || payload.type !== "function_call" || typeof payload.id !== "string") return false;
@@ -1507,10 +1669,10 @@ function normalizeStoredFunctionCallId(record: any): boolean {
  * deleting those would damage a normal GPT rollout, so the V2 pattern also
  * requires the null encrypted_content that this gateway emitted.
  */
-function repairNativeRollouts(): number {
+export function repairNativeRollouts(): number {
   const roots = [
-    path.join(os.homedir(), ".codex", "sessions"),
-    path.join(os.homedir(), ".codex", "archived_sessions"),
+    path.join(codexHomeDir(), "sessions"),
+    path.join(codexHomeDir(), "archived_sessions"),
   ];
   let repaired = 0;
 
@@ -1531,7 +1693,10 @@ function repairNativeRollouts(): number {
     }
 
     const sanitized = records.filter((record) => {
-      if (isGatewayReasoningItem(record) || isForeignResponsesReasoningItem(record)) {
+      // Preserve unknown reasoning records. They may belong to a native
+      // rollout; deleting them heuristically can leave an old conversation
+      // blank when Desktop reopens it. Only a gateway marker is actionable.
+      if (isGatewayReasoningItem(record)) {
         changed = true;
         return false;
       }
@@ -1540,7 +1705,7 @@ function repairNativeRollouts(): number {
     if (!changed) continue;
 
     try {
-      fs.writeFileSync(rolloutPath, `${sanitized.map((record) => JSON.stringify(record)).join("\n")}\n`, "utf-8");
+      writeRolloutAtomically(rolloutPath, `${sanitized.map((record) => JSON.stringify(record)).join("\n")}\n`);
       repaired++;
     } catch (error: any) {
       console.error(`[OpenCodex V2] Could not repair native rollout ${rolloutPath}: ${error.message}`);
@@ -1558,10 +1723,10 @@ function repairNativeRollouts(): number {
  * Keep the native-mode safety repair, but yield between files so a mode
  * change does not block the gateway's HTTP event loop.
  */
-async function repairNativeRolloutsAsync(): Promise<number> {
+export async function repairNativeRolloutsAsync(): Promise<number> {
   const roots = [
-    path.join(os.homedir(), ".codex", "sessions"),
-    path.join(os.homedir(), ".codex", "archived_sessions"),
+    path.join(codexHomeDir(), "sessions"),
+    path.join(codexHomeDir(), "archived_sessions"),
   ];
   let repaired = 0;
 
@@ -1594,7 +1759,7 @@ async function repairNativeRolloutsAsync(): Promise<number> {
     }
 
     const sanitized = records.filter((record) => {
-      if (isGatewayReasoningItem(record) || isForeignResponsesReasoningItem(record)) {
+      if (isGatewayReasoningItem(record)) {
         changed = true;
         return false;
       }
@@ -1602,10 +1767,9 @@ async function repairNativeRolloutsAsync(): Promise<number> {
     });
     if (changed) {
       try {
-        await fs.promises.writeFile(
+        await writeRolloutAtomicallyAsync(
           rolloutPath,
           sanitized.map((record) => JSON.stringify(record)).join("\n") + "\n",
-          "utf-8",
         );
         repaired++;
       } catch (error: any) {
@@ -1634,6 +1798,7 @@ export class CodexBridgeServer {
   private readonly adminToken: string;
   private readonly agentProfileStore: AgentProfileStore;
   private readonly taskRouter: TaskRouter;
+  private readonly liveTaskRouter: TaskRouter;
   private readonly subagentOrchestrator: SubagentOrchestrator;
   private readonly chatgptAccountPool: ChatGptAccountPool;
   private readonly chatgptAccountLogin: ChatGptAccountLoginService;
@@ -1645,14 +1810,18 @@ export class CodexBridgeServer {
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
   private livePickerOverlayProcess: ReturnType<typeof spawn> | null = null;
+  // The floating picker is an opt-in runtime surface. A gateway restart must
+  // never resurrect the previous process-level toggle from disk.
+  private liveModelPickerEnabled = false;
 
   constructor(port = 8765) {
     this.port = port;
-    this.dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex");
+    this.dataDir = opencodexDataDir();
     this.desktopRestartMarkerPath = path.join(this.dataDir, "restart_desktop_after_gateway_ready");
     this.adminToken = this.loadOrCreateAdminToken();
     this.agentProfileStore = new AgentProfileStore(this.dataDir);
-    this.taskRouter = new TaskRouter(this.agentProfileStore);
+    this.taskRouter = new TaskRouter(this.agentProfileStore, "subagent");
+    this.liveTaskRouter = new TaskRouter(this.agentProfileStore, "gpt-live");
     this.subagentOrchestrator = new SubagentOrchestrator(this.dataDir);
     this.chatgptAccountPool = new ChatGptAccountPool(this.dataDir);
     this.chatgptAccountLogin = new ChatGptAccountLoginService(this.chatgptAccountPool);
@@ -1670,14 +1839,14 @@ export class CodexBridgeServer {
    * real child Responses turn locally and returns its text as the tool result
    * for the parent provider continuation.
    */
-  private findSubagentProfileForModel(modelValue: string): any | undefined {
+  private findSubagentProfileForModel(modelValue: string, profileRouter: TaskRouter = this.taskRouter): any | undefined {
     const requested = this.stripReasoningSuffix(String(modelValue || "").trim()).toLowerCase();
     if (!requested) return undefined;
     const normalizedRequested = requested.replace(/^opencode-go\//i, "opencode/");
-    const catalogModel = this.taskRouter.listModels().find((model) =>
+    const catalogModel = profileRouter.listModels().find((model) =>
       model.slug.toLowerCase() === requested || model.backend_model.toLowerCase() === requested,
     );
-    return this.taskRouter.listProfiles().find((profile: any) => {
+    return profileRouter.listProfiles().find((profile: any) => {
       if (!profile?.enabled || !profile?.subagent_enabled || !profile.model_ref) return false;
       const ref = profile.model_ref;
       const catalogSlug = String(ref.catalog_slug || "").trim().toLowerCase();
@@ -1781,6 +1950,7 @@ export class CodexBridgeServer {
     const message = String(argumentsValue?.message || argumentsValue?.task || argumentsValue?.instructions || "").trim();
     const forcedModel = String(argumentsValue?.model || "").trim();
     const profileId = String(argumentsValue?.profile_id || "").trim();
+    const profileName = String(argumentsValue?.profile_name || "").trim();
     const callReasoning = String(
       argumentsValue?.reasoning_effort || argumentsValue?.reasoning?.effort || "",
     ).trim();
@@ -1789,7 +1959,7 @@ export class CodexBridgeServer {
       return { call_id: call.call_id, output: "", error: "spawn_agent 缺少 message" };
     }
 
-    const taskId = `gateway-child-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 7)}`;
+    const taskId = `gateway-child-${index}-${randomUUID()}`;
     // This function is the spawn_agent boundary. It must forward the
     // unresolved child request to the gateway and let chooseSubagentRoute()
     // make the only routing decision. In particular, do not call TaskRouter
@@ -1802,12 +1972,15 @@ export class CodexBridgeServer {
         "x-openai-subagent": "1",
         thread_source: "subagent",
         subagent_kind: "gateway-spawn-agent",
+        subagent_origin: context.source === "gpt-live" ? "gpt-live" : "desktop",
+        subagent_depth: 1,
         request_kind: "turn",
         session_id: taskId,
         parent_task_id: context.parent_task_id || "gateway-main",
         turn_id: `turn-${taskId}`,
         ...(forcedModel ? { model_override: forcedModel } : {}),
         ...(profileId ? { profile_id: profileId } : {}),
+        ...(profileName ? { profile_name: profileName } : {}),
         ...(taskName ? { task_type: taskName } : {}),
         ...(callReasoning ? { reasoning_effort: callReasoning } : {}),
       },
@@ -1824,6 +1997,7 @@ export class CodexBridgeServer {
             Authorization: `Bearer ${this.adminToken}`,
             "x-openai-subagent": "1",
             "x-codex-parent-thread-id": context.parent_task_id || "gateway-main",
+            "x-codex-subagent-source": context.source === "gpt-live" ? "gpt-live" : "desktop",
           },
           body: JSON.stringify({ ...childBody, input: childInput }),
           signal: AbortSignal.timeout(600_000),
@@ -2033,7 +2207,7 @@ export class CodexBridgeServer {
     app_server: DesktopAppServerState;
     health: ReturnType<typeof desktopCompatibilityHealth>;
   }> {
-    const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
     let catalog: any = { models: [] };
     if (fs.existsSync(catalogPath)) {
       try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
@@ -2067,9 +2241,12 @@ export class CodexBridgeServer {
     let content = "";
     try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
     const nextConfig = buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, mode === "bridge");
-    fs.mkdirSync(path.dirname(configPath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(configPath, nextConfig, "utf-8");
+    writePrivateTextFile(configPath, nextConfig);
     writeDesktopModePreference(mode);
+
+    // Stop the current Desktop before relaunching it so the native session
+    // store has one owner during the mode transition.
+    stopDesktopClients();
 
     if (mode === "bridge") {
       CatalogSyncService.syncCustomModelsToCodexCache();
@@ -2079,11 +2256,11 @@ export class CodexBridgeServer {
       repairNativeRollouts();
     }
 
-    restartDesktopClients(true, mode);
+    restartDesktopClients(true, mode, true);
     let appServer = await waitForDesktopAppServer(mode);
     if (mode === "bridge" && process.platform === "darwin" && appServer !== "bridge") {
       console.warn(`[CodexSplit Gateway] Desktop Bridge was not detected after the first launch (state=${appServer}); retrying once while keeping Bridge selected.`);
-      restartDesktopClients(true, mode);
+      restartDesktopClients(true, mode, true);
       appServer = await waitForDesktopAppServer(mode);
     }
     if (mode === "bridge" && process.platform === "darwin" && appServer !== "bridge") {
@@ -2110,7 +2287,9 @@ export class CodexBridgeServer {
   }
 
   private reconcilePreferredBridgeAfterGatewayReady(): void {
-    if (readDesktopModePreference() !== "bridge") return;
+    // Bridge is the durable default. Only an explicit native preference
+    // suppresses reattachment after the gateway itself restarts.
+    if ((readDesktopModePreference() || "bridge") !== "bridge") return;
     if (desktopAppServerState() === "bridge") {
       console.log("[CodexSplit Gateway] Desktop Bridge is already attached; gateway restart leaves the existing Desktop untouched.");
       return;
@@ -2120,11 +2299,11 @@ export class CodexBridgeServer {
       return;
     }
     const launchTimer = setTimeout(() => {
-      if (readDesktopModePreference() !== "bridge" || desktopAppServerState() === "bridge") return;
+      if ((readDesktopModePreference() || "bridge") !== "bridge" || desktopAppServerState() === "bridge") return;
       restartDesktopClients(true, "bridge");
       console.log("[CodexSplit Gateway] Gateway is ready; restored the selected Desktop Bridge mode after restart.");
       const verifyTimer = setTimeout(() => {
-        if (readDesktopModePreference() === "bridge" && desktopAppServerState() !== "bridge") {
+        if ((readDesktopModePreference() || "bridge") === "bridge" && desktopAppServerState() !== "bridge") {
           console.warn("[CodexSplit Gateway] Desktop Bridge did not attach after gateway restart; the selected Bridge mode is being preserved for the next retry.");
         }
       }, 3000);
@@ -2162,8 +2341,9 @@ export class CodexBridgeServer {
     }
 
     const launchTimer = setTimeout(() => {
-      if (mode === "bridge" && configuredDesktopLaunchMode() !== "bridge") {
-        console.log("[CodexSplit Gateway] Ignored a stale bridge takeover marker because neither third-party routing nor official account rotation is enabled.");
+      const selectedMode = readDesktopModePreference() || "bridge";
+      if (mode !== selectedMode) {
+        console.log(`[CodexSplit Gateway] Ignored a stale ${mode} Desktop launch marker because ${selectedMode} mode is selected.`);
         return;
       }
       const expectedState = mode === "bridge" ? "bridge" : "native";
@@ -2189,9 +2369,25 @@ export class CodexBridgeServer {
         }
       } catch {}
     };
-    addCatalog(path.join(os.homedir(), ".codex", "models_catalog.json"));
-    addCatalog(path.join(os.homedir(), ".opencodex", "custom_model_catalog.json"));
+    addCatalog(path.join(codexHomeDir(), "models_catalog.json"));
+    addCatalog(path.join(opencodexDataDir(), "custom_model_catalog.json"));
     return orderOfficialModelsFirst(Array.from(models), readOfficialModelMap().keys());
+  }
+
+  private defaultRequestModel(): string {
+    const configured = String(process.env.OPENCODEX_DEFAULT_MODEL || "").trim();
+    if (configured) return configured;
+    try {
+      const content = fs.existsSync(codexConfigPath()) ? fs.readFileSync(codexConfigPath(), "utf-8") : "";
+      const match = content.match(/^\s*model\s*=\s*"([^"]+)"/m);
+      if (match?.[1]?.trim()) return match[1].trim();
+    } catch {}
+    const official = readOfficialModelMap().keys().next().value;
+    if (typeof official === "string" && official.trim()) return official.trim();
+    const custom = this.readImportedModelCatalog()
+      .map((entry: any) => String(entry?.slug || entry?.model || entry?.id || "").trim())
+      .find(Boolean);
+    return custom || "";
   }
 
   private liveModelIntentCandidates(): string[] {
@@ -2214,28 +2410,31 @@ export class CodexBridgeServer {
   }
 
   private isLiveModelPickerEnabled(): boolean {
-    try {
-      const state = JSON.parse(fs.readFileSync(this.liveModelPickerStatePath(), "utf-8"));
-      if (typeof state?.enabled === "boolean") return state.enabled;
-    } catch {}
-
-    // Read the legacy field once for existing installations. New writes use
-    // the dedicated Live state file so ordinary voice-settings saves cannot
-    // turn the floating ball off during a Codex restart.
-    try {
-      const settings = JSON.parse(fs.readFileSync(this.liveModelPickerSettingsPath(), "utf-8"));
-      return settings?.live_model_picker_enabled === true;
-    } catch {
-      return false;
-    }
+    return this.liveModelPickerEnabled;
   }
 
-  private setLiveModelPickerEnabled(enabled: boolean): void {
+  private persistLiveModelPickerEnabled(enabled: boolean): void {
     const statePath = this.liveModelPickerStatePath();
     fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(statePath, JSON.stringify({ enabled }, null, 2), "utf-8");
     try { fs.chmodSync(statePath, 0o600); } catch {}
-    if (!enabled) {
+  }
+
+  private resetLivePickerForGatewayStart(): void {
+    this.liveModelPickerEnabled = false;
+    this.resetLiveModelPicker();
+    // Make the reset visible to any other local helper immediately. The
+    // in-memory flag remains authoritative for this gateway instance.
+    this.persistLiveModelPickerEnabled(false);
+    // A hard gateway kill does not run stop(); remove an orphaned native
+    // helper before the new gateway can serve the dashboard.
+    this.stopLivePickerOverlay();
+  }
+
+  private setLiveModelPickerEnabled(enabled: boolean): void {
+    this.liveModelPickerEnabled = enabled === true;
+    this.persistLiveModelPickerEnabled(this.liveModelPickerEnabled);
+    if (!this.liveModelPickerEnabled) {
       this.resetLiveModelPicker();
       this.stopLivePickerOverlay();
     } else {
@@ -2259,8 +2458,18 @@ export class CodexBridgeServer {
     if (process.platform !== "darwin" || this.livePickerOverlayProcess || !this.isLiveModelPickerEnabled()) return;
     const executable = this.livePickerOverlayExecutable();
     if (!executable) {
-      console.warn("[OpenCodex Realtime] Native Live picker overlay is unavailable; keeping the web fallback available.");
+      console.warn("[OpenCodex Realtime] Native Live picker overlay is unavailable; the web duplicate remains disabled.");
       return;
+    }
+    const existingPids = this.livePickerOverlayPids(executable);
+    if (existingPids.length > 0) {
+      // The gateway can be restarted independently from the native picker.
+      // Stop every old copy before starting the current binary, otherwise an
+      // old helper survives the restart and its UI code never gets updated.
+      for (const pid of existingPids) {
+        try { process.kill(pid); } catch {}
+      }
+      console.log("[OpenCodex Realtime] Refreshing native Live picker overlay; removed " + existingPids.length + " old copy/copies");
     }
     const child = spawn(executable, [], {
       cwd: path.dirname(executable),
@@ -2283,20 +2492,36 @@ export class CodexBridgeServer {
     console.log(`[OpenCodex Realtime] Native Live picker overlay started for port ${this.port}`);
   }
 
+  private livePickerOverlayPids(executable: string): number[] {
+    if (!executable) return [];
+    try {
+      const output = execFileSync("pgrep", ["-f", executable], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return output
+        .split(/\s+/)
+        .map((value) => Number.parseInt(value, 10))
+        .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+    } catch {
+      return [];
+    }
+  }
+
   private stopLivePickerOverlay(): void {
     const child = this.livePickerOverlayProcess;
     this.livePickerOverlayProcess = null;
     if (child && !child.killed) child.kill();
+    if (!child) {
+      const executable = this.livePickerOverlayExecutable();
+      for (const pid of this.livePickerOverlayPids(executable)) {
+        try { process.kill(pid); } catch {}
+      }
+    }
   }
 
   private liveRoutingMode(): "auto" | "forced" | "off" {
-    const routingPath = path.join(this.dataDir, "live_routing.json");
-    if (!fs.existsSync(routingPath)) {
-      // Existing 1.0.8 installations have only the picker flag. Preserve that
-      // behavior until the user explicitly saves the 1.1.0 routing setting.
-      return this.isLiveModelPickerEnabled() ? "forced" : "off";
-    }
-    return this.taskRouter.getSettings().mode;
+    return this.liveTaskRouter.getSettings().mode;
   }
 
   private liveRouteRequest(body: any, source: "gpt-live" = "gpt-live") {
@@ -2312,6 +2537,71 @@ export class CodexBridgeServer {
       required_tools: Array.isArray(body?.required_tools) ? body.required_tools : (Array.isArray(metadata.required_tools) ? metadata.required_tools : []),
       permission: body?.permission || metadata.permission || "",
     };
+  }
+
+  private currentLiveModelBinding(body: any): { model: string; expiresAt: number } | null {
+    if (!this.isRealtimeActive()) return null;
+    const now = Date.now();
+    const sessionKey = liveModelSessionKey(body);
+    const sessionBinding = this.liveModelBindings.get(sessionKey);
+    if (sessionBinding?.expiresAt > now) {
+      sessionBinding.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
+      return sessionBinding;
+    }
+    if (sessionBinding) this.liveModelBindings.delete(sessionKey);
+
+    if (this.activeLiveModel?.expiresAt > now) {
+      const binding = {
+        model: this.activeLiveModel.model,
+        expiresAt: now + LIVE_MODEL_BINDING_TTL_MS,
+      };
+      this.liveModelBindings.set(sessionKey, binding);
+      return binding;
+    }
+    if (this.activeLiveModel) this.activeLiveModel = null;
+    return null;
+  }
+
+  private selectedLiveModelForPicker(sessionKey = ""): string {
+    const mode = this.liveRoutingMode();
+    if (mode === "off") return "";
+
+    if (mode === "forced") {
+      const settings = this.liveTaskRouter.getSettings();
+      const forcedModel = normalizeRealtimeWorkModel(settings.forced_model);
+      if (forcedModel) return forcedModel;
+      if (settings.forced_profile_id) {
+        const profile = this.liveTaskRouter.findProfileSelector(settings.forced_profile_id);
+        const profileModel = normalizeRealtimeWorkModel(profile?.model_ref?.catalog_slug || profile?.model_ref?.backend_model);
+        if (profileModel) return profileModel;
+      }
+    }
+
+    if (sessionKey) {
+      const binding = this.liveModelBindings.get(sessionKey);
+      if (binding?.expiresAt > Date.now()) return binding.model;
+      if (binding) this.liveModelBindings.delete(sessionKey);
+    }
+    if (this.activeLiveModel?.expiresAt > Date.now()) return this.activeLiveModel.model;
+    if (this.activeLiveModel) this.activeLiveModel = null;
+    return "";
+  }
+
+  private selectedLiveModels(): string[] {
+    const now = Date.now();
+    const selected = new Set<string>();
+    const forced = this.selectedLiveModelForPicker();
+    if (forced) selected.add(forced);
+    if (this.activeLiveModel?.expiresAt > now) selected.add(this.activeLiveModel.model);
+    else if (this.activeLiveModel) this.activeLiveModel = null;
+    for (const [key, binding] of this.liveModelBindings) {
+      if (binding.expiresAt <= now) {
+        this.liveModelBindings.delete(key);
+        continue;
+      }
+      selected.add(binding.model);
+    }
+    return Array.from(selected);
   }
 
   private isSubagentResponsesRequest(body: any, req?: http.IncomingMessage): boolean {
@@ -2337,8 +2627,64 @@ export class CodexBridgeServer {
     );
   }
 
+  private subagentOrigin(body: any, req?: http.IncomingMessage): SubagentOrigin {
+    const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
+    const headerMetadata = requestTurnMetadata(req);
+    const explicit = String(
+      body?.subagent_origin ||
+      body?.subagent_source ||
+      bodyMetadata.subagent_origin ||
+      bodyMetadata.subagent_source ||
+      headerMetadata.subagent_origin ||
+      headerMetadata.subagent_source ||
+      requestHeader(req, "x-codex-subagent-source") ||
+      "",
+    ).trim().toLowerCase();
+    if (explicit === "gpt-live" || explicit === "gpt_live" || explicit === "realtime" || explicit === "realtime_voice") {
+      return "gpt-live";
+    }
+    if (explicit === "desktop" || explicit === "main-agent" || explicit === "main_agent") return "desktop";
+
+    const realtimeParent = [
+      bodyMetadata.thread_source,
+      bodyMetadata.parent_thread_source,
+      headerMetadata.thread_source,
+      headerMetadata.parent_thread_source,
+      body?.thread_source,
+    ].some((value) => String(value || "").trim().toLowerCase() === "realtime_voice");
+    const nativeLiveThreadSpawn = Boolean(
+      bodyMetadata?.source?.subagent?.thread_spawn ||
+      body?.source?.subagent?.thread_spawn ||
+      headerMetadata?.source?.subagent?.thread_spawn,
+    );
+    const isChildRequest = this.isSubagentResponsesRequest(body, req);
+    const liveParentKeys = [
+      bodyMetadata.parent_thread_id,
+      bodyMetadata.parentThreadId,
+      bodyMetadata.parent_task_id,
+      body?.parent_thread_id,
+      body?.parent_task_id,
+    ].map((value) => String(value || "").trim()).filter(Boolean);
+    const followsLiveBinding = isChildRequest && liveParentKeys.some((key) => this.liveModelBindings.has(key));
+    if (realtimeParent || (nativeLiveThreadSpawn && this.isRealtimeActive()) || followsLiveBinding || (!isChildRequest && this.isRealtimeActive() && (isLikelyLiveWorkRequest(body) || isLikelyLiveModelIntentRequest(body, true)))) {
+      return "gpt-live";
+    }
+    return "desktop";
+  }
+
+  private subagentRoutingMode(): "auto" | "forced" | "off" {
+    return this.taskRouter.getSettings().mode;
+  }
+
   private chooseSubagentRoute(body: any, req?: http.IncomingMessage): { model: string; reasoning_effort?: string; profile_id?: string; reason?: string; task_id?: string } | null {
     if (!this.isSubagentResponsesRequest(body, req)) return null;
+    const origin = this.subagentOrigin(body, req);
+    const routingRouter = origin === "gpt-live" ? this.liveTaskRouter : this.taskRouter;
+    const routingMode = origin === "gpt-live" ? this.liveRoutingMode() : this.subagentRoutingMode();
+    // With routing disabled, the owning native runtime keeps model selection.
+    // Let the request continue with the model it already carries instead of
+    // turning the child boundary into a gateway-generated 400.
+    if (routingMode === "off") return null;
     const bodyMetadata = body?.client_metadata && typeof body.client_metadata === "object" ? body.client_metadata : {};
     const headerMetadata = requestTurnMetadata(req);
     const metadata = { ...headerMetadata, ...bodyMetadata };
@@ -2347,6 +2693,10 @@ export class CodexBridgeServer {
     // the child identity first; otherwise concurrent children of one parent
     // overwrite each other's model and lifecycle state.
     const taskId = String(
+      metadata.subagent_task_id ||
+      metadata.subagentTaskId ||
+      body?.subagent_task_id ||
+      body?.subagentTaskId ||
       metadata.child_thread_id ||
       metadata.subagent_thread_id ||
       metadata.thread_id ||
@@ -2381,27 +2731,50 @@ export class CodexBridgeServer {
       (!bodyModelIsNative ? bodyModel : "") ||
       "",
     ).trim();
-    const configuredProfiles = this.taskRouter.listProfiles();
-    const requestedProfileId = String(
+    const configuredProfiles = routingRouter.listProfiles();
+    const requestedProfileSelector = String(
       body?.agent_profile_id ||
       body?.profile_id ||
       body?.subagent_profile_id ||
       body?.child_profile_id ||
+      body?.profile_name ||
+      body?.subagent_profile_name ||
+      body?.child_profile_name ||
       metadata.agent_profile_id ||
       metadata.agentProfileId ||
       metadata.profile_id ||
       metadata.subagent_profile_id ||
       metadata.child_profile_id ||
+      metadata.profile_name ||
+      metadata.subagent_profile_name ||
+      metadata.child_profile_name ||
       "",
     ).trim();
-    const explicitProfile = requestedProfileId
-      ? configuredProfiles.find((profile: any) => profile.id === requestedProfileId)
-      : undefined;
-    const modelProfile = explicitModel ? this.findSubagentProfileForModel(explicitModel) : undefined;
+    const taskText = extractTaskText(body);
+    const namedProfile = requestedProfileSelector
+      ? routingRouter.findProfileSelector(requestedProfileSelector)
+      : configuredProfiles.find((profile: any) => {
+        const name = String(profile?.name || "").trim();
+        return name.length >= 2 && taskText.toLocaleLowerCase().includes(name.toLocaleLowerCase());
+      });
+    const requestedProfileId = namedProfile?.id || "";
+    const modelProfile = explicitModel ? this.findSubagentProfileForModel(explicitModel, routingRouter) : undefined;
+    const routingSettings = routingRouter.getSettings();
+    const liveBinding = origin === "gpt-live" && (routingMode === "auto" || (
+      routingMode === "forced" && !routingSettings.forced_model && !routingSettings.forced_profile_id
+    )) ? this.currentLiveModelBinding(body) : null;
+    const liveModelProfile = liveBinding?.model ? this.findSubagentProfileForModel(liveBinding.model, routingRouter) : undefined;
     // A model selected in the Web directory carries its own durable Profile.
     // Bind that Profile here as well as in the gateway-owned spawn_agent path,
     // so a parent-generated reasoning value cannot override its configuration.
-    const boundProfile = explicitProfile || modelProfile;
+    // In forced mode, the saved forced target is authoritative and any
+    // per-child model/profile request is deliberately ignored.
+    const boundProfile = routingMode === "forced" ? undefined : (namedProfile || modelProfile || liveModelProfile);
+    const forcedProfileId = routingMode === "forced" ? String(routingSettings.forced_profile_id || "").trim() : "";
+    const liveOverrideModel = liveBinding?.model || "";
+    const forcedModel = routingMode === "forced"
+      ? String(routingSettings.forced_model || "").trim() || (forcedProfileId ? "" : liveOverrideModel)
+      : (boundProfile ? "" : (explicitModel || liveOverrideModel));
     const now = Date.now();
     for (const [bindingId, binding] of this.subagentRouteBindings) {
       if (binding.expiresAt <= now) this.subagentRouteBindings.delete(bindingId);
@@ -2413,14 +2786,18 @@ export class CodexBridgeServer {
       metadata.reasoning_effort ||
       "",
     ).trim();
-    if (existingBinding && (!explicitModel || explicitModel.toLowerCase() === existingBinding.route.model.toLowerCase())) {
+    if (existingBinding && (
+      routingMode === "forced" ||
+      !explicitModel ||
+      explicitModel.toLowerCase() === existingBinding.route.model.toLowerCase()
+    )) {
       existingBinding.expiresAt = now + SUBAGENT_ROUTE_BINDING_TTL_MS;
       const bindingProfile = existingBinding.route.profile_id
         ? configuredProfiles.find((profile: any) => profile.id === existingBinding.route.profile_id)
         : undefined;
       const profileReasoning = boundProfile?.reasoning_effort || bindingProfile?.reasoning_effort;
       const reasoning = profileReasoning || (explicitReasoning
-        ? this.taskRouter.normalizeReasoningEffort(existingBinding.route.model, explicitReasoning, true) || existingBinding.route.reasoning_effort
+        ? routingRouter.normalizeReasoningEffort(existingBinding.route.model, explicitReasoning, true) || existingBinding.route.reasoning_effort
         : existingBinding.route.reasoning_effort);
       existingBinding.route = {
         ...existingBinding.route,
@@ -2430,41 +2807,75 @@ export class CodexBridgeServer {
       return existingBinding.route;
     }
     const routeRequest = {
-      source: "subagent" as const,
+      source: origin === "gpt-live" ? "gpt-live" as const : "subagent" as const,
       task_id: taskId,
-      task_text: extractTaskText(body),
+      task_text: taskText,
       task_type: body?.task_type || metadata.task_type || metadata.taskType || "",
       tags: Array.isArray(body?.tags) ? body.tags : (Array.isArray(metadata.tags) ? metadata.tags : []),
-      profile_id: boundProfile?.id || requestedProfileId,
-      forced_model: boundProfile ? "" : explicitModel,
+      profile_id: routingMode === "forced" ? forcedProfileId : (boundProfile?.id || requestedProfileId),
+      forced_model: forcedModel,
       reasoning_effort: boundProfile?.reasoning_effort || explicitReasoning,
       preserve_reasoning_effort: Boolean(!boundProfile && explicitReasoning),
       required_tools: Array.isArray(body?.required_tools) ? body.required_tools : (Array.isArray(metadata.required_tools) ? metadata.required_tools : []),
       permission: body?.permission || metadata.permission || "",
     };
-    const route = this.taskRouter.resolve(routeRequest);
+    let route = routingRouter.resolve(routeRequest);
+    if ((!route.ok || !route.model) && origin === "gpt-live" && routingMode === "auto" && !explicitModel && !requestedProfileId) {
+      route = routingRouter.resolveAnyAvailable(routeRequest);
+    }
     if (!route.ok || !route.model) {
       console.warn(`[OpenCodex Subagent] Routing did not select a model: ${route.reason}`);
       return null;
     }
-    this.taskRouter.record(routeRequest, route);
+    const parentTaskId =
+      metadata.parent_task_id ||
+      metadata.parentThreadId ||
+      metadata.parent_thread_id ||
+      body?.parent_task_id ||
+      body?.parent_thread_id ||
+      headerMetadata.parent_thread_id ||
+      headerMetadata.parent_task_id ||
+      requestHeader(req, "x-codex-parent-thread-id");
+    const depthValue = Number(
+      metadata.subagent_depth ||
+      metadata.depth ||
+      body?.subagent_depth ||
+      body?.depth ||
+      (origin === "gpt-live" || this.isSubagentResponsesRequest(body, req) ? 1 : 0),
+    );
     const task = this.subagentOrchestrator.start({
       task_id: routeRequest.task_id,
-      parent_task_id:
-        metadata.parent_task_id ||
-        metadata.parentThreadId ||
-        metadata.parent_thread_id ||
-        body?.parent_task_id ||
-        body?.parent_thread_id ||
-        headerMetadata.parent_thread_id ||
-        headerMetadata.parent_task_id ||
-        requestHeader(req, "x-codex-parent-thread-id"),
+      parent_task_id: parentTaskId,
+      parent_turn_id:
+        metadata.turn_id ||
+        metadata.parent_turn_id ||
+        body?.turn_id ||
+        body?.parent_turn_id ||
+        headerMetadata.turn_id ||
+        headerMetadata.parent_turn_id ||
+        requestHeader(req, "x-codex-parent-turn-id"),
+      task_name:
+        body?.task_name ||
+        metadata.task_name ||
+        body?.task_type ||
+        metadata.task_type ||
+        metadata.taskType,
+      prompt: extractTaskText(body),
       profile_id: route.profile_id,
       provider: route.provider,
       model: route.model,
       backend_model: route.backend_model,
       reasoning_effort: route.reasoning_effort,
+      origin,
+      depth: Number.isFinite(depthValue) ? Math.max(0, Math.min(16, Math.floor(depthValue))) : 1,
     });
+    routingRouter.record(routeRequest, route);
+    if (origin === "gpt-live") {
+      // Automatic/explicit child selection is scoped to this Live child. It
+      // must appear in the multi-model picker without changing other child
+      // bindings or becoming the global default for the next child.
+      this.bindLiveModel(route.model, liveModelSessionKey(body), false);
+    }
     console.log(`[OpenCodex Subagent] Routed child task: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
     const selectedRoute = { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason, task_id: task.id };
     if (taskId !== "__active__") {
@@ -2491,18 +2902,21 @@ export class CodexBridgeServer {
     const isLiveRequest = isLikelyLiveWorkRequest(body) || isToolContinuation(body);
     const isLiveSessionRequest = isLiveRequest || isLikelyLiveModelIntentRequest(body, this.isRealtimeActive());
 
-    // Explicit model speech remains a force action even in automatic mode.
-    // The voice turn itself stays native; the binding is used by the next
-    // actual work handoff.
-    if (isLiveSessionRequest && (mode === "auto" || this.isLiveModelPickerEnabled())) {
+    const settings = this.liveTaskRouter.getSettings();
+    const hasFixedForcedTarget = mode === "forced" && Boolean(settings.forced_model || settings.forced_profile_id);
+
+    // In automatic mode, an explicit model mentioned in the Live turn is a
+    // deliberate per-session override. A forced target remains authoritative,
+    // so speech that names another model must not bypass it.
+    if (isLiveSessionRequest && mode !== "off" && (mode === "auto" || (mode === "forced" && !hasFixedForcedTarget))) {
       const requestedModel = extractLiveModelIntent(body, this.liveModelIntentCandidates());
       if (requestedModel) {
         const routeRequest = { ...this.liveRouteRequest(body), forced_model: requestedModel };
-        const route = this.taskRouter.resolve(routeRequest);
+        const route = this.liveTaskRouter.resolve(routeRequest);
         if (route.ok && route.model) {
-          this.taskRouter.record(routeRequest, route);
-          const selected = this.bindLiveModel(route.model);
-          this.resolvePendingLiveModelSelection(selected, true);
+          this.liveTaskRouter.record(routeRequest, route);
+          const selected = this.bindLiveModel(route.model, sessionKey);
+          this.resolvePendingLiveModelSelection(selected, sessionKey, true);
           console.log(`[OpenCodex Realtime] Voice model selection updated: ${selected}${isLiveRequest ? " (current work handoff)" : " (next work handoff)"}`);
           return isLiveRequest ? { model: selected, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "explicit voice model selection" } : null;
         }
@@ -2513,52 +2927,66 @@ export class CodexBridgeServer {
     if (mode === "off" || !isLiveRequest) return null;
 
     if (mode === "auto") {
+      const binding = this.currentLiveModelBinding(body);
+      if (binding) {
+        const routeRequest = { ...this.liveRouteRequest(body), forced_model: binding.model };
+        const route = this.liveTaskRouter.resolve(routeRequest);
+        if (route.ok && route.model) {
+          this.liveTaskRouter.record(routeRequest, route);
+          console.log("[OpenCodex Realtime] Applied manual Live model binding: " + route.model + (route.reasoning_effort ? " reasoning=" + route.reasoning_effort : ""));
+          return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "manual Live model binding" };
+        }
+        console.warn("[OpenCodex Realtime] Manual Live model binding was not routable: " + route.reason);
+        return null;
+      }
       const routeRequest = this.liveRouteRequest(body);
-      const route = this.taskRouter.resolve(routeRequest);
+      const route = this.liveTaskRouter.resolve(routeRequest);
       if (route.ok && route.model) {
-        this.taskRouter.record(routeRequest, route);
+        this.liveTaskRouter.record(routeRequest, route);
+        this.bindLiveModel(route.model, sessionKey, false);
         console.log(`[OpenCodex Realtime] Auto-routed Live work: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
         return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason };
+      }
+      const fallbackRoute = this.liveTaskRouter.resolveAnyAvailable(routeRequest);
+      if (fallbackRoute.ok && fallbackRoute.model) {
+        this.liveTaskRouter.record(routeRequest, fallbackRoute);
+        this.bindLiveModel(fallbackRoute.model, sessionKey, false);
+        console.log(`[OpenCodex Realtime] Auto-routed Live work to available model: ${fallbackRoute.model}`);
+        return { model: fallbackRoute.model, reasoning_effort: fallbackRoute.reasoning_effort, profile_id: fallbackRoute.profile_id, reason: fallbackRoute.reason };
       }
       console.warn(`[OpenCodex Realtime] Auto routing did not select a model: ${route.reason}`);
       return null;
     }
 
-    const settings = this.taskRouter.getSettings();
     if (settings.forced_model || settings.forced_profile_id) {
       const routeRequest = {
         ...this.liveRouteRequest(body),
         forced_model: settings.forced_model || "",
         profile_id: settings.forced_profile_id || "",
       };
-      const route = this.taskRouter.resolve(routeRequest);
+      const route = this.liveTaskRouter.resolve(routeRequest);
       if (route.ok && route.model) {
-        this.taskRouter.record(routeRequest, route);
-        this.bindLiveModel(route.model);
+        this.liveTaskRouter.record(routeRequest, route);
+        this.bindLiveModel(route.model, sessionKey);
         return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: route.reason };
       }
       console.warn(`[OpenCodex Realtime] Forced routing did not select a model: ${route.reason}`);
       return null;
     }
 
+    const binding = this.currentLiveModelBinding(body);
+    if (binding) {
+      const routeRequest = { ...this.liveRouteRequest(body), forced_model: binding.model };
+      const route = this.liveTaskRouter.resolve(routeRequest);
+      if (route.ok && route.model) {
+        this.liveTaskRouter.record(routeRequest, route);
+        return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "existing Live picker binding" };
+      }
+      console.warn("[OpenCodex Realtime] Existing Live picker binding was not routable: " + route.reason);
+      return null;
+    }
+
     if (!this.isLiveModelPickerEnabled()) return null;
-
-    // Legacy 1.0.8 floating-picker behavior.
-    const sessionBinding = this.liveModelBindings.get(sessionKey);
-    if (sessionBinding?.expiresAt > now) {
-      sessionBinding.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
-      this.activeLiveModel = sessionBinding;
-      return { model: sessionBinding.model, reason: "existing Live picker binding" };
-    }
-    if (sessionBinding) this.liveModelBindings.delete(sessionKey);
-
-    if (this.activeLiveModel?.expiresAt > now) {
-      this.activeLiveModel.expiresAt = now + LIVE_MODEL_BINDING_TTL_MS;
-      this.liveModelBindings.set(sessionKey, this.activeLiveModel);
-      return { model: this.activeLiveModel.model, reason: "active Live picker binding" };
-    }
-    if (this.activeLiveModel?.expiresAt <= now) this.activeLiveModel = null;
-    this.liveModelBindings.delete(sessionKey);
 
     const models = this.availableRealtimeWorkModels();
     if (models.length === 0) {
@@ -2583,17 +3011,13 @@ export class CodexBridgeServer {
     });
 
     if (selected) {
-      this.activeLiveModel = {
-        model: selected,
-        expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
-      };
-      this.liveModelBindings.set(sessionKey, this.activeLiveModel);
+      this.bindLiveModel(selected, sessionKey);
       return { model: selected, reason: "manual Live picker selection" };
     }
 
     const fallbackModel = normalizeRealtimeWorkModel(body?.model);
     if (fallbackModel) {
-      this.bindLiveModel(fallbackModel);
+      this.bindLiveModel(fallbackModel, sessionKey, false);
       console.warn(`[OpenCodex Realtime] Live picker timed out; using incoming default model: ${fallbackModel}`);
       return { model: fallbackModel, reason: "Live picker timeout fallback" };
     }
@@ -2611,7 +3035,8 @@ export class CodexBridgeServer {
         enabled: this.isLiveModelPickerEnabled(),
         native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
         models: this.isLiveModelPickerEnabled() ? this.availableRealtimeWorkModels() : [],
-        selected_model: this.activeLiveModel?.model || "",
+        selected_model: this.selectedLiveModelForPicker(),
+        selected_models: this.selectedLiveModels(),
       };
     }
     return {
@@ -2621,13 +3046,15 @@ export class CodexBridgeServer {
       native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
       request_id: waiter.requestId,
       models: waiter.models,
-      selected_model: this.activeLiveModel?.model || "",
+      selected_model: this.selectedLiveModelForPicker(waiter.sessionKey),
+      selected_models: this.selectedLiveModels(),
       created_at: waiter.createdAt,
     };
   }
 
   private selectLiveModel(model: unknown): { ok: boolean; error?: string; model?: string } {
     if (!this.isLiveModelPickerEnabled()) return { ok: false, error: "GPT-Live 模型选择未开启" };
+    if (this.liveRoutingMode() === "off") return { ok: false, error: "当前已关闭 GPT-Live 路由，模型由 Live 原生选择" };
     const selected = normalizeRealtimeWorkModel(model);
     const models = this.availableRealtimeWorkModels();
     if (!selected) {
@@ -2640,15 +3067,18 @@ export class CodexBridgeServer {
     return { ok: true, model: selected };
   }
 
-  private bindLiveModel(selected: string): string {
-    this.activeLiveModel = {
-      model: selected,
-      expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
-    };
-    // A model switch must update the existing Live conversation bindings;
-    // clearing them makes the next task fall back to the Desktop model.
-    for (const key of this.liveModelBindings.keys()) {
-      this.liveModelBindings.set(key, this.activeLiveModel);
+  private bindLiveModel(selected: string, sessionKey = "", promoteToDefault = true): string {
+    if (promoteToDefault) {
+      this.activeLiveModel = {
+        model: selected,
+        expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
+      };
+    }
+    if (sessionKey) {
+      this.liveModelBindings.set(sessionKey, {
+        model: selected,
+        expiresAt: Date.now() + LIVE_MODEL_BINDING_TTL_MS,
+      });
     }
     return selected;
   }
@@ -2659,31 +3089,30 @@ export class CodexBridgeServer {
     if (!waiter) return { ok: false, error: "模型选择请求已过期" };
     const selected = normalizeRealtimeWorkModel(model);
     if (!selected) {
-      for (const pending of this.liveModelPickerWaiters.values()) {
-        clearTimeout(pending.timer);
-        pending.resolve("");
-      }
-      this.liveModelPickerWaiters.clear();
+      clearTimeout(waiter.timer);
+      waiter.resolve("");
+      this.liveModelPickerWaiters.delete(id);
       this.activeLiveModel = null;
-      this.liveModelBindings.clear();
+      this.liveModelBindings.delete(waiter.sessionKey);
       return { ok: true, cancelled: true };
     }
     if (!waiter.models.includes(selected)) {
       return { ok: false, error: "所选模型不在当前可用模型列表中" };
     }
-    this.resolvePendingLiveModelSelection(selected);
+    this.bindLiveModel(selected, waiter.sessionKey);
+    this.resolvePendingLiveModelSelection(selected, waiter.sessionKey);
     return { ok: true };
   }
 
-  private resolvePendingLiveModelSelection(selected: string, allowOutsidePicker = false): void {
-    // A single Live task can issue multiple requests while the first picker
-    // is still waiting for the user. One selection must release all of those
-    // waiters together, otherwise the same task opens the picker repeatedly.
-    for (const pending of this.liveModelPickerWaiters.values()) {
+  private resolvePendingLiveModelSelection(selected: string, sessionKey = "", allowOutsidePicker = false): void {
+    // Resolve only the waiters belonging to this Live child. A concurrent
+    // child must retain its own picker and model binding.
+    for (const [requestId, pending] of this.liveModelPickerWaiters) {
+      if (sessionKey && pending.sessionKey !== sessionKey) continue;
       clearTimeout(pending.timer);
       pending.resolve(allowOutsidePicker || pending.models.includes(selected) ? selected : "");
+      this.liveModelPickerWaiters.delete(requestId);
     }
-    this.liveModelPickerWaiters.clear();
   }
 
   private resetLiveModelPicker(): void {
@@ -2850,7 +3279,7 @@ export class CodexBridgeServer {
   }
 
   private readImportedModelCatalog(): any[] {
-    const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
     try {
       const data = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
       return Array.isArray(data.models) ? data.models : [];
@@ -2904,7 +3333,7 @@ export class CodexBridgeServer {
       return {
         name: providerName,
         preset_id: providerName,
-        baseUrl: `https://subscription.${providerName}.internal`,
+        baseUrl: SUBSCRIPTION_TRANSPORTS[providerName as keyof typeof SUBSCRIPTION_TRANSPORTS]?.endpoint || "",
         models: matches.map((entry) => String(entry.slug || entry.model || "")).filter(Boolean)
       };
     }
@@ -3076,7 +3505,7 @@ export class CodexBridgeServer {
     res: http.ServerResponse,
     rawBody?: Buffer,
   ): Promise<void> {
-    const rawRequestedModel = body?.model || "deepseek-v4-pro";
+    const rawRequestedModel = body?.model || this.defaultRequestModel();
     const requestedModel = this.stripReasoningSuffix(String(rawRequestedModel));
     const providers = CredentialStore.loadProviders();
     const nativeModel = this.isNativeCatalogModel(requestedModel);
@@ -3131,195 +3560,25 @@ export class CodexBridgeServer {
     }
   }
 
-  private ensurePythonScripts() {
-    const minimaxScript = `import sys
-import os
-import json
-import urllib.request
-import binascii
+  private ensurePythonScripts(): void {
+    const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
+    const scripts = [
+      ["minimax_tts.py", "/tmp/ocb_minimax_tts.py"],
+      ["transcribe.py", "/tmp/ocb_transcribe.py"],
+      ["silero_vad_daemon.py", "/tmp/ocb_silero_vad_daemon.py"],
+    ] as const;
 
-def main():
-    if len(sys.argv) < 3:
-        print("ERROR: Missing text or output path")
-        sys.exit(1)
-        
-    text = sys.argv[1]
-    output_path = sys.argv[2]
-    voice_id = sys.argv[3] if len(sys.argv) > 3 else "presenter_male"
-    speed = float(sys.argv[4]) if len(sys.argv) > 4 else 1.5
-    
-    api_key = os.environ.get("MINIMAX_API_KEY")
-    api_host = os.environ.get("MINIMAX_API_HOST", "https://api.minimaxi.com")
-    
-    if not api_key:
-        print("ERROR: Missing MINIMAX_API_KEY environment variable")
-        sys.exit(1)
-        
-    url = f"{api_host}/v1/t2a_v2"
-    
-    payload = {
-        "model": "speech-2.8-turbo",
-        "text": text,
-        "stream": False,
-        "voice_setting": {
-            "voice_id": voice_id,
-            "speed": speed,
-            "vol": 1.0,
-            "pitch": 2,
-            "emotion": "happy"
-        },
-        "audio_setting": {
-            "sample_rate": 32000,
-            "bitrate": 128000,
-            "format": "mp3"
-        },
-        "output_format": "hex"
+    for (const [name, targetPath] of scripts) {
+      const sourcePath = [
+        path.join(runtimeDir, "voice", name),
+        path.join(runtimeDir, "..", "scripts", "voice", name),
+        path.join(process.cwd(), "scripts", "voice", name),
+      ].find((candidate) => fs.existsSync(candidate));
+      if (!sourcePath) throw new Error(`Voice helper script not found: ${name}`);
+      fs.copyFileSync(sourcePath, targetPath);
+      try { fs.chmodSync(targetPath, 0o600); } catch {}
     }
-    
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-        with urllib.request.urlopen(req) as response:
-            res_body = response.read().decode('utf-8')
-            res_json = json.loads(res_body)
-            
-            if res_json.get("base_resp", {}).get("status_code") == 0:
-                audio_hex = res_json.get("data", {}).get("audio", "")
-                if audio_hex:
-                    audio_bytes = binascii.unhexlify(audio_hex)
-                    with open(output_path, "wb") as f:
-                        f.write(audio_bytes)
-                    print(f"SUCCESS: Audio written to {output_path}")
-                else:
-                    print("ERROR: No audio data in response")
-                    sys.exit(1)
-            else:
-                msg = res_json.get("base_resp", {}).get("status_msg", "Unknown error")
-                print(f"ERROR: MiniMax API failed: {msg}")
-                sys.exit(1)
-    except Exception as e:
-        print(f"ERROR: Exception occurred: {str(e)}")
-        sys.exit(1)
-
-if __name__ == "__main__":
-    main()`;
-
-    const transcribeScript = `import sys
-import os
-import warnings
-
-warnings.filterwarnings("ignore")
-
-try:
-    import whisper
-    
-    if len(sys.argv) < 2:
-        print("ERROR: Missing audio file path")
-        sys.exit(1)
-        
-    audio_path = sys.argv[1]
-    if not os.path.exists(audio_path):
-        print(f"ERROR: File not found: {audio_path}")
-        sys.exit(1)
-        
-    model_name = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2].strip() else "base"
-    model = whisper.load_model(model_name)
-    
-    result = model.transcribe(audio_path, fp16=False)
-    print(result.get("text", "").strip())
-except Exception as e:
-    print(f"ERROR: {str(e)}")
-    sys.exit(1)`;
-
-    const sileroVadScript = `import sys
-import os
-import json
-import base64
-import warnings
-
-warnings.filterwarnings("ignore")
-
-import torch
-import numpy as np
-
-def main():
-    try:
-        from silero_vad import load_silero_vad, get_speech_timestamps
-        model = load_silero_vad()
-    except Exception as e:
-        print(json.dumps({"error": f"Failed to load VAD model: {str(e)}"}))
-        sys.exit(1)
-
-    print(json.dumps({"status": "ready"}), flush=True)
-
-    accumulated_samples = []
-
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            break
-        
-        line = line.strip()
-        if not line:
-            continue
-            
-        try:
-            req = json.loads(line)
-            action = req.get("action")
-            
-            if action == "reset":
-                accumulated_samples = []
-                print(json.dumps({"status": "reset"}), flush=True)
-                continue
-                
-            elif action == "chunk":
-                b64_data = req.get("data", "")
-                pcm_bytes = base64.b64decode(b64_data)
-                
-                chunk_samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                accumulated_samples.extend(chunk_samples)
-                
-                audio_tensor = torch.from_numpy(np.array(accumulated_samples, dtype=np.float32))
-                
-                speech_timestamps = get_speech_timestamps(audio_tensor, model, sampling_rate=16000, threshold=0.45)
-                has_speech = len(speech_timestamps) > 0
-                
-                total_duration_sec = len(audio_tensor) / 16000.0
-                last_speech_end_sec = 0.0
-                if has_speech:
-                    last_speech_end_sec = speech_timestamps[-1]['end'] / 16000.0
-                    
-                silence_at_end_sec = total_duration_sec - last_speech_end_sec
-                
-                result = {
-                    "has_speech": has_speech,
-                    "total_duration": total_duration_sec,
-                    "last_speech_end": last_speech_end_sec,
-                    "silence_at_end": silence_at_end_sec,
-                }
-                print(json.dumps(result), flush=True)
-                
-            elif action == "exit":
-                break
-        except Exception as e:
-            print(json.dumps({"error": str(e)}), flush=True)
-
-if __name__ == "__main__":
-    main()`;
-
-    try {
-      fs.writeFileSync("/tmp/ocb_minimax_tts.py", minimaxScript, "utf-8");
-      fs.writeFileSync("/tmp/ocb_transcribe.py", transcribeScript, "utf-8");
-      fs.writeFileSync("/tmp/ocb_silero_vad_daemon.py", sileroVadScript, "utf-8");
-      console.log("[OpenCodex] Written helper python scripts to /tmp successfully.");
-    } catch (err: any) {
-      console.error("[OpenCodex] Failed to write helper python scripts: " + err.message);
-    }
+    console.log("[CodexSplit Voice] Installed helper Python scripts from the packaged voice assets.");
   }
 
   private vadProcess: any = null;
@@ -3434,7 +3693,7 @@ if __name__ == "__main__":
       }
 
       const fetchModels = async (accessToken: string): Promise<Response> => fetch(
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+        SUBSCRIPTION_TRANSPORTS.antigravity.modelsEndpoint!,
         {
           method: "POST",
           headers: {
@@ -3615,6 +3874,7 @@ if __name__ == "__main__":
       this.port = overridePort;
     }
     this.acquireServerLock();
+    this.resetLivePickerForGatewayStart();
     // Older releases exported the bridge through launchd. Remove only that
     // owned legacy state; the current gateway never registers a global
     // CODEX_CLI_PATH during ordinary startup.
@@ -3631,38 +3891,34 @@ if __name__ == "__main__":
     const cleanedLegacyComputerUseConfig = stripOwnedLegacyComputerUseConfig(managedConfig);
     if (cleanedLegacyComputerUseConfig !== managedConfig) {
       try {
-        fs.writeFileSync(configPath, cleanedLegacyComputerUseConfig, "utf-8");
+        writePrivateTextFile(configPath, cleanedLegacyComputerUseConfig);
         managedConfig = cleanedLegacyComputerUseConfig;
         console.log("[CodexSplit Gateway] Removed the disabled legacy OpenCodex Computer Use MCP entry; the official bundled launcher was left untouched.");
       } catch (err: any) {
         console.warn(`[CodexSplit Gateway] Could not remove the legacy Computer Use MCP entry: ${err?.message || err}`);
       }
     }
-    const startupCatalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+    const startupCatalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
     let startupCatalog: any = { models: [] };
     if (fs.existsSync(startupCatalogPath)) {
       try { startupCatalog = JSON.parse(fs.readFileSync(startupCatalogPath, "utf-8")); } catch {}
     }
-    const startupProviders = CredentialStore.loadProviders();
-    const startupBridgeConfigured = desktopBridgeConfigured(
-      startupProviders,
-      startupCatalog,
-      isOfficialAccountRotationReady(this.chatgptAccountPool),
-    );
     const pendingLaunchMode = this.pendingDesktopLaunchMode();
     const existingDesktopMode = desktopAppServerState();
-    const preferredDesktopMode = readDesktopModePreference();
-    const keepManagedDesktopRouting = preferredDesktopMode === "native"
-      ? false
-      : pendingLaunchMode === "bridge"
-        || existingDesktopMode === "bridge"
-        || preferredDesktopMode === "bridge";
+    const storedDesktopMode = readDesktopModePreference();
+    const preferredDesktopMode = storedDesktopMode || "bridge";
+    // A missing preference means the durable default: Bridge. Persist it so a
+    // gateway restart cannot fall back to a workload-dependent native mode.
+    if (!storedDesktopMode) writeDesktopModePreference("bridge", false);
+    const keepManagedDesktopRouting = preferredDesktopMode === "bridge"
+      || pendingLaunchMode === "bridge"
+      || existingDesktopMode === "bridge";
     if (managedConfig.includes("opencodex managed") && !keepManagedDesktopRouting) {
       try {
         managedConfig = buildCodexRoutingConfig(managedConfig, this.port, this.adminToken, startupCatalogPath, false);
-        fs.writeFileSync(configPath, managedConfig, "utf-8");
+        writePrivateTextFile(configPath, managedConfig);
         CatalogSyncService.syncNativeModelsToCodexCache();
-        console.log(`[CodexSplit Gateway] Removed managed routing; native Codex remains active because no durable Desktop Bridge mode is active (${startupBridgeConfigured ? "Bridge is not selected" : "Bridge has no configured workload"}).`);
+        console.log("[CodexSplit Gateway] Removed managed routing because native Desktop was explicitly selected.");
       } catch (err: any) {
         console.warn(`[CodexSplit Gateway] Could not remove stale managed routing: ${err?.message || err}`);
       }
@@ -3680,13 +3936,13 @@ if __name__ == "__main__":
         }
         const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
         if (synchronizedConfig !== managedConfig) {
-          fs.writeFileSync(configPath, synchronizedConfig, "utf-8");
+          writePrivateTextFile(configPath, synchronizedConfig);
           console.log(`[CodexSplit Gateway] Synchronized managed Codex config to port ${this.port} before startup.`);
         }
       } catch (err: any) {
         console.warn(`[CodexSplit Gateway] Could not synchronize managed Codex config: ${err?.message || err}`);
       }
-      const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+      const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
       let catalog: any = { models: [] };
       if (fs.existsSync(catalogPath)) {
         try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
@@ -3750,7 +4006,7 @@ if __name__ == "__main__":
         // 1. Handshake / Healthcheck & Dashboard UI
         if (req.method === "GET" && url.pathname === "/health") {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "ok", name: "CodexSplit Engine V2", version: "2.0.0-beta.1", opencodex: true }));
+          res.end(JSON.stringify({ status: "ok", name: "CodexSplit Engine V2", version: APP_VERSION, opencodex: true }));
           return;
         }
 
@@ -3876,11 +4132,14 @@ if __name__ == "__main__":
             const request = await this.parseJsonRequest(req);
             const body = request.body;
             const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
+            const subagentOrigin = this.subagentOrigin(body, req);
             const requestedModelBeforeRouting = this.stripReasoningSuffix(String(body?.model || ""));
             const nativeControlPlaneRequest = isNativeControlPlaneModel(requestedModelBeforeRouting);
             const nativeModelRequest = nativeControlPlaneRequest || (Boolean(requestedModelBeforeRouting)
               && this.isNativeCatalogModel(requestedModelBeforeRouting));
-            const resolveSubagentRoute = shouldResolveSubagentRoute(isSubagentRequest, nativeControlPlaneRequest);
+            const subagentRoutingMode = subagentOrigin === "gpt-live" ? this.liveRoutingMode() : this.subagentRoutingMode();
+            const resolveSubagentRoute = shouldResolveSubagentRoute(isSubagentRequest, nativeControlPlaneRequest)
+              && subagentRoutingMode !== "off";
             const subagentRoute = resolveSubagentRoute
               ? this.chooseSubagentRoute(body, req)
               : null;
@@ -3899,6 +4158,13 @@ if __name__ == "__main__":
               // same child a second time before it reaches /v1/responses.
               res.setHeader("x-opencodex-subagent-task-id", subagentRoute.task_id || "");
               res.setHeader("x-opencodex-subagent-model", subagentRoute.model || "");
+              const subagentThreadId = requestSubagentThreadId(body, req);
+              if (subagentThreadId) {
+                // Do not make the bridge guess whether the task id, session id,
+                // or a native request header is the Desktop thread id. This is
+                // the identity used for the visible settings update.
+                res.setHeader("x-opencodex-subagent-thread-id", subagentThreadId);
+              }
               if (subagentRoute.reasoning_effort) {
                 res.setHeader("x-opencodex-subagent-reasoning-effort", subagentRoute.reasoning_effort);
               }
@@ -3911,7 +4177,12 @@ if __name__ == "__main__":
             // the gateway may inspect that boundary to select a configured
             // subagent model. Once selected, native targets still use the
             // native proxy and third-party targets use the provider router.
-            const liveWorkRoute = isSubagentRequest || nativePassthroughTurn
+            const nativeLiveModelIntentTurn = this.isRealtimeActive()
+              && !isSubagentRequest
+              && isLikelyLiveModelIntentRequest(body, true)
+              && !isLikelyLiveWorkRequest(body)
+              && !isToolContinuation(body);
+            const liveWorkRoute = isSubagentRequest || (nativePassthroughTurn && !nativeLiveModelIntentTurn)
               ? null
               : await this.chooseLiveWorkRoute(body);
             subagentTaskId = subagentRoute?.task_id || "";
@@ -3948,7 +4219,7 @@ if __name__ == "__main__":
               console.log(`[OpenCodex Routing] Applied selected work model: ${body.model || "(default)"} -> ${selectedWorkRoute.model}`);
             }
             console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
-            const rawRequestedModel = effectiveBody.model || "deepseek-v4-pro";
+            const rawRequestedModel = effectiveBody.model || this.defaultRequestModel();
             const requestedModel = this.stripReasoningSuffix(rawRequestedModel);
             const providers = CredentialStore.loadProviders();
             // Subscription imports are the source of truth. A model may only
@@ -3964,6 +4235,7 @@ if __name__ == "__main__":
                 // Keep the native GPT lane transparent. No body-level
                 // translation, reasoning rewrite, or provider fallback is
                 // allowed here.
+                if (subagentTaskId) res.setHeader("x-opencodex-subagent-egress", "openai-native");
                 const nativeRawBody = effectiveBody === body ? request.rawBody : undefined;
                 await this.proxyNativeResponses(req, nativeRawBody ?? effectiveBody, res);
                 if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
@@ -3984,6 +4256,7 @@ if __name__ == "__main__":
             const catalogModel = this.findCatalogBackendModel(requestedModel) || requestedModel;
             const upstreamModel = this.normalizeProviderModel(catalogModel, provider);
             const protocol = effectiveBody.protocol || this.findCatalogProtocol(requestedModel, provider);
+            const adapterName = String((provider as any).adapter || (provider as any).protocol_adapter || (provider as any).preset_id || "").trim();
             const normalizedReasoning = this.taskRouter.normalizeReasoningEffort(
               requestedModel,
               effectiveBody?.reasoning?.effort || effectiveBody?.reasoning_effort,
@@ -3999,7 +4272,8 @@ if __name__ == "__main__":
             const providerUrl = rawUrl;
 
             const nativeImageHeaders = copyNativeRequestHeaders(req, { localAdminToken: this.adminToken }, true);
-            await this.router.handleResponses(
+            if (subagentTaskId) res.setHeader("x-opencodex-subagent-egress", "provider-gateway");
+            const responseResult = await this.router.handleResponses(
               routingBody,
               upstreamModel,
               apiKey,
@@ -4010,8 +4284,13 @@ if __name__ == "__main__":
               requestedModel,
               isSubagentRequest,
               credentialId,
+              adapterName,
+              subagentOrigin === "gpt-live" ? "gpt-live" : "main-agent",
             );
-            if (subagentTaskId) this.subagentOrchestrator.complete(subagentTaskId);
+            if (subagentTaskId) {
+              if (responseResult.completed) this.subagentOrchestrator.complete(subagentTaskId, responseResult.output);
+              else this.subagentOrchestrator.fail(subagentTaskId, "子智能体请求未完成");
+            }
           } catch (err: any) {
             if (subagentTaskId) this.subagentOrchestrator.fail(subagentTaskId, err?.message || "subagent request failed");
             if (!res.headersSent) {
@@ -4152,13 +4431,13 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/live-model-picker/pending") {
-          res.writeHead(200, { "Content-Type": "application/json" });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify(this.pendingLiveModelPicker()));
           return;
         }
 
         if (req.method === "GET" && url.pathname === "/api/live-model-picker/settings") {
-          res.writeHead(200, { "Content-Type": "application/json" });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
           res.end(JSON.stringify({ enabled: this.isLiveModelPickerEnabled() }));
           return;
         }
@@ -4171,9 +4450,10 @@ if __name__ == "__main__":
               res.end(JSON.stringify({ error: "enabled 必须是布尔值" }));
               return;
             }
-            this.setLiveModelPickerEnabled(body.enabled);
+            const enabled = body.enabled && this.liveRoutingMode() !== "off";
+            this.setLiveModelPickerEnabled(enabled);
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ enabled: body.enabled }));
+            res.end(JSON.stringify({ enabled }));
           } catch (err: any) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));
@@ -4285,11 +4565,26 @@ if __name__ == "__main__":
         if ((req.method === "POST" || req.method === "PUT") && url.pathname === "/api/agent-routing/settings") {
           try {
             const body = await this.parseJsonBody(req);
-            const settings = this.agentProfileStore.saveRoutingSettings(body);
-            // Auto mode must not leave the 1.0.8 floating picker waiting for a
-            // selection. Forced mode without a fixed target keeps that picker.
-            const pickerEnabled = settings.mode === "forced" && !settings.forced_model && !settings.forced_profile_id;
-            this.setLiveModelPickerEnabled(pickerEnabled);
+            const settings = this.agentProfileStore.saveRoutingSettings(body, "subagent");
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify(settings));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/live-agent-routing/settings") {
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify(this.liveTaskRouter.getSettings()));
+          return;
+        }
+
+        if ((req.method === "POST" || req.method === "PUT") && url.pathname === "/api/live-agent-routing/settings") {
+          try {
+            const body = await this.parseJsonBody(req);
+            const settings = this.agentProfileStore.saveRoutingSettings(body, "gpt-live");
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify(settings));
           } catch (err: any) {
@@ -4326,6 +4621,22 @@ if __name__ == "__main__":
           return;
         }
 
+        if (req.method === "GET" && url.pathname === "/api/agent-tasks/events") {
+          const limit = Number(url.searchParams.get("limit") || 100);
+          const after = Number(url.searchParams.get("after") || 0);
+          const parentTaskId = url.searchParams.get("parent_task_id") || undefined;
+          const parentTurnId = url.searchParams.get("parent_turn_id") || undefined;
+          const events = this.subagentOrchestrator.listEvents({
+            limit,
+            after,
+            parent_task_id: parentTaskId,
+            parent_turn_id: parentTurnId,
+          });
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ events, next_cursor: this.subagentOrchestrator.latestEventSequence() }));
+          return;
+        }
+
         const agentTaskPathMatch = url.pathname.match(/^\/api\/agent-tasks\/([^/]+)\/cancel$/);
         if (agentTaskPathMatch && req.method === "POST") {
           const task = this.subagentOrchestrator.requestCancel(decodeURIComponent(agentTaskPathMatch[1]));
@@ -4348,7 +4659,7 @@ if __name__ == "__main__":
             isGatewayActive = content.includes("opencodex managed");
           }
 
-          const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+          const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
           let catalogModels: any[] = [];
           if (fs.existsSync(catalogPath)) {
             try {
@@ -4483,6 +4794,7 @@ if __name__ == "__main__":
               provider = {
                 name: resolvedProviderName,
                 preset_id: presetId,
+                ...(normalizeAdapterName(body.adapter || body.adapter_name || presetId) ? { adapter: normalizeAdapterName(body.adapter || body.adapter_name || presetId) } : {}),
                 baseUrl,
                 models: selectedModels,
                 model_protocols: selectedModelProtocols,
@@ -4492,6 +4804,8 @@ if __name__ == "__main__":
               provider.baseUrl = baseUrl || provider.baseUrl;
               provider.name = resolvedProviderName;
               provider.preset_id = presetId;
+              const configuredAdapter = normalizeAdapterName(body.adapter || body.adapter_name || presetId);
+              if (configuredAdapter) provider.adapter = configuredAdapter;
               // The dashboard sends the complete current list. Replace the
               // stored list so removals and edits are reflected on reopen.
               provider.models = Array.from(new Set(selectedModels));
@@ -4531,7 +4845,7 @@ if __name__ == "__main__":
             // Remove models previously owned by this provider but omitted from
             // the latest list, otherwise the next edit resurrects them.
             if (body.install_models !== false) {
-              const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+              const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
               let catalog: any = { models: [] };
               if (fs.existsSync(catalogPath)) {
                 try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
@@ -4574,27 +4888,16 @@ if __name__ == "__main__":
               preserveOfficialModels(catalog);
               fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
-              // Enable or remove the managed block according to the final
-              // selected-model state, but preserve an explicitly disabled
-              // Desktop Bridge. Saving credentials/models while Bridge is off
-              // must not expose a third-party slug to native Codex.
+              // Keep the managed transport block according to the durable
+              // Desktop mode. The Bridge remains present even when this save
+              // leaves the third-party catalog empty; model exposure is a
+              // separate concern from the Bridge/account-rotation lifecycle.
               const configPath = codexConfigPath();
-              const bridgeConfiguredAfterSave = desktopBridgeConfigured(
-                providers,
-                catalog,
-                isOfficialAccountRotationReady(this.chatgptAccountPool),
-              );
-              let bridgeActive = false;
+              const bridgeActive = configuredDesktopLaunchMode() === "bridge";
               if (fs.existsSync(configPath)) {
                 let content = fs.readFileSync(configPath, "utf-8");
-                bridgeActive = content.includes("opencodex managed") && bridgeConfiguredAfterSave;
-                fs.writeFileSync(
-                  configPath,
-                  buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
-                  "utf-8",
-                );
+                writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive));
               }
-              if (!bridgeConfiguredAfterSave) writeDesktopModePreference("native");
               // The catalog file is the source of truth, but Codex's desktop
               // picker reads its local model cache on the next launch. Keep
               // the cache in sync at the same moment the provider is saved.
@@ -4725,7 +5028,7 @@ if __name__ == "__main__":
           }
 
           let catalogModels: any[] = [];
-          const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+          const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
           if (fs.existsSync(catalogPath)) {
             try {
               const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
@@ -4798,6 +5101,7 @@ if __name__ == "__main__":
               launch_mode: desktopLaunchMode,
               desired_mode: desktopLaunchMode,
               mode_preference: preferredDesktopMode,
+              mode_change_in_progress: this.gatewayRestartInProgress,
               configured: configuredThirdPartyModels,
               bridge_configured: bridgeConfigured,
               bridge_available: desktopBridgeRuntimeAvailable(),
@@ -4886,7 +5190,7 @@ if __name__ == "__main__":
           try {
             const body = await this.parseJsonBody(req);
             const cli = body.cli || "antigravity";
-            const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
             let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
               try { catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8")); } catch {}
@@ -4939,27 +5243,16 @@ if __name__ == "__main__":
             preserveOfficialModels(catalog);
             fs.writeFileSync(catalogPath, JSON.stringify(catalog, null, 2), "utf-8");
 
-            // CLI imports add provider-owned models, so managed routing is
-            // preserved only when the Desktop Bridge was already enabled and
-            // the final catalog actually contains one. Importing while the
-            // Bridge is off must keep native Desktop safe.
+            // CLI imports update the catalog without changing the durable
+            // Bridge selection. The Bridge may carry only official GPT
+            // account rotation while the imported third-party catalog is
+            // empty or temporarily unavailable.
             const configPath = codexConfigPath();
-            const bridgeConfiguredAfterImport = desktopBridgeConfigured(
-              CredentialStore.loadProviders(),
-              catalog,
-              isOfficialAccountRotationReady(this.chatgptAccountPool),
-            );
-            let bridgeActive = false;
+            const bridgeActive = configuredDesktopLaunchMode() === "bridge";
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              bridgeActive = content.includes("opencodex managed") && bridgeConfiguredAfterImport;
-              fs.writeFileSync(
-                configPath,
-                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
-                "utf-8",
-              );
+              writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive));
             }
-            if (!bridgeConfiguredAfterImport) writeDesktopModePreference("native");
             if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
             else CatalogSyncService.syncNativeModelsToCodexCache();
 
@@ -5618,7 +5911,7 @@ if __name__ == "__main__":
             } catch {}
             if (!activeThreadId) {
               try {
-                const dbPath = path.join(os.homedir(), ".codex", "state_5.sqlite");
+        const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
                 if (fs.existsSync(dbPath)) {
                   const cp = await import("node:child_process");
                   activeThreadId = cp.execFileSync("sqlite3", [dbPath, "SELECT id FROM threads WHERE archived = 0 ORDER BY updated_at DESC LIMIT 1;"], { encoding: "utf-8" }).trim();
@@ -5696,7 +5989,7 @@ if __name__ == "__main__":
               }, estimatedDuration);
             }
 
-            const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+            const settingsPath = path.join(opencodexDataDir(), "voice_settings.json");
             let settings: any = {};
             if (fs.existsSync(settingsPath)) {
               try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
@@ -5908,7 +6201,7 @@ if __name__ == "__main__":
             await new Promise<void>((resolve) => req.on("end", resolve));
             const rawBody = Buffer.concat(chunks);
 
-            const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+            const settingsPath = path.join(opencodexDataDir(), "voice_settings.json");
             let settings: any = {
               stt_engine: "local-whisper",
               stt_api_key: "",
@@ -6013,7 +6306,7 @@ if __name__ == "__main__":
         if (req.method === "POST" && url.pathname === "/api/voice-settings") {
           try {
             const data = await this.parseJsonBody(req);
-            const settingsDir = path.join(os.homedir(), ".opencodex");
+            const settingsDir = opencodexDataDir();
             if (!fs.existsSync(settingsDir)) fs.mkdirSync(settingsDir, { recursive: true });
             const settingsPath = path.join(settingsDir, "voice_settings.json");
             let previous: any = {};
@@ -6089,7 +6382,7 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/voice-settings") {
-          const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+          const settingsPath = path.join(opencodexDataDir(), "voice_settings.json");
           let settings: any = {
             stt_engine: "local-whisper",
             stt_api_key: "",
@@ -6119,7 +6412,7 @@ if __name__ == "__main__":
           
           let available_models: string[] = [];
           try {
-            const catalogPath = path.join(os.homedir(), ".codex", "models_catalog.json");
+          const catalogPath = path.join(codexHomeDir(), "models_catalog.json");
             if (fs.existsSync(catalogPath)) {
               const cat = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
               available_models = (cat.models || []).map((m: any) => m.slug);
@@ -6132,11 +6425,11 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/sessions") {
-          const sessionsDir = path.join(os.homedir(), ".codex", "sessions");
+          const sessionsDir = path.join(codexHomeDir(), "sessions");
           const sessions: any[] = [];
           const registeredTitles = new Map<string, string>();
           try {
-            const dbPath = path.join(os.homedir(), ".codex", "state_5.sqlite");
+          const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
             if (fs.existsSync(dbPath)) {
               const cp = await import("node:child_process");
               const raw = cp.execFileSync("sqlite3", ["-json", dbPath, "SELECT rollout_path, title FROM threads WHERE archived = 0 AND title <> '';"], { maxBuffer: 10 * 1024 * 1024 }).toString("utf-8").trim();
@@ -6265,7 +6558,7 @@ if __name__ == "__main__":
           try {
             const body = await this.parseJsonBody(req);
             const id = String(body.id || "");
-            const sessionsDir = path.join(os.homedir(), ".codex", "sessions");
+            const sessionsDir = path.join(codexHomeDir(), "sessions");
             const agLogPath = path.join(os.homedir(), ".gemini", "antigravity", "brain", extractSessionUuid(id), ".system_generated", "logs", "transcript.jsonl");
 
             const messages: any[] = [];
@@ -6577,7 +6870,7 @@ if __name__ == "__main__":
             const year = now.getFullYear();
             const month = String(now.getMonth() + 1).padStart(2, "0");
             const day = String(now.getDate()).padStart(2, "0");
-            const targetDir = path.join(os.homedir(), ".codex", "sessions", String(year), month, day);
+            const targetDir = path.join(codexHomeDir(), "sessions", String(year), month, day);
             if (!fs.existsSync(targetDir)) {
               fs.mkdirSync(targetDir, { recursive: true });
             }
@@ -7062,7 +7355,7 @@ if __name__ == "__main__":
               fs.writeFileSync(targetFilePath, importedLines.join("\n") + "\n", "utf-8");
 
               // Register into Codex desktop SQLite database (~/.codex/state_5.sqlite) so Codex UI presents it in the sidebar
-              const dbPath = path.join(os.homedir(), ".codex", "state_5.sqlite");
+              const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
               if (!fs.existsSync(dbPath)) {
                 throw new Error("Codex 会话数据库不存在，无法注册到侧边栏");
               }
@@ -7085,6 +7378,7 @@ if __name__ == "__main__":
               if (!firstPrompt) firstPrompt = "Imported Session";
               const nowSec = Math.floor(Date.now() / 1000);
               const cleanTitle = (requestedTitle || firstPrompt || "Imported Session").replace(/\s+/g, " ").trim().slice(0, 200);
+              const databaseModel = this.defaultRequestModel();
               const sandboxPolicy = JSON.stringify({
                 type: "managed",
                 file_system: {
@@ -7098,7 +7392,7 @@ if __name__ == "__main__":
                 },
                 network: "restricted"
               });
-              const sql = `INSERT OR REPLACE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, preview, first_user_message, has_user_event, recency_at, recency_at_ms, cli_version, thread_source, model, memory_mode, history_mode) VALUES ('${quoteSql(sessionId)}', '${quoteSql(targetFilePath)}', ${nowSec}, ${nowSec}, 'vscode', 'openai', '${quoteSql(os.homedir())}', '${quoteSql(cleanTitle)}', '${quoteSql(sandboxPolicy)}', 'on-request', '${quoteSql(cleanTitle)}', '${quoteSql(cleanTitle)}', 1, ${nowSec}, ${Date.now()}, '0.142.5', 'user', 'gpt-5.5', 'enabled', 'legacy');`;
+              const sql = `INSERT OR REPLACE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, preview, first_user_message, has_user_event, recency_at, recency_at_ms, cli_version, thread_source, model, memory_mode, history_mode) VALUES ('${quoteSql(sessionId)}', '${quoteSql(targetFilePath)}', ${nowSec}, ${nowSec}, 'vscode', 'openai', '${quoteSql(os.homedir())}', '${quoteSql(cleanTitle)}', '${quoteSql(sandboxPolicy)}', 'on-request', '${quoteSql(cleanTitle)}', '${quoteSql(cleanTitle)}', 1, ${nowSec}, ${Date.now()}, '0.142.5', 'user', '${quoteSql(databaseModel)}', 'enabled', 'legacy');`;
               cp.execFileSync("sqlite3", [dbPath, sql], { stdio: "pipe" });
               const registeredId = cp.execFileSync("sqlite3", [dbPath, `SELECT id FROM threads WHERE id = '${quoteSql(sessionId)}' AND rollout_path = '${quoteSql(targetFilePath)}';`], { encoding: "utf-8" }).trim();
               if (registeredId !== sessionId) {
@@ -7123,7 +7417,9 @@ if __name__ == "__main__":
           }
           this.gatewayRestartInProgress = true;
           try {
-            const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            const restartRequest = await this.parseJsonBody(req);
+            const applyConfiguredModels = restartRequest?.apply_models === true;
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
             const configPath = codexConfigPath();
 
             let catalog: any = { models: [] };
@@ -7135,43 +7431,47 @@ if __name__ == "__main__":
             const launchMode = resolveDesktopRestartMode(
               providers,
               catalog,
-              thirdPartyModelsConfigured ? null : readDesktopModePreference(),
+              readDesktopModePreference(),
+              applyConfiguredModels ? "apply_models" : "normal",
             );
-            // Persist the effective mode before stopping Desktop. In
-            // particular, a newly added provider model must promote a stale
-            // native preference to Bridge for this restart and all later
-            // restarts.
+            // Persist the durable transport choice. The model-application
+            // action is the one intentional exception: it explicitly asks
+            // Desktop to expose the newly configured third-party models.
             writeDesktopModePreference(launchMode);
             const bridgeActive = launchMode === "bridge";
+            const existingDesktopMode = desktopAppServerState();
+            const preserveExistingBridge = bridgeActive && existingDesktopMode === "bridge";
 
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
-              fs.writeFileSync(
-                configPath,
-                buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive),
-                "utf-8",
-              );
+              writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive));
               if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
               else CatalogSyncService.syncNativeModelsToCodexCache();
               console.log(`[CodexSplit Gateway] Applied ${bridgeActive ? "managed gateway" : "native"} Codex routing before restart.`);
             }
 
-            // Codex reads model_catalog_json only when the desktop process
-            // starts. Stop the desktop before the gateway restart and let the
-            // new gateway launch it after startup has repaired the catalog.
-            // Launching it here races the PM2 restart and makes native-only
-            // models appear permanently until another manual restart.
-            this.requestDesktopLaunchAfterGatewayReady(launchMode);
-            stopDesktopClients();
+            // A gateway restart must not tear down an already-running Bridge:
+            // the Bridge is also the official GPT account-rotation Egress and
+            // is intentionally independent from the gateway process lifetime.
+            // Only a mode change or an absent/mismatched Desktop requires a
+            // Desktop relaunch hand-off.
+            if (!preserveExistingBridge) {
+              this.requestDesktopLaunchAfterGatewayReady(launchMode);
+              stopDesktopClients();
+            }
 
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({
               status: "success",
-              message: bridgeActive
-                ? "已检测到第三方模型，Desktop Bridge 将随重启自动开启。"
-                : "Desktop 将以原生模式重新启动。",
+              message: preserveExistingBridge
+                ? "网关将重启，现有 Desktop Bridge 保持运行。"
+                : bridgeActive
+                  ? "Desktop Bridge 将随重启自动保持开启。"
+                  : "Desktop 将以原生模式重新启动。",
               mode: launchMode,
+              applied_models: applyConfiguredModels,
               third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured,
+              desktop_preserved: preserveExistingBridge,
             }));
 
             setTimeout(() => {
@@ -7179,10 +7479,13 @@ if __name__ == "__main__":
                 execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex", "--no-treekill"], { stdio: "ignore" });
               } catch {
                 // Keep the current gateway usable if PM2 is unavailable. The
-                // old process already has the final config/catalog, so it is
-                // safe to consume the marker and relaunch the desktop here.
-                try { fs.unlinkSync(this.desktopRestartMarkerPath); } catch {}
-                launchDesktopClient(true, launchMode);
+                // old process already has the final config/catalog. If the
+                // Bridge was preserved, leave it alone; otherwise consume the
+                // marker and relaunch the requested Desktop mode here.
+                if (!preserveExistingBridge) {
+                  try { fs.unlinkSync(this.desktopRestartMarkerPath); } catch {}
+                  launchDesktopClient(true, launchMode);
+                }
                 this.gatewayRestartInProgress = false;
               }
             }, 300);
@@ -7226,7 +7529,7 @@ if __name__ == "__main__":
           try {
             const { getVisualizerHtml } = await import("../services/visualizer.js");
             const isHud = url.searchParams.get("mode") === "hud";
-            const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+            const settingsPath = path.join(opencodexDataDir(), "voice_settings.json");
             let hudTheme = "vortex";
             if (fs.existsSync(settingsPath)) {
               try {
@@ -7245,7 +7548,7 @@ if __name__ == "__main__":
         }
 
         if (req.method === "GET" && url.pathname === "/api/models") {
-          const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+              const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
           let catalog: any[] = [];
           if (fs.existsSync(catalogPath)) {
             try {
@@ -7332,7 +7635,7 @@ if __name__ == "__main__":
             }
             if (providersChanged) CredentialStore.saveProviders(providers);
 
-            const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
             let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
               catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
@@ -7352,16 +7655,8 @@ if __name__ == "__main__":
             const configPath = codexConfigPath();
             let content = "";
             try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
-            const bridgeConfiguredAfterDelete = desktopBridgeConfigured(
-              providers,
-              catalog,
-              isOfficialAccountRotationReady(this.chatgptAccountPool),
-            );
-            if (!bridgeConfiguredAfterDelete) writeDesktopModePreference("native");
-            const gatewayActive = content.includes("opencodex managed")
-              && configuredDesktopLaunchMode() === "bridge"
-              && bridgeConfiguredAfterDelete;
-            fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive), "utf-8");
+            const gatewayActive = configuredDesktopLaunchMode() === "bridge";
+            writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive));
             if (gatewayActive) {
               CatalogSyncService.syncCustomModelsToCodexCache();
             } else {
@@ -7385,7 +7680,7 @@ if __name__ == "__main__":
             providers = providers.filter((p: any) => p.name !== providerName && p.id !== providerName);
             CredentialStore.saveProviders(providers);
 
-            const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
             let catalog: any = { models: [] };
             if (fs.existsSync(catalogPath)) {
               try {
@@ -7402,16 +7697,8 @@ if __name__ == "__main__":
             const configPath = codexConfigPath();
             let content = "";
             try { content = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf-8") : ""; } catch {}
-            const bridgeConfiguredAfterDelete = desktopBridgeConfigured(
-              providers,
-              catalog,
-              isOfficialAccountRotationReady(this.chatgptAccountPool),
-            );
-            if (!bridgeConfiguredAfterDelete) writeDesktopModePreference("native");
-            const gatewayActive = content.includes("opencodex managed")
-              && configuredDesktopLaunchMode() === "bridge"
-              && bridgeConfiguredAfterDelete;
-            fs.writeFileSync(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive), "utf-8");
+            const gatewayActive = configuredDesktopLaunchMode() === "bridge";
+            writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, gatewayActive));
             if (gatewayActive) {
               CatalogSyncService.syncCustomModelsToCodexCache();
             } else {
@@ -7440,8 +7727,8 @@ if __name__ == "__main__":
 
             const deletedFiles: string[] = [];
             const rolloutRoots = [
-              path.join(os.homedir(), ".codex", "sessions"),
-              path.join(os.homedir(), ".codex", "archived_sessions")
+              path.join(codexHomeDir(), "sessions"),
+              path.join(codexHomeDir(), "archived_sessions")
             ];
             for (const root of rolloutRoots) {
               if (!fs.existsSync(root)) continue;
@@ -7463,7 +7750,7 @@ if __name__ == "__main__":
               return;
             }
 
-            const historyPath = path.join(os.homedir(), ".codex", "history.jsonl");
+            const historyPath = path.join(codexHomeDir(), "history.jsonl");
             if (fs.existsSync(historyPath)) {
               try {
                 const remaining = fs.readFileSync(historyPath, "utf-8")
@@ -7476,7 +7763,7 @@ if __name__ == "__main__":
               } catch {}
             }
 
-            const dbPath = path.join(os.homedir(), ".codex", "state_5.sqlite");
+            const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
             if (fs.existsSync(dbPath)) {
               const escapedId = id.replace(/'/g, "''");
               const rolloutPredicates = deletedFiles
@@ -7515,7 +7802,7 @@ if __name__ == "__main__":
             const year = now.getFullYear();
             const month = String(now.getMonth() + 1).padStart(2, "0");
             const day = String(now.getDate()).padStart(2, "0");
-            const targetDir = path.join(os.homedir(), ".codex", "sessions", String(year), month, day);
+            const targetDir = path.join(codexHomeDir(), "sessions", String(year), month, day);
             if (!fs.existsSync(targetDir)) {
               fs.mkdirSync(targetDir, { recursive: true });
             }
@@ -7561,16 +7848,17 @@ if __name__ == "__main__":
 
             if (importedLines.length > 1) {
               fs.writeFileSync(targetFilePath, importedLines.join("\n") + "\n", "utf-8");
-              const dbPath = path.join(os.homedir(), ".codex", "state_5.sqlite");
+              const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
               if (fs.existsSync(dbPath)) {
                 const cp = await import("node:child_process");
                 const nowSec = Math.floor(Date.now() / 1000);
                 const title = String(fileName || "Imported Session").replace(/'/g, "''").replace(/[\r\n]/g, " ").slice(0, 200);
                 const sandboxPolicy = JSON.stringify({ type: "managed", file_system: { type: "restricted", entries: [] }, network: "restricted" }).replace(/'/g, "''");
-                const sql = `INSERT OR REPLACE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, preview, first_user_message, has_user_event, recency_at, recency_at_ms, cli_version, thread_source, model, memory_mode, history_mode) VALUES ('${sessionId}', '${targetFilePath}', ${nowSec}, ${nowSec}, 'vscode', 'openai', '${os.homedir()}', '${title}', '${sandboxPolicy}', 'on-request', '${title}', '${title}', 1, ${nowSec}, ${Date.now()}, '0.142.5', 'user', 'gpt-5.5', 'enabled', 'legacy');`;
+                const databaseModel = this.defaultRequestModel().replace(/'/g, "''");
+                const sql = `INSERT OR REPLACE INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode, preview, first_user_message, has_user_event, recency_at, recency_at_ms, cli_version, thread_source, model, memory_mode, history_mode) VALUES ('${sessionId}', '${targetFilePath}', ${nowSec}, ${nowSec}, 'vscode', 'openai', '${os.homedir()}', '${title}', '${sandboxPolicy}', 'on-request', '${title}', '${title}', 1, ${nowSec}, ${Date.now()}, '0.142.5', 'user', '${databaseModel}', 'enabled', 'legacy');`;
                 cp.execFileSync("sqlite3", [dbPath, sql], { stdio: "pipe" });
               }
-              const devDbPath = path.join(os.homedir(), ".codex", "sqlite", "codex-dev.db");
+              const devDbPath = path.join(codexHomeDir(), "sqlite", "codex-dev.db");
               if (fs.existsSync(devDbPath)) {
                 const cp = await import("node:child_process");
                 const nowSec = Math.floor(Date.now() / 1000);
@@ -7602,10 +7890,11 @@ if __name__ == "__main__":
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
               content = stripManagedCodexConfig(content);
-              content = content.replace(/^model\s*=\s*".*?"/m, 'model = "gpt-5.5"');
-              fs.writeFileSync(configPath, content + "\n", "utf-8");
+              // Preserve the user's native model. Reset must remove managed
+              // routing, not silently switch the account to a hardcoded slug.
+              writePrivateTextFile(configPath, content.endsWith("\n") ? content : `${content}\n`);
             }
-            const catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
             if (fs.existsSync(catalogPath)) {
               fs.writeFileSync(catalogPath, JSON.stringify({ models: [] }), "utf-8");
             }
@@ -7770,7 +8059,7 @@ if __name__ == "__main__":
                     speechDetected = true;
 
                     let silenceThreshold = 0.8;
-                    const p = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+                    const p = path.join(opencodexDataDir(), "voice_settings.json");
                     if (fs.existsSync(p)) {
                       try {
                         const settings = JSON.parse(fs.readFileSync(p, "utf-8"));
@@ -7826,7 +8115,7 @@ if __name__ == "__main__":
                     const currentBuffer = audioBuffer;
                     lastProcessedLength = currentBuffer.length;
 
-                    const p = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+                    const p = path.join(opencodexDataDir(), "voice_settings.json");
                     let settings: any = {
                       stt_engine: "local-whisper",
                       stt_api_key: "",
@@ -7902,7 +8191,7 @@ if __name__ == "__main__":
             } else if (msg.type === "active_session_changed") {
               const sid = msg.session_id;
               if (sid) {
-                const settingsPath = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+                const settingsPath = path.join(opencodexDataDir(), "voice_settings.json");
                 let settings: any = {};
                 if (fs.existsSync(settingsPath)) {
                   try { settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")); } catch {}
@@ -8021,7 +8310,7 @@ if __name__ == "__main__":
       : `${baseUrl.replace(/\/$/, "")}/audio/transcriptions`;
 
     const audioData = fs.readFileSync(filePath);
-    const boundary = `----WebKitFormBoundary${Math.random().toString(36).substring(2)}`;
+    const boundary = `----WebKitFormBoundary${randomBytes(18).toString("hex")}`;
     let payload = Buffer.alloc(0);
 
     const appendField = (name: string, value: string) => {
@@ -8271,7 +8560,7 @@ if __name__ == "__main__":
 
   private async processWebSocketSTT(ws: any, pcmBuffer: Buffer, fallbackText: string = "") {
     try {
-      const p = path.join(os.homedir(), ".opencodex", "voice_settings.json");
+      const p = path.join(opencodexDataDir(), "voice_settings.json");
       let settings: any = {
         stt_engine: "local-whisper",
         stt_api_key: "",
@@ -8344,6 +8633,9 @@ if __name__ == "__main__":
       // launchd cleanup belongs to startup or an explicit native-mode switch,
       // never to ordinary gateway shutdown.
       this.chatgptAccountLogin.stopAll();
+      this.liveModelPickerEnabled = false;
+      this.resetLiveModelPicker();
+      try { this.persistLiveModelPickerEnabled(false); } catch {}
       this.stopLivePickerOverlay();
       if (this.server) {
         this.server.close(() => {

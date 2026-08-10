@@ -105,9 +105,13 @@ export function clearProviderModelSelections(providers: ProviderConfig[]): Provi
 
 export class CredentialStore {
   private static readonly providerService = "OpenCodex Provider Credential";
-  private static providersConfigPath = path.join(os.homedir(), ".opencodex", "providers.json");
+  private static get providersConfigPath(): string {
+    const dataDir = String(process.env.OPENCODEX_DATA_DIR || "").trim() || path.join(os.homedir(), ".opencodex");
+    return path.join(dataDir, "providers.json");
+  }
   private static cachedProviders: ProviderConfig[] = [];
   private static lastMtime = 0;
+  private static lastProvidersConfigPath = "";
   private static rotationCursors = new Map<string, string>();
 
   private static normalizeCredential(raw: any, index: number): ProviderCredential | null {
@@ -192,7 +196,9 @@ export class CredentialStore {
     try {
       if (fs.existsSync(CredentialStore.providersConfigPath)) {
         const stat = fs.statSync(CredentialStore.providersConfigPath);
-        if (stat.mtimeMs === CredentialStore.lastMtime && CredentialStore.cachedProviders.length > 0) {
+        if (CredentialStore.providersConfigPath === CredentialStore.lastProvidersConfigPath
+          && stat.mtimeMs === CredentialStore.lastMtime
+          && CredentialStore.cachedProviders.length > 0) {
           return CredentialStore.cachedProviders;
         }
         const raw = fs.readFileSync(CredentialStore.providersConfigPath, "utf-8");
@@ -214,6 +220,7 @@ export class CredentialStore {
         for (const provider of CredentialStore.cachedProviders as any[]) CredentialStore.ensureCredentialMetadata(provider);
         if (migrated) CredentialStore.saveProviders(CredentialStore.cachedProviders);
         CredentialStore.lastMtime = stat.mtimeMs;
+        CredentialStore.lastProvidersConfigPath = CredentialStore.providersConfigPath;
         return CredentialStore.cachedProviders;
       }
     } catch {
@@ -554,6 +561,7 @@ export class CredentialStore {
       fs.chmodSync(CredentialStore.providersConfigPath, 0o600);
       CredentialStore.cachedProviders = safeProviders;
       CredentialStore.lastMtime = fs.statSync(CredentialStore.providersConfigPath).mtimeMs;
+      CredentialStore.lastProvidersConfigPath = CredentialStore.providersConfigPath;
     } catch (e: any) {
       console.error(`Failed to save providers config: ${e.message}`);
     }

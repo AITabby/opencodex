@@ -17,6 +17,10 @@ function accountPoolProfileRoot(): string {
   return path.join(process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"), "chatgpt-accounts");
 }
 
+function accountPoolSettingsPath(): string {
+  return path.join(process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"), "chatgpt_account_settings.json");
+}
+
 export type RealtimeProxyOptions = {
   /** The bearer token installed in Codex config for the local gateway. */
   localAdminToken?: string;
@@ -26,6 +30,12 @@ export type RealtimeProxyOptions = {
   nativeAccountId?: string;
   /** Replace even a real bearer supplied by native Codex. */
   forceNativeAccessToken?: boolean;
+  /** Rewrite the local request URL before resolving the official upstream. */
+  requestUrl?: string;
+  /** The caller has already established that this is native Live traffic. */
+  forceNativeSession?: boolean;
+  /** Add the native V3 Live sideband protocol header at the local egress. */
+  nativeLiveSideband?: boolean;
 };
 
 export type RealtimeUpstream = {
@@ -43,9 +53,25 @@ function headerValue(req: http.IncomingMessage, name: string): string {
   return typeof value === "string" ? value : "";
 }
 
-function readAccountPoolAccessToken(accountId: string): string {
+type NativeAccountCredential = {
+  token: string;
+  upstreamId: string;
+};
+
+function configuredFixedAccountId(): string {
+  try {
+    const settings = JSON.parse(fs.readFileSync(accountPoolSettingsPath(), "utf8"));
+    if (settings?.rotation_enabled !== true || settings?.mode !== "fixed") return "";
+    const accountId = typeof settings?.default_account_id === "string" ? settings.default_account_id.trim() : "";
+    return accountId && !/[^a-zA-Z0-9._-]/.test(accountId) ? accountId : "";
+  } catch {
+    return "";
+  }
+}
+
+function readAccountPoolCredential(accountId: string): NativeAccountCredential {
   const normalized = String(accountId || "").trim();
-  if (!normalized || /[^a-zA-Z0-9._-]/.test(normalized)) return "";
+  if (!normalized || /[^a-zA-Z0-9._-]/.test(normalized)) return { token: "", upstreamId: "" };
   const root = accountPoolProfileRoot();
   const candidates = [path.join(root, normalized)];
   try {
@@ -55,7 +81,7 @@ function readAccountPoolAccessToken(accountId: string): string {
       }
     }
   } catch {
-    return "";
+    return { token: "", upstreamId: "" };
   }
   for (const profile of candidates) {
     try {
@@ -63,23 +89,31 @@ function readAccountPoolAccessToken(accountId: string): string {
       const profileAccountId = typeof auth?.tokens?.account_id === "string" ? auth.tokens.account_id.trim() : "";
       if (profileAccountId !== normalized && path.basename(profile) !== normalized) continue;
       const token = typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
-      if (token) return token;
+      if (token) return { token, upstreamId: profileAccountId };
     } catch {
       // An incomplete isolated profile is not a usable credential.
     }
   }
-  return "";
+  return { token: "", upstreamId: "" };
+}
+
+function readNativeAccountCredential(accountId = ""): NativeAccountCredential {
+  const requested = String(accountId || "").trim() || configuredFixedAccountId();
+  const accountCredential = readAccountPoolCredential(requested);
+  if (accountCredential.token) return accountCredential;
+  try {
+    const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
+    return {
+      token: typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "",
+      upstreamId: typeof auth?.tokens?.account_id === "string" ? auth.tokens.account_id.trim() : "",
+    };
+  } catch {
+    return { token: "", upstreamId: "" };
+  }
 }
 
 export function readNativeAccessToken(accountId = ""): string {
-  const accountToken = readAccountPoolAccessToken(accountId);
-  if (accountToken) return accountToken;
-  try {
-    const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
-    return typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "";
-  } catch {
-    return "";
-  }
+  return readNativeAccountCredential(accountId).token;
 }
 
 function bearerValue(value: string): string {
@@ -102,12 +136,20 @@ function nativeBackendPath(pathname: string): string {
   return `/backend-api/${subPath}`;
 }
 
+function normalizedRealtimePath(pathname: string): string {
+  return pathname.replace(/\/+$/, "") || "/";
+}
+
 function isLiveCallPath(pathname: string): boolean {
-  return pathname === "/v1/live";
+  return normalizedRealtimePath(pathname) === "/v1/live";
 }
 
 function isLiveSidebandPath(pathname: string): boolean {
-  return pathname.startsWith("/v1/live/");
+  return normalizedRealtimePath(pathname).startsWith("/v1/live/");
+}
+
+function isRealtimeSidebandPath(pathname: string): boolean {
+  return normalizedRealtimePath(pathname) === "/v1/realtime";
 }
 
 function isNativeChatGptRequest(req: http.IncomingMessage, pathname: string): boolean {
@@ -115,6 +157,20 @@ function isNativeChatGptRequest(req: http.IncomingMessage, pathname: string): bo
     headerValue(req, "chatgpt-account-id")
     || pathname.startsWith("/backend-api/")
   );
+}
+
+export function nativeLiveCallTarget(search = ""): string {
+  const targetSearch = `${search ? `${search}&` : "?"}intent=quicksilver&architecture=avas`;
+  return `https://chatgpt.com/backend-api/codex/realtime/calls${targetSearch}`;
+}
+
+/**
+ * Native Codex Live V3 exposes the call id in the path. This is distinct from
+ * the public API Realtime WebSocket, which uses `/v1/realtime?call_id=...`.
+ */
+export function nativeLiveSidebandTarget(pathname: string, search = ""): string {
+  const normalizedPath = normalizedRealtimePath(pathname);
+  return `https://api.openai.com${normalizedPath}${search ? (search.startsWith("?") ? search : `?${search}`) : ""}`;
 }
 
 export function copyNativeRequestHeaders(req: http.IncomingMessage, options: RealtimeProxyOptions = {}, nativeSession = true): Record<string, string> {
@@ -132,7 +188,11 @@ export function copyNativeRequestHeaders(req: http.IncomingMessage, options: Rea
   }
 
   const incomingAuthorization = headerValue(req, "authorization");
-  const nativeToken = options.nativeAccessToken || readNativeAccessToken(headerValue(req, "chatgpt-account-id"));
+  const incomingAccountId = headerValue(req, "chatgpt-account-id");
+  const nativeCredential = options.nativeAccessToken
+    ? { token: options.nativeAccessToken, upstreamId: options.nativeAccountId || "" }
+    : readNativeAccountCredential(incomingAccountId);
+  const nativeToken = nativeCredential.token;
   const shouldReplaceNativeToken = options.forceNativeAccessToken === true
     || isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
   if (nativeSession && nativeToken && shouldReplaceNativeToken) {
@@ -145,28 +205,39 @@ export function copyNativeRequestHeaders(req: http.IncomingMessage, options: Rea
       if (key.toLowerCase() === "chatgpt-account-id") delete headers[key];
     }
     headers["chatgpt-account-id"] = options.nativeAccountId;
+  } else if (nativeSession && shouldReplaceNativeToken && nativeCredential.upstreamId && !incomingAccountId) {
+    headers["chatgpt-account-id"] = nativeCredential.upstreamId;
+  }
+  if (options.nativeLiveSideband) {
+    headers["openai-alpha"] = "quicksilver=v2";
   }
   return headers;
 }
 
 export function resolveRealtimeUpstream(req: http.IncomingMessage, options: RealtimeProxyOptions = {}): RealtimeUpstream {
-  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  const url = new URL(options.requestUrl || req.url || "/", `http://${req.headers.host || "localhost"}`);
   const incomingAuthorization = headerValue(req, "authorization");
   const nativeAccessToken = options.nativeAccessToken || readNativeAccessToken(headerValue(req, "chatgpt-account-id"));
   const localBearer = isLocalOrPlaceholderBearer(incomingAuthorization, options.localAdminToken);
+  const websocketRequest = req.method === "GET"
+    || req.headers.upgrade?.toLowerCase() === "websocket"
+    || (req.headers.connection || "").toLowerCase().includes("upgrade");
+  const explicitNativeSession = options.forceNativeSession === true;
   const nativeLiveCall = isLiveCallPath(url.pathname)
-    && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
-  const nativeLiveSideband = isLiveSidebandPath(url.pathname)
-    && (isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
+    && !websocketRequest
+    && (explicitNativeSession || isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
+  const nativeLiveSideband = (isLiveSidebandPath(url.pathname)
+    || (isRealtimeSidebandPath(url.pathname) && websocketRequest)
+    || (isLiveCallPath(url.pathname) && websocketRequest))
+    && (explicitNativeSession || isNativeChatGptRequest(req, url.pathname) || (Boolean(nativeAccessToken) && localBearer));
   const nativeSession = isNativeChatGptRequest(req, url.pathname) || nativeLiveCall || nativeLiveSideband;
   const targetHost = nativeLiveSideband ? "api.openai.com" : (nativeSession ? "chatgpt.com" : "api.openai.com");
   const targetPath = nativeLiveCall
     ? "/backend-api/codex/realtime/calls"
-    : (nativeSession && !nativeLiveSideband ? nativeBackendPath(url.pathname) : url.pathname);
-  const targetSearch = nativeLiveCall
-    ? `${url.search ? `${url.search}&` : "?"}intent=quicksilver&architecture=avas`
-    : url.search;
-  const targetUrl = `https://${targetHost}${targetPath}${targetSearch}`;
+    : (nativeSession ? nativeBackendPath(url.pathname) : url.pathname);
+  const targetUrl = nativeLiveCall
+    ? nativeLiveCallTarget(url.search)
+    : (nativeLiveSideband ? nativeLiveSidebandTarget(url.pathname, url.search) : `https://${targetHost}${targetPath}${url.search}`);
   return {
     targetUrl,
     targetHost,
@@ -224,7 +295,11 @@ export function normalizeNativeLiveCallBody(rawBody: Buffer, contentType: string
 
 export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: Buffer, options: RealtimeProxyOptions = {}): void {
   const upstream = resolveRealtimeUpstream(req, options);
-  console.log(`[OpenCodex WebRTC Proxy] Proxying ${upstream.nativeSession ? "native ChatGPT" : "API"} WebSocket signal to wss://${upstream.targetHost}${upstream.targetPath}`);
+  const target = new URL(upstream.targetUrl);
+  // The provider bridge speaks JSONL on stdout to the native app-server.
+  // Never write transport diagnostics there: one plain-text line makes the
+  // Desktop parser drop subsequent child/realtime lifecycle messages.
+  console.error(`[OpenCodex WebRTC Proxy] Proxying ${upstream.nativeSession ? "native ChatGPT" : "API"} WebSocket signal to wss://${upstream.targetHost}${target.pathname}${target.search}`);
 
   const targetSocket = tls.connect({
     host: upstream.targetHost,
@@ -232,7 +307,7 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
     servername: upstream.targetHost,
     rejectUnauthorized: true,
   }, () => {
-    let reqLines = `${req.method} ${upstream.targetPath}${new URL(req.url || "/", `http://${req.headers.host || "localhost"}`).search} HTTP/1.1\r\n`;
+    let reqLines = `${req.method} ${target.pathname}${target.search} HTTP/1.1\r\n`;
     reqLines += `Host: ${upstream.targetHost}\r\n`;
     reqLines += "Connection: Upgrade\r\nUpgrade: websocket\r\n";
     for (const [key, value] of Object.entries(upstream.headers)) {

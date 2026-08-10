@@ -28,8 +28,10 @@ test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => 
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-agent-api-"));
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
   const previousConfigPath = process.env.OPENCODEX_CODEX_CONFIG_PATH;
+  const previousCodexHome = process.env.OPENCODEX_CODEX_HOME;
   process.env.OPENCODEX_DATA_DIR = dataDir;
   process.env.OPENCODEX_CODEX_CONFIG_PATH = path.join(dataDir, "config.toml");
+  process.env.OPENCODEX_CODEX_HOME = path.join(dataDir, "codex");
   await fs.writeFile(path.join(dataDir, "custom_model_catalog.json"), JSON.stringify({ models: [{
     slug: "antigravity/code-model",
     backend_model: "gemini-code-1",
@@ -47,6 +49,8 @@ test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => 
       else process.env.OPENCODEX_DATA_DIR = previousDataDir;
       if (previousConfigPath === undefined) delete process.env.OPENCODEX_CODEX_CONFIG_PATH;
       else process.env.OPENCODEX_CODEX_CONFIG_PATH = previousConfigPath;
+      if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+      else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
       await fs.rm(dataDir, { recursive: true, force: true });
       return;
     }
@@ -89,6 +93,8 @@ test("1.1.0 Agent routing APIs persist Profile and GPT-Live mode", async (t) => 
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;
     if (previousConfigPath === undefined) delete process.env.OPENCODEX_CODEX_CONFIG_PATH;
     else process.env.OPENCODEX_CODEX_CONFIG_PATH = previousConfigPath;
+    if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+    else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });

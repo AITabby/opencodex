@@ -39,6 +39,20 @@ test("Live voice intent selects one uniquely named model", () => {
     "deepseek/deepseek-chat",
   );
   assert.equal(
+    extractLiveModelIntent(
+      { input: "请用 DeepSeek 创建一个子智能体" },
+      ["deepseek/deepseek-v4-flash", "opencode/deepseek-v4-flash", "gpt-5.6-terra"],
+    ),
+    "deepseek/deepseek-v4-flash",
+  );
+  assert.equal(
+    extractLiveModelIntent(
+      { input: "请用 OpenCode DeepSeek 创建一个子智能体" },
+      ["deepseek/deepseek-v4-flash", "opencode/deepseek-v4-flash"],
+    ),
+    "opencode/deepseek-v4-flash",
+  );
+  assert.equal(
     extractLiveModelIntent({ input: "这个任务改用 GPT-5.4 执行" }, models),
     "gpt-5.4",
   );
@@ -134,14 +148,17 @@ test("Live voice intent selects one uniquely named model", () => {
       { input: "请用 豆包 模型运行" },
       ["volcengine/doubao-seed-1.6", "volcengine/doubao-seed-1.7"],
     ),
-    "",
+    "volcengine/doubao-seed-1.6",
   );
   assert.equal(extractLiveModelIntent({ input: "不要使用 Claude" }, models), "");
 });
 
-test("Live voice intent ignores ambiguous or incidental model mentions", () => {
+test("Live voice intent auto-selects duplicate brands but ignores incidental mentions", () => {
   const models = ["anthropic/claude-sonnet-4", "anthropic/claude-opus-4"];
-  assert.equal(extractLiveModelIntent({ input: "这个任务用 Claude 执行" }, models), "");
+  assert.equal(
+    extractLiveModelIntent({ input: "这个任务用 Claude 执行" }, models),
+    "anthropic/claude-sonnet-4",
+  );
   assert.equal(extractLiveModelIntent({ input: "帮我写一个 Claude 相关的说明" }, models), "");
 });
 

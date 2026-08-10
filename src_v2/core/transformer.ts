@@ -59,8 +59,10 @@ function imageUrlFromContentPart(part: any): { url: string; detail?: string } | 
       ? rawImageUrl.url.trim()
       : typeof part.url === "string"
         ? part.url.trim()
-        : typeof part.data === "string" && typeof part.mimeType === "string"
-          ? `data:${part.mimeType};base64,${part.data}`
+        : typeof part.screenshot === "string"
+          ? part.screenshot.trim()
+          : typeof part.data === "string" && typeof (part.mimeType || part.mime_type) === "string"
+            ? `data:${part.mimeType || part.mime_type};base64,${part.data}`
           : "";
   if (!url) return null;
 
@@ -160,6 +162,7 @@ function mcpCallToolName(item: any): string {
 }
 
 function responseFunctionCallToolName(item: any): string {
+  if (item?.type === "computer_call") return canonicalNativeComputerUseExecutorName("mcp__node_repl_js");
   const name = String(item?.name || "").trim();
   if (item?.type === "mcp_call") return mcpCallToolName(item);
 
@@ -174,9 +177,10 @@ function responseFunctionCallToolName(item: any): string {
 
 function appendChatToolCall(messages: ChatMessage[], item: any): string {
   const callId = String(item?.call_id || item?.id || `call_${Date.now()}`).trim() || `call_${Date.now()}`;
-  const argsStr = typeof item?.arguments === "string"
-    ? item.arguments
-    : JSON.stringify(item?.arguments || {});
+  const rawArguments = item?.arguments ?? item?.input ?? item?.action;
+  const argsStr = typeof rawArguments === "string"
+    ? rawArguments
+    : JSON.stringify(rawArguments || {});
   const thoughtSignature = String(item?.thought_signature || item?.thoughtSignature || item?.signature || "").trim();
   const toolCall = {
     id: callId,
@@ -234,28 +238,39 @@ export function responsesInputToChatMessages(input?: any[]): ChatMessage[] {
       let role = item.role || "user";
       if (role === "developer") role = "system";
       const content = contentToChatContent(item.content);
+      const passthrough = item.internal_chat_message_metadata_passthrough;
+      const reasoningContent = typeof item.reasoning_content === "string"
+        ? item.reasoning_content
+        : typeof item.reasoningContent === "string"
+          ? item.reasoningContent
+          : typeof passthrough?.reasoning_content === "string"
+            ? passthrough.reasoning_content
+            : "";
 
       const last = messages[messages.length - 1];
       if (last && last.role === role && role === "assistant" && !last.tool_calls) {
         last.content = joinChatContent(last.content, content);
+        if (reasoningContent) last.reasoning_content = reasoningContent;
       } else {
         messages.push({
           role: role as any,
           content,
+          ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
         });
       }
-    } else if (itemType === "function_call" || itemType === "mcp_call") {
+    } else if (itemType === "function_call" || itemType === "mcp_call" || itemType === "custom_tool_call" || itemType === "computer_call") {
       const callId = appendChatToolCall(messages, item);
       const toolName = responseFunctionCallToolName(item);
       if (toolName) toolNames.set(callId, toolName);
       // A completed MCP item is commonly replayed with its output attached to
       // the same item. Preserve both halves for Chat providers.
-      if (itemType === "mcp_call" && item.output !== undefined) {
+      if ((itemType === "mcp_call" || itemType === "custom_tool_call") && item.output !== undefined) {
         appendChatToolOutput(messages, callId, item.output, toolName);
       }
-    } else if (itemType === "function_call_output") {
-      appendChatToolOutput(messages, item.call_id, item.output, toolNames.get(String(item.call_id || "").trim()) || "");
-    } else if (itemType === "mcp_call_output") {
+    } else if (itemType === "function_call_output"
+      || itemType === "mcp_call_output"
+      || itemType === "custom_tool_call_output"
+      || itemType === "computer_call_output") {
       const callId = item.call_id || item.id;
       appendChatToolOutput(messages, callId, item.output, toolNames.get(String(callId || "").trim()) || "");
     }
@@ -269,7 +284,7 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
     type: "function",
     function: {
       name: "spawn_agent",
-      description: "Dispatch one real Codex subagent task asynchronously. Before acting, decide whether the task needs no child, one child, or multiple independent children. Call spawn_agent once for each child you decide to create; multiple calls may be issued in the same turn or in subsequent turns. Do not call wait_agent or list_agents, and do not fall back to doing delegated work yourself. When the user explicitly assigns a model or saved Agent Profile to a child, pass exactly one of model or profile_id; that explicit binding overrides capability auto-routing. When no target is named, omit both and let the gateway route from the user's saved model capability directory. Use fork_turns only when conversation context is required, and use reasoning_effort only when deliberately overriding the selected target's saved default. Do not claim a child finished; only report that it was dispatched after each tool call succeeds.",
+      description: "Dispatch one real Codex subagent task asynchronously. Before acting, decide whether the task needs no child, one child, or multiple independent children. Call spawn_agent once for each child you decide to create; multiple calls may be issued in the same turn or in subsequent turns. Do not call wait_agent or list_agents, and do not fall back to doing delegated work yourself. When the user explicitly assigns a model or saved Agent Profile to a child, pass exactly one of model, profile_id, or profile_name; that explicit binding overrides capability auto-routing. If the user names multiple Profiles, issue one spawn_agent call per named child so each has an independent lifecycle. When no target is named, omit all target fields and let the gateway route from the user's saved model capability directory. Use fork_turns only when conversation context is required, and use reasoning_effort only when deliberately overriding the selected target's saved default. Do not claim a child finished; only report that it was dispatched after each tool call succeeds.",
       parameters: {
         type: "object",
         properties: {
@@ -277,6 +292,7 @@ const DEFAULT_WORKSPACE_TOOLS: ChatTool[] = [
           message: { type: "string", description: "Complete task instructions and expected deliverable for the subagent" },
           model: { type: "string", description: "Optional exact model slug from the gateway catalog; use only when the user explicitly assigns this child to a model" },
           profile_id: { type: "string", description: "Optional saved Agent Profile id; use only when the user explicitly assigns this child to a Profile" },
+          profile_name: { type: "string", description: "Optional exact saved Agent Profile name; use only when the user explicitly names this child Profile" },
           fork_turns: { type: "string", enum: ["none", "all"], description: "Whether to include the current conversation context; use none unless context is required" },
           reasoning_effort: { type: "string", description: "Optional per-child reasoning override; use one of the reasoning levels advertised by the selected model's catalog entry" }
         },
@@ -578,6 +594,8 @@ export function transformResponsesToChat(
   upstreamModel: string,
   sessionId?: string,
   allowSubagentDispatch = true,
+  adapterName?: string,
+  providerReasoningContent = "",
 ): ChatCompletionRequestBody {
   const messages: ChatMessage[] = [];
   const sourceTools = allowSubagentDispatch ? body.tools : stripSubagentRuntimeTools(body.tools);
@@ -609,9 +627,15 @@ export function transformResponsesToChat(
   messages.push(...repairedMessages);
 
   // Apply model-specific adapter (DeepSeek, MiniMax, Anthropic, Google)
-  const adapter = AdapterFactory.getAdapter(undefined, undefined);
+  const adapter = AdapterFactory.getAdapter(undefined, undefined, adapterName);
   const sanitizedMessages = adapter.sanitizeMessages(messages);
   const mergedMessages = mergeConsecutiveMessages(sanitizedMessages);
+  if (providerReasoningContent) {
+    const assistantWithToolCall = [...mergedMessages].reverse().find((message) =>
+      message.role === "assistant" && Array.isArray(message.tool_calls) && message.tool_calls.length > 0,
+    );
+    if (assistantWithToolCall) assistantWithToolCall.reasoning_content = providerReasoningContent;
+  }
 
   const chatBody: ChatCompletionRequestBody = {
     model: upstreamModel,

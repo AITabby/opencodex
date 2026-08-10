@@ -10,13 +10,17 @@ import readline from "node:readline";
 import {
   classifyProviderModel,
   cliEgressRoute,
+  extractNativeLiveCallIds,
   OfficialAccountRouter,
   isHardOfficialQuotaFailure,
   isOfficialAuthFailure,
   isOfficialQuotaFailure,
   isNativeControlPlaneRequest,
   isNativeSubagentRequest,
+  isNativeLiveCreateCall,
+  nativeLiveUpgradeRequestUrl,
   nativeEgressRoute,
+  rewriteNativeGatewayRequestBody,
   nativeRuntimeArgs,
   normalizeThreadListParams,
 } from "../dist/codex-provider-bridge.js";
@@ -60,6 +64,29 @@ test("standalone CLI keeps official requests native and sends provider-owned mod
   assert.equal(cliEgressRoute({ model: "antigravity/gemini-3.6-flash-medium" }), "gateway");
   assert.equal(cliEgressRoute({ model: "opencode/deepseek-v4-flash" }), "gateway");
   assert.equal(cliEgressRoute({ model: "minimax/minimax-m3" }), "gateway");
+  assert.equal(cliEgressRoute({
+    model: "gpt-5.5",
+    client_metadata: {
+      thread_source: "subagent",
+      subagent_origin: "gpt-live",
+      model_override: "antigravity/gemini-3.6-flash-medium",
+    },
+  }), "gateway");
+  assert.equal(cliEgressRoute({
+    model: "gpt-5.5",
+    client_metadata: { thread_source: "subagent", model_override: "codex-auto-review" },
+  }), "native");
+  assert.equal(cliEgressRoute({ model: "gpt-5.5" }, {
+    "x-openai-subagent": "1",
+    "x-codex-subagent-source": "gpt-live",
+  }), "gateway");
+  assert.equal(cliEgressRoute({
+    model: "gpt-5.5",
+    client_metadata: {
+      subagent_origin: "gpt-live",
+      model_override: "antigravity/gemini-3.6-flash-medium",
+    },
+  }), "gateway");
 });
 
 test("account failover only recognizes official quota and rate-limit responses", () => {
@@ -172,6 +199,19 @@ test("1.1.5 history listing is provider-neutral even when Desktop sends a provid
 
 test("native child routing is request-scoped and leaves the native provider untouched", () => {
   assert.equal(nativeEgressRoute({ model: "gpt-5.5" }, {}), "native");
+  const routedThirdPartyRequest = {
+    model: "gpt-5.5",
+    client_metadata: { opencodex_model_override: "antigravity/gemini-3.6-flash-medium" },
+  };
+  assert.equal(nativeEgressRoute(routedThirdPartyRequest, {}), "gateway");
+  assert.equal(rewriteNativeGatewayRequestBody(routedThirdPartyRequest).model, "antigravity/gemini-3.6-flash-medium");
+  assert.equal(rewriteNativeGatewayRequestBody({ model: "gpt-5.5" }).model, "gpt-5.5");
+  const nativeEgressBase = "/__opencodex_native_egress_test/v1";
+  assert.equal(isNativeLiveCreateCall(`${nativeEgressBase}/live`, nativeEgressBase), true);
+  assert.equal(isNativeLiveCreateCall(`${nativeEgressBase}/live/rtc_test`, nativeEgressBase), false);
+  // Live remains in the native lane; only its upstream path/body shape is
+  // special-cased after it has crossed the local Egress boundary.
+  assert.equal(nativeEgressRoute({}, {}), "native");
   assert.equal(isNativeSubagentRequest({ model: "gpt-5.5" }, {
     "x-openai-subagent": "collab_spawn",
     "x-codex-parent-thread-id": "parent-thread",
@@ -201,11 +241,64 @@ test("native child routing is request-scoped and leaves the native provider unto
   assert.deepEqual(args.slice(0, 8), [
     "--profile", "default",
     "-c", "openai_base_url=http://127.0.0.1:43127/v1",
+    "-c", "experimental_realtime_webrtc_call_base_url=http://127.0.0.1:43127/v1",
+    "-c", "experimental_realtime_ws_base_url=ws://127.0.0.1:43127/v1/realtime",
+  ]);
+  assert.deepEqual(args.slice(8, 12), [
     "-c", "features.responses_websockets=false",
     "-c", "features.responses_websockets_v2=false",
   ]);
   assert.equal(args.includes("model_provider=opencodex"), false);
-  assert.equal(args[8], "app-server");
+  assert.equal(args[12], "app-server");
+});
+
+test("native Live response ids can bind the following sideband to the same account", () => {
+  assert.deepEqual(
+    extractNativeLiveCallIds(Buffer.from(JSON.stringify({
+      call_id: "rtc_u0_test-call",
+      session: { id: "session-not-the-call" },
+    }))),
+    ["rtc_u0_test-call"],
+  );
+  assert.deepEqual(
+    extractNativeLiveCallIds(Buffer.from("{\"sdp\":\"v=0\"}"), {
+      "x-realtime-session-id": "rtc_u2_header-call",
+    }),
+    ["rtc_u2_header-call"],
+  );
+  assert.deepEqual(
+    extractNativeLiveCallIds(Buffer.from("{\"sdp\":\"v=0\"}"), {
+      "x-session-id": "rtc_u3_session-header-call",
+    }),
+    ["rtc_u3_session-header-call"],
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl("/v1/live", "/live", "rtc_u4_latest-call"),
+    "/v1/live/rtc_u4_latest-call",
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl("/v1/live?call_id=rtc_u5_query-call", "/live", "rtc_u5_query-call"),
+    "/v1/live?call_id=rtc_u5_query-call",
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl("/v1/realtime", "/realtime", "rtc_u6_realtime-call"),
+    "/v1/realtime?call_id=rtc_u6_realtime-call",
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl("/v1/realtime/", "/realtime/", "rtc_u7_realtime-call"),
+    "/v1/realtime?call_id=rtc_u7_realtime-call",
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl("/v1/live/", "/live/", "rtc_u8_live-call"),
+    "/v1/live/rtc_u8_live-call",
+  );
+  assert.equal(
+    nativeLiveUpgradeRequestUrl(
+      "/__opencodex_native_egress_test/v1/v1/live/rtc_u9_duplicate-v1",
+      "/v1/live/rtc_u9_duplicate-v1",
+    ),
+    "/v1/live/rtc_u9_duplicate-v1",
+  );
 });
 
 test("standalone CLI bridge routes each Responses request by model", async () => {
@@ -286,6 +379,168 @@ if (tracePath) fs.writeFileSync(tracePath, JSON.stringify({ argv: process.argv, 
     assert.equal(trace.results.every((result) => result.status === 200), true);
   } finally {
     if (bridge.exitCode === null) bridge.kill("SIGTERM");
+    await new Promise((resolve) => {
+      if (bridge.exitCode !== null) resolve();
+      else bridge.once("exit", resolve);
+    });
+    await new Promise((resolve) => nativeUpstream.close(resolve));
+    await new Promise((resolve) => gateway.close(resolve));
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("default app-server bridge keeps native sessions intact while routing GPT-Live child images by lineage", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-thin-app-server-egress-"));
+  const fakeNativePath = join(tempRoot, "fake-native-app-server.mjs");
+  const fakeNativeSource = `#!/usr/bin/env node
+import readline from "node:readline";
+
+const baseArg = process.argv.find((value) => value.startsWith("openai_base_url=")) || "";
+const baseUrl = baseArg.slice("openai_base_url=".length);
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+const requestUpstream = async (params, headers = {}) => {
+  const response = await fetch(new URL("responses", baseUrl.endsWith("/") ? baseUrl : baseUrl + "/"), {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(params),
+  });
+  return { status: response.status, body: await response.text() };
+};
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  void (async () => {
+    const message = JSON.parse(line);
+    if (message.method === "initialize") {
+      send({ id: message.id, result: { initialized: true } });
+      return;
+    }
+    if (message.method === "thread/start") {
+      // This echo proves the bridge did not rewrite JSON-RPC thread state.
+      send({ id: message.id, result: { thread: { id: "native-thread-1", model: message.params?.model || "gpt-5.5" }, echo: message.params } });
+      return;
+    }
+    if (message.method === "turn/start") {
+      const params = message.params || {};
+      const isLiveChild = params.client_metadata?.subagent_origin === "gpt-live";
+      const payload = isLiveChild
+        ? {
+          model: "gpt-5.5",
+          input: [{ type: "message", role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,AAAA" }] }],
+          client_metadata: {
+            thread_source: "subagent",
+            subagent_origin: "gpt-live",
+            model_override: "antigravity/gemini-3.6-flash-medium",
+          },
+        }
+        : { model: params.model || "gpt-5.5", input: params.input || [] };
+      const upstream = await requestUpstream(payload, isLiveChild
+        ? { "x-openai-subagent": "1", "x-codex-subagent-source": "gpt-live" }
+        : {});
+      send({ id: message.id, result: { status: upstream.status, body: upstream.body } });
+      return;
+    }
+    send({ id: message.id, result: {} });
+  })().catch((error) => send({ id: message.id, error: { message: String(error?.message || error) } }));
+});
+`;
+  await writeFile(fakeNativePath, fakeNativeSource, "utf8");
+  await chmod(fakeNativePath, 0o755);
+
+  const nativeSeen = [];
+  const gatewaySeen = [];
+  const createUpstream = (seen, status = 200) => http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      seen.push({ url: req.url, headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) });
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: status < 400 }));
+    });
+  });
+  const nativeUpstream = createUpstream(nativeSeen);
+  const gateway = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      gatewaySeen.push({ url: req.url, headers: req.headers, body });
+      // A non-multimodal provider failure must be returned as one request
+      // failure; it must not terminate the native app-server or bridge.
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "image input is not supported" } }));
+    });
+  });
+  await new Promise((resolve) => nativeUpstream.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+  const nativePort = nativeUpstream.address().port;
+  const gatewayPort = gateway.address().port;
+  const bridgePath = new URL("../dist/codex-provider-bridge.js", import.meta.url);
+  const bridge = spawn(process.execPath, [fileURLToPath(bridgePath), "app-server"], {
+    env: {
+      ...process.env,
+      OPENCODEX_LEGACY_PROVIDER_BRIDGE: undefined,
+      CODEX_CLI_PATH: "",
+      OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
+      OPENCODEX_NATIVE_UPSTREAM_BASE_URL: `http://127.0.0.1:${nativePort}`,
+      OPENCODEX_GATEWAY_PORT: String(gatewayPort),
+      OPENCODEX_DATA_DIR: tempRoot,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const messages = [];
+  const stderr = [];
+  bridge.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
+  const output = readline.createInterface({ input: bridge.stdout });
+  output.on("line", (line) => {
+    if (!line.trim()) return;
+    try { messages.push(JSON.parse(line)); } catch {}
+  });
+  const send = (message) => bridge.stdin.write(`${JSON.stringify(message)}\n`);
+  const waitFor = (id) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`request ${id} timed out\\n${stderr.join("")}`)), 8000);
+    const interval = setInterval(() => {
+      const index = messages.findIndex((message) => message.id === id);
+      if (index < 0) return;
+      clearTimeout(timer);
+      clearInterval(interval);
+      resolve(messages.splice(index, 1)[0]);
+    }, 5);
+  });
+
+  try {
+    send({ id: 1, method: "initialize", params: {} });
+    assert.deepEqual(await waitFor(1), { id: 1, result: { initialized: true } });
+    send({ id: 2, method: "thread/start", params: { model: "gpt-5.5" } });
+    const started = await waitFor(2);
+    assert.deepEqual(started.result.echo, { model: "gpt-5.5" });
+
+    send({ id: 3, method: "turn/start", params: { model: "gpt-5.5", input: [] } });
+    assert.equal((await waitFor(3)).result.status, 200);
+    send({
+      id: 4,
+      method: "turn/start",
+      params: {
+        model: "gpt-5.5",
+        client_metadata: { thread_source: "subagent", subagent_origin: "gpt-live" },
+      },
+    });
+    assert.equal((await waitFor(4)).result.status, 400);
+    // The failed third-party image request did not kill the bridge or poison
+    // the next native conversation request.
+    send({ id: 5, method: "turn/start", params: { model: "gpt-5.5", input: [] } });
+    assert.equal((await waitFor(5)).result.status, 200);
+
+    assert.equal(nativeSeen.length, 2);
+    assert.equal(nativeSeen.every((entry) => entry.url === "/backend-api/codex/responses"), true);
+    assert.equal(gatewaySeen.length, 1);
+    assert.equal(gatewaySeen[0].url, "/v1/responses");
+    assert.equal(gatewaySeen[0].body.model, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(gatewaySeen[0].body.client_metadata.subagent_origin, "gpt-live");
+    assert.equal(gatewaySeen[0].body.input[0].content[0].type, "input_image");
+  } finally {
+    output.close();
+    bridge.kill("SIGTERM");
     await new Promise((resolve) => {
       if (bridge.exitCode !== null) resolve();
       else bridge.once("exit", resolve);
@@ -472,7 +727,7 @@ const handleLine = async (line) => {
       threadSettings: { model: "gpt-5.5", modelProvider: "openai", effort: "low" },
     } });
   }
-  send({ id: message.id, result: { thread: { id: "native-thread-1", model: "gpt-5.5", modelProvider: "openai" } } });
+  send({ id: message.id, result: { reasoningEffort: "low", thread: { id: "child-thread-1", model: "gpt-5.5", modelProvider: "openai" } } });
 };
 rl.on("line", (line) => { void handleLine(line); });
 `;
@@ -490,6 +745,7 @@ rl.on("line", (line) => { void handleLine(line); });
         "x-opencodex-subagent-model": "antigravity/gemini-3.6-flash-medium",
         "x-opencodex-subagent-reasoning-effort": "high",
         "x-opencodex-subagent-task-id": "child-thread-1",
+        "x-opencodex-subagent-thread-id": "child-thread-1",
       });
       res.end(JSON.stringify({ ok: true }));
     });
@@ -504,6 +760,7 @@ rl.on("line", (line) => { void handleLine(line); });
       OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
       OPENCODEX_GATEWAY_PORT: String(gatewayPort),
       OPENCODEX_DATA_DIR: tempRoot,
+      OPENCODEX_LEGACY_PROVIDER_BRIDGE: "1",
       FAKE_EGRESS_TRACE: tracePath,
       FAKE_EGRESS_SETTINGS_TRACE: settingsTracePath,
       FAKE_EGRESS_CHILD_THREAD: "child-thread-1",
@@ -544,6 +801,7 @@ rl.on("line", (line) => { void handleLine(line); });
       }, 5);
     });
     assert.equal(started.error, undefined);
+    assert.equal(started.result.reasoningEffort, "high");
     assert.equal(seen.length, 1);
     assert.equal(seen[0].url, "/v1/responses");
     assert.equal(seen[0].headers["x-openai-subagent"], "collab_spawn");
@@ -556,6 +814,9 @@ rl.on("line", (line) => { void handleLine(line); });
     assert.equal(childSettings?.params?.threadSettings?.model, "antigravity/gemini-3.6-flash-medium");
     assert.equal(childSettings?.params?.threadSettings?.modelProvider, "opencodex");
     assert.equal(childSettings?.params?.threadSettings?.effort, "high");
+    assert.equal(messages
+      .filter((message) => message.method === "thread/settings/updated" && message.params?.threadId === "child-thread-1")
+      .every((message) => message.params?.threadSettings?.effort === "high"), true);
     const persistedSettings = (await readFile(settingsTracePath, "utf8"))
       .trim().split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
     assert.equal(persistedSettings.some((settings) => settings.threadId === "child-thread-1" && settings.effort === "high"), true);
@@ -640,6 +901,7 @@ rl.on("line", (line) => {
       CODEX_CLI_PATH: "",
       OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
       OPENCODEX_DATA_DIR: tempRoot,
+      OPENCODEX_LEGACY_PROVIDER_BRIDGE: "1",
       FAKE_ACCOUNT_TRACE: tracePath,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -769,6 +1031,7 @@ rl.on("line", (line) => {
       CODEX_CLI_PATH: "",
       OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
       OPENCODEX_DATA_DIR: tempRoot,
+      OPENCODEX_LEGACY_PROVIDER_BRIDGE: "1",
       FAKE_ACCOUNT_TRACE: tracePath,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -904,6 +1167,7 @@ rl.on("line", (line) => {
       OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
       OPENCODEX_DATA_DIR: tempRoot,
       OPENCODEX_PROVIDER_SESSION_MAP_PATH: routesPath,
+      OPENCODEX_LEGACY_PROVIDER_BRIDGE: "1",
       FAKE_ACCOUNT_TRACE: tracePath,
     },
     stdio: ["pipe", "pipe", "pipe"],
@@ -1034,16 +1298,18 @@ test("native restore clears an inherited legacy bridge environment", () => {
   }
 });
 
-test("1.1.5 uses an official canonical thread and isolated third-party turns", async () => {
+test("1.1.5 keeps one local native conversation and routes provider turns at Egress", async () => {
   const [source, launcher] = await Promise.all([
     readFile(new URL("../src_v2/codex-provider-bridge.ts", import.meta.url), "utf8"),
     readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8"),
   ]);
-  assert.match(source, /thread\/inject_items/);
   assert.match(source, /spawnRuntime/);
   assert.match(source, /OPENCODEX_PROVIDER_BRIDGE_RUNTIME/);
-  assert.match(source, /ephemeral: true/);
-  assert.match(source, /function beginGatewayTurn/);
+  assert.match(source, /rewriteNativeGatewayRequestBody/);
+  assert.doesNotMatch(source, /thread\/inject_items/);
+  assert.doesNotMatch(source, /function beginGatewayTurn/);
+  assert.doesNotMatch(source, /ensureRuntime\(GATEWAY_PROVIDER\)/);
+  assert.doesNotMatch(source, /ephemeral: true/);
   assert.match(source, /method === "thread\/list"/);
   assert.match(source, /thread\/settings\/update/);
   assert.match(source, /modelProviders/);

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { fetchUpstream } from "./upstream_fetch.js";
+import { APP_VERSION } from "../version.js";
 
 /**
  * Read-only official Codex account usage.
@@ -444,7 +445,7 @@ function readRateLimitsFromNative(profileDir: string, nativePath: string): Promi
         id: "opencodex-usage-initialize",
         method: "initialize",
         params: {
-          clientInfo: { name: "CodexSplit Account Usage", version: "2.0.0-beta.1" },
+          clientInfo: { name: "CodexSplit Account Usage", version: APP_VERSION },
           capabilities: { experimentalApi: true, requestAttestation: true },
         },
       });

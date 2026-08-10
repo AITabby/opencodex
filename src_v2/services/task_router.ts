@@ -5,6 +5,7 @@ import {
   AgentProfile,
   AgentProfileStore,
   AgentRouteEvent,
+  AgentRoutingScope,
   AgentRoutingMode,
   AgentTaskSource,
 } from "./agent_profile_store.js";
@@ -34,6 +35,7 @@ export interface TaskRouteRequest {
   task_type?: string;
   tags?: string[];
   profile_id?: string;
+  profile_name?: string;
   forced_model?: string;
   reasoning_effort?: string;
   /** Keep an explicitly selected per-turn effort verbatim at the provider boundary. */
@@ -73,6 +75,11 @@ function list(value: unknown, max = 64): string[] {
 
 function lower(value: unknown): string {
   return clean(value, 400).toLowerCase();
+}
+
+function defaultCodexHomeDir(): string {
+  const configured = String(process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME || "").trim();
+  return configured || path.join(os.homedir(), ".codex");
 }
 
 function normalizeReasoningForModel(model: RoutingCatalogModel, requestedValue?: string, preserveExplicit = false): string | undefined {
@@ -220,7 +227,7 @@ function modelFromEntry(entry: any, source: "custom" | "native"): RoutingCatalog
 
 export function readRoutingCatalog(
   dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"),
-  nativeDataDir = path.join(os.homedir(), ".codex"),
+  nativeDataDir = defaultCodexHomeDir(),
 ): RoutingCatalogModel[] {
   const sources: Array<{ filePath: string; source: "custom" | "native" }> = [
     // This is Codex's existing model capability interface/cache. It carries
@@ -353,9 +360,11 @@ function matchingProfileScore(profile: AgentProfile, request: TaskRouteRequest):
 
 export class TaskRouter {
   public readonly store: AgentProfileStore;
+  private readonly scope: AgentRoutingScope;
 
-  constructor(store = new AgentProfileStore()) {
+  constructor(store = new AgentProfileStore(), scope: AgentRoutingScope = "subagent") {
     this.store = store;
+    this.scope = scope;
   }
 
   public listProfiles(): AgentProfile[] {
@@ -366,8 +375,33 @@ export class TaskRouter {
     return readRoutingCatalog(this.store.dataDir);
   }
 
+  public findProfileSelector(selector: unknown): AgentProfile | undefined {
+    const value = clean(selector, 160).toLowerCase();
+    if (!value) return undefined;
+    return this.listProfiles().find((profile) =>
+      profile.id.toLowerCase() === value || profile.name.toLowerCase() === value,
+    );
+  }
+
   public getSettings() {
-    return this.store.loadRoutingSettings();
+    return this.store.loadRoutingSettings(this.scope);
+  }
+
+  /** Select a concrete catalog model when automatic routing has no Profile. */
+  public resolveAnyAvailable(request: TaskRouteRequest): ResolvedTaskRoute {
+    const model = this.listModels().find((entry) => entry.available);
+    if (!model) return this.unavailable(request, "no available model is configured");
+    return {
+      ok: true,
+      mode: this.getSettings().mode,
+      model: model.slug,
+      backend_model: model.backend_model,
+      provider: model.provider,
+      protocol: model.protocol,
+      reasoning_effort: normalizeReasoningForModel(model, request.reasoning_effort, request.preserve_reasoning_effort),
+      reason: "auto: first available catalog model",
+      catalog_model: model,
+    };
   }
 
   /**
@@ -389,7 +423,7 @@ export class TaskRouter {
   }
 
   public resolve(request: TaskRouteRequest): ResolvedTaskRoute {
-    const settings = this.store.loadRoutingSettings();
+    const settings = this.store.loadRoutingSettings(this.scope);
     const profiles = this.store.loadProfiles();
     const catalog = this.listModels();
     const source = request.source || "manual";
@@ -399,9 +433,12 @@ export class TaskRouter {
       return this.resolveModel(explicitModel, undefined, request, catalog, "explicit forced model");
     }
 
-    const explicitProfileId = clean(request.profile_id, 80);
+    const explicitProfileId = clean(request.profile_id || request.profile_name, 160);
     if (explicitProfileId) {
-      const profile = profiles.find((item) => item.id === explicitProfileId);
+      const profile = profiles.find((item) =>
+        item.id.toLowerCase() === explicitProfileId.toLowerCase()
+        || item.name.toLowerCase() === explicitProfileId.toLowerCase(),
+      );
       if (!profile) return this.unavailable(request, "requested profile is not configured");
       if (!profile.enabled) return this.unavailable(request, `profile ${profile.id} is disabled`, profile);
       if (request.source === "gpt-live" && !profile.live_enabled) return this.unavailable(request, `profile ${profile.id} is not enabled for GPT-Live`, profile);
@@ -507,7 +544,7 @@ export class TaskRouter {
     );
     return {
       ok: true,
-      mode: this.store.loadRoutingSettings().mode,
+      mode: this.store.loadRoutingSettings(this.scope).mode,
       profile_id: profile?.id,
       profile_name: profile?.name,
       model: model.slug,
@@ -525,7 +562,7 @@ export class TaskRouter {
   private unavailable(request: TaskRouteRequest, reason: string, profile?: AgentProfile): ResolvedTaskRoute {
     const route: ResolvedTaskRoute = {
       ok: false,
-      mode: this.store.loadRoutingSettings().mode,
+      mode: this.store.loadRoutingSettings(this.scope).mode,
       profile_id: profile?.id,
       profile_name: profile?.name,
       reason,

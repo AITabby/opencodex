@@ -83,7 +83,35 @@ test("third-party Responses keep the selected catalog model identity and usage",
 
   const completed = events.find((event) => event.type === "response.completed")?.response;
   assert.equal(completed.model, "opencode/deepseek-v4-flash");
-  assert.deepEqual(completed.usage, { input_tokens: 12, output_tokens: 3, total_tokens: 15 });
+  assert.deepEqual(completed.usage, {
+    input_tokens: 12,
+    output_tokens: 3,
+    total_tokens: 15,
+    input_tokens_details: { cached_tokens: 0 },
+  });
+});
+
+test("stream usage fills the native cached_tokens field when a provider omits it", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("provider-model", "turn-usage-compat");
+  const emit = async (event) => events.push(event);
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { content: "ok" } }],
+    usage: {
+      prompt_tokens: 10,
+      completion_tokens: 2,
+      total_tokens: 12,
+      prompt_tokens_details: { audio_tokens: 0 },
+    },
+  });
+  await engine.finish(emit);
+  assert.deepEqual(events.find((event) => event.type === "response.completed")?.response?.usage, {
+    input_tokens: 10,
+    output_tokens: 2,
+    total_tokens: 12,
+    input_tokens_details: { audio_tokens: 0, cached_tokens: 0 },
+  });
 });
 
 test("V2 stream ignores provider chunks with an empty choices array", async () => {
@@ -117,7 +145,8 @@ test("V2 source keeps Computer Use on the Codex-native executor path", async () 
   assert.match(router, /generateNativeCodexImage/);
   assert.match(router, /proxyThirdPartyResponses\(\s*reqBody/);
   assert.match(router, /hasComputerUseTool/);
-  assert.doesNotMatch(router, /proxyThirdPartyResponsesWithComputerUse|ensureResponsesComputerUseTool|computer_call_output|opencodex_computer_use/);
+  assert.doesNotMatch(router, /proxyThirdPartyResponsesWithComputerUse|ensureResponsesComputerUseTool|opencodex_computer_use/);
+  assert.match(router, /computer_call_output/);
   assert.match(catalog, /NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS/);
 });
 

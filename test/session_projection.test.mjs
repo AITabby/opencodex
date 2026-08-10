@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { responsesInputToChatMessages } from "../dist/core/transformer.js";
+import { SessionHistoryService } from "../dist/services/session_history.js";
 
 test("session projection preserves visible user and assistant messages", () => {
   const result = responsesInputToChatMessages([
@@ -18,6 +22,56 @@ test("internal Codex envelopes are not projected to third-party providers", () =
     { type: "message", role: "user", content: "<environment_context>private</environment_context>你好" }
   ]);
   assert.equal(result[0].content, "你好");
+});
+
+test("orphaned tool calls are repaired before the next ordinary user message", () => {
+  const merged = SessionHistoryService.repairAndMergeHistory([
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "call-stuck", type: "function", function: { name: "mcp__node_repl_js", arguments: "{}" } }],
+    },
+    { role: "user", content: "继续回答我" },
+  ]);
+  assert.deepEqual(merged.map((message) => [message.role, message.tool_call_id || "", message.content]), [
+    ["assistant", "", ""],
+    ["tool", "call-stuck", "Tool execution failed or was cancelled; continue without this tool result."],
+    ["user", "", "继续回答我"],
+  ]);
+});
+
+test("session history reads native JSONL response items and drops empty messages", async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-session-history-"));
+  const previousCodexHome = process.env.OPENCODEX_CODEX_HOME;
+  const sessionId = "session-jsonl-context";
+  const rolloutPath = path.join(codexHome, "sessions", "2026", "08", "10", `rollout-${sessionId}.jsonl`);
+  try {
+    process.env.OPENCODEX_CODEX_HOME = codexHome;
+    await fs.mkdir(path.dirname(rolloutPath), { recursive: true });
+    await fs.writeFile(rolloutPath, [
+      { type: "session_meta", payload: { id: sessionId } },
+      { type: "response_item", payload: { item: { type: "message", role: "user", content: [{ type: "input_text", text: "上一条问题" }] } } },
+      { type: "response_item", payload: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "上一条回答" }], internal_chat_message_metadata_passthrough: { reasoning_content: "保留的推理" } } } },
+      { type: "response_item", payload: { item: { type: "message", role: "assistant", content: [] } } },
+      { type: "response_item", payload: { type: "custom_tool_call", id: "call-custom", call_id: "call-custom", name: "exec_command", input: "{\"cmd\":\"pwd\"}" } },
+      { type: "response_item", payload: { type: "custom_tool_call_output", call_id: "call-custom", output: "/tmp" } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+
+    const reconstructed = SessionHistoryService.reconstructPastMessages(sessionId);
+    assert.deepEqual(reconstructed.slice(0, 2).map((message) => message.content), ["上一条问题", "上一条回答"]);
+    assert.equal(reconstructed[1].reasoning_content, "保留的推理");
+    assert.equal(reconstructed[2].tool_calls[0].id, "call-custom");
+    assert.equal(reconstructed[3].tool_call_id, "call-custom");
+
+    const merged = SessionHistoryService.repairAndMergeHistory([
+      { role: "user", content: "当前问题" },
+    ], sessionId);
+    assert.deepEqual(merged.map((message) => message.content), ["上一条问题", "上一条回答", "", "/tmp", "当前问题"]);
+  } finally {
+    if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+    else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
+    await fs.rm(codexHome, { recursive: true, force: true });
+  }
 });
 
 test("session detail filters compact tool traces masquerading as user text", async () => {

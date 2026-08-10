@@ -74,11 +74,13 @@ test("native executor arguments bootstrap sky and isolate persistent REPL variab
   const normalized = JSON.parse(normalizeNativeComputerUseToolArguments(raw));
 
   assert.match(normalized.code, /opencodex-native-computer-use-call/);
-  assert.match(normalized.code, /setupComputerUseRuntime/);
+  assert.match(normalized.code, /import\('@oai\/sky'\)/);
+  assert.doesNotMatch(normalized.code, /computer-use-client\.mjs/);
   assert.match(normalized.code, /async \(\) =>/);
   assert.match(normalized.code, /const lines/);
   assert.notEqual(normalized.code, JSON.parse(raw).code);
 });
+
 
 test("ordinary third-party requests do not receive a gateway-specific Computer Use function", () => {
   const names = convertToolsToChatTools().map((tool) => tool.function?.name);

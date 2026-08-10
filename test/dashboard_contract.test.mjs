@@ -216,11 +216,16 @@ test("dashboard exposes an explicit Desktop Bridge switch below the compact subs
     "third_party_models_exposed",
     "desired_mode",
     "mode_preference",
+    "mode_change_in_progress",
+    "subscriptionsRequestSerial",
+    "subscriptionsAppliedSerial",
+    "pendingMode",
     "bridge_available",
     "official_account_rotation_enabled",
     "官方 GPT 始终走 OpenAI 原生上游",
     "重启 Codex 时将自动开启 Desktop Bridge",
     "Desktop Bridge 当前关闭；官方 GPT 仍走 OpenAI 原生上游",
+    "已开启 · 等待 Desktop",
     "网关重启不会改变 Bridge 开关",
     "不会删除已保存的 Provider、账号或模型",
   ]) {
@@ -229,7 +234,10 @@ test("dashboard exposes an explicit Desktop Bridge switch below the compact subs
   assert.match(text, /grid-column:2/);
   assert.match(text, /mode==='native'/);
   assert.match(text, /mode==='bridge'/);
+  assert.match(text, /switchButton\.getAttribute\('aria-checked'\)==='true'\?'native':'bridge'/);
   assert.match(text, /restart\.disabled=!staged\.length/);
+  assert.match(text, /post\('\/api\/restart-codex',applyModels\?\{apply_models:true\}:\{\}\)/);
+  assert.match(text, /q\('#restart-button'\)\.onclick=function\(\)\{restart\(this,\{applyModels:true\}\)\}/);
   assert.match(text, /waitForDesktopMode\(result&&result\.mode\|\|expectedMode\)/);
 });
 

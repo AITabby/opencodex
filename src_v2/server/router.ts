@@ -1,4 +1,7 @@
 import http from "node:http";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
 import { ResponsesStreamEngine } from "../core/stream_engine.js";
 import { buildGatewaySubagentResponseTool, isSubagentDispatchToolName, stripSubagentRuntimeTools, transformResponsesToChat } from "../core/transformer.js";
 import { AdapterFactory } from "../adapters/factory.js";
@@ -7,6 +10,8 @@ import { AnthropicAdapter } from "../adapters/anthropic.js";
 import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { extractImageGenerationContext, generateNativeCodexImage, parseImageGenerationArguments } from "../services/native_image_bridge.js";
+import { analyzeWithNativeVision, assertNoNativeVisionImages, extractNativeVisionImages, extractNativeVisionImagesInCurrentTurn, hasNativeVisionImages, hasNativeVisionImagesInCurrentTurn, isProviderImageInputRejection, nativeVisionAuthorizationFingerprint, nativeVisionImageKey, NativeVisionBridgeError, normalizeTextOnlyProviderChatPayload, replaceImagesWithNativeVisionText, stripImageInspectionToolsForTextOnlyTurn, type NativeVisionErrorCode, type NativeVisionImageReference, type NativeVisionResult } from "../services/native_vision_bridge.js";
+import { normalizeLegacyImageRequestBody } from "../services/image_input.js";
 import { appendComputerUseInstructions, hasComputerUseTool, hasNativeComputerUseTool, normalizeComputerUseResponsesTools, normalizeNativeComputerUseResponsesPayload } from "../services/computer_use_native.js";
 import {
   hasChatToolImages,
@@ -20,8 +25,9 @@ import { optimizeThirdPartyComputerUseImages } from "../services/computer_use_im
 import { acquireCursorStreamReader, cursorAdvertisedToolNames, decodeCursorEndStreamError, decodeCursorStreamComplete, decodeCursorStreamText, decodeCursorToolCallCompleted, fetchCursorModelsCached, resolveCursorAgentModelSelector, streamCursorChat, type CursorExternalToolRequest, type CursorToolContinuation, type CursorToolEvent, type CursorToolResult } from "../services/cursor_protocol.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
-import { CatalogSyncService } from "../services/catalog_sync.js";
+import { CatalogSyncService, getProviderModelVisionCapability } from "../services/catalog_sync.js";
 import { CredentialStore } from "../services/credential_store.js";
+import { resolveSubscriptionTransport } from "../services/provider_transports.js";
 
 export class ProviderCredentialError extends Error {
   public readonly statusCode: number;
@@ -39,6 +45,328 @@ function shouldRotateProviderCredential(statusCode: number): boolean {
   return statusCode === 401 || statusCode === 403 || statusCode === 408 || statusCode === 429 || statusCode >= 500;
 }
 
+function configuredProviderVisionCapability(providerName: string, upstreamModel: string): boolean | undefined {
+  const wanted = String(providerName || "").trim().toLowerCase();
+  if (!wanted) return undefined;
+  try {
+    const provider = CredentialStore.loadProviders().find((item: any) =>
+      String(item?.name || "").trim().toLowerCase() === wanted
+      || String(item?.preset_id || "").trim().toLowerCase() === wanted,
+    );
+    return provider ? getProviderModelVisionCapability(provider, upstreamModel) : undefined;
+  } catch {
+    // Capability metadata is an optimization. A damaged catalog must not
+    // make an otherwise routable provider unavailable.
+    return undefined;
+  }
+}
+
+/**
+ * Every provider error is scoped to one Responses turn. A raw HTTP 4xx/5xx or
+ * an SSE body that ends after `response.failed` leaves the native Codex client
+ * waiting for the turn boundary and can make the next text/tool request look
+ * stuck. Always close the local turn with the complete terminal sequence.
+ */
+export async function emitGatewayResponsesFailure(
+  res: http.ServerResponse,
+  error: { code?: string; message: string },
+  requestBody: any,
+  upstreamModel: string,
+  responseModel = "",
+): Promise<void> {
+  if (res.writableEnded) return;
+  if (!res.headersSent) {
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    });
+  }
+  const selectedResponseModel = String(responseModel || requestBody?.model || upstreamModel).trim() || upstreamModel;
+  const write = async (payload: any) => {
+    if (!res.writableEnded) await writeSseData(res, payload);
+  };
+  const engine = new ResponsesStreamEngine(
+    upstreamModel,
+    requestBody?.client_metadata?.turn_id,
+    { responseModel: selectedResponseModel },
+  );
+  await engine.start(write);
+  const now = Math.floor(Date.now() / 1000);
+  const failedResponse = {
+    id: engine.getResponseId(),
+    object: "response",
+    created_at: now,
+    completed_at: now,
+    status: "failed",
+    model: selectedResponseModel,
+    output: [],
+    error: {
+      code: error.code || "provider_request_failed",
+      message: error.message,
+    },
+  };
+  await write({ type: "response.failed", response: failedResponse });
+  await write({ type: "response.completed", response: failedResponse });
+  await write({ type: "response.done", response: failedResponse });
+  if (!res.writableEnded) {
+    res.write("data: [DONE]\n\n");
+    res.end();
+  }
+}
+
+async function emitNativeVisionBridgeFailure(
+  res: http.ServerResponse,
+  error: NativeVisionBridgeError,
+  requestBody: any,
+  upstreamModel: string,
+  responseModel = "",
+): Promise<void> {
+  await emitGatewayResponsesFailure(res, error, requestBody, upstreamModel, responseModel);
+}
+
+const NATIVE_VISION_CACHE_SCHEMA_VERSION = 2;
+const NATIVE_VISION_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_NATIVE_VISION_CACHE_ENTRIES = 64;
+const nativeVisionCache = new Map<string, { result: NativeVisionResult; expiresAt: number }>();
+type PersistedNativeVisionEntry = {
+  status: "ready" | "failed";
+  text?: string;
+  model?: string;
+  imageCount?: number;
+  errorCode?: string;
+  errorMessage?: string;
+  statusCode?: number;
+  authorizationFingerprint?: string;
+  updatedAt: number;
+};
+const persistedNativeVisionCache = new Map<string, PersistedNativeVisionEntry>();
+let persistedNativeVisionCacheLoaded = false;
+
+function nativeVisionCachePath(): string {
+  const dataDir = String(process.env.OPENCODEX_DATA_DIR || "").trim() || path.join(os.homedir(), ".opencodex");
+  return path.join(dataDir, "native_vision_cache.json");
+}
+
+function loadPersistedNativeVisionCache(): void {
+  if (persistedNativeVisionCacheLoaded) return;
+  persistedNativeVisionCacheLoaded = true;
+  try {
+    const raw = JSON.parse(fs.readFileSync(nativeVisionCachePath(), "utf8"));
+    if (raw?.schema_version !== NATIVE_VISION_CACHE_SCHEMA_VERSION) return;
+    for (const [key, value] of Object.entries(raw?.entries || {})) {
+      if (!key || !value || typeof value !== "object") continue;
+      const entry = value as PersistedNativeVisionEntry;
+      if ((entry.status !== "ready" && entry.status !== "failed") || !Number.isFinite(entry.updatedAt)) continue;
+      persistedNativeVisionCache.set(key, entry);
+    }
+  } catch {
+    // A missing or damaged cache must never affect routing or session recovery.
+  }
+}
+
+function savePersistedNativeVisionCache(): void {
+  try {
+    const filePath = nativeVisionCachePath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
+    const tempPath = `${filePath}.tmp-${process.pid}`;
+    fs.writeFileSync(tempPath, JSON.stringify({ schema_version: NATIVE_VISION_CACHE_SCHEMA_VERSION, entries: Object.fromEntries(persistedNativeVisionCache) }), { encoding: "utf8", mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+  } catch {
+    // The in-memory cache remains useful even when the optional disk cache is unavailable.
+  }
+}
+
+function failedVisionFallback(entry: PersistedNativeVisionEntry, imageCount: number): NativeVisionResult {
+  const safeError = String(entry.errorMessage || "视觉分析暂不可用")
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=_-]+/gi, "[图片数据已隐藏]")
+    .replace(/base64,[a-z0-9+/=_-]{16,}/gi, "base64,[图片数据已隐藏]")
+    .replace(/\b(?:input_image|output_image|image_url)\b/gi, "图片字段")
+    .slice(0, 800);
+  const knownCodes: NativeVisionErrorCode[] = [
+    "official_vision_auth_unavailable",
+    "official_vision_quota_exhausted",
+    "official_vision_invalid_request",
+    "official_vision_request_failed",
+    "official_vision_unreachable",
+  ];
+  const code = knownCodes.includes(entry.errorCode as NativeVisionErrorCode)
+    ? entry.errorCode as NativeVisionErrorCode
+    : "official_vision_request_failed";
+  return {
+    model: (entry.model || "gpt-5.6-luna") as NativeVisionResult["model"],
+    imageCount: entry.imageCount || imageCount,
+    text: `[图片视觉分析暂不可用：${safeError}]`,
+    error: {
+      code,
+      message: safeError || "官方视觉模型没有返回图片分析文本。",
+      ...(Number.isFinite(entry.statusCode) ? { statusCode: entry.statusCode } : {}),
+    },
+  };
+}
+
+function pruneNativeVisionCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of nativeVisionCache) {
+    if (entry.expiresAt <= now) nativeVisionCache.delete(key);
+  }
+  while (nativeVisionCache.size > MAX_NATIVE_VISION_CACHE_ENTRIES) {
+    const oldest = nativeVisionCache.keys().next().value;
+    if (oldest === undefined) break;
+    nativeVisionCache.delete(oldest);
+  }
+}
+
+async function analyzeNativeVisionOnce(
+  requestBody: any,
+  nativeHeaders: Record<string, string>,
+  options: { providerApiKey?: string; signal?: AbortSignal; allowNetwork?: boolean } = {},
+): Promise<NativeVisionResult> {
+  pruneNativeVisionCache();
+  loadPersistedNativeVisionCache();
+  const images = extractNativeVisionImages(requestBody);
+  if (images.length === 0) {
+    return {
+      model: "gpt-5.6-luna",
+      imageCount: 0,
+      text: "[图片视觉分析暂不可用：请求中没有可用的图片数据。]",
+    };
+  }
+  const authFingerprint = nativeVisionAuthorizationFingerprint(nativeHeaders);
+  const currentImageKeys = new Set(extractNativeVisionImagesInCurrentTurn(requestBody).map(nativeVisionImageKey));
+  const textByImageKey = new Map<string, string>();
+  const imageByKey = new Map<string, NativeVisionImageReference>();
+  const pending: Array<{ key: string; image: NativeVisionImageReference }> = [];
+  let currentTurnError: NativeVisionResult["error"];
+
+  for (const image of images) {
+    const key = nativeVisionImageKey(image);
+    if (imageByKey.has(key)) continue;
+    imageByKey.set(key, image);
+
+    const cached = nativeVisionCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      textByImageKey.set(key, cached.result.text);
+      continue;
+    }
+    const persisted = persistedNativeVisionCache.get(key);
+    if (persisted?.status === "ready" && persisted.text) {
+      const result: NativeVisionResult = {
+        model: (persisted.model || "gpt-5.6-luna") as NativeVisionResult["model"],
+        text: persisted.text,
+        imageCount: 1,
+      };
+      nativeVisionCache.set(key, { result, expiresAt: Date.now() + NATIVE_VISION_CACHE_TTL_MS });
+      textByImageKey.set(key, result.text);
+      continue;
+    }
+    if (persisted?.status === "failed" && persisted.authorizationFingerprint === authFingerprint) {
+      const result = failedVisionFallback(persisted, 1);
+      nativeVisionCache.set(key, { result, expiresAt: Date.now() + NATIVE_VISION_CACHE_TTL_MS });
+      textByImageKey.set(key, result.text);
+      if (currentImageKeys.has(key) && result.error) currentTurnError ||= result.error;
+      continue;
+    }
+    if (options.allowNetwork === false || !currentImageKeys.has(key)) {
+      textByImageKey.set(key, "[历史图片未在本地视觉缓存中，已跳过重复读取。]");
+      continue;
+    }
+    pending.push({ key, image });
+  }
+
+  // Analyze only uncached images from the current turn. In particular, adding
+  // a second image must never resend every image in the old transcript.
+  for (const { key, image } of pending) {
+    try {
+      const result = await analyzeWithNativeVision(requestBody, nativeHeaders, {
+        ...options,
+        images: [image],
+      });
+      nativeVisionCache.set(key, { result, expiresAt: Date.now() + NATIVE_VISION_CACHE_TTL_MS });
+      persistedNativeVisionCache.set(key, {
+        status: "ready",
+        text: result.text,
+        model: result.model,
+        imageCount: 1,
+        updatedAt: Date.now(),
+      });
+      textByImageKey.set(key, result.text);
+    } catch (error) {
+      if (!(error instanceof NativeVisionBridgeError)) throw error;
+      const failedEntry: PersistedNativeVisionEntry = {
+        status: "failed",
+        model: "gpt-5.6-luna",
+        imageCount: 1,
+        errorCode: error.code,
+        errorMessage: error.message,
+        statusCode: error.statusCode,
+        authorizationFingerprint: authFingerprint,
+        updatedAt: Date.now(),
+      };
+      persistedNativeVisionCache.set(key, failedEntry);
+      const result = failedVisionFallback(failedEntry, 1);
+      nativeVisionCache.set(key, { result, expiresAt: Date.now() + NATIVE_VISION_CACHE_TTL_MS });
+      textByImageKey.set(key, result.text);
+      if (currentImageKeys.has(key) && result.error) currentTurnError ||= result.error;
+    }
+  }
+  if (pending.length > 0) savePersistedNativeVisionCache();
+  pruneNativeVisionCache();
+
+  const text = Array.from(imageByKey.keys())
+    .map((key, index) => `图片${index + 1}：${textByImageKey.get(key) || "[图片说明不可用]"}`)
+    .join("\n\n");
+  return {
+    model: "gpt-5.6-luna",
+    imageCount: imageByKey.size,
+    text,
+    ...(currentTurnError ? { error: currentTurnError } : {}),
+  };
+}
+
+async function preprocessKnownTextOnlyImages(
+  requestBody: any,
+  upstreamModel: string,
+  responseModel: string,
+  apiKey: string,
+  providerName: string,
+  nativeHeaders: Record<string, string>,
+  res: http.ServerResponse,
+): Promise<{ requestBody: any; failed: boolean }> {
+  requestBody = normalizeLegacyImageRequestBody(requestBody);
+  const visionCapability = configuredProviderVisionCapability(providerName, upstreamModel);
+  if (visionCapability !== false || !hasNativeVisionImages(requestBody)) {
+    return { requestBody, failed: false };
+  }
+
+  const vision = await analyzeNativeVisionOnce(requestBody, nativeHeaders, {
+    providerApiKey: apiKey,
+    allowNetwork: hasNativeVisionImagesInCurrentTurn(requestBody),
+  });
+  if (vision.error) {
+    await emitNativeVisionBridgeFailure(
+      res,
+      new NativeVisionBridgeError(vision.error.code, vision.error.message, vision.error.statusCode || 0),
+      requestBody,
+      upstreamModel,
+      responseModel,
+    );
+    return { requestBody, failed: true };
+  }
+
+  console.info(
+    `[CodexSplit Provider] preprocessed images through native vision `
+    + `model=${vision.model} provider=${providerName || "provider"} `
+    + `backend=${upstreamModel} images=${vision.imageCount}`,
+  );
+  const bridgedRequestBody = replaceImagesWithNativeVisionText(requestBody, vision.text);
+  return {
+    requestBody: stripImageInspectionToolsForTextOnlyTurn(bridgedRequestBody),
+    failed: false,
+  };
+}
+
 export interface GatewaySubagentDispatchCall {
   id: string;
   call_id: string;
@@ -53,6 +381,7 @@ export interface GatewaySubagentDispatchContext {
   provider?: string;
   backend_model?: string;
   parent_reasoning_effort?: string;
+  source?: "gpt-live" | "main-agent" | "subagent";
 }
 
 export interface GatewaySubagentDispatchResult {
@@ -64,6 +393,11 @@ export interface GatewaySubagentDispatchResult {
   error?: string;
 }
 
+export interface GatewayResponsesResult {
+  completed: boolean;
+  output: string;
+}
+
 export type GatewaySubagentDispatcher = (
   calls: GatewaySubagentDispatchCall[],
   context: GatewaySubagentDispatchContext,
@@ -73,9 +407,63 @@ export type GatewaySubagentDispatcher = (
 
 const CURSOR_TEXT_IDLE_TIMEOUT_MS = 2000;
 const CURSOR_TOOL_IDLE_TIMEOUT_MS = 8000;
+// Some OpenAI-compatible gateways omit both finish_reason and [DONE] after a
+// tool call. Do not leave the native client waiting until its next user
+// message; once a tool call is visible, a bounded idle read closes this turn.
+const PROVIDER_TOOL_IDLE_TIMEOUT_MS = 12_000;
+const PROVIDER_TEXT_IDLE_TIMEOUT_MS = 30_000;
+// An upstream that opens an empty SSE response must not keep the native
+// Desktop turn pending until a later user message wakes the session up.
+const PROVIDER_EMPTY_IDLE_TIMEOUT_MS = 45_000;
 const MAX_CURSOR_SESSION_MESSAGES = 40;
 const MAX_CURSOR_SESSION_CACHE_ENTRIES = 100;
 const cursorSessionHistory = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+let cursorSessionHistoryLoadedPath = "";
+
+function cursorSessionHistoryPath(): string {
+  const dataDir = String(process.env.OPENCODEX_DATA_DIR || "").trim() || path.join(os.homedir(), ".opencodex");
+  return path.join(dataDir, "cursor_session_history.json");
+}
+
+function loadCursorSessionHistory(): void {
+  const filePath = cursorSessionHistoryPath();
+  if (cursorSessionHistoryLoadedPath === filePath) return;
+  cursorSessionHistoryLoadedPath = filePath;
+  cursorSessionHistory.clear();
+  try {
+    const payload = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+    const sessions = payload?.sessions && typeof payload.sessions === "object" ? payload.sessions : {};
+    for (const [key, value] of Object.entries(sessions)) {
+      if (!key || !Array.isArray(value)) continue;
+      const messages = value
+        .filter((message: any) => (message?.role === "user" || message?.role === "assistant") && typeof message?.content === "string")
+        .map((message: any) => ({ role: message.role, content: message.content.slice(0, 120_000) }))
+        .filter((message: any) => message.content.trim())
+        .slice(-MAX_CURSOR_SESSION_MESSAGES);
+      if (messages.length > 0) cursorSessionHistory.set(key, messages);
+    }
+    while (cursorSessionHistory.size > MAX_CURSOR_SESSION_CACHE_ENTRIES) {
+      const oldest = cursorSessionHistory.keys().next().value;
+      if (!oldest) break;
+      cursorSessionHistory.delete(oldest);
+    }
+  } catch {}
+}
+
+function persistCursorSessionHistory(): void {
+  const filePath = cursorSessionHistoryPath();
+  const payload = { schema_version: 1, sessions: Object.fromEntries(cursorSessionHistory), updated_at: new Date().toISOString() };
+  const dataDir = path.dirname(filePath);
+  const tempPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+  try {
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(tempPath, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+    fs.renameSync(tempPath, filePath);
+    try { fs.chmodSync(filePath, 0o600); } catch {}
+  } finally {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+  }
+}
 type CursorPendingToolCall = {
   key: string;
   callId: string;
@@ -98,6 +486,79 @@ const cursorPendingToolCalls = new Map<string, CursorPendingToolCall>();
 // by the old request closure and silently discarded.
 const cursorExternalToolQueues = new Map<string, CursorExternalToolRequest[]>();
 const CURSOR_PENDING_TOOL_TTL_MS = 10 * 60 * 1000;
+
+type PendingProviderReasoning = {
+  content: string;
+  providerName: string;
+  providerUrl: string;
+  upstreamModel: string;
+  createdAt: number;
+};
+
+// Thinking-mode Chat providers require the exact reasoning_content from the
+// assistant tool-call turn to be echoed when its tool result is continued.
+// Keep that provider-private state keyed by the provider call id instead of
+// putting it into the Responses stream that Codex Desktop persists.
+const pendingProviderReasoning = new Map<string, PendingProviderReasoning>();
+const PENDING_PROVIDER_REASONING_TTL_MS = 10 * 60 * 1000;
+
+function providerReasoningKey(providerName: string, providerUrl: string, upstreamModel: string, callId: string): string {
+  return [providerName.trim().toLowerCase(), providerUrl.trim().toLowerCase(), upstreamModel.trim(), callId.trim()].join("\u0000");
+}
+
+function prunePendingProviderReasoning(): void {
+  const cutoff = Date.now() - PENDING_PROVIDER_REASONING_TTL_MS;
+  for (const [key, entry] of pendingProviderReasoning) {
+    if (entry.createdAt < cutoff) pendingProviderReasoning.delete(key);
+  }
+}
+
+function rememberPendingProviderReasoning(
+  callIds: string[],
+  content: string,
+  providerName: string,
+  providerUrl: string,
+  upstreamModel: string,
+): void {
+  const preservedContent = typeof content === "string" ? content : "";
+  if (!preservedContent.trim() || callIds.length === 0) return;
+  prunePendingProviderReasoning();
+  const entry = { content: preservedContent, providerName, providerUrl, upstreamModel, createdAt: Date.now() };
+  for (const rawCallId of callIds) {
+    const callId = String(rawCallId || "").trim();
+    if (!callId) continue;
+    pendingProviderReasoning.set(providerReasoningKey(providerName, providerUrl, upstreamModel, callId), entry);
+  }
+}
+
+function providerReasoningForRequest(
+  input: unknown,
+  providerName: string,
+  providerUrl: string,
+  upstreamModel: string,
+): string {
+  prunePendingProviderReasoning();
+  if (!Array.isArray(input)) return "";
+  const callIds = input
+    .filter((item: any) => item && typeof item === "object" && [
+      "function_call",
+      "function_call_output",
+      "mcp_call",
+      "mcp_call_output",
+      "custom_tool_call",
+      "custom_tool_call_output",
+      "computer_call",
+      "computer_call_output",
+    ].includes(item.type))
+    .map((item: any) => String(item.call_id || item.id || "").trim())
+    .filter(Boolean)
+    .reverse();
+  for (const callId of callIds) {
+    const entry = pendingProviderReasoning.get(providerReasoningKey(providerName, providerUrl, upstreamModel, callId));
+    if (entry) return entry.content;
+  }
+  return "";
+}
 
 function responsesEndpointForProvider(providerUrl: string): string {
   const base = String(providerUrl || "").replace(/\/(?:chat\/completions|messages|responses)\/?$/i, "").replace(/\/$/, "");
@@ -165,12 +626,48 @@ function isResponsesUnsupported(status: number, body: string): boolean {
   return /response|protocol|endpoint|unsupported|not supported|not found/i.test(body);
 }
 
+function normalizeResponsesUsageShape(usage: any): any {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
+  const details = usage.input_tokens_details && typeof usage.input_tokens_details === "object"
+    ? usage.input_tokens_details
+    : usage.prompt_tokens_details && typeof usage.prompt_tokens_details === "object"
+      ? usage.prompt_tokens_details
+      : {};
+  const rawCached = Number(usage.cached_tokens ?? usage.cached_input_tokens ?? details.cached_tokens);
+  return {
+    ...usage,
+    input_tokens_details: {
+      ...details,
+      cached_tokens: Number.isFinite(rawCached) ? rawCached : 0,
+    },
+  };
+}
+
+function normalizeResponsesUsagePayload(payload: any): any {
+  if (!payload || typeof payload !== "object") return payload;
+  let next = payload;
+  if (payload.usage && typeof payload.usage === "object") {
+    next = { ...next, usage: normalizeResponsesUsageShape(payload.usage) };
+  }
+  if (payload.response?.usage && typeof payload.response.usage === "object") {
+    next = {
+      ...next,
+      response: {
+        ...payload.response,
+        usage: normalizeResponsesUsageShape(payload.response.usage),
+      },
+    };
+  }
+  return next;
+}
+
 function sanitizeThirdPartyResponsesPayload(
   payload: any,
   blockedReasoningIds: Set<string>,
   nativeComputerUseCallIds?: Set<string>,
 ): any | null {
   if (!payload || typeof payload !== "object") return payload;
+  payload = normalizeResponsesUsagePayload(payload);
 
   const item = payload.item;
   if (item?.type === "reasoning") {
@@ -281,6 +778,37 @@ type CollectedThirdPartyResponses = {
   calls: GatewaySubagentDispatchCall[];
   json?: any;
 };
+
+function thirdPartyResponsesHasTerminalEvent(events: string[]): boolean {
+  for (const raw of events) {
+    const dataLines = raw.split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart());
+    for (const data of dataLines) {
+      if (data.trim() === "[DONE]") return true;
+      try {
+        const payload = JSON.parse(data);
+        if (payload?.type === "response.completed"
+          || payload?.type === "response.failed"
+          || payload?.type === "response.done") {
+          return true;
+        }
+      } catch {
+        // A malformed provider event is not a terminal event. The caller will
+        // close this turn with a structured gateway failure instead.
+      }
+    }
+  }
+  return false;
+}
+
+function thirdPartyResponsesHasJsonPayload(collected: CollectedThirdPartyResponses): boolean {
+  if (collected.json === undefined || collected.json === null) return false;
+  if (typeof collected.json !== "object") return Boolean(String(collected.json).trim());
+  const candidate = collected.json?.response ?? collected.json;
+  if (!candidate || typeof candidate !== "object") return Boolean(String(candidate || "").trim());
+  return Object.keys(candidate).length > 0;
+}
 
 function responseFunctionCallFromItem(item: any): GatewaySubagentDispatchCall | null {
   const name = String(item?.name || "").trim();
@@ -419,34 +947,57 @@ async function proxyThirdPartyResponses(
   providerName = "",
   allowCredentialFailover = true,
   credentialId = "",
-): Promise<"handled" | "fallback"> {
+  nativeImageHeaders: Record<string, string> = {},
+): Promise<"handled" | "failed" | "fallback"> {
+  // The native Desktop app-server may encode a user screenshot as
+  // `[Image: data:image/...;base64,...]` inside an input_text item. Convert
+  // that transport-only representation to the same structured image part
+  // used by native GPT before the provider protocol is selected.
+  reqBody = normalizeLegacyImageRequestBody(reqBody);
+  const preprocessed = await preprocessKnownTextOnlyImages(
+    reqBody,
+    upstreamModel,
+    responseModel,
+    apiKey,
+    providerName,
+    nativeImageHeaders,
+    res,
+  );
+  if (preprocessed.failed) return "failed";
+  reqBody = preprocessed.requestBody;
   const targetUrl = responsesEndpointForProvider(providerUrl);
-  const optimized = await optimizeThirdPartyComputerUseImages(reqBody);
-  const sanitizedBody = sanitizeThirdPartyResponsesRequest(optimized.body, upstreamModel, true);
-  const upstreamBody = {
-    ...sanitizedBody,
-    ...(isSubagentRequest
-      ? { tools: stripSubagentRuntimeTools(sanitizedBody?.tools) }
-      : subagentDispatcher
-        ? {
-          tools: [
-            ...(Array.isArray(sanitizedBody?.tools) ? sanitizedBody.tools : []),
-            buildGatewaySubagentResponseTool(),
-          ].filter((tool: any, index: number, list: any[]) => list.findIndex((candidate) => String(candidate?.name || candidate?.function?.name || "") === String(tool?.name || tool?.function?.name || "")) === index),
-          ...(sanitizedBody?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
-        }
-        : {}),
+  const prepareUpstreamBody = async (sourceBody: any): Promise<{ body: any; optimized: any }> => {
+    const optimized = await optimizeThirdPartyComputerUseImages(sourceBody);
+    const sanitizedBody = sanitizeThirdPartyResponsesRequest(optimized.body, upstreamModel, true);
+    const body = {
+      ...sanitizedBody,
+      ...(isSubagentRequest
+        ? { tools: stripSubagentRuntimeTools(sanitizedBody?.tools) }
+        : subagentDispatcher
+          ? {
+            tools: [
+              ...(Array.isArray(sanitizedBody?.tools) ? sanitizedBody.tools : []),
+              buildGatewaySubagentResponseTool(),
+            ].filter((tool: any, index: number, list: any[]) => list.findIndex((candidate) => String(candidate?.name || candidate?.function?.name || "") === String(tool?.name || tool?.function?.name || "")) === index),
+            ...(sanitizedBody?.parallel_tool_calls === undefined ? { parallel_tool_calls: true } : {}),
+          }
+          : {}),
+    };
+    return { body, optimized };
   };
-  if (optimized.stats.optimized || optimized.stats.deduplicated) {
-    console.info(
-      `[OpenCodex Computer Use] optimized third-party Responses screenshots ` +
-      `optimized=${optimized.stats.optimized} deduplicated=${optimized.stats.deduplicated} ` +
-      `bytes=${optimized.stats.inputBytes}->${optimized.stats.outputBytes}`,
-    );
-  }
-
+  let prepared: { body: any; optimized: any };
+  let upstreamBody: any;
   try {
-    const upstreamRes = await fetchUpstream(targetUrl, {
+    prepared = await prepareUpstreamBody(reqBody);
+    upstreamBody = prepared.body;
+    if (prepared.optimized.stats.optimized || prepared.optimized.stats.deduplicated) {
+      console.info(
+        `[OpenCodex Computer Use] optimized third-party Responses screenshots ` +
+        `optimized=${prepared.optimized.stats.optimized} deduplicated=${prepared.optimized.stats.deduplicated} ` +
+        `bytes=${prepared.optimized.stats.inputBytes}->${prepared.optimized.stats.outputBytes}`,
+      );
+    }
+    let upstreamRes = await fetchUpstream(targetUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -459,25 +1010,79 @@ async function proxyThirdPartyResponses(
     });
 
     if (!upstreamRes.ok || !upstreamRes.body) {
-      const errorText = await upstreamRes.text();
-      if (upstreamRes.status === 400) {
-        CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errorText);
-      }
-      if (isResponsesUnsupported(upstreamRes.status, errorText)) {
-        console.warn(`[CodexSplit Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
-        return "fallback";
-      }
-      if (allowCredentialFailover && credentialId && shouldRotateProviderCredential(upstreamRes.status)) {
-        throw new ProviderCredentialError(
-          `Provider API Key 请求失败（HTTP ${upstreamRes.status}）：${errorText.slice(0, 800)}`,
-          upstreamRes.status,
-          credentialId,
+      let errorText = await upstreamRes.text();
+      if (isProviderImageInputRejection(upstreamRes.status, errorText, reqBody)) {
+        // The provider gets the first chance to handle its own native image
+        // input. Only an explicit image-shape validation failure enters this
+        // bridge; ordinary provider auth/outage errors never do.
+        const vision = await analyzeNativeVisionOnce(reqBody, nativeImageHeaders, {
+          providerApiKey: apiKey,
+          allowNetwork: hasNativeVisionImagesInCurrentTurn(reqBody),
+        });
+        if (vision.error) {
+          await emitNativeVisionBridgeFailure(
+            res,
+            new NativeVisionBridgeError(vision.error.code, vision.error.message, vision.error.statusCode || 0),
+            reqBody,
+            upstreamModel,
+            responseModel,
+          );
+          return "failed";
+        }
+        const bridgedBody = replaceImagesWithNativeVisionText(reqBody, vision.text);
+        if (reqBody && typeof reqBody === "object" && bridgedBody && typeof bridgedBody === "object") {
+          Object.assign(reqBody, bridgedBody);
+        }
+        prepared = await prepareUpstreamBody(bridgedBody);
+        upstreamBody = prepared.body;
+        console.warn(
+          `[CodexSplit Provider] provider rejected image input; retrying through native vision ` +
+          `model=${vision.model} provider=${providerName || "provider"} backend=${upstreamModel} images=${vision.imageCount}`,
         );
+        upstreamRes = await fetchUpstream(targetUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(upstreamBody),
+          maxAttempts: 1,
+          timeoutMs: 120_000,
+          operation: "native-third-party-responses-vision-fallback",
+        });
+        if (!upstreamRes.ok || !upstreamRes.body) errorText = await upstreamRes.text();
       }
-      const responseHeaders: Record<string, string> = { "Content-Type": "application/json" };
-      res.writeHead(upstreamRes.status, responseHeaders);
-      res.end(errorText || JSON.stringify({ error: `Upstream API Error (${upstreamRes.status})` }));
-      return "handled";
+      if (!upstreamRes.ok || !upstreamRes.body) {
+        if (upstreamRes.status === 400) {
+          CatalogSyncService.learnReasoningLevelsFromProviderError(providerName, upstreamModel, errorText);
+        }
+        if (isResponsesUnsupported(upstreamRes.status, errorText)) {
+          console.warn(`[CodexSplit Provider] Responses unsupported by ${targetUrl}; falling back to Chat conversion`);
+          return "fallback";
+        }
+        if (allowCredentialFailover && credentialId && shouldRotateProviderCredential(upstreamRes.status)) {
+          throw new ProviderCredentialError(
+            `Provider API Key 请求失败（HTTP ${upstreamRes.status}）：${errorText.slice(0, 800)}`,
+            upstreamRes.status,
+            credentialId,
+          );
+        }
+        let message = `Upstream API Error (${upstreamRes.status})`;
+        try {
+          const parsed = JSON.parse(errorText);
+          message = String(parsed?.error?.message || parsed?.error || parsed?.message || errorText || message);
+        } catch {
+          message = errorText || message;
+        }
+        await emitGatewayResponsesFailure(
+          res,
+          { code: `provider_http_${upstreamRes.status}`, message },
+          reqBody,
+          upstreamModel,
+          responseModel,
+        );
+        return "failed";
+      }
     }
 
     let responseForHeaders = upstreamRes;
@@ -514,6 +1119,29 @@ async function proxyThirdPartyResponses(
       collected = await collectThirdPartyResponsesBody(continuationResponse);
     }
 
+    // A fetch body existing is not the same as a completed Responses turn.
+    // Empty SSE streams and streams that stop before response.done used to be
+    // forwarded as HTTP 200, leaving Codex Desktop waiting forever and making
+    // the next text/tool request appear broken.
+    if ((collected.events.length === 0
+      && (!collected.response || (typeof collected.response === "object" && Object.keys(collected.response).length === 0))
+      && !thirdPartyResponsesHasJsonPayload(collected))
+      || (collected.events.length > 0 && !thirdPartyResponsesHasTerminalEvent(collected.events))) {
+      await emitGatewayResponsesFailure(
+        res,
+        {
+          code: collected.events.length > 0 ? "incomplete_provider_response" : "empty_provider_response",
+          message: collected.events.length > 0
+            ? "第三方 Responses 上游在终止事件前结束，没有形成完整回复。"
+            : "第三方 Responses 上游返回了空响应。",
+        },
+        reqBody,
+        upstreamModel,
+        responseModel,
+      );
+      return "failed";
+    }
+
     const responseHeaders = copySafeResponseHeaders(responseForHeaders.headers);
     res.writeHead(responseForHeaders.status, responseHeaders);
     if (collected.events.length > 0) {
@@ -541,14 +1169,21 @@ async function proxyThirdPartyResponses(
       ...details,
       attempts: err?.attempts,
     });
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      error: err.message,
-      type: "upstream_unreachable",
-      retryable: Boolean(err?.retryable),
-      cause_code: details.code,
-    }));
-    return "handled";
+    if (err instanceof NativeVisionBridgeError) {
+      await emitNativeVisionBridgeFailure(res, err, reqBody, upstreamModel, responseModel);
+      return "failed";
+    }
+    await emitGatewayResponsesFailure(
+      res,
+      {
+        code: "upstream_unreachable",
+        message: err?.message || `无法连接第三方 Responses 上游${details.code ? ` [${details.code}]` : ""}`,
+      },
+      reqBody,
+      upstreamModel,
+      responseModel,
+    );
+    return "failed";
   }
 }
 
@@ -646,6 +1281,7 @@ function rememberCursorSession(
   messages: Array<{ role: string; content: string }>,
   assistantText: string,
 ): void {
+  loadCursorSessionHistory();
   if (!key || !assistantText.trim()) return;
   const conversation = messages
     .filter((message): message is { role: "user" | "assistant"; content: string } =>
@@ -658,6 +1294,7 @@ function rememberCursorSession(
     if (!oldest) break;
     cursorSessionHistory.delete(oldest);
   }
+  persistCursorSessionHistory();
 }
 
 export class GatewayRouter {
@@ -783,6 +1420,11 @@ export class GatewayRouter {
       error: { code: "provider_credential_unavailable", message },
     };
     await write({ type: "response.failed", response: failedResponse });
+    // Keep the failed status, but also emit the same terminal event shape as
+    // a normal Responses turn. Codex Desktop otherwise treats an HTTP 200 SSE
+    // stream that ends after response.failed as an incomplete transport and
+    // replays the same user turn several times.
+    await write({ type: "response.completed", response: failedResponse });
     await write({ type: "response.done", response: failedResponse });
     if (!res.writableEnded) {
       res.write("data: [DONE]\n\n");
@@ -800,8 +1442,10 @@ export class GatewayRouter {
     nativeImageHeaders: Record<string, string> = {},
     responseModel = "",
     isSubagentRequest = false,
-    credentialId = "",
-  ): Promise<void> {
+  credentialId = "",
+  adapterName = "",
+  subagentSource: GatewaySubagentDispatchContext["source"] = "main-agent",
+): Promise<GatewayResponsesResult> {
     let selectedApiKey = String(apiKey || "");
     let selectedCredentialId = String(credentialId || "");
     if (providerName && !selectedApiKey) {
@@ -836,34 +1480,58 @@ export class GatewayRouter {
         isSubagentRequest,
         selectedCredentialId,
         true,
+        adapterName,
+        subagentSource,
       );
-      if (completed && selectedCredentialId) CredentialStore.markProviderCredentialSuccess(providerName, selectedCredentialId);
+      if (completed.completed && selectedCredentialId) CredentialStore.markProviderCredentialSuccess(providerName, selectedCredentialId);
+      return completed;
     } catch (error: any) {
-      if (!(error instanceof ProviderCredentialError) || !selectedCredentialId || res.headersSent || res.writableEnded) throw error;
-      CredentialStore.markProviderCredentialFailure(providerName, selectedCredentialId, error.statusCode, error.message);
-      const next = CredentialStore.selectNextApiKeyCredential(providerName, selectedCredentialId);
-      if (next && next.id !== selectedCredentialId) {
-        console.warn(`[CodexSplit Provider] credential failover provider=${providerName} failed=${selectedCredentialId} next=${next.id}`);
-        return this.handleResponses(
+      if (error instanceof ProviderCredentialError && selectedCredentialId && !res.headersSent && !res.writableEnded) {
+        CredentialStore.markProviderCredentialFailure(providerName, selectedCredentialId, error.statusCode, error.message);
+        const next = CredentialStore.selectNextApiKeyCredential(providerName, selectedCredentialId);
+        if (next && next.id !== selectedCredentialId) {
+          console.warn(`[CodexSplit Provider] credential failover provider=${providerName} failed=${selectedCredentialId} next=${next.id}`);
+          return this.handleResponses(
+            reqBody,
+            upstreamModel,
+            next.apiKey,
+            providerUrl,
+            res,
+            providerName,
+            nativeImageHeaders,
+            responseModel,
+            isSubagentRequest,
+            next.id,
+            adapterName,
+            subagentSource,
+          );
+        }
+        await this.emitProviderCredentialFailure(
           reqBody,
           upstreamModel,
-          next.apiKey,
-          providerUrl,
-          res,
-          providerName,
-          nativeImageHeaders,
           responseModel,
-          isSubagentRequest,
-          next.id,
+          res,
+          `${error.message}；没有其他可用 API Key，请在 Provider 设置中检测或移除失效凭证。`,
         );
+        return { completed: false, output: "" };
       }
-      await this.emitProviderCredentialFailure(
-        reqBody,
-        upstreamModel,
-        responseModel,
-        res,
-        `${error.message}；没有其他可用 API Key，请在 Provider 设置中检测或移除失效凭证。`,
-      );
+
+      // Keep unexpected failures on the same per-turn Responses contract.
+      // The outer HTTP handler must not turn an image/tool failure into a raw
+      // JSON 400 that leaves the native app-server waiting for turn/done.
+      if (!res.writableEnded) {
+        const message = error instanceof Error ? error.message : String(error || "第三方请求失败");
+        console.error(`[CodexBridge V2] Responses request failed before a terminal response: ${message}`);
+        await emitGatewayResponsesFailure(
+          res,
+          { code: error?.code || "provider_request_failed", message },
+          reqBody,
+          upstreamModel,
+          responseModel,
+        );
+        return { completed: false, output: "" };
+      }
+      throw error;
     }
   }
 
@@ -879,9 +1547,24 @@ export class GatewayRouter {
   isSubagentRequest = false,
   credentialId = "",
   allowCredentialFailover = true,
-): Promise<boolean> {
-    const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
+  adapterName = "",
+  subagentSource: GatewaySubagentDispatchContext["source"] = "main-agent",
+  ): Promise<GatewayResponsesResult> {
+    reqBody = normalizeLegacyImageRequestBody(reqBody);
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
+    const textOnlyProvider = configuredProviderVisionCapability(providerName, upstreamModel) === false;
+    const preprocessed = await preprocessKnownTextOnlyImages(
+      reqBody,
+      upstreamModel,
+      selectedResponseModel,
+      apiKey,
+      providerName,
+      nativeImageHeaders,
+      res,
+    );
+    if (preprocessed.failed) return { completed: false, output: "" };
+    reqBody = preprocessed.requestBody;
+    const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
     const requestUsesComputerUse = hasComputerUseTool(reqBody?.tools);
@@ -912,29 +1595,71 @@ export class GatewayRouter {
           parent_model: selectedResponseModel,
           backend_model: upstreamModel,
           parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+          source: subagentSource,
         },
         providerName,
         allowCredentialFailover,
         credentialId,
+        nativeImageHeaders,
       );
-      if (nativeResult === "handled") return true;
+      if (nativeResult === "handled") return { completed: true, output: "" };
+      if (nativeResult === "failed") return { completed: false, output: "" };
       // The configured Responses endpoint is unavailable; use the existing
       // Chat compatibility conversion for this request.
       reqBody = { ...reqBody, protocol: "chat" };
     }
     const imageGenerationContext = extractImageGenerationContext(reqBody);
-    const chatBody = transformResponsesToChat(reqBody, upstreamModel, sessionId, !isSubagentRequest);
+    const providerReasoningContent = providerReasoningForRequest(
+      reqBody?.input,
+      providerName,
+      providerUrl,
+      upstreamModel,
+    );
+    let chatBody = transformResponsesToChat(
+      reqBody,
+      upstreamModel,
+      sessionId,
+      !isSubagentRequest,
+      adapterName,
+      providerReasoningContent,
+    );
+    // SessionHistoryService may rehydrate screenshots from the native rollout
+    // after the request-level preprocessing above has already run. Apply the
+    // same native vision boundary to the reconstructed Chat transcript before
+    // it reaches a text-only provider; otherwise the old image reappears in
+    // `messages[*].content` and the provider rejects the whole continuation.
+    const preprocessedChat = await preprocessKnownTextOnlyImages(
+      chatBody,
+      upstreamModel,
+      selectedResponseModel,
+      apiKey,
+      providerName,
+      nativeImageHeaders,
+      res,
+    );
+    if (preprocessedChat.failed) return { completed: false, output: "" };
+    chatBody = preprocessedChat.requestBody;
+    if (textOnlyProvider) {
+      chatBody = normalizeTextOnlyProviderChatPayload(chatBody);
+      assertNoNativeVisionImages(chatBody);
+    }
+    if (providerReasoningContent) {
+      console.info(
+        `[CodexSplit Provider] restored provider reasoning_content for continuation `
+        + `provider=${providerName || "provider"} model=${upstreamModel}`,
+      );
+    }
     const optimizedChat = await optimizeThirdPartyComputerUseImages(chatBody);
-    const optimizedChatBody = optimizedChat.body;
+    let optimizedChatBody = optimizedChat.body;
     const isXiaomiMimoChat = isXiaomiMimoProvider(providerName, providerUrl, upstreamModel);
     // MiMo's Chat validator is stricter than the OpenAI schema for tool
     // history: an assistant tool-call turn and an image-only tool result must
     // still carry a text field. Keep this isolated to the Xiaomi/MiMo route;
     // MiniMax and all other providers retain the ordinary Chat payload.
-    const providerChatBody = isXiaomiMimoChat
+    let providerChatBody = isXiaomiMimoChat
       ? normalizeXiaomiChatToolHistory(optimizedChatBody)
       : optimizedChatBody;
-    providerChatBody.stream = true;
+    if (textOnlyProvider) providerChatBody = normalizeTextOnlyProviderChatPayload(providerChatBody);
     if (optimizedChat.stats.optimized || optimizedChat.stats.deduplicated) {
       console.info(
         `[OpenCodex Computer Use] optimized third-party Chat screenshots ` +
@@ -942,9 +1667,7 @@ export class GatewayRouter {
         `bytes=${optimizedChat.stats.inputBytes}->${optimizedChat.stats.outputBytes}`,
       );
     }
-    optimizedChatBody.stream = true;
-
-    const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl);
+    const adapter = AdapterFactory.getAdapter(reqBody?.protocol, providerUrl, adapterName);
     const { urlEndpoint, headers: adapterHeaders, body: payloadBody } = adapter.transformPayload(providerChatBody);
 
     // Callers may provide either a provider base URL or an already selected
@@ -974,16 +1697,14 @@ export class GatewayRouter {
     }
 
     // Clean V2 Antigravity Subscription Routing
-    const isAntigravityModel = (
-      providerName.toLowerCase() === "antigravity" ||
-      apiKey === "antigravity-cli-auto" ||
-      providerUrl.includes("antigravity") ||
-      providerUrl.includes("generativelanguage")
-    ) && !apiKey.startsWith("AIzaSy");
+    const subscriptionTransport = resolveSubscriptionTransport(providerName, apiKey);
+    const isAntigravityModel = subscriptionTransport?.id === "antigravity";
 
     let finalTargetUrl = targetUrl;
     let finalHeaders = { ...headers };
-    let finalPayloadBody = payloadBody;
+    let finalPayloadBody = textOnlyProvider
+      ? normalizeTextOnlyProviderChatPayload(payloadBody)
+      : payloadBody;
 
     let activeAdapter = adapter;
 
@@ -993,7 +1714,7 @@ export class GatewayRouter {
       console.log(`[OpenCodex V2] Antigravity token resolved: ${Boolean(oauthToken)}`);
 
       if (oauthToken) {
-        finalTargetUrl = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+        finalTargetUrl = subscriptionTransport!.endpoint;
         finalHeaders["Authorization"] = `Bearer ${oauthToken}`;
         finalHeaders["User-Agent"] = "antigravity/hub/2.2.1 darwin/arm64";
 
@@ -1009,34 +1730,24 @@ export class GatewayRouter {
     }
 
     // Grok Subscription Routing
-    const isGrokModel = (
-      providerName.toLowerCase() === "grok" ||
-      apiKey === "grok-cli-auto" ||
-      providerUrl.includes("x.ai") ||
-      providerUrl.includes("grok")
-    ) && !apiKey.startsWith("xai-") && !isAntigravityModel;
+    const isGrokModel = subscriptionTransport?.id === "grok" && !isAntigravityModel;
 
     if (isGrokModel) {
       const grokToken = await SubscriptionAuthService.getGrokAccessToken();
       if (grokToken) {
         finalHeaders["Authorization"] = `Bearer ${grokToken}`;
         finalHeaders["User-Agent"] = "grok-cli/1.89.0";
-        finalTargetUrl = "https://api.x.ai/v1/chat/completions";
+        finalTargetUrl = subscriptionTransport!.endpoint;
       }
     }
 
     // Claude Subscription Routing
-    const isClaudeModel = (
-      providerName.toLowerCase() === "claude" ||
-      apiKey === "claude-cli-auto" ||
-      providerUrl.includes("anthropic") ||
-      providerUrl.includes("claude")
-    ) && !isAntigravityModel && !isGrokModel;
+    const isClaudeModel = subscriptionTransport?.id === "claude" && !isAntigravityModel && !isGrokModel;
 
     if (isClaudeModel) {
       activeAdapter = new AnthropicAdapter();
       const payload = activeAdapter.transformPayload(optimizedChatBody);
-      finalTargetUrl = "https://api.anthropic.com/v1/messages";
+      finalTargetUrl = subscriptionTransport!.endpoint;
       finalPayloadBody = payload.body;
 
       const claudeKey = await SubscriptionAuthService.getClaudeAccessToken();
@@ -1054,14 +1765,11 @@ export class GatewayRouter {
     }
 
     // Cursor Subscription Routing
-    const isCursorModel = (
-      providerName.toLowerCase() === "cursor" ||
-      apiKey === "cursor-cli-auto" ||
-      providerUrl.includes("cursor")
-    ) && !isAntigravityModel && !isGrokModel && !isClaudeModel;
+    const isCursorModel = subscriptionTransport?.id === "cursor"
+      && !isAntigravityModel && !isGrokModel && !isClaudeModel;
 
     if (isCursorModel) {
-      finalTargetUrl = "https://agent.api5.cursor.sh/agent.v1.AgentService/Run";
+      finalTargetUrl = subscriptionTransport!.endpoint;
     }
 
     // Ask OpenAI-compatible Chat endpoints for their actual stream usage when
@@ -1076,13 +1784,119 @@ export class GatewayRouter {
         },
       };
     }
+    if (textOnlyProvider) {
+      finalPayloadBody = normalizeTextOnlyProviderChatPayload(finalPayloadBody);
+      assertNoNativeVisionImages(finalPayloadBody);
+    }
+
+    const rebuildProviderPayloadAfterVision = async (nextReqBody: any, sourceChatBody?: any): Promise<void> => {
+      const nextChatBody = sourceChatBody || transformResponsesToChat(
+        nextReqBody,
+        upstreamModel,
+        sessionId,
+        !isSubagentRequest,
+        adapterName,
+        providerReasoningContent,
+      );
+      const nextOptimized = await optimizeThirdPartyComputerUseImages(nextChatBody);
+      optimizedChatBody = nextOptimized.body;
+      const nextProviderChatBody = isXiaomiMimoChat
+        ? normalizeXiaomiChatToolHistory(optimizedChatBody)
+        : optimizedChatBody;
+      const transformed = activeAdapter.transformPayload(nextProviderChatBody);
+      let nextPayloadBody = transformed.body;
+      if (isAntigravityModel) {
+        nextPayloadBody = {
+          project: "default-cli-project",
+          model: upstreamModel,
+          request: nextPayloadBody,
+        };
+      }
+      if (activeAdapter.name === "openai" && nextPayloadBody && typeof nextPayloadBody === "object") {
+        nextPayloadBody = {
+          ...nextPayloadBody,
+          stream_options: {
+            ...(nextPayloadBody.stream_options || {}),
+            include_usage: true,
+          },
+        };
+      }
+      finalPayloadBody = textOnlyProvider
+        ? normalizeTextOnlyProviderChatPayload(nextPayloadBody)
+        : nextPayloadBody;
+      if (textOnlyProvider) assertNoNativeVisionImages(finalPayloadBody);
+      if (nextOptimized.stats.optimized || nextOptimized.stats.deduplicated) {
+        console.info(
+          `[OpenCodex Computer Use] optimized third-party Chat vision fallback ` +
+          `optimized=${nextOptimized.stats.optimized} deduplicated=${nextOptimized.stats.deduplicated} ` +
+          `bytes=${nextOptimized.stats.inputBytes}->${nextOptimized.stats.outputBytes}`,
+        );
+      }
+    };
+
+    const retryChatImagesThroughNativeVision = async (
+      imageRequestBody: any,
+      operation: string,
+    ): Promise<Response> => {
+      const visionRequestBody = hasNativeVisionImages(imageRequestBody) ? imageRequestBody : reqBody;
+      const vision = await analyzeNativeVisionOnce(visionRequestBody, nativeImageHeaders, {
+        providerApiKey: apiKey,
+        signal: controller.signal,
+        allowNetwork: hasNativeVisionImagesInCurrentTurn(visionRequestBody),
+      });
+      if (vision.error) {
+        throw new NativeVisionBridgeError(
+          vision.error.code,
+          vision.error.message,
+          vision.error.statusCode || 0,
+        );
+      }
+
+      const bridgedRequestBody = stripImageInspectionToolsForTextOnlyTurn(
+        replaceImagesWithNativeVisionText(
+          hasNativeVisionImages(reqBody) ? reqBody : imageRequestBody,
+          vision.text,
+        ),
+      );
+      const chatSource = hasNativeVisionImages(optimizedChatBody)
+        ? optimizedChatBody
+        : hasNativeVisionImages(imageRequestBody)
+          ? imageRequestBody
+          : optimizedChatBody;
+      const bridgedChatBody = stripImageInspectionToolsForTextOnlyTurn(
+        normalizeTextOnlyProviderChatPayload(
+          replaceImagesWithNativeVisionText(chatSource, vision.text),
+        ),
+      );
+      assertNoNativeVisionImages(bridgedChatBody);
+      reqBody = bridgedRequestBody;
+      await rebuildProviderPayloadAfterVision(bridgedRequestBody, bridgedChatBody);
+      console.warn(
+        `[CodexSplit Provider] provider rejected tool/image input; retrying through native vision `
+        + `model=${vision.model} provider=${providerName || "provider"} backend=${upstreamModel} images=${vision.imageCount}`,
+      );
+      return fetchUpstream(finalTargetUrl, {
+        method: "POST",
+        headers: finalHeaders,
+        body: JSON.stringify(finalPayloadBody),
+        signal: controller.signal,
+        maxAttempts: 1,
+        timeoutMs: 120_000,
+        operation,
+      });
+    };
 
     console.info(
       `[CodexSplit Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
       `messages=${Array.isArray(finalPayloadBody?.messages) ? finalPayloadBody.messages.length : 0} ` +
       `tools=${Array.isArray(finalPayloadBody?.tools) ? finalPayloadBody.tools.map((tool: any) => tool?.function?.name || tool?.name).filter(Boolean).join(",") || "(none)" : "(none)"} ` +
       `tool_images=${hasChatToolImages(finalPayloadBody)} ` +
-      `continuation=${Boolean(reqBody?.input?.some?.((item: any) => item?.type === "function_call_output"))}`,
+      `continuation=${Boolean(reqBody?.input?.some?.((item: any) => [
+        "function_call_output",
+        "mcp_call_output",
+        "custom_tool_call_output",
+        "computer_call_output",
+      ].includes(item?.type)))}`,
     );
 
     pruneCursorPendingToolCalls();
@@ -1149,6 +1963,9 @@ export class GatewayRouter {
         error: { code, message },
       };
       await writeSse({ type: "response.failed", response: failedResponse });
+      // A failed provider turn still needs a protocol-level terminal event;
+      // without it the native client retries the already-failed turn.
+      await writeSse({ type: "response.completed", response: failedResponse });
       await writeSse({ type: "response.done", response: failedResponse });
     };
     let cursorToolResult: CursorToolResult | undefined;
@@ -1181,7 +1998,7 @@ export class GatewayRouter {
         ? cursorUserMessagesAfterToolResult(currentCursorMessages)
         : [];
       const rememberedCursorMessages = isCursorModel && cursorHistoryId
-        ? cursorSessionHistory.get(cursorHistoryId) || []
+        ? (loadCursorSessionHistory(), cursorSessionHistory.get(cursorHistoryId) || [])
         : [];
       const resumedCursorMessages = matchedPendingCursorTool && requestedCursorToolOutput
         ? [
@@ -1348,24 +2165,30 @@ export class GatewayRouter {
       let preReadErrorText: string | undefined;
       if (!response.ok || !response.body) {
         const initialErrorText = await response.text();
-        if (isConsoleGoToolImageRejection(response.status, initialErrorText, finalPayloadBody)) {
-          const fallbackPayloadBody = stripChatToolImages(finalPayloadBody);
-          console.warn(
-            `[CodexSplit Provider] retrying Chat request without tool images provider=${providerName || "provider"} model=${upstreamModel}`,
+        // The Chat transformer can add screenshots rehydrated from the native
+        // rollout. Use the actual provider payload as the image signal when
+        // it contains one; checking only the current Responses delta misses
+        // those historical tool-result images.
+        const imageRequestBody = hasNativeVisionImages(finalPayloadBody) ? finalPayloadBody : reqBody;
+        if (isProviderImageInputRejection(response.status, initialErrorText, imageRequestBody)) {
+          response = await retryChatImagesThroughNativeVision(
+            imageRequestBody,
+            `responses:${providerName || "provider"}:vision-fallback`,
           );
-          const fallbackResponse = await fetchUpstream(finalTargetUrl, {
-            method: "POST",
-            headers: finalHeaders,
-            body: JSON.stringify(fallbackPayloadBody),
-            signal: controller.signal,
-            maxAttempts: 1,
-            timeoutMs: 120_000,
-            operation: `responses:${providerName || "provider"}:chat-tool-image-fallback`,
-          });
-          response = fallbackResponse;
-          if (response.ok && response.body) {
-            finalPayloadBody = fallbackPayloadBody;
-          } else {
+          if (!response.ok || !response.body) {
+            preReadErrorText = await response.text();
+          }
+        } else if (isConsoleGoToolImageRejection(response.status, initialErrorText, finalPayloadBody)) {
+          // Console Go's generic wrapper used to trigger a silent screenshot
+          // deletion here. That made a text-only third-party model appear to
+          // understand the request while actually losing the user's image.
+          // Route the same native Computer Use screenshot through official
+          // Codex vision first; a vision failure is surfaced as a failed turn.
+          response = await retryChatImagesThroughNativeVision(
+            imageRequestBody,
+            `responses:${providerName || "provider"}:chat-tool-image-vision-fallback`,
+          );
+          if (!response.ok || !response.body) {
             preReadErrorText = await response.text();
           }
         } else if (isXiaomiChatToolTextRejection(response.status, initialErrorText, finalPayloadBody)) {
@@ -1374,22 +2197,31 @@ export class GatewayRouter {
           // once with the textual accessibility result only. Do not apply this
           // fallback to MiniMax or to an unrelated Xiaomi 400.
           const normalizedPayload = normalizeXiaomiChatToolHistory(finalPayloadBody);
-          const fallbackPayloadBody = stripChatToolImages(normalizedPayload);
+          const fallbackPayloadBody = hasNativeVisionImages(imageRequestBody)
+            ? undefined
+            : stripChatToolImages(normalizedPayload);
           console.warn(
-            `[CodexSplit Provider] retrying MiMo Chat continuation with text-only tool results provider=${providerName || "provider"} model=${upstreamModel}`,
+            `[CodexSplit Provider] retrying MiMo Chat continuation `
+            + `${fallbackPayloadBody ? "with text-only tool results" : "through native vision"} `
+            + `provider=${providerName || "provider"} model=${upstreamModel}`,
           );
-          const fallbackResponse = await fetchUpstream(finalTargetUrl, {
-            method: "POST",
-            headers: finalHeaders,
-            body: JSON.stringify(fallbackPayloadBody),
-            signal: controller.signal,
-            maxAttempts: 1,
-            timeoutMs: 120_000,
-            operation: `responses:${providerName || "provider"}:mimo-chat-tool-fallback`,
-          });
+          const fallbackResponse = fallbackPayloadBody
+            ? await fetchUpstream(finalTargetUrl, {
+              method: "POST",
+              headers: finalHeaders,
+              body: JSON.stringify(fallbackPayloadBody),
+              signal: controller.signal,
+              maxAttempts: 1,
+              timeoutMs: 120_000,
+              operation: `responses:${providerName || "provider"}:mimo-chat-tool-fallback`,
+            })
+            : await retryChatImagesThroughNativeVision(
+              imageRequestBody,
+              `responses:${providerName || "provider"}:mimo-chat-tool-vision-fallback`,
+            );
           response = fallbackResponse;
           if (response.ok && response.body) {
-            finalPayloadBody = fallbackPayloadBody;
+            if (fallbackPayloadBody) finalPayloadBody = fallbackPayloadBody;
           } else {
             preReadErrorText = await response.text();
           }
@@ -1453,7 +2285,7 @@ export class GatewayRouter {
         // though no model response or tool call ever arrived.
         await emitFailedResponse(msg);
         res.end();
-        return false;
+        return { completed: false, output: "" };
       }
 
       res.flushHeaders();
@@ -1480,6 +2312,9 @@ export class GatewayRouter {
       let providerStreamCompleted = false;
       let providerDataObserved = false;
       let parentTextLength = 0;
+      const providerWantsStream = isAntigravityModel
+        ? finalPayloadBody?.request?.stream !== false
+        : finalPayloadBody?.stream !== false;
 
       if (isCursorModel) {
         let binaryBuffer = new Uint8Array(0);
@@ -1652,6 +2487,54 @@ export class GatewayRouter {
           try { matchedPendingCursorTool.providerReader?.releaseLock(); } catch {}
         }
         if (!pendingCursorToolRequest) rememberCursorSession(cursorHistoryId, cursorMessages, engine.getMessageText());
+      } else if (!providerWantsStream) {
+        let raw = "";
+        while (true) {
+          const readResult = await readWithTimeout(120_000);
+          if (readResult.done) {
+            raw += decoder.decode();
+            break;
+          }
+          raw += decoder.decode(readResult.value, { stream: true });
+        }
+        let payload: any;
+        try {
+          payload = JSON.parse(raw);
+        } catch {
+          throw new Error("上游返回了不可解析的非流式响应");
+        }
+        providerDataObserved = true;
+        engine.observeProviderChunk(payload);
+        const choice = payload?.choices?.[0];
+        if (choice?.message && typeof choice.message === "object") {
+          const message = choice.message;
+          const delta: any = {};
+          if (typeof message.role === "string") delta.role = message.role;
+          if (message.content !== undefined) delta.content = message.content;
+          const reasoningContent = typeof message.reasoning_content === "string"
+            ? message.reasoning_content
+            : typeof message.reasoning === "string"
+              ? message.reasoning
+              : "";
+          if (reasoningContent) delta.reasoning_content = reasoningContent;
+          if (Array.isArray(message.tool_calls)) delta.tool_calls = message.tool_calls;
+          if (Object.keys(delta).length > 0) {
+            await engine.processChatChunk(writeSse, {
+              choices: [{ delta, finish_reason: choice.finish_reason }],
+              ...(payload.usage ? { usage: payload.usage } : {}),
+            });
+          }
+        } else if (typeof payload?.output_text === "string" && payload.output_text) {
+          await engine.processChatChunk(writeSse, { choices: [{ delta: { content: payload.output_text } }] });
+        } else if (Array.isArray(payload?.content)) {
+          const text = payload.content
+            .filter((item: any) => item?.type === "text" && typeof item.text === "string")
+            .map((item: any) => item.text)
+            .join("");
+          if (text) await engine.processChatChunk(writeSse, { choices: [{ delta: { content: text } }] });
+        }
+        if (!engine.hasOutput()) throw new Error("上游非流式响应没有可用的模型输出");
+        providerStreamCompleted = true;
       } else {
         const processSseLine = async (line: string): Promise<void> => {
           const trimmed = line.trim();
@@ -1687,7 +2570,26 @@ export class GatewayRouter {
         };
 
         while (!providerStreamCompleted) {
-          const readResult = await readWithTimeout(600000);
+          const providerReadTimeout = engine.getToolCallIds().length > 0
+            ? PROVIDER_TOOL_IDLE_TIMEOUT_MS
+            : engine.getMessageText().trim()
+              ? PROVIDER_TEXT_IDLE_TIMEOUT_MS
+              : PROVIDER_EMPTY_IDLE_TIMEOUT_MS;
+          let readResult: ReadableStreamReadResult<Uint8Array>;
+          try {
+            readResult = await readWithTimeout(providerReadTimeout);
+          } catch (readErr: any) {
+            if (engine.hasOutput() && /Stream read timeout/.test(String(readErr?.message || ""))) {
+              console.warn(
+                `[CodexSplit Provider] closing provider turn after idle output `
+                + `provider=${providerName || "provider"} model=${upstreamModel} `
+                + `tool_calls=${engine.getToolCallIds().length}`,
+              );
+              providerStreamCompleted = true;
+              break;
+            }
+            throw readErr;
+          }
           const { done, value } = readResult;
           if (done) {
             buffer += decoder.decode();
@@ -1703,6 +2605,10 @@ export class GatewayRouter {
           const lines = buffer.split("\n");
           buffer = lines.pop() || "";
           for (const line of lines) await processSseLine(line);
+        }
+
+        if (providerStreamCompleted && !engine.hasOutput()) {
+          throw new Error("上游流已结束，但没有收到可显示的模型输出或工具调用");
         }
 
         if (!providerStreamCompleted) {
@@ -1723,6 +2629,14 @@ export class GatewayRouter {
         }
       }
 
+      rememberPendingProviderReasoning(
+        engine.getToolCallIds(),
+        engine.getReasoningContent(),
+        providerName,
+        providerUrl,
+        upstreamModel,
+      );
+
       // Third-party main models cannot hand `spawn_agent` back to Codex
       // Desktop: the desktop only knows its native private tool executor.
       // Consume the gateway-owned calls here, run the selected child models,
@@ -1740,8 +2654,11 @@ export class GatewayRouter {
         let nextBuffer = "";
         let nextCompleted = false;
         let nextDataObserved = false;
-        const nextReadWithTimeout = (): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
-          const timer = setTimeout(() => reject(new Error("主模型子代理续答流读取超时（600s）")), 600000);
+        let nextOutputObserved = false;
+        const previousMessageText = engine.getMessageText();
+        const previousToolCallIds = new Set(engine.getToolCallIds());
+        const nextReadWithTimeout = (timeoutMs: number): Promise<ReadableStreamReadResult<Uint8Array>> => new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`主模型子代理续答流读取超时（${Math.ceil(timeoutMs / 1000)}s）`)), timeoutMs);
           nextReader.read().then((result) => {
             clearTimeout(timer);
             resolve(result);
@@ -1763,6 +2680,21 @@ export class GatewayRouter {
           let chunk: any;
           try { chunk = JSON.parse(dataStr); } catch { return; }
           if (providerChunkSignalsCompletion(chunk)) nextCompleted = true;
+          const choice = chunk?.choices?.[0];
+          const delta = choice?.delta;
+          const message = choice?.message;
+          if (
+            (typeof delta?.content === "string" && delta.content.length > 0)
+            || (typeof delta?.text === "string" && delta.text.length > 0)
+            || (typeof delta?.reasoning_content === "string" && delta.reasoning_content.length > 0)
+            || (typeof delta?.reasoning === "string" && delta.reasoning.length > 0)
+            || (typeof message?.content === "string" && message.content.length > 0)
+            || (typeof message?.reasoning_content === "string" && message.reasoning_content.length > 0)
+            || (Array.isArray(delta?.tool_calls) && delta.tool_calls.length > 0)
+            || (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0)
+          ) {
+            nextOutputObserved = true;
+          }
           if (activeAdapter.processStreamChunk) {
             engine.observeProviderChunk(chunk);
             for (const normalizedChunk of activeAdapter.processStreamChunk(chunk)) {
@@ -1771,16 +2703,38 @@ export class GatewayRouter {
           } else {
             await engine.processChatChunk(writeSse, chunk);
           }
+          if (engine.getMessageText() !== previousMessageText) nextOutputObserved = true;
+          if (engine.getToolCallIds().some((callId) => !previousToolCallIds.has(callId))) nextOutputObserved = true;
         };
 
         while (!nextCompleted) {
-          const readResult = await nextReadWithTimeout();
+          const nextReadTimeout = engine.getToolCallIds().length > 0
+            ? PROVIDER_TOOL_IDLE_TIMEOUT_MS
+            : engine.getMessageText().trim()
+              ? PROVIDER_TEXT_IDLE_TIMEOUT_MS
+              : PROVIDER_EMPTY_IDLE_TIMEOUT_MS;
+          let readResult: ReadableStreamReadResult<Uint8Array>;
+          try {
+            readResult = await nextReadWithTimeout(nextReadTimeout);
+          } catch (readErr: any) {
+            if (nextOutputObserved && /续答流读取超时/.test(String(readErr?.message || ""))) {
+              console.warn(
+                `[CodexSplit Provider] closing subagent continuation after idle output `
+                + `provider=${providerName || "provider"} model=${upstreamModel} `
+                + `tool_calls=${engine.getToolCallIds().length}`,
+              );
+              nextCompleted = true;
+              break;
+            }
+            throw readErr;
+          }
           if (readResult.done) {
             nextBuffer += nextDecoder.decode();
             if (nextBuffer.trim()) {
               for (const line of nextBuffer.split("\n")) await processContinuationLine(line);
             }
             nextBuffer = "";
+            if (!nextCompleted && nextOutputObserved) nextCompleted = true;
             break;
           }
           nextBuffer += nextDecoder.decode(readResult.value, { stream: true });
@@ -1788,8 +2742,12 @@ export class GatewayRouter {
           nextBuffer = lines.pop() || "";
           for (const line of lines) await processContinuationLine(line);
         }
-        if (!nextCompleted && !nextDataObserved) {
-          throw new Error("主模型子代理续答流在完成事件前结束");
+        if (!nextOutputObserved) {
+          throw new Error(
+            nextDataObserved
+              ? "主模型子代理续答流只返回了非输出事件，已拒绝空回复"
+              : "主模型子代理续答流在完成事件前结束，且没有收到可收尾的模型输出",
+          );
         }
       };
 
@@ -1815,6 +2773,10 @@ export class GatewayRouter {
             },
           };
         }
+        if (textOnlyProvider) {
+          finalPayloadBody = normalizeTextOnlyProviderChatPayload(finalPayloadBody);
+          assertNoNativeVisionImages(finalPayloadBody);
+        }
       };
 
       let subagentRound = 0;
@@ -1830,6 +2792,7 @@ export class GatewayRouter {
           provider: providerName,
           backend_model: upstreamModel,
           parent_reasoning_effort: String(reqBody?.reasoning?.effort || reqBody?.reasoning_effort || "").trim() || undefined,
+          source: subagentSource,
         });
         if (results.length > 0 && results.every((result) => Boolean(result.error))) {
           const details = results.map((result) => result.error).filter(Boolean).join("；");
@@ -1897,7 +2860,7 @@ export class GatewayRouter {
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      return true;
+      return { completed: true, output: engine.getMessageText().trim() };
     } catch (err: any) {
       if (err instanceof ProviderCredentialError) throw err;
       clearTimeout(timeoutId);
@@ -1908,6 +2871,22 @@ export class GatewayRouter {
         ...upstreamDetails,
         attempts: err?.attempts,
       });
+      if (err instanceof NativeVisionBridgeError) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+            "X-Accel-Buffering": "no",
+          });
+        }
+        await emitFailedResponse(err.message, err.code);
+        if (!res.writableEnded) {
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+        return { completed: false, output: "" };
+      }
       const attemptsText = Number.isFinite(err?.attempts) ? `（已尝试 ${err.attempts} 次）` : "";
       const causeText = upstreamDetails.code ? ` [${upstreamDetails.code}]` : "";
       const detailMsg = isCursorModel && /outdated|deprecated|upgrade/i.test(String(err.message || ""))
@@ -1927,11 +2906,14 @@ export class GatewayRouter {
         // A transport failure is also a failed Responses turn, regardless of
         // whether the provider failed before headers or during its stream.
         // Never synthesize assistant text or response.completed here.
-        await emitFailedResponse(detailMsg, "upstream_unreachable");
+        await emitFailedResponse(
+          detailMsg,
+          err instanceof NativeVisionBridgeError ? err.code : "upstream_unreachable",
+        );
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      return false;
+      return { completed: false, output: "" };
     }
   }
 }

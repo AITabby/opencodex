@@ -1,12 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { copyNativeRequestHeaders, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "../dist/server/webrtc_proxy.js";
+import {
+  copyNativeRequestHeaders,
+  nativeLiveSidebandTarget,
+  normalizeNativeLiveCallBody,
+  resolveRealtimeUpstream,
+} from "../dist/server/webrtc_proxy.js";
 
 function request(url, headers = {}) {
   return { url, headers };
 }
 
-test("native ChatGPT Realtime requests keep the global gateway but use the native backend route", () => {
+test("native ChatGPT Realtime requests use the native backend route", () => {
   const upstream = resolveRealtimeUpstream(
     request("/v1/realtime/calls", {
       host: "127.0.0.1:8765",
@@ -94,7 +99,7 @@ test("gateway bearer native Live call uses the ChatGPT backend call shape", () =
   assert.equal(upstream.headers.authorization, "Bearer native-token");
 });
 
-test("native Live sideband stays on the API WebSocket path", () => {
+test("native Live sideband keeps the native V3 path-shaped call id", () => {
   const upstream = resolveRealtimeUpstream(
     request("/v1/live/rtc_test", {
       host: "127.0.0.1:8765",
@@ -107,6 +112,101 @@ test("native Live sideband stays on the API WebSocket path", () => {
   assert.equal(upstream.nativeLiveCall, false);
   assert.equal(upstream.targetUrl, "https://api.openai.com/v1/live/rtc_test");
   assert.equal(upstream.headers.authorization, "Bearer native-token");
+});
+
+test("native Live sideband preserves query parameters", () => {
+  assert.equal(
+    nativeLiveSidebandTarget("/v1/live/rtc_test", "trace=1"),
+    "https://api.openai.com/v1/live/rtc_test?trace=1",
+  );
+});
+
+test("a native Live WebSocket at /v1/live is treated as sideband, not session creation", () => {
+  const upstream = resolveRealtimeUpstream(
+    {
+      method: "GET",
+      url: "/v1/live",
+      headers: {
+        host: "127.0.0.1:8765",
+        authorization: "Bearer gateway-token",
+        upgrade: "websocket",
+        connection: "Upgrade",
+      },
+    },
+    {
+      localAdminToken: "gateway-token",
+      nativeAccessToken: "native-token",
+      forceNativeSession: true,
+    },
+  );
+
+  assert.equal(upstream.nativeLiveCall, false);
+  assert.equal(upstream.targetUrl, "https://api.openai.com/v1/live");
+  assert.equal(upstream.headers.authorization, "Bearer native-token");
+});
+
+test("a native V1 Live sideband at /v1/realtime uses the API Realtime path", () => {
+  const upstream = resolveRealtimeUpstream(
+    request("/v1/realtime?call_id=rtc_v1_sideband", {
+      host: "127.0.0.1:8765",
+      authorization: "Bearer gateway-token",
+      upgrade: "websocket",
+      connection: "Upgrade",
+    }),
+    {
+      localAdminToken: "gateway-token",
+      nativeAccessToken: "native-token",
+      forceNativeSession: true,
+    },
+  );
+
+  assert.equal(upstream.nativeLiveCall, false);
+  assert.equal(upstream.nativeSession, true);
+  assert.equal(upstream.targetUrl, "https://api.openai.com/v1/realtime?call_id=rtc_v1_sideband");
+  assert.equal(upstream.headers.authorization, "Bearer native-token");
+});
+
+test("a native V3 Live sideband preserves the live path and alpha header", () => {
+  const upstream = resolveRealtimeUpstream(
+    request("/v1/live/rtc_v3_sideband", {
+      host: "127.0.0.1:8765",
+      authorization: "Bearer gateway-token",
+      upgrade: "websocket",
+      connection: "Upgrade",
+    }),
+    {
+      localAdminToken: "gateway-token",
+      nativeAccessToken: "native-token",
+      nativeAccountId: "account-id",
+      forceNativeAccessToken: true,
+      forceNativeSession: true,
+      nativeLiveSideband: true,
+    },
+  );
+
+  assert.equal(upstream.targetUrl, "https://api.openai.com/v1/live/rtc_v3_sideband");
+  assert.equal(upstream.headers.authorization, "Bearer native-token");
+  assert.equal(upstream.headers["openai-alpha"], "quicksilver=v2");
+});
+
+test("a trailing slash on the local Realtime sideband is normalized before upstream", () => {
+  const upstream = resolveRealtimeUpstream(
+    request("/v1/realtime/?call_id=rtc_v1_trailing", {
+      host: "127.0.0.1:8765",
+      authorization: "Bearer gateway-token",
+      upgrade: "websocket",
+      connection: "Upgrade",
+    }),
+    {
+      localAdminToken: "gateway-token",
+      nativeAccessToken: "native-token",
+      forceNativeSession: true,
+    },
+  );
+
+  assert.equal(upstream.nativeLiveCall, false);
+  assert.equal(upstream.nativeSession, true);
+  assert.equal(upstream.targetUrl, "https://api.openai.com/v1/realtime?call_id=rtc_v1_trailing");
 });
 
 test("native Live multipart calls are converted to the backend JSON shape", () => {

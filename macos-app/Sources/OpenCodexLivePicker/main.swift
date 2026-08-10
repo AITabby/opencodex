@@ -13,6 +13,7 @@ private struct PendingResponse: Decodable {
     let request_id: String?
     let models: [String]?
     let selected_model: String?
+    let selected_models: [String]?
 }
 
 @MainActor
@@ -20,6 +21,7 @@ private final class LivePickerAgent: ObservableObject {
     @Published private(set) var enabled = false
     @Published private(set) var request: LivePickerRequest?
     @Published private(set) var selectedModel = ""
+    @Published private(set) var selectedModels: [String] = []
     @Published private(set) var availableModels: [String] = []
     var onChange: (() -> Void)?
 
@@ -56,6 +58,7 @@ private final class LivePickerAgent: ObservableObject {
         guard let request else { return }
         guard (try? await send(requestID: request.id, model: model)) == true else { return }
         selectedModel = model
+        if !selectedModels.contains(model) { selectedModels.append(model) }
         self.request = nil
         onChange?()
     }
@@ -67,6 +70,7 @@ private final class LivePickerAgent: ObservableObject {
         }
         guard (try? await sendSelection(model: model)) == true else { return }
         selectedModel = model
+        if !selectedModels.contains(model) { selectedModels.append(model) }
         onChange?()
     }
 
@@ -75,6 +79,7 @@ private final class LivePickerAgent: ObservableObject {
         enabled = false
         request = nil
         selectedModel = ""
+        selectedModels = []
         availableModels = []
         onChange?()
     }
@@ -94,6 +99,7 @@ private final class LivePickerAgent: ObservableObject {
                 enabled = nextEnabled
                 if !nextEnabled {
                     selectedModel = ""
+                    selectedModels = []
                     self.request = nil
                     availableModels = []
                 }
@@ -101,8 +107,15 @@ private final class LivePickerAgent: ObservableObject {
             }
             guard enabled else { return }
             availableModels = payload.models ?? []
-            if payload.pending == false, let selected = payload.selected_model, selectedModel != selected {
+            selectedModels = (payload.selected_models ?? payload.selected_model.map { [$0] } ?? [])
+                .filter { availableModels.contains($0) }
+                .reduce(into: [String]()) { result, model in
+                    if !result.contains(model) { result.append(model) }
+                }
+            if let selected = payload.selected_model, availableModels.contains(selected), selectedModel != selected {
                 selectedModel = selected
+            } else if !selectedModel.isEmpty && !availableModels.contains(selectedModel) {
+                selectedModel = ""
             }
             if !payload.pending {
                 if self.request != nil {
@@ -423,7 +436,7 @@ private struct LiveCardView: View {
                                 Text(model)
                                     .foregroundStyle(.white)
                                 Spacer()
-                                if selectedModel == model {
+                                if agent.selectedModels.contains(model) {
                                     Image(systemName: "checkmark.circle.fill")
                                         .foregroundStyle(.white)
                                 }
@@ -438,18 +451,18 @@ private struct LiveCardView: View {
                             }
                             .background(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .fill(selectedModel == model ? Color.accentColor.opacity(0.75) : Color.white.opacity(0.09))
+                                    .fill(agent.selectedModels.contains(model) ? Color.accentColor.opacity(0.75) : Color.white.opacity(0.09))
                             )
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .stroke(selectedModel == model ? Color.white.opacity(0.9) : Color.white.opacity(0.16), lineWidth: selectedModel == model ? 1.5 : 1)
+                                    .stroke(agent.selectedModels.contains(model) ? Color.white.opacity(0.9) : Color.white.opacity(0.16), lineWidth: agent.selectedModels.contains(model) ? 1.5 : 1)
                             )
                         }
                     }
                 }
                 .frame(maxHeight: 210)
-                if !selectedModel.isEmpty {
-                    Text("当前选中模型：\(selectedModel)")
+                    if !agent.selectedModels.isEmpty {
+                        Text("当前选中模型：\(agent.selectedModels.joined(separator: ", "))")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
@@ -571,7 +584,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         contextHostingView.layer?.masksToBounds = true
         contextPanel.contentView = contextHostingView
         positionOrb(initial: true)
-        orbPanel.orderFrontRegardless()
+        // Do not show the orb before the first authoritative gateway poll.
+        // The gateway may have been restarted with the picker disabled.
+        orbPanel.orderOut(nil)
         cardPanel.orderOut(nil)
         contextPanel.orderOut(nil)
         agent.onChange = { [weak self] in self?.refreshPanels() }
@@ -592,6 +607,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard agent.enabled else {
             orbPanel.orderOut(nil)
             cardPanel.orderOut(nil)
+            contextPanel.orderOut(nil)
+            cardManuallyShown = false
             return
         }
         orbPanel.orderFrontRegardless()

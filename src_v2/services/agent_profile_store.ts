@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { randomUUID } from "node:crypto";
 
 export const AGENT_PROFILE_SCHEMA_VERSION = 1;
 export const AGENT_ROUTING_SCHEMA_VERSION = 1;
 
 export type AgentRoutingMode = "auto" | "forced" | "off";
 export type AgentTaskSource = "gpt-live" | "main-agent" | "subagent" | "manual";
+export type AgentRoutingScope = "subagent" | "gpt-live";
 
 export interface AgentModelRef {
   provider: string;
@@ -119,12 +121,12 @@ function normalizeProfile(value: unknown): AgentProfile | null {
   };
 }
 
-function normalizeSettings(value: unknown): AgentRoutingSettings {
+function normalizeSettings(value: unknown, defaultMode: AgentRoutingMode = "off"): AgentRoutingSettings {
   const source = value && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
   return {
-    mode: normalizeMode(source.mode),
+    mode: source.mode === undefined ? defaultMode : normalizeMode(source.mode),
     default_profile_id: nullableString(source.default_profile_id || source.defaultProfileId, 80),
     forced_profile_id: nullableString(source.forced_profile_id || source.forcedProfileId, 80),
     forced_model: nullableString(source.forced_model || source.forcedModel, 240),
@@ -144,13 +146,19 @@ function readJson(filePath: string): any {
 export class AgentProfileStore {
   public readonly dataDir: string;
   private readonly profilesPath: string;
-  private readonly routingPath: string;
+  private readonly legacyRoutingPath: string;
+  private readonly subagentRoutingPath: string;
+  private readonly liveRoutingPath: string;
   private readonly eventsPath: string;
 
   constructor(dataDir = process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex")) {
     this.dataDir = dataDir;
     this.profilesPath = path.join(dataDir, "agent_profiles.json");
-    this.routingPath = path.join(dataDir, "live_routing.json");
+    // Keep the old file as a compatibility bridge. New writes are scoped so
+    // ordinary Desktop subagents cannot accidentally change GPT-Live routing.
+    this.legacyRoutingPath = path.join(dataDir, "live_routing.json");
+    this.subagentRoutingPath = path.join(dataDir, "subagent_routing.json");
+    this.liveRoutingPath = path.join(dataDir, "gpt_live_routing.json");
     this.eventsPath = path.join(dataDir, "agent_routing_events.jsonl");
   }
 
@@ -188,35 +196,53 @@ export class AgentProfileStore {
     const next = profiles.filter((profile) => profile.id !== profileId);
     if (next.length === profiles.length) return false;
     this.saveProfiles(next);
-    const settings = this.loadRoutingSettings();
-    let changed = false;
-    for (const key of ["default_profile_id", "forced_profile_id"] as const) {
-      if (settings[key] === profileId) {
-        settings[key] = null;
-        changed = true;
+    for (const scope of ["subagent", "gpt-live"] as const) {
+      const settings = this.loadRoutingSettings(scope);
+      let changed = false;
+      for (const key of ["default_profile_id", "forced_profile_id"] as const) {
+        if (settings[key] === profileId) {
+          settings[key] = null;
+          changed = true;
+        }
       }
+      if (changed) this.saveRoutingSettings(settings, scope);
     }
-    if (changed) this.saveRoutingSettings(settings);
     return true;
   }
 
-  public loadRoutingSettings(): AgentRoutingSettings {
-    return normalizeSettings(readJson(this.routingPath));
+  public loadRoutingSettings(scope: AgentRoutingScope = "subagent"): AgentRoutingSettings {
+    const scopedPath = scope === "gpt-live" ? this.liveRoutingPath : this.subagentRoutingPath;
+    if (fs.existsSync(scopedPath)) {
+      return normalizeSettings(readJson(scopedPath), scope === "gpt-live" ? "auto" : "off");
+    }
+    // Existing installations only have live_routing.json. Treat it as the
+    // legacy normal-subagent setting; GPT-Live now defaults to automatic mode
+    // until it receives its own explicit scoped configuration.
+    if (scope === "subagent" && fs.existsSync(this.legacyRoutingPath)) {
+      return normalizeSettings(readJson(this.legacyRoutingPath), "off");
+    }
+    return normalizeSettings({}, scope === "gpt-live" ? "auto" : "off");
   }
 
-  public saveRoutingSettings(value: unknown): AgentRoutingSettings {
-    const normalized = normalizeSettings(value);
+  public saveRoutingSettings(value: unknown, scope?: AgentRoutingScope): AgentRoutingSettings {
+    const normalized = normalizeSettings(value, scope === "gpt-live" ? "auto" : "off");
     normalized.updated_at = new Date().toISOString();
-    this.writeJson(this.routingPath, {
-      schema_version: AGENT_ROUTING_SCHEMA_VERSION,
-      ...normalized,
-    });
+    const payload = { schema_version: AGENT_ROUTING_SCHEMA_VERSION, ...normalized };
+    if (!scope) {
+      // Preserve the public helper's legacy behavior for older callers and
+      // fixtures, while all production routes use an explicit scope.
+      this.writeJson(this.legacyRoutingPath, payload);
+      this.writeJson(this.subagentRoutingPath, payload);
+      this.writeJson(this.liveRoutingPath, payload);
+    } else {
+      this.writeJson(scope === "gpt-live" ? this.liveRoutingPath : this.subagentRoutingPath, payload);
+    }
     return normalized;
   }
 
   public appendRouteEvent(event: Omit<AgentRouteEvent, "id" | "timestamp">): AgentRouteEvent {
     const record: AgentRouteEvent = {
-      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      id: randomUUID(),
       timestamp: new Date().toISOString(),
       ...event,
     };

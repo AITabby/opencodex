@@ -136,6 +136,26 @@ async function fixture() {
   return dataDir;
 }
 
+test("2.0.0 starts GPT-Live picker disabled after a gateway restart", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-live-picker-restart-"));
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  try {
+    await fs.writeFile(path.join(dataDir, "live_model_picker.json"), JSON.stringify({ enabled: true }));
+    await fs.writeFile(path.join(dataDir, "voice_settings.json"), JSON.stringify({ live_model_picker_enabled: true }));
+    process.env.OPENCODEX_DATA_DIR = dataDir;
+
+    const server = new CodexBridgeServer(0);
+    const state = server.pendingLiveModelPicker();
+    assert.equal(state.enabled, false);
+    assert.equal(state.native_overlay, false);
+    assert.deepEqual(state.models, []);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("1.1.0 Agent Profiles survive save/load and auto routing uses user policy", async () => {
   const dataDir = await fixture();
   try {
@@ -478,7 +498,8 @@ test("1.1.0 records native child-task lifecycle without claiming cancellation is
     assert.equal(started.status, "running");
     assert.equal(orchestrator.requestCancel("child-1")?.status, "cancel_requested");
     assert.equal(orchestrator.list(1)[0].parent_task_id, "parent-1");
-    assert.equal(orchestrator.complete("child-1")?.status, "completed");
+    assert.equal(orchestrator.complete("child-1", "子任务最终结果")?.status, "completed");
+    assert.equal(orchestrator.list(1)[0].output, "子任务最终结果");
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
@@ -675,6 +696,80 @@ test("1.1.0 recognizes native subagent headers and ignores their prewarm request
   }
 });
 
+test("1.2.0 applies Live model precedence across automatic, forced, and off modes", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.saveRoutingSettings({ mode: "auto" });
+    const server = new CodexBridgeServer(0);
+    server.markRealtimeActive();
+
+    const voiceSelection = await server.chooseLiveWorkRoute({
+      client_metadata: { session_id: "live-parent" },
+      input: "接下来请使用 MiniMax 执行任务",
+    });
+    assert.equal(voiceSelection, null);
+    assert.equal(server.pendingLiveModelPicker().selected_model, "minimax/minimax-m3");
+
+    const liveBinding = server.chooseSubagentRoute({
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "live-parent",
+        thread_id: "live-child",
+        parent_thread_id: "live-parent",
+      },
+      input: "执行一个没有点名模型的任务",
+    });
+    assert.equal(liveBinding?.model, "minimax/minimax-m3");
+    server.subagentOrchestrator.complete(liveBinding.task_id);
+
+    const explicitChild = server.chooseSubagentRoute({
+      model: "minimax/minimax-m3",
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "live-parent",
+        thread_id: "explicit-child",
+        parent_thread_id: "live-parent",
+      },
+      input: "这个子任务明确使用 MiniMax",
+    });
+    assert.equal(explicitChild?.model, "minimax/minimax-m3");
+    server.subagentOrchestrator.complete(explicitChild.task_id);
+
+    store.saveRoutingSettings({ mode: "forced", forced_model: "opencode/deepseek-v4-flash" });
+    const forced = server.chooseSubagentRoute({
+      model: "minimax/minimax-m3",
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "forced-parent",
+        thread_id: "forced-child",
+        parent_thread_id: "forced-parent",
+      },
+      input: "即使请求写了 MiniMax，强制模式也必须使用绑定模型",
+    });
+    assert.equal(forced?.model, "opencode/deepseek-v4-flash");
+    server.subagentOrchestrator.complete(forced.task_id);
+
+    store.saveRoutingSettings({ mode: "off" });
+    const disabled = server.chooseSubagentRoute({
+      client_metadata: {
+        "x-openai-subagent": "1",
+        session_id: "off-parent",
+        thread_id: "off-child",
+        parent_thread_id: "off-parent",
+      },
+      input: "关闭路由后交给 Live 原生选择",
+    });
+    assert.equal(disabled, null);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("1.1.0 accepts multiple child requests from one parent and routes each independently", async () => {
   const dataDir = await fixture();
   const previousDataDir = process.env.OPENCODEX_DATA_DIR;
@@ -767,6 +862,105 @@ test("1.1.0 keeps a non-native child body's explicit reasoning selection", async
   } finally {
     if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
     else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("2.0.0 keeps normal and GPT-Live routing settings independent", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.saveRoutingSettings({ mode: "off" }, "subagent");
+    const server = new CodexBridgeServer(0);
+    server.markRealtimeActive();
+    const liveRoute = await server.chooseLiveWorkRoute({
+      client_metadata: { session_id: "live-independent" },
+      tools: [{ type: "function", name: "exec" }],
+      input: "执行一个自动任务",
+    });
+    assert.ok(liveRoute?.model);
+    assert.equal(server.chooseSubagentRoute({
+      client_metadata: { "x-openai-subagent": "1", session_id: "desktop-off", thread_id: "desktop-off-child" },
+      input: "普通桌面子任务",
+    }), null);
+    assert.equal(store.loadRoutingSettings("gpt-live").mode, "auto");
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("2.0.0 resolves an explicitly named Profile and records Live children independently", async () => {
+  const dataDir = await fixture();
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  process.env.OPENCODEX_DATA_DIR = dataDir;
+  try {
+    const store = new AgentProfileStore(dataDir);
+    store.upsertProfile({
+      id: "review",
+      name: "深度审查",
+      model_ref: { provider: "thirdparty", backend_model: "review-1", catalog_slug: "thirdparty/review-model" },
+      subagent_enabled: true,
+      live_enabled: true,
+    });
+    store.upsertProfile({
+      id: "implementation",
+      name: "快速实现",
+      model_ref: { provider: "antigravity", backend_model: "gemini-code-1", catalog_slug: "antigravity/code-model" },
+      subagent_enabled: true,
+      live_enabled: true,
+    });
+    store.saveRoutingSettings({ mode: "auto" }, "subagent");
+    store.saveRoutingSettings({ mode: "auto" }, "gpt-live");
+    const server = new CodexBridgeServer(0);
+    const named = server.chooseSubagentRoute({
+      client_metadata: { "x-openai-subagent": "1", profile_name: "深度审查", session_id: "desktop-parent", thread_id: "named-child" },
+      input: "按指定子智能体执行审查",
+    });
+    assert.equal(named?.model, "thirdparty/review-model");
+    server.subagentOrchestrator.complete(named?.task_id);
+
+    server.markRealtimeActive();
+    const liveFirst = server.chooseSubagentRoute({
+      model: "thirdparty/review-model",
+      client_metadata: { "x-openai-subagent": "1", subagent_origin: "gpt-live", session_id: "live-parent", thread_id: "live-review" },
+      input: "Live 审查",
+    });
+    const liveSecond = server.chooseSubagentRoute({
+      model: "antigravity/code-model",
+      client_metadata: { "x-openai-subagent": "1", subagent_origin: "gpt-live", session_id: "live-parent", thread_id: "live-implementation" },
+      input: "Live 实现",
+    });
+    assert.equal(liveFirst?.model, "thirdparty/review-model");
+    assert.equal(liveSecond?.model, "antigravity/code-model");
+    assert.deepEqual(server.pendingLiveModelPicker().selected_models.sort(), [
+      "antigravity/code-model",
+      "thirdparty/review-model",
+    ]);
+    const liveTasks = server.subagentOrchestrator.list(10).filter((task) => task.origin === "gpt-live");
+    assert.deepEqual(liveTasks.map((task) => task.model).sort(), ["antigravity/code-model", "thirdparty/review-model"]);
+    server.subagentOrchestrator.complete(liveFirst?.task_id);
+    server.subagentOrchestrator.complete(liveSecond?.task_id);
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("2.0.0 bounds active child creation per parent", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-subagent-cap-"));
+  try {
+    const orchestrator = new SubagentOrchestrator(dataDir);
+    for (let index = 0; index < 16; index += 1) {
+      orchestrator.start({ task_id: `child-${index}`, parent_task_id: "parent-cap", origin: "desktop", depth: 1 });
+    }
+    assert.throws(() => orchestrator.start({ task_id: "child-over-cap", parent_task_id: "parent-cap", origin: "desktop", depth: 1 }), /运行中的子智能体/);
+    for (let index = 0; index < 16; index += 1) orchestrator.complete(`child-${index}`);
+  } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });

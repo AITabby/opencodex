@@ -7,10 +7,12 @@ import {
   buildFullCatalogEntry,
   CatalogSyncService,
   extractModelReasoningLevels,
+  extractModelVisionCapability,
   findModelRegistryMatch,
   flattenModelRegistry,
   getActualContextWindow,
   getProviderModelContextWindow,
+  getProviderModelVisionCapability,
 } from "../dist/services/catalog_sync.js";
 import { clearProviderModelSelections } from "../dist/services/credential_store.js";
 import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, isFreshDesktopRestartMarker, migrateProviderCatalogOwner, preserveOfficialModels, resolveDesktopBridgeStatus, resolveDesktopRestartMode, stripManagedCodexConfig, stripOwnedLegacyComputerUseConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
@@ -24,6 +26,22 @@ test("catalog entries preserve the selected upstream protocol", () => {
   assert.equal(responses.backend_protocol, "responses");
   assert.equal(chat.protocol, "chat");
   assert.equal(chat.backend_protocol, "chat");
+});
+
+test("catalog separates provider vision from gateway image acceptance", () => {
+  assert.equal(extractModelVisionCapability({ input_modalities: ["text"] }), false);
+  assert.equal(extractModelVisionCapability({ input_modalities: ["text", "image"] }), true);
+  assert.equal(getProviderModelVisionCapability({ name: "opencode" }, "deepseek-v4-flash"), false);
+
+  const textOnly = buildFullCatalogEntry("deepseek-v4-flash", "opencode", undefined, "chat", { supports_vision: false });
+  assert.deepEqual(textOnly.input_modalities, ["text", "image"]);
+  assert.equal(textOnly.supports_image_detail_original, true);
+  assert.equal(textOnly.supports_vision, false);
+  assert.equal(textOnly.vision_bridge_enabled, true);
+
+  const vision = buildFullCatalogEntry("vision-model", "custom", undefined, "chat", { supports_vision: true });
+  assert.deepEqual(vision.input_modalities, ["text", "image"]);
+  assert.equal(vision.supports_image_detail_original, true);
 });
 
 test("interactive provider discovery preserves exact upstream IDs and uses the supplied key", async () => {
@@ -396,19 +414,28 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
 
   const restartBlock = gateway.slice(restartStart, restartEnd);
   assert.match(restartBlock, /const launchMode = resolveDesktopRestartMode\(/);
-  assert.match(restartBlock, /thirdPartyModelsConfigured \? null : readDesktopModePreference\(\)/);
+  assert.match(restartBlock, /const restartRequest = await this\.parseJsonBody\(req\)/);
+  assert.match(restartBlock, /applyConfiguredModels/);
+  assert.match(restartBlock, /applyConfiguredModels \? "apply_models" : "normal"/);
+  assert.match(restartBlock, /readDesktopModePreference\(\)/);
   assert.match(restartBlock, /writeDesktopModePreference\(launchMode\)/);
   assert.match(restartBlock, /third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured/);
-  assert.match(restartBlock, /requestDesktopLaunchAfterGatewayReady\(launchMode\);\s*stopDesktopClients\(\);/);
+  assert.match(restartBlock, /if \(!preserveExistingBridge\) \{[\s\S]*requestDesktopLaunchAfterGatewayReady\(launchMode\);[\s\S]*stopDesktopClients\(\);/);
+  assert.doesNotMatch(restartBlock, /syncProviderMirrorThreadsToNativeCatalog\(\)/);
+  assert.match(restartBlock, /preserveExistingBridge = bridgeActive && existingDesktopMode === "bridge"/);
   assert.ok(
     restartBlock.indexOf("stopDesktopClients();") < restartBlock.indexOf('execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex", "--no-treekill"]'),
   );
   assert.match(gateway, /this\.launchDesktopAfterGatewayReadyIfRequested\(\);\s*resolve\(\);/);
   assert.match(gateway, /private reconcilePreferredBridgeAfterGatewayReady\(\)/);
   assert.match(gateway, /this\.reconcilePreferredBridgeAfterGatewayReady\(\)/);
-  assert.match(gateway, /readDesktopModePreference\(\) !== "bridge"/);
+  assert.match(gateway, /readDesktopModePreference\(\) \|\| "bridge"\) !== "bridge"/);
+  assert.match(gateway, /const selectedMode = readDesktopModePreference\(\) \|\| "bridge";[\s\S]*if \(mode !== selectedMode\)/);
   assert.match(gateway, /restartDesktopClients\(true, "bridge"\)/);
   assert.match(gateway, /restartDesktopClients\(true, mode\);\s*console\.log\(`/);
+  assert.match(gateway, /mode_change_in_progress: this\.gatewayRestartInProgress/);
+  assert.match(gateway, /Skipped duplicate Desktop/);
+  assert.match(gateway, /restartDesktopClients\(true, mode, true\)/);
   assert.match(gateway, /keeping Bridge selected and preserving third-party models/);
   assert.doesNotMatch(gateway, /clearOwnedProviderBridgeLaunchEnvironment\(\);\s*restartDesktopClients\(true, "native"\);\s*writeDesktopModePreference\("native"\)/);
   assert.match(gateway, /expectedMode === "bridge" \? 45_000 : 30_000/);
@@ -430,19 +457,24 @@ test("native restore persists native mode and returns without waiting for Deskto
   assert.match(resetBlock, /desktopCompatibilityHealth\("native", false\)/);
   assert.match(resetBlock, /pending: verification\.app_server !== "native"/);
   assert.match(resetBlock, /stopDesktopClients\(\)/);
+  assert.doesNotMatch(resetBlock, /syncProviderMirrorThreadsToNativeCatalog\(\)/);
   assert.match(resetBlock, /repairNativeRolloutsAsync\(\)/);
   assert.doesNotMatch(resetBlock, /repairNativeRollouts\(\);/);
   assert.doesNotMatch(resetBlock, /await waitForDesktopAppServer\("native"\)/);
 });
 
-test("new provider models promote an unset mode while explicit Bridge or native preferences remain durable", () => {
+test("Bridge remains the default transport while explicit native restore stays durable", () => {
   assert.equal(
     resolveDesktopRestartMode([{ name: "deepseek", models: ["deepseek-chat"] }], { models: [] }, "native"),
     "native",
   );
-  assert.equal(resolveDesktopRestartMode([], { models: [] }, null), "native");
+  assert.equal(resolveDesktopRestartMode([], { models: [] }, null), "bridge");
   assert.equal(resolveDesktopRestartMode([], { models: [] }, "bridge"), "bridge");
   assert.equal(resolveDesktopRestartMode([{ name: "deepseek", models: ["deepseek-chat"] }], { models: [] }, null), "bridge");
+  assert.equal(
+    resolveDesktopRestartMode([{ name: "deepseek", models: ["deepseek-chat"] }], { models: [] }, "native", "apply_models"),
+    "bridge",
+  );
 });
 
 test("Desktop Bridge status is independent from gateway activation and keeps the selected mode", () => {
@@ -470,7 +502,7 @@ test("Desktop Bridge status is independent from gateway activation and keeps the
       bridge_enabled: false,
       third_party_models_exposed: false,
       official_account_rotation_active: false,
-      needs_bridge: false,
+      needs_bridge: true,
     },
   );
 });

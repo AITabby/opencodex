@@ -4,6 +4,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import http2 from "node:http2";
 import { relative, resolve as resolvePath, sep } from "node:path";
 import { promisify } from "node:util";
+import { SUBSCRIPTION_TRANSPORTS } from "./provider_transports.js";
 import { create, fromBinary, fromJson, toBinary } from "@bufbuild/protobuf";
 import { ValueSchema } from "@bufbuild/protobuf/wkt";
 import {
@@ -2043,7 +2044,7 @@ export async function fetchCursorModels(
   clientVersion: string,
   signal?: AbortSignal,
 ): Promise<CursorModel[]> {
-  const response = await fetch("https://api2.cursor.sh/aiserver.v1.AiService/AvailableModels", {
+  const response = await fetch(SUBSCRIPTION_TRANSPORTS.cursor.modelsEndpoint!, {
     method: "POST",
     headers: cursorHeaders(token, clientVersion, "application/proto"),
     // Connect unary requests are raw protobuf, not a streaming envelope.
@@ -2102,7 +2103,8 @@ export async function streamCursorChat(
   const agentClientVersion = `cli-${new Date().toISOString().slice(0, 10).replace(/-/g, ".")}-agent-host`;
 
   return new Promise<Response>((resolve, reject) => {
-    const session = http2.connect("https://agent.api5.cursor.sh");
+    const cursorEndpoint = new URL(SUBSCRIPTION_TRANSPORTS.cursor.endpoint);
+    const session = http2.connect(cursorEndpoint.origin);
     let settled = false;
     let request: http2.ClientHttp2Stream | null = null;
     const heartbeat = setInterval(() => {
@@ -2141,9 +2143,9 @@ export async function streamCursorChat(
         let nativeToolsUsedInTurn = false;
         request = session.request({
           ":method": "POST",
-          ":path": "/agent.v1.AgentService/Run",
+          ":path": `${cursorEndpoint.pathname}${cursorEndpoint.search}`,
           ":scheme": "https",
-          ":authority": "agent.api5.cursor.sh",
+          ":authority": cursorEndpoint.host,
           authorization: `Bearer ${token}`,
           "content-type": "application/connect+proto",
           accept: "application/connect+proto",

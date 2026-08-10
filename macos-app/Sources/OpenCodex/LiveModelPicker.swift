@@ -68,11 +68,11 @@ struct LiveModelPickerView: View {
         .onAppear {
             configureWindow()
             if selectedModel.isEmpty {
-                selectedModel = request?.models.first ?? ""
+                selectedModel = request?.selectedModel ?? request?.models.first ?? ""
             }
         }
         .onChange(of: request?.id) { _ in
-            selectedModel = request?.models.first ?? ""
+            selectedModel = request?.selectedModel ?? request?.models.first ?? ""
             errorMessage = ""
         }
     }

@@ -252,21 +252,32 @@ interface ImageGenerationState {
 
 function normalizeResponseUsage(raw: any): Record<string, any> | undefined {
   if (!raw || typeof raw !== "object") return undefined;
-  const input = Number(raw.input_tokens ?? raw.prompt_tokens);
-  const output = Number(raw.output_tokens ?? raw.completion_tokens);
-  const total = Number(raw.total_tokens ?? (Number.isFinite(input) && Number.isFinite(output) ? input + output : NaN));
-  if (![input, output, total].some((value) => Number.isFinite(value))) return undefined;
+  const rawInput = Number(raw.input_tokens ?? raw.prompt_tokens);
+  const rawOutput = Number(raw.output_tokens ?? raw.completion_tokens);
+  const input = Number.isFinite(rawInput) ? rawInput : 0;
+  const output = Number.isFinite(rawOutput) ? rawOutput : 0;
+  const rawTotal = Number(raw.total_tokens);
+  const total = Number.isFinite(rawTotal) ? rawTotal : input + output;
+  if (![rawInput, rawOutput, rawTotal].some((value) => Number.isFinite(value))) return undefined;
 
   const usage: Record<string, any> = {};
   if (Number.isFinite(input)) usage.input_tokens = input;
   if (Number.isFinite(output)) usage.output_tokens = output;
   if (Number.isFinite(total)) usage.total_tokens = total;
-  if (raw.input_tokens_details && typeof raw.input_tokens_details === "object") {
-    usage.input_tokens_details = raw.input_tokens_details;
-  }
-  if (raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object") {
-    usage.input_tokens_details = usage.input_tokens_details || raw.prompt_tokens_details;
-  }
+  const rawDetails = raw.input_tokens_details && typeof raw.input_tokens_details === "object"
+    ? raw.input_tokens_details
+    : raw.prompt_tokens_details && typeof raw.prompt_tokens_details === "object"
+      ? raw.prompt_tokens_details
+      : {};
+  const rawCached = Number(raw.cached_tokens ?? raw.cached_input_tokens ?? rawDetails.cached_tokens);
+  // Codex Desktop parses the Responses usage shape strictly. Several
+  // OpenAI-compatible providers emit input_tokens_details without the
+  // required cached_tokens member; default that optional metric to zero at
+  // the compatibility boundary instead of making the whole stream fail.
+  usage.input_tokens_details = {
+    ...rawDetails,
+    cached_tokens: Number.isFinite(rawCached) ? rawCached : 0,
+  };
   return usage;
 }
 
@@ -286,6 +297,11 @@ export class ResponsesStreamEngine {
   private internalImageToolCalls: Record<number, ToolCallState> = {};
   private imageGenerations: ImageGenerationState[] = [];
   private reasoningState: ReasoningState | null = null;
+  // Keep provider-native thinking private to the gateway. Some Chat
+  // providers require the exact reasoning_content to be echoed on the next
+  // request that follows a tool call, while Codex Desktop must not receive
+  // or persist that provider-private chain of thought.
+  private providerReasoningContent = "";
 
   private thinkFilter = new ThinkTagFilter();
   private turnId?: string;
@@ -308,6 +324,16 @@ export class ResponsesStreamEngine {
 
   public getMessageText(): string {
     return this.messageText;
+  }
+
+  public getReasoningContent(): string {
+    return this.providerReasoningContent;
+  }
+
+  public getToolCallIds(): string[] {
+    return Object.values(this.toolCalls)
+      .map((state) => state.call_id)
+      .filter((callId) => Boolean(callId));
   }
 
   /**
@@ -438,7 +464,7 @@ export class ResponsesStreamEngine {
     // persist that item and replay it against chatgpt.com, where it does not
     // exist because the gateway cannot store it upstream.
     void writeSse;
-    void text;
+    if (text) this.providerReasoningContent += text;
   }
 
   private async closeReasoning(writeSse: (payload: any) => Promise<void>): Promise<void> {

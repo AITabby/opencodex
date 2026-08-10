@@ -6,13 +6,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
-import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { ProviderConfig } from "../core/types.js";
 import { CredentialStore } from "./credential_store.js";
 import { NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS } from "./computer_use_native.js";
 
-import { codexConfigPath, stripManagedCodexConfig } from "../server/gateway.js";
+import { codexConfigPath, codexHomeDir, opencodexDataDir, stripManagedCodexConfig, writePrivateTextFile } from "../server/gateway.js";
 
 const DEFAULT_REASONING_PRESETS = [
   { effort: "low", description: "轻度推理（速度优先）" },
@@ -148,6 +147,65 @@ export function extractModelReasoningLevels(model: any): Array<{ effort: string;
   return undefined;
 }
 
+function modalityNames(value: any): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || "").trim().toLowerCase()).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value.split(/[\s,|]+/).map((item) => item.trim().toLowerCase()).filter(Boolean);
+  }
+  if (value && typeof value === "object") {
+    return Object.entries(value)
+      .filter(([, enabled]) => enabled === true)
+      .map(([name]) => name.trim().toLowerCase())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+/**
+ * Resolve only an explicitly reported image-input capability. A missing
+ * value means "unknown"; it must not be turned into vision=true merely
+ * because this gateway can delegate images to the native lane.
+ */
+export function extractModelVisionCapability(model: any): boolean | undefined {
+  if (!model || typeof model !== "object") return undefined;
+
+  for (const key of [
+    "supports_vision",
+    "supportsVision",
+    "supports_image_input",
+    "supportsImageInput",
+    "vision",
+    "multimodal",
+    "multi_modal",
+    "multiModal",
+  ]) {
+    if (typeof model[key] === "boolean") return model[key];
+  }
+
+  for (const key of [
+    "input_modalities",
+    "inputModalities",
+    "supported_input_modalities",
+    "supportedInputModalities",
+    "input_capabilities",
+    "inputCapabilities",
+  ]) {
+    if (!Object.prototype.hasOwnProperty.call(model, key)) continue;
+    const modalities = modalityNames(model[key]);
+    if (modalities.some((name) => /image|vision|multimodal/.test(name))) return true;
+    if (modalities.length > 0) return false;
+  }
+
+  const capabilities = model.capabilities;
+  if (capabilities && typeof capabilities === "object") {
+    const nested = extractModelVisionCapability(capabilities);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
 function withDefaultReasoningLevels(
   discovered: Array<{ effort: string; description?: string }>,
 ): Array<{ effort: string; description?: string }> {
@@ -206,6 +264,7 @@ export type ProviderModelDescriptor = {
   context_window_source?: "provider_metadata" | "model_registry" | "unknown";
   supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
   reasoning?: boolean;
+  supports_vision?: boolean;
   default_reasoning_level?: string;
   metadata_source?: string;
   metadata_updated_at?: string;
@@ -267,11 +326,13 @@ export function normalizeProviderModelDescriptor(value: any): ProviderModelDescr
   if (!id) return null;
   const context = extractModelContextWindow(value);
   const reasoningLevels = extractModelReasoningLevels(value);
+  const vision = extractModelVisionCapability(value);
   return {
     id,
     ...(context ? { context_window: context, max_context_window: context } : {}),
     ...(reasoningLevels !== undefined ? { supported_reasoning_levels: reasoningLevels } : {}),
     ...(typeof value.reasoning === "boolean" ? { reasoning: value.reasoning } : {}),
+    ...(vision !== undefined ? { supports_vision: vision } : {}),
     ...(typeof (value.default_reasoning_level ?? value.defaultReasoningEffort ?? value.defaultReasoningLevel) === "string"
       ? { default_reasoning_level: value.default_reasoning_level ?? value.defaultReasoningEffort ?? value.defaultReasoningLevel }
       : {}),
@@ -314,7 +375,7 @@ function codexModelCacheMetadata(modelSlug: string): any | undefined {
   const requested = String(modelSlug || "").trim().toLowerCase();
   if (!requested) return undefined;
   try {
-    const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+    const cachePath = path.join(codexHomeDir(), "models_cache.json");
     const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
     const models = Array.isArray(cache?.models) ? cache.models : [];
     return models.find((model: any) => [model?.slug, model?.id, model?.model, model?.backend_model]
@@ -333,6 +394,29 @@ export function getProviderModelContextWindow(provider: any, modelSlug: string):
 
 export function getProviderModelMetadata(provider: any, modelSlug: string): any | undefined {
   return providerMetadataEntry(provider, modelSlug);
+}
+
+/**
+ * Return the provider's own image-input capability without consulting the
+ * derived Desktop catalog. The latter used to mark every imported model as
+ * multimodal, which made a text-only DeepSeek deployment receive a raw image
+ * and wait for an upstream timeout.
+ */
+export function getProviderModelVisionCapability(provider: any, modelSlug: string): boolean | undefined {
+  const metadata = providerMetadataEntry(provider, modelSlug);
+  const explicit = extractModelVisionCapability(metadata);
+  if (explicit !== undefined) return explicit;
+
+  // DeepSeek's ordinary chat/reasoning families are text-only. Keep VL/
+  // vision variants unknown unless their own metadata says true, so those
+  // models still get their native image path instead of a false fallback.
+  const providerName = String(provider?.name || provider?.preset_id || "").trim().toLowerCase();
+  const modelName = String(modelSlug || "").trim().toLowerCase().split("/").pop() || "";
+  if ((providerName.includes("deepseek") || modelName.includes("deepseek"))
+    && !/(?:^|[-_])(?:vl|vision)(?:[-_]|$)/i.test(modelName)) {
+    return false;
+  }
+  return undefined;
 }
 
 export function getActualContextWindow(_modelSlug: string, apiContextWindow?: number): number | undefined {
@@ -380,6 +464,14 @@ export function buildFullCatalogEntry(
   // an unknown-model guess. Only use the schema fallback when neither the
   // provider nor the registry knows this model.
   const catalogContext = reportedContext || registryContext || DEFAULT_CATALOG_CONTEXT_WINDOW;
+  const visionCapability = extractModelVisionCapability(capabilities);
+  // `supports_vision` describes the provider model itself. `vision_bridge_enabled`
+  // describes the gateway boundary: even a text-only provider can receive an
+  // image here because the gateway can replace it with a native vision
+  // description before the provider request. Desktop must therefore allow the
+  // attachment to reach the gateway instead of rejecting the turn locally.
+  const visionBridgeEnabled = true;
+  const desktopAcceptsImageInput = visionCapability === true || visionBridgeEnabled;
   const reasoningLevels = resolveModelReasoningLevels(capabilities);
   const defaultValue = capabilities?.default_reasoning_level ?? capabilities?.defaultReasoningEffort ?? capabilities?.defaultReasoningLevel;
   const requestedDefaultReasoning = String(typeof defaultValue === "object"
@@ -423,8 +515,8 @@ export function buildFullCatalogEntry(
     supports_search_tool: false,
     supports_parallel_tool_calls: true,
     experimental_supported_tools: ["computer_use", "mcp"],
-    input_modalities: ["text", "image"],
-    supports_image_detail_original: true,
+    input_modalities: desktopAcceptsImageInput ? ["text", "image"] : ["text"],
+    ...(desktopAcceptsImageInput ? { supports_image_detail_original: true } : {}),
     shell_type: "shell_command",
     visibility: "list",
     minimal_client_version: "0.0.1",
@@ -439,7 +531,10 @@ export function buildFullCatalogEntry(
     }).base_instructions,
     supports_computer_use: true,
     supports_mcp: true,
-    vision_bridge_enabled: true,
+    ...(visionCapability !== undefined
+      ? { supports_vision: visionCapability }
+      : {}),
+    vision_bridge_enabled: visionBridgeEnabled,
     // Third-party chat models can delegate image generation to the native
     // Codex Responses image tool. This capability is independent from
     // the model's own vision input capability.
@@ -588,8 +683,12 @@ export function findModelRegistryMatch(payload: any, provider: any, modelSlug: s
 }
 
 export class CatalogSyncService {
-  private static catalogPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
-  private static modelRegistryCachePath = path.join(os.homedir(), ".opencodex", "model_registry_cache.json");
+  private static get catalogPath(): string {
+    return path.join(opencodexDataDir(), "custom_model_catalog.json");
+  }
+  private static get modelRegistryCachePath(): string {
+    return path.join(opencodexDataDir(), "model_registry_cache.json");
+  }
   private static modelRegistryPayload: any | null = null;
   private static modelRegistryLoadedAt = 0;
 
@@ -720,8 +819,8 @@ export class CatalogSyncService {
 
   public static syncCustomModelsToCodexCache(): boolean {
     try {
-      const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
-      const catPath = path.join(os.homedir(), ".opencodex", "custom_model_catalog.json");
+      const cachePath = path.join(codexHomeDir(), "models_cache.json");
+      const catPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
       if (!fs.existsSync(cachePath) || !fs.existsSync(catPath)) return false;
 
       const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
@@ -751,7 +850,7 @@ export class CatalogSyncService {
    */
   public static syncNativeModelsToCodexCache(): boolean {
     try {
-      const cachePath = path.join(os.homedir(), ".codex", "models_cache.json");
+      const cachePath = path.join(codexHomeDir(), "models_cache.json");
       if (!fs.existsSync(cachePath)) return false;
 
       const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
@@ -772,13 +871,13 @@ export class CatalogSyncService {
       if (!fs.existsSync(configPath)) return [];
       const backup = fs.readFileSync(configPath, "utf-8");
       const tempContent = stripManagedCodexConfig(backup);
-      fs.writeFileSync(configPath, tempContent, "utf-8");
+      writePrivateTextFile(configPath, tempContent);
       try {
         const raw = execFileSync("/Applications/ChatGPT.app/Contents/Resources/codex", ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
         const json = JSON.parse(raw);
         return (json.models || []).filter((m: any) => m.slug !== "codex-auto-review");
       } finally {
-        fs.writeFileSync(configPath, backup, "utf-8");
+        writePrivateTextFile(configPath, backup);
       }
     } catch {
       return [];
@@ -896,6 +995,9 @@ export class CatalogSyncService {
       const directLevels = extractModelReasoningLevels(model);
       const providerContext = extractModelContextWindow(providerMetadata);
       const providerLevels = extractModelReasoningLevels(providerMetadata);
+      const directVision = extractModelVisionCapability(model);
+      const providerVision = extractModelVisionCapability(providerMetadata);
+      const registryVision = extractModelVisionCapability(registryMetadata);
       const selectedLevels = directLevels !== undefined ? directLevels : providerLevels !== undefined ? providerLevels : registryLevels;
       const contextSource = directContext
         ? "provider_metadata"
@@ -914,6 +1016,9 @@ export class CatalogSyncService {
         ...(typeof model.reasoning === "boolean" || typeof providerMetadata?.reasoning === "boolean" || typeof registryMetadata?.reasoning === "boolean"
           ? { reasoning: typeof model.reasoning === "boolean" ? model.reasoning : typeof providerMetadata?.reasoning === "boolean" ? providerMetadata.reasoning : registryMetadata.reasoning }
           : {}),
+        ...(directVision !== undefined || providerVision !== undefined || registryVision !== undefined
+          ? { supports_vision: directVision !== undefined ? directVision : providerVision !== undefined ? providerVision : registryVision }
+          : {}),
         ...((directContext || providerContext || directLevels !== undefined || providerLevels !== undefined)
           ? { metadata_source: "provider_metadata" }
           : (registryContext || registryLevels !== undefined)
@@ -928,7 +1033,8 @@ export class CatalogSyncService {
     for (const model of models) {
       const context = extractModelContextWindow(model);
       const levels = extractModelReasoningLevels(model);
-      if (!context && levels === undefined && typeof model.reasoning !== "boolean") continue;
+      const vision = extractModelVisionCapability(model);
+      if (!context && levels === undefined && typeof model.reasoning !== "boolean" && vision === undefined) continue;
       const source = context
         ? (model.context_window_source || (model.metadata_source === "model_registry" ? "model_registry" : "provider_metadata"))
         : undefined;
@@ -937,6 +1043,7 @@ export class CatalogSyncService {
         ...(source ? { context_window_source: source } : {}),
         ...(levels !== undefined ? { supported_reasoning_levels: levels } : {}),
         ...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
+        ...(vision !== undefined ? { supports_vision: vision } : {}),
         ...(model.default_reasoning_level ? { default_reasoning_level: model.default_reasoning_level } : {}),
         ...(model.metadata_source ? { metadata_source: model.metadata_source } : {}),
       };

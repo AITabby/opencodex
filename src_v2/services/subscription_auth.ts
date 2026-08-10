@@ -14,7 +14,10 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { SubscriptionAccountPool, type SubscriptionProvider } from "./subscription_account_pool.js";
 
-const GROK_AUTH_PATH = path.join(os.homedir(), ".grok", "auth.json");
+function defaultGrokAuthDir(): string {
+  const configured = String(process.env.OPENCODEX_GROK_AUTH_DIR || process.env.GROK_AUTH_DIR || "").trim();
+  return configured || path.join(os.homedir(), ".grok");
+}
 const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
 const ANTIGRAVITY_KEYCHAIN_SERVICE = "gemini";
 const ANTIGRAVITY_KEYCHAIN_PREFIX = "go-keyring-base64:";
@@ -88,7 +91,7 @@ function writeJsonSecure(filePath: string, value: unknown): void {
   }
 }
 
-function readGrokSession(homeDir = path.dirname(GROK_AUTH_PATH)): { authData: Record<string, GrokSession>; sessionKey: string; session: GrokSession; authPath: string } | null {
+function readGrokSession(homeDir = defaultGrokAuthDir()): { authData: Record<string, GrokSession>; sessionKey: string; session: GrokSession; authPath: string } | null {
   const authPath = path.join(homeDir, "auth.json");
   try {
     if (!fs.existsSync(authPath)) return null;

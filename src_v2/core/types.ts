@@ -77,6 +77,23 @@ export interface ResponseMcpCallOutputItem {
   output: string | ResponseContentPart[];
 }
 
+/** Native Computer Use clients may keep the tool pair under these types. */
+export interface ResponseComputerCallItem {
+  id?: string;
+  type: "computer_call";
+  call_id?: string;
+  action?: Record<string, any>;
+  arguments?: string | Record<string, any>;
+  output?: string | ResponseContentPart[] | Record<string, any>;
+}
+
+export interface ResponseComputerCallOutputItem {
+  id?: string;
+  type: "computer_call_output";
+  call_id?: string;
+  output: string | ResponseContentPart[] | Record<string, any>;
+}
+
 export interface ResponseReasoningItem {
   id?: string;
   type: "reasoning";
@@ -97,6 +114,8 @@ export type ResponseInputItem =
   | ResponseFunctionCallOutputItem
   | ResponseMcpCallItem
   | ResponseMcpCallOutputItem
+  | ResponseComputerCallItem
+  | ResponseComputerCallOutputItem
   | ResponseReasoningItem
   | ResponseCompactionItem
   | string;
@@ -238,6 +257,8 @@ export interface ProviderConfig {
   name: string;
   type?: string;
   preset_id?: string;
+  /** Explicit payload adapter for providers that share an OpenAI endpoint shape. */
+  adapter?: "openai" | "deepseek" | "minimax" | "anthropic" | "google";
   baseUrl: string;
   api_key_env?: string;
   api_key?: string;
@@ -262,6 +283,7 @@ export interface ProviderConfig {
     context_window_source?: "provider_metadata" | "model_registry" | "unknown";
     supported_reasoning_levels?: Array<{ effort: string; description?: string }>;
     reasoning?: boolean;
+    supports_vision?: boolean;
     default_reasoning_level?: string;
     metadata_source?: string;
     metadata_updated_at?: string;
@@ -279,6 +301,7 @@ export interface CatalogModelEntry {
   display_name?: string;
   backend_model?: string;
   backend_provider?: string;
+  adapter?: "openai" | "deepseek" | "minimax" | "anthropic" | "google";
   protocol?: "chat" | "responses";
   backend_protocol?: "chat" | "responses";
   provider?: string;

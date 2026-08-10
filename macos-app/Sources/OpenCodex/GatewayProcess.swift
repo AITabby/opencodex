@@ -4,6 +4,8 @@ import AppKit
 struct LiveModelPickerRequest: Identifiable, Equatable {
     let id: String
     let models: [String]
+    let selectedModel: String
+    let selectedModels: [String]
     let createdAt: Date
 }
 
@@ -12,6 +14,8 @@ private struct LiveModelPickerResponse: Decodable {
     let enabled: Bool?
     let request_id: String?
     let models: [String]?
+    let selected_model: String?
+    let selected_models: [String]?
     let created_at: Double?
 }
 
@@ -300,8 +304,16 @@ final class GatewayProcess: ObservableObject {
                 return
             }
             let createdAt = Date(timeIntervalSince1970: payload.created_at ?? Date().timeIntervalSince1970)
-            let next = LiveModelPickerRequest(id: requestID, models: models, createdAt: createdAt)
+            let selectedModel = payload.selected_model.flatMap { models.contains($0) ? $0 : nil } ?? ""
+            let selectedModels = (payload.selected_models ?? [selectedModel])
+                .filter { models.contains($0) }
+                .reduce(into: [String]()) { result, model in
+                    if !result.contains(model) { result.append(model) }
+                }
+            let next = LiveModelPickerRequest(id: requestID, models: models, selectedModel: selectedModel, selectedModels: selectedModels, createdAt: createdAt)
             if liveModelPickerRequest?.id != next.id {
+                liveModelPickerRequest = next
+            } else if liveModelPickerRequest?.selectedModel != next.selectedModel || liveModelPickerRequest?.selectedModels != next.selectedModels {
                 liveModelPickerRequest = next
             }
         } catch {

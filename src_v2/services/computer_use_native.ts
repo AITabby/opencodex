@@ -29,17 +29,8 @@ export const CANONICAL_NATIVE_COMPUTER_USE_EXECUTOR_NAME = "mcp__node_repl_js";
  */
 const NATIVE_COMPUTER_USE_BOOTSTRAP = [
   "if (!globalThis.sky) {",
-  "  var cuNodeRepl = globalThis.nodeRepl;",
-  "  var cuHome = cuNodeRepl?.env?.HOME || cuNodeRepl?.homeDir || globalThis.process?.env?.HOME;",
-  "  if (!cuHome) throw new Error('Computer Use node runtime has no HOME directory');",
-  "  var cuFs = await import('node:fs/promises');",
-  "  var cuPath = await import('node:path');",
-  "  var cuRoot = cuPath.join(cuHome, '.codex', 'plugins', 'cache', 'openai-bundled', 'computer-use');",
-  "  var cuEntries = await cuFs.readdir(cuRoot, { withFileTypes: true });",
-  "  var cuVersions = cuEntries.filter((entry) => entry.isDirectory() && /^\\d/.test(entry.name)).map((entry) => entry.name).sort().reverse();",
-  "  if (!cuVersions[0]) throw new Error('Computer Use plugin is not installed');",
-  "  var cuClient = await import(cuPath.join(cuRoot, cuVersions[0], 'scripts', 'computer-use-client.mjs'));",
-  "  await cuClient.setupComputerUseRuntime({ globals: globalThis });",
+  "  globalThis.sky = (await import('@oai/sky')).sky;",
+  "  if (!globalThis.sky) throw new Error('Computer Use native runtime is unavailable');",
   "}",
 ].join("\n");
 
@@ -48,7 +39,7 @@ const NATIVE_COMPUTER_USE_WRAPPER_MARKER = "/* opencodex-native-computer-use-cal
 export const NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS = [
   "Codex native Computer Use is available through the provided native node-repl executor (the provider-facing tool name is `mcp__node_repl_js`).",
   "When the user asks you to operate the desktop, browser, or an app, call that executor directly with JavaScript and inspect fresh state after each action.",
-  "Use the native `@oai/sky` runtime: the gateway bootstraps it before every executor call when `globalThis.sky` is absent. If you need to bootstrap it yourself, use `nodeRepl.env.HOME` (or `process.env.HOME`), not a presumed `nodeRepl.homeDir`, then select the newest `~/.codex/plugins/cache/openai-bundled/computer-use` version and call `setupComputerUseRuntime({ globals: globalThis })`.",
+  "Use the native `@oai/sky` runtime: the gateway bootstraps it before every executor call when `globalThis.sky` is absent. If you need to bootstrap it yourself, run `globalThis.sky = (await import('@oai/sky')).sky`; do not search for a plugin script or construct a versioned computer-use path.",
   "Every direct action must include the target `app` as a plain data property: this includes `click`, `scroll`, `type_text`, `set_value`, `select_text`, `drag`, and `press_key`.",
   "Use exact API shapes: click and scroll use `element_index`; the Enter key is `Return`; modifier combinations are one string such as `super+t`, `super+l`, or `super+a` (the compatible spelling `meta+t` is also a string), never an array and never a `modifiers` field.",
   "There is no `sky.open_app` in this runtime, and no shell `open -a` fallback is needed: `sky.get_app_state({ app: 'com.google.Chrome' })` launches or attaches to the app transparently. Do not inspect a presumed `windows` field; the state shape is `{ app, screenshot, text }`, and the accessibility tree is in `state.text`.",
