@@ -647,6 +647,30 @@ function turnMetadataFromHeaders(headers: HeaderBag): JsonRecord {
   }
 }
 
+function nativeLiveOrigin(body: unknown, headers: HeaderBag): string {
+  const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
+  const metadata = value.client_metadata && typeof value.client_metadata === "object"
+    ? value.client_metadata as JsonRecord
+    : {};
+  const headerMetadata = turnMetadataFromHeaders(headers);
+  return cleanString(
+    value.subagent_origin
+      || value.subagent_source
+      || metadata.subagent_origin
+      || metadata.subagent_source
+      || headerMetadata.subagent_origin
+      || headerMetadata.subagent_source
+      || headerValue(headers, "x-codex-subagent-source"),
+  ).toLowerCase();
+}
+
+function isLiveOrigin(origin: string): boolean {
+  return origin === "gpt-live"
+    || origin === "gpt_live"
+    || origin === "realtime"
+    || origin === "realtime_voice";
+}
+
 function nativeSubagentParentIdentityValues(body: unknown, headers: HeaderBag): Set<string> {
   const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
   const bodyMetadata = value.client_metadata && typeof value.client_metadata === "object"
@@ -823,6 +847,14 @@ export function isNativeSubagentRequest(body: unknown, headers: HeaderBag = {}):
   );
 }
 
+export function isNativeLiveParentRequest(body: unknown, headers: HeaderBag = {}): boolean {
+  return isLiveOrigin(nativeLiveOrigin(body, headers)) && !isNativeSubagentRequest(body, headers);
+}
+
+export function isNativeLiveChildRequest(body: unknown, headers: HeaderBag = {}): boolean {
+  return isLiveOrigin(nativeLiveOrigin(body, headers)) && isNativeSubagentRequest(body, headers);
+}
+
 function requestModelMetadata(body: unknown): JsonRecord {
   const value = body && typeof body === "object" && !Array.isArray(body) ? body as JsonRecord : {};
   return value.client_metadata && typeof value.client_metadata === "object" && !Array.isArray(value.client_metadata)
@@ -851,6 +883,9 @@ export function isNativeControlPlaneRequest(body: unknown, headers: HeaderBag = 
 }
 
 export function nativeEgressRoute(body: unknown, headers: HeaderBag = {}): "native" | "gateway" {
+  // GPT-Live's parent conversation never enters the provider gateway. The
+  // only gateway boundary is an explicitly marked child thread.
+  if (isNativeLiveParentRequest(body, headers)) return "native";
   const selectedModel = requestModelSlug(body, headers);
   if (classifyRuntimeModel(selectedModel) === GATEWAY_PROVIDER) return "gateway";
   if (isNativeControlPlaneRequest(body, headers)) return "native";
@@ -935,6 +970,7 @@ async function notifyGatewayLiveClosed(callId = ""): Promise<void> {
       },
       body: JSON.stringify({
         reason: `native Live WebSocket closed${callId ? ` call=${callId}` : ""}`,
+        keys: callId ? [callId] : [],
       }),
       signal: controller.signal,
     });
@@ -1359,9 +1395,16 @@ async function handleNativeEgressRequest(
   const gatewayCredential = route === "gateway" && !nativeLiveCall
     ? accountRouter.credentialForRequest(req)
     : null;
+  const liveCallId = route === "gateway" && !nativeLiveCall && isNativeLiveChildRequest(parsedBody, req.headers)
+    ? liveBindings.latestCallId()
+    : "";
   const gatewayRequestPreparation = route === "gateway" && !nativeLiveCall
     ? {
-      prepareRequest: () => ({ headers: localEgressHeaders(req, gatewayCredential), body: gatewayBody }),
+      prepareRequest: () => {
+        const headers = localEgressHeaders(req, gatewayCredential);
+        if (liveCallId) headers["x-opencodex-live-call-id"] = liveCallId;
+        return { headers, body: gatewayBody };
+      },
     }
     : undefined;
   await proxyNativeEgressRequest(
@@ -1726,19 +1769,18 @@ async function startCliEgressRouter(
 
 export function nativeRuntimeArgs(args: string[], egressPort: number, egressBasePath = "/v1"): string[] {
   const nativeEgressBaseUrl = `http://127.0.0.1:${egressPort}${egressBasePath}`;
-  // Codex normalizes a Frameless/V3 websocket base ending in `/realtime` to
-  // `/live` before appending the call id. Keep that semantic suffix after the
-  // randomized local egress path; using only the `/v1` base makes it emit
-  // `.../v1/<call_id>`, which the bridge correctly rejects as a non-Live WS.
+  // Codex derives the native V3 WebSocket path from the realtime base. Keep
+  // the `/realtime` semantic suffix here; the runtime normalizes it to the
+  // `/live/<call_id>` sideband path before the local egress handles Upgrade.
   const nativeRealtimeWebSocketBaseUrl = `ws://127.0.0.1:${egressPort}${egressBasePath}/realtime`;
   const overrides = [
     // Keep ordinary Responses/API traffic on the local Egress so account
     // selection and provider-owned task routing remain request-scoped.
     "-c", `openai_base_url=${nativeEgressBaseUrl}`,
-    // Live also crosses this Egress, but only as a transparent native
-    // transport. The HTTP call creation and WebSocket sideband have separate
-    // settings; the latter must use ws:// so the runtime performs a real
-    // Upgrade instead of issuing a plain GET that receives the local 426.
+    // Live also crosses this Egress as a transparent native transport. The
+    // HTTP call creation and WebSocket sideband have separate settings; the
+    // latter must use ws:// so the runtime performs a real Upgrade instead of
+    // issuing a plain HTTP request that receives the local 426 fallback.
     "-c", `experimental_realtime_webrtc_call_base_url=${nativeEgressBaseUrl}`,
     "-c", `experimental_realtime_ws_base_url=${nativeRealtimeWebSocketBaseUrl}`,
     // Responses WebSockets remain disabled because task metadata is routed on

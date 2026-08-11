@@ -422,7 +422,8 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
   assert.match(restartBlock, /third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured/);
   assert.match(restartBlock, /if \(!preserveExistingBridge\) \{[\s\S]*requestDesktopLaunchAfterGatewayReady\(launchMode\);[\s\S]*stopDesktopClients\(\);/);
   assert.doesNotMatch(restartBlock, /syncProviderMirrorThreadsToNativeCatalog\(\)/);
-  assert.match(restartBlock, /preserveExistingBridge = bridgeActive && existingDesktopMode === "bridge"/);
+  assert.match(restartBlock, /preserveExistingBridge = !applyConfiguredModels\s*&&\s*bridgeActive\s*&&\s*existingDesktopMode === "bridge"/);
+  assert.match(restartBlock, /desktop_relaunch_required: !preserveExistingBridge/);
   assert.ok(
     restartBlock.indexOf("stopDesktopClients();") < restartBlock.indexOf('execFileSync("/opt/homebrew/bin/pm2", ["restart", "opencodex", "--no-treekill"]'),
   );

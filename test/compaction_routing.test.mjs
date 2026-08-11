@@ -9,6 +9,7 @@ import {
   CodexBridgeServer,
   hasThirdPartyModels,
   isNativeCodexPassthrough,
+  shouldResolveLiveWorkRoute,
 } from "../dist/server/gateway.js";
 import {
   GatewayRouter,
@@ -20,6 +21,13 @@ test("native GPT remains transport-only, including child boundaries", () => {
   assert.equal(isNativeCodexPassthrough(true, false), true);
   assert.equal(isNativeCodexPassthrough(true, true), true);
   assert.equal(isNativeCodexPassthrough(false, false), false);
+});
+
+test("GPT-Live parent never resolves a third-party work route", () => {
+  assert.equal(shouldResolveLiveWorkRoute(false, "desktop"), false);
+  assert.equal(shouldResolveLiveWorkRoute(false, "gpt-live"), false);
+  assert.equal(shouldResolveLiveWorkRoute(true, "desktop"), false);
+  assert.equal(shouldResolveLiveWorkRoute(true, "gpt-live"), true);
 });
 
 test("native GPT compaction forwards the request bytes unchanged", async () => {

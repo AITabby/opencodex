@@ -5,7 +5,6 @@
 
 import http from "node:http";
 import net from "node:net";
-import tls from "node:tls";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -21,7 +20,7 @@ import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalog
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
 import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
-import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, resolveRealtimeUpstream } from "./webrtc_proxy.js";
+import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccountCredential, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
@@ -64,6 +63,79 @@ type ActiveLiveRequest = {
   startedAt: number;
 };
 
+type NativeLiveCredential = {
+  localId: string;
+  upstreamId: string;
+  token: string;
+};
+
+type NativeLiveBinding = {
+  credential: NativeLiveCredential;
+  expiresAt: number;
+};
+
+const NATIVE_LIVE_ACCOUNT_BINDING_TTL_MS = 15 * 60 * 1000;
+const MAX_NATIVE_LIVE_ACCOUNT_BINDINGS = 256;
+
+function safeNativeLiveCallId(value: unknown): string {
+  const normalized = String(value || "").trim();
+  return /^[A-Za-z0-9._-]{1,240}$/.test(normalized) ? normalized : "";
+}
+
+function nativeLiveCallIdsFromResponse(body: Buffer | string, headers: Record<string, string> = {}): string[] {
+  const text = Buffer.isBuffer(body) ? body.toString("utf8") : String(body || "");
+  const ids = new Set<string>();
+  const visit = (value: unknown, key = "", depth = 0): void => {
+    if (depth > 5 || value === null || value === undefined) return;
+    if (typeof value === "string") {
+      const normalizedKey = key.toLowerCase().replace(/[-_]/g, "");
+      if (normalizedKey.includes("callid") || normalizedKey.includes("realtimesessionid")) {
+        const id = safeNativeLiveCallId(value);
+        if (id) ids.add(id);
+      }
+      return;
+    }
+    if (typeof value !== "object") return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, key, depth + 1);
+      return;
+    }
+    for (const [childKey, child] of Object.entries(value as Record<string, unknown>)) {
+      visit(child, childKey, depth + 1);
+    }
+  };
+  try { visit(JSON.parse(text)); } catch {}
+  for (const match of text.matchAll(/\brtc_[A-Za-z0-9._-]+\b/g)) {
+    const id = safeNativeLiveCallId(match[0]);
+    if (id) ids.add(id);
+  }
+  for (const [name, value] of Object.entries(headers)) {
+    if (!["x-call-id", "x-session-id", "x-realtime-session-id", "x-codex-call-id", "location"].includes(name.toLowerCase())) continue;
+    const id = safeNativeLiveCallId(value);
+    if (id) ids.add(id);
+    for (const match of String(value || "").matchAll(/\brtc_[A-Za-z0-9._-]+\b/g)) {
+      const headerId = safeNativeLiveCallId(match[0]);
+      if (headerId) ids.add(headerId);
+    }
+  }
+  return Array.from(ids);
+}
+
+function nativeLiveCallIdFromRequest(url: URL, req: http.IncomingMessage): string {
+  const pathMatch = url.pathname.match(/^\/v1\/live\/([^/]+)/i);
+  let pathId = "";
+  if (pathMatch?.[1]) {
+    try { pathId = safeNativeLiveCallId(decodeURIComponent(pathMatch[1])); } catch {}
+  }
+  return pathId
+    || safeNativeLiveCallId(url.searchParams.get("call_id"))
+    || safeNativeLiveCallId(url.searchParams.get("callId"))
+    || safeNativeLiveCallId(requestHeader(req, "x-call-id"))
+    || safeNativeLiveCallId(requestHeader(req, "x-session-id"))
+    || safeNativeLiveCallId(requestHeader(req, "x-realtime-session-id"))
+    || safeNativeLiveCallId(requestHeader(req, "x-codex-call-id"));
+}
+
 type RequestResponseAbortBinding = {
   controller: AbortController;
   signal: AbortSignal;
@@ -91,6 +163,18 @@ type GatewaySubagentTurn = {
  */
 export function isNativeCodexPassthrough(modelIsNative: boolean, _isSubagent: boolean): boolean {
   return modelIsNative;
+}
+
+export function shouldResolveLiveWorkRoute(
+  isSubagentRequest: boolean,
+  subagentOrigin: string,
+): boolean {
+  // GPT-Live's parent turn is always the native Live conversation. Ordinary
+  // desktop turns must not inherit Live routing merely because a Live socket
+  // is still active. Only an explicitly marked Live child may resolve a Live
+  // work route through the gateway.
+  return isSubagentRequest
+    && String(subagentOrigin || "").trim().toLowerCase() === "gpt-live";
 }
 
 export function shouldResolveSubagentRoute(isSubagentRequest: boolean, isNativeControlPlaneRequest: boolean): boolean {
@@ -1858,6 +1942,14 @@ export class CodexBridgeServer {
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
   private activeLiveRequests = new Map<string, ActiveLiveRequest>();
+  // Native GPT-Live is one session, even though the client uses a create-call
+  // HTTP request followed by one or more WebSocket/sideband requests. Keep the
+  // selected account attached to that session instead of selecting a new pool
+  // account for every transport hop.
+  private nativeLiveAccountBindings = new Map<string, NativeLiveBinding>();
+  private latestNativeLiveAccountBinding: NativeLiveBinding | null = null;
+  private latestNativeLiveCallId = "";
+  private activeNativeLiveSockets = new Map<string, { callId: string; close: () => void }>();
   // Durable subagent status is not enough to stop a live HTTP turn. Keep the
   // actual request controllers by task id so the dashboard cancel action can
   // abort the provider stream, child tool, and native egress boundary.
@@ -2252,6 +2344,108 @@ export class CodexBridgeServer {
     this.realtimeActiveUntil = Date.now() + 15 * 60 * 1000;
   }
 
+  private pruneNativeLiveAccountBindings(): void {
+    const now = Date.now();
+    for (const [callId, binding] of this.nativeLiveAccountBindings) {
+      if (binding.expiresAt <= now) this.nativeLiveAccountBindings.delete(callId);
+    }
+    if (this.latestNativeLiveAccountBinding?.expiresAt && this.latestNativeLiveAccountBinding.expiresAt <= now) {
+      this.latestNativeLiveAccountBinding = null;
+      this.latestNativeLiveCallId = "";
+    }
+    while (this.nativeLiveAccountBindings.size > MAX_NATIVE_LIVE_ACCOUNT_BINDINGS) {
+      const oldest = this.nativeLiveAccountBindings.keys().next().value;
+      if (oldest === undefined) break;
+      this.nativeLiveAccountBindings.delete(oldest);
+    }
+  }
+
+  private nativeLiveCredentialForCreate(): NativeLiveCredential | null {
+    this.pruneNativeLiveAccountBindings();
+    if (!this.chatgptAccountPool.rotationEnabled()) return null;
+    const selected = this.chatgptAccountPool.selectForInvocation(process.env.OPENCODEX_CHATGPT_ACCOUNT_ID);
+    if (!selected) return null;
+    const metadata = readNativeAccountCredential(selected.id, true);
+    if (!metadata.token) {
+      console.warn(`[OpenCodex Realtime] selected Live account=${selected.id} has no usable access token`);
+      return null;
+    }
+    const credential = {
+      localId: selected.id,
+      upstreamId: metadata.upstreamId || selected.id,
+      token: metadata.token,
+    };
+    console.error(`[OpenCodex Realtime] native Live account=${credential.localId}`);
+    return credential;
+  }
+
+  private nativeLiveCredentialForRequest(
+    req: http.IncomingMessage,
+    url: URL,
+    isCreate: boolean,
+  ): { credential: NativeLiveCredential | null; callId: string } {
+    this.pruneNativeLiveAccountBindings();
+    const callId = nativeLiveCallIdFromRequest(url, req);
+    if (isCreate) return { credential: this.nativeLiveCredentialForCreate(), callId };
+    if (callId) {
+      const binding = this.nativeLiveAccountBindings.get(callId);
+      if (binding) {
+        binding.expiresAt = Date.now() + NATIVE_LIVE_ACCOUNT_BINDING_TTL_MS;
+        return { credential: binding.credential, callId };
+      }
+    }
+    // The first sideband can arrive without the call id being echoed in the
+    // local request. It still belongs to the latest Live create call.
+    if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/") || callId) {
+      const latest = this.latestNativeLiveAccountBinding;
+      if (latest) {
+        latest.expiresAt = Date.now() + NATIVE_LIVE_ACCOUNT_BINDING_TTL_MS;
+        return { credential: latest.credential, callId: callId || this.latestNativeLiveCallId };
+      }
+    }
+    return { credential: null, callId };
+  }
+
+  private rememberNativeLiveAccountBinding(
+    body: Buffer,
+    headers: Record<string, string>,
+    credential: NativeLiveCredential | null,
+  ): void {
+    if (!credential) return;
+    const binding: NativeLiveBinding = {
+      credential,
+      expiresAt: Date.now() + NATIVE_LIVE_ACCOUNT_BINDING_TTL_MS,
+    };
+    this.latestNativeLiveAccountBinding = binding;
+    for (const callId of nativeLiveCallIdsFromResponse(body, headers)) {
+      this.latestNativeLiveCallId = callId;
+      this.nativeLiveAccountBindings.delete(callId);
+      this.nativeLiveAccountBindings.set(callId, binding);
+    }
+    this.pruneNativeLiveAccountBindings();
+  }
+
+  private releaseNativeLiveAccountBinding(callId = ""): void {
+    this.pruneNativeLiveAccountBindings();
+    const binding = callId ? this.nativeLiveAccountBindings.get(callId) : this.latestNativeLiveAccountBinding;
+    if (callId) this.nativeLiveAccountBindings.delete(callId);
+    if (binding && this.latestNativeLiveAccountBinding === binding) {
+      this.latestNativeLiveAccountBinding = null;
+      this.latestNativeLiveCallId = "";
+    }
+  }
+
+  private closeNativeLiveSockets(keys: Set<string>): number {
+    let closed = 0;
+    for (const [socketId, entry] of this.activeNativeLiveSockets) {
+      if (keys.size > 0 && (!entry.callId || !keys.has(entry.callId))) continue;
+      this.activeNativeLiveSockets.delete(socketId);
+      closed += 1;
+      try { entry.close(); } catch {}
+    }
+    return closed;
+  }
+
   private liveRequestKeys(body: any, req?: http.IncomingMessage): Set<string> {
     const metadata = body?.client_metadata && typeof body.client_metadata === "object"
       ? body.client_metadata
@@ -2281,6 +2475,11 @@ export class CodexBridgeServer {
       requestHeader(req, "session-id"),
       requestHeader(req, "x-codex-call-id"),
       requestHeader(req, "x-realtime-session-id"),
+      requestHeader(req, "x-opencodex-live-call-id"),
+      // The V3 WebRTC call id is transport metadata.  The child Responses
+      // request often does not echo it in its body or headers, so retain the
+      // currently bound native Live call as a cancellation key as well.
+      this.latestNativeLiveCallId,
     ]
       .map((value) => String(value || "").trim())
       .filter((value) => value && value !== "__active__");
@@ -2309,13 +2508,19 @@ export class CodexBridgeServer {
    * matching Responses request id, so the default is deliberately scoped to
    * Live requests only rather than trying to cancel arbitrary desktop turns.
    */
-  private cancelLiveSession(reason = "Live session closed", keys: unknown[] = []): { cancelled: number; reset: boolean } {
+  private cancelLiveSession(
+    reason = "Live session closed",
+    keys: unknown[] = [],
+    closeNativeSockets = true,
+  ): { cancelled: number; reset: boolean } {
     const requestedKeys = new Set(
       keys.map((value) => String(value || "").trim()).filter(Boolean),
     );
     let cancelled = 0;
+    let matchedLiveRequest = false;
     for (const [id, entry] of this.activeLiveRequests) {
       if (requestedKeys.size > 0 && !Array.from(requestedKeys).some((key) => entry.keys.has(key))) continue;
+      matchedLiveRequest = true;
       this.activeLiveRequests.delete(id);
       cancelled += 1;
       try {
@@ -2323,6 +2528,42 @@ export class CodexBridgeServer {
       } catch {
         // An already-aborted controller is still a successful cancellation.
       }
+    }
+    if (closeNativeSockets) cancelled += this.closeNativeLiveSockets(requestedKeys);
+    // A native Live socket carries the rtc_* id, but the Live child request
+    // can be registered without that id.  Once the last native socket has
+    // closed, all remaining activeLiveRequests are still guaranteed to be
+    // Live-scoped (ordinary conversations never enter this registry), so
+    // cancel them instead of leaving the shared app-server turn blocked.
+    if (requestedKeys.size > 0 && !matchedLiveRequest && this.activeNativeLiveSockets.size === 0 && this.activeLiveRequests.size > 0) {
+      const fallbackCount = this.activeLiveRequests.size;
+      for (const [id, entry] of this.activeLiveRequests) {
+        this.activeLiveRequests.delete(id);
+        cancelled += 1;
+        try {
+          entry.controller.abort(new DOMException(reason, "AbortError"));
+        } catch {
+          // An already-aborted controller is still a successful cancellation.
+        }
+      }
+      console.warn(`[OpenCodex Realtime] ${reason}; transport call id did not appear in Responses metadata, cancelled=${fallbackCount} Live-scoped request(s)`);
+    }
+    if (requestedKeys.size > 0 && cancelled === 0) {
+      if (this.activeLiveRequests.size === 0 && this.activeNativeLiveSockets.size === 0) {
+        this.realtimeActiveUntil = 0;
+        this.resetLiveModelPicker();
+        console.warn(`[OpenCodex Realtime] ${reason}; no active Live scope remained; reset=true`);
+        return { cancelled: 0, reset: true };
+      }
+      console.warn(`[OpenCodex Realtime] ${reason}; no matching Live scope for keys=${Array.from(requestedKeys).join(",")}`);
+      return { cancelled: 0, reset: false };
+    }
+    // A call-scoped socket can close while another Live call is still active.
+    // Do not reset the shared picker/binding state until the last scoped
+    // request/socket has gone away.
+    if (requestedKeys.size > 0 && (this.activeLiveRequests.size > 0 || this.activeNativeLiveSockets.size > 0)) {
+      console.warn(`[OpenCodex Realtime] ${reason}; cancelled=${cancelled}; other Live scopes remain`);
+      return { cancelled, reset: false };
     }
     this.realtimeActiveUntil = 0;
     this.resetLiveModelPicker();
@@ -2851,7 +3092,11 @@ export class CodexBridgeServer {
       body?.parent_task_id,
     ].map((value) => String(value || "").trim()).filter(Boolean);
     const followsLiveBinding = isChildRequest && liveParentKeys.some((key) => this.liveModelBindings.has(key));
-    if (realtimeParent || (nativeLiveThreadSpawn && this.isRealtimeActive()) || followsLiveBinding || (!isChildRequest && this.isRealtimeActive() && (isLikelyLiveWorkRequest(body) || isLikelyLiveModelIntentRequest(body, true)))) {
+    // Do not infer a Live parent from a generic session/thread/metadata field.
+    // Those fields are present on ordinary Desktop turns too, and the old
+    // realtimeActive heuristic poisoned every conversation for the duration
+    // of the global Live-active window.
+    if (realtimeParent || (nativeLiveThreadSpawn && this.isRealtimeActive()) || followsLiveBinding) {
       return "gpt-live";
     }
     return "desktop";
@@ -4247,7 +4492,7 @@ export class CodexBridgeServer {
 
         // Handle WebSocket Upgrade HTTP requests with 426 Upgrade Required (triggers codex-rs HTTP fallback)
         if (req.headers.upgrade?.toLowerCase() === "websocket" || (req.headers.connection || "").toLowerCase().includes("upgrade")) {
-          if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.startsWith("/v1/live/")) {
+          if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) {
             // Handled by server.on("upgrade") for transparent proxying to api.openai.com
             return;
           }
@@ -4277,10 +4522,24 @@ export class CodexBridgeServer {
 
         // Native OpenAI Realtime / Audio / Voice transparent HTTP proxy
         if (url.pathname.startsWith("/v1/realtime") || url.pathname.startsWith("/v1/audio") || url.pathname.startsWith("/v1/voice") || url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
-          if (url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
-          const realtimeUpstream = resolveRealtimeUpstream(req, { localAdminToken: this.adminToken });
+          const nativeLivePath = url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/");
+          const nativeLiveCreate = nativeLivePath && req.method === "POST" && url.pathname === "/v1/live";
+          const liveAccount = nativeLivePath
+            ? this.nativeLiveCredentialForRequest(req, url, nativeLiveCreate)
+            : { credential: null, callId: "" };
+          if (nativeLivePath) this.markRealtimeActive();
+          const realtimeUpstream = resolveRealtimeUpstream(req, {
+            localAdminToken: this.adminToken,
+            ...(nativeLivePath ? {
+              forceNativeSession: true,
+              nativeAccessToken: liveAccount.credential?.token,
+              nativeAccountId: liveAccount.credential?.upstreamId,
+              forceNativeAccessToken: Boolean(liveAccount.credential),
+            } : {}),
+          });
           const targetUrl = realtimeUpstream.targetUrl;
           const requestAbort = bindRequestResponseAbort(req, res);
+          const responseBodyChunks: Buffer[] = [];
 
           try {
             const rawBody = ["POST", "PUT", "PATCH"].includes(req.method || "") ? await this.parseRawBuffer(req) : undefined;
@@ -4327,11 +4586,19 @@ export class CodexBridgeServer {
                     () => { void reader.cancel(); },
                   );
                   if (result.done) break;
+                  if (nativeLiveCreate) responseBodyChunks.push(Buffer.from(result.value));
                   res.write(result.value);
                 }
               } finally {
                 reader.releaseLock();
               }
+            }
+            if (nativeLiveCreate && upstreamRes.status < 400) {
+              this.rememberNativeLiveAccountBinding(
+                Buffer.concat(responseBodyChunks),
+                respHeaders,
+                liveAccount.credential,
+              );
             }
             res.end();
           } catch (err: any) {
@@ -4412,23 +4679,23 @@ export class CodexBridgeServer {
             const body = request.body;
             const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
             const subagentOrigin = this.subagentOrigin(body, req);
-            const liveRequestCandidate = subagentOrigin === "gpt-live"
-              || (this.isRealtimeActive() && isLikelyLiveWorkRequest(body));
+            const nativeLiveParentRequest = subagentOrigin === "gpt-live" && !isSubagentRequest;
+            // Live activity is global state used by the picker, not a signal
+            // that an unrelated Responses request belongs to Live. The
+            // request must carry an explicit Live origin/binding.
+            const liveRequestCandidate = subagentOrigin === "gpt-live";
             if (liveRequestCandidate) {
               liveRequestAbort = bindRequestResponseAbort(req, res);
               releaseLiveRequest = this.registerLiveRequest(body, req, liveRequestAbort.controller);
             }
             const requestedModelBeforeRouting = this.stripReasoningSuffix(String(body?.model || ""));
             const nativeControlPlaneRequest = isNativeControlPlaneModel(requestedModelBeforeRouting);
-            const nativeModelRequest = nativeControlPlaneRequest || (Boolean(requestedModelBeforeRouting)
-              && this.isNativeCatalogModel(requestedModelBeforeRouting));
             const subagentRoutingMode = subagentOrigin === "gpt-live" ? this.liveRoutingMode() : this.subagentRoutingMode();
             const resolveSubagentRoute = shouldResolveSubagentRoute(isSubagentRequest, nativeControlPlaneRequest)
               && subagentRoutingMode !== "off";
             const subagentRoute = resolveSubagentRoute
               ? this.chooseSubagentRoute(body, req)
               : null;
-            const nativePassthroughTurn = isNativeCodexPassthrough(nativeModelRequest, isSubagentRequest);
             if (resolveSubagentRoute && !subagentRoute) {
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({
@@ -4462,14 +4729,12 @@ export class CodexBridgeServer {
             // the gateway may inspect that boundary to select a configured
             // subagent model. Once selected, native targets still use the
             // native proxy and third-party targets use the provider router.
-            const nativeLiveModelIntentTurn = this.isRealtimeActive()
-              && !isSubagentRequest
-              && isLikelyLiveModelIntentRequest(body, true)
-              && !isLikelyLiveWorkRequest(body)
-              && !isToolContinuation(body);
-            const liveWorkRoute = isSubagentRequest || (nativePassthroughTurn && !nativeLiveModelIntentTurn)
-              ? null
-              : await this.chooseLiveWorkRoute(body, liveRequestAbort?.signal);
+            const liveWorkRoute = shouldResolveLiveWorkRoute(
+              isSubagentRequest,
+              subagentOrigin,
+            )
+              ? await this.chooseLiveWorkRoute(body, liveRequestAbort?.signal)
+              : null;
             subagentTaskId = subagentRoute?.task_id || "";
             if (subagentTaskId) {
               // A native child turn can be stopped either by the parent HTTP
@@ -4523,7 +4788,7 @@ export class CodexBridgeServer {
             // Official ownerless GPT models must win before any third-party
             // backend alias is considered; otherwise a custom provider that
             // happens to expose the same raw slug could steal native routing.
-            const nativeModel = this.isNativeCatalogModel(requestedModel);
+            const nativeModel = nativeLiveParentRequest || this.isNativeCatalogModel(requestedModel);
             const provider = nativeModel ? null : this.findCatalogProvider(requestedModel, providers);
 
             if (!provider) {
@@ -4813,6 +5078,15 @@ export class CodexBridgeServer {
           try {
             const body = await this.parseJsonBody(req);
             const keys = Array.isArray(body?.keys) ? body.keys : [];
+            // A bridge close without a call id is ambiguous. Never turn that
+            // transport-level ambiguity into a global cancellation of another
+            // Live session; the next scoped close or normal timeout will clean
+            // up the orphaned request.
+            if (keys.length === 0) {
+              res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+              res.end(JSON.stringify({ ok: true, cancelled: 0, reset: false, ignored: true }));
+              return;
+            }
             const result = this.cancelLiveSession(
               String(body?.reason || "Live session closed"),
               keys,
@@ -7782,7 +8056,12 @@ export class CodexBridgeServer {
             writeDesktopModePreference(launchMode);
             const bridgeActive = launchMode === "bridge";
             const existingDesktopMode = desktopAppServerState();
-            const preserveExistingBridge = bridgeActive && existingDesktopMode === "bridge";
+            // The model-menu restart is an explicit Bridge refresh. Even when
+            // Desktop is already bridged, stop and relaunch it so the native
+            // app-server rereads the freshly synchronized model catalog.
+            const preserveExistingBridge = !applyConfiguredModels
+              && bridgeActive
+              && existingDesktopMode === "bridge";
 
             if (fs.existsSync(configPath)) {
               let content = fs.readFileSync(configPath, "utf-8");
@@ -7814,6 +8093,7 @@ export class CodexBridgeServer {
               applied_models: applyConfiguredModels,
               third_party_models_exposed: bridgeActive && thirdPartyModelsConfigured,
               desktop_preserved: preserveExistingBridge,
+              desktop_relaunch_required: !preserveExistingBridge,
             }));
 
             setTimeout(() => {
@@ -8555,60 +8835,50 @@ export class CodexBridgeServer {
         });
       });
 
-      const proxyWebSocketToOpenAI = (req: http.IncomingMessage, socket: any, head: Buffer) => {
-        const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-        const targetHost = "api.openai.com";
-        const targetPort = 443;
-
-        console.log(`[CodexBridge V2] Proxying Realtime WebSocket to wss://${targetHost}${url.pathname}${url.search}`);
-
-        const targetSocket = tls.connect(targetPort, targetHost, { servername: targetHost }, () => {
-          let reqLines = `${req.method} ${url.pathname}${url.search} HTTP/1.1\r\n`;
-          reqLines += `Host: ${targetHost}\r\n`;
-
-          for (const [key, value] of Object.entries(req.headers)) {
-            const k = key.toLowerCase();
-            if (k === "host") continue;
-            if (k === "origin") {
-              reqLines += `Origin: https://chatgpt.com\r\n`;
-              continue;
-            }
-            if (Array.isArray(value)) {
-              for (const v of value) {
-                reqLines += `${key}: ${v}\r\n`;
-              }
-            } else if (value) {
-              reqLines += `${key}: ${value}\r\n`;
-            }
-          }
-          reqLines += "\r\n";
-
-          targetSocket.write(reqLines);
-          if (head && head.length > 0) {
-            targetSocket.write(head);
-          }
-
-          socket.pipe(targetSocket);
-          targetSocket.pipe(socket);
-        });
-
-        targetSocket.on("error", (err) => {
-          console.error(`[CodexBridge V2] Realtime WebSocket proxy error: ${err.message}`);
-          socket.destroy();
-        });
-
-        socket.on("error", () => {
-          targetSocket.destroy();
-        });
-      };
-
       this.server.on("upgrade", (req, socket, head) => {
         const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-        if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
-          if (url.pathname.startsWith("/v1/live/")) this.markRealtimeActive();
+        if (url.pathname.includes("realtime") || url.pathname.includes("audio") || url.pathname.includes("voice") || url.pathname === "/v1/live" || url.pathname.startsWith("/v1/live/") || url.pathname.startsWith("/backend-api/")) {
+          const liveCallId = nativeLiveCallIdFromRequest(url, req);
+          const nativeLiveUpgrade = url.pathname === "/v1/live"
+            || url.pathname.startsWith("/v1/live/")
+            || (url.pathname === "/v1/realtime" && Boolean(liveCallId));
+          const liveAccount = nativeLiveUpgrade
+            ? this.nativeLiveCredentialForRequest(req, url, false)
+            : { credential: null, callId: liveCallId };
+          if (nativeLiveUpgrade) this.markRealtimeActive();
+          const nativeLiveSocketId = nativeLiveUpgrade ? randomUUID() : "";
           handleWebRtcProxy(req, socket, head, {
             localAdminToken: this.adminToken,
-            onClose: () => this.cancelLiveSession("native Live WebSocket closed"),
+            ...(nativeLiveUpgrade ? {
+              nativeAccessToken: liveAccount.credential?.token,
+              nativeAccountId: liveAccount.credential?.upstreamId,
+              forceNativeAccessToken: Boolean(liveAccount.credential),
+              forceNativeSession: true,
+              nativeLiveSideband: true,
+            } : {}),
+            onSocket: nativeLiveUpgrade
+              ? (close) => {
+                this.activeNativeLiveSockets.set(nativeLiveSocketId, {
+                  callId: liveAccount.callId,
+                  close,
+                });
+              }
+              : undefined,
+            onClose: () => {
+              if (nativeLiveSocketId) this.activeNativeLiveSockets.delete(nativeLiveSocketId);
+              if (nativeLiveUpgrade) this.releaseNativeLiveAccountBinding(liveAccount.callId);
+              // This socket is already closed. Reset only the Live work state;
+              // do not tear down a different concurrent native Live socket.
+              if (liveAccount.callId) {
+                this.cancelLiveSession(
+                  "native Live WebSocket closed",
+                  [liveAccount.callId],
+                  false,
+                );
+              } else {
+                console.warn("[OpenCodex Realtime] native Live WebSocket closed without a call id; leaving scoped Live state intact");
+              }
+            },
           });
           return;
         }

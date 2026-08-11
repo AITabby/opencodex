@@ -4,13 +4,13 @@
 
 CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型、模型目录、语音助手、GPT-Live、会话管理和 Agent 工具集中到一个桌面应用中，同时保留 Codex 原生模型、原生登录、Computer Use 与 MCP 的独立运行方式。
 
-> **项目更名说明**：CodexSplit 是原 `OpenCodex` 项目的延续与正式更名版本。从 `v2.0.0-beta.1` 起，产品、源码发布和 GitHub 仓库统一使用 CodexSplit；仓库地址已更新为 [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit)。历史提交、旧版 tag、部分内部目录与兼容标识仍可能出现 `OpenCodex`，这些属于历史或兼容信息，不是另一个项目。原仓库的提交历史和 Stars 也会保留在更名后的仓库中。
+> **项目更名说明**：CodexSplit 是原 `OpenCodex` 项目的延续与正式更名版本。从 `v2.0.0` 起，产品、源码发布和 GitHub 仓库统一使用 CodexSplit；仓库地址已更新为 [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit)。历史提交、旧版 tag、部分内部目录与兼容标识仍可能出现 `OpenCodex`，这些属于历史或兼容信息，不是另一个项目。原仓库的提交历史和 Stars 也会保留在更名后的仓库中。
 
 <p align="center">
   <a href="https://github.com/AITabby/codexsplit/releases"><img src="https://img.shields.io/github/v/release/AITabby/codexsplit?display_name=tag&style=flat-square&label=release" alt="Latest Release"></a>
   <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/github/stars/AITabby/codexsplit?style=flat-square" alt="GitHub Stars"></a>
-  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0-beta.1"><img src="https://img.shields.io/badge/macOS-source%20v2.0.0--beta.1-111111?style=flat-square&logo=apple" alt="macOS source v2.0.0-beta.1"></a>
-  <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/badge/Windows-source%20beta.1-0078D6?style=flat-square&logo=windows" alt="Windows source beta.1"></a>
+  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0"><img src="https://img.shields.io/badge/macOS-source%20v2.0.0-111111?style=flat-square&logo=apple" alt="macOS source v2.0.0"></a>
+  <a href="https://github.com/AITabby/codexsplit"><img src="https://img.shields.io/badge/Windows-source%20v2.0.0-0078D6?style=flat-square&logo=windows" alt="Windows source v2.0.0"></a>
   <a href="https://x.com/youngxxxxu"><img src="https://img.shields.io/badge/X-@youngxxxxu-000000?style=flat-square&logo=x" alt="X @youngxxxxu"></a>
 </p>
 
@@ -19,11 +19,11 @@ CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型
 </p>
 
 <p align="center">
-  <a href="https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg">⬇️ 下载 CodexSplit v2.0.0-beta.1（macOS）</a>
+  <a href="https://github.com/AITabby/codexsplit/releases/download/v2.0.0/CodexSplit-2.0.0-arm64.dmg">⬇️ 下载 CodexSplit v2.0.0（macOS）</a>
   ·
   <a href="https://github.com/AITabby/codexsplit">🪟 Windows 源码（安装包后续提供）</a>
   ·
-  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0-beta.1">查看 Beta Release</a>
+  <a href="https://github.com/AITabby/codexsplit/releases/tag/v2.0.0">查看 v2.0.0 Release</a>
   ·
   <a href="https://x.com/youngxxxxu">🐦 @youngxxxxu</a>
 </p>
@@ -54,7 +54,7 @@ CodexSplit 是运行在本机的 Codex Desktop 控制中心：把第三方模型
   <img src="./assets/screenshots/04-voice-bar.png" alt="CodexSplit 语音栏" width="960">
 </p>
 
-> 当前 Beta：macOS Apple Silicon `v2.0.0-beta.1`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；Windows 先提供同一版本源码，安装包后续发布。Linux 版本尚未发布。
+> 当前版本：macOS Apple Silicon `v2.0.0`（`spawn_agent` 子会话先进入 8765 网关，再由网关按模型/Profile 分流）；Windows 先提供同一版本源码，安装包后续发布。Linux 版本尚未发布。
 >
 > `v1.1.2` 在 `v1.1.1` 基础上统一了官方 GPT 与第三方模型的原生 `gpt-image-2` 生图路径，并保留 `gpt-image-1.5` 作为明确兜底；同时 GPT-Live 只在用户主动开启时启动。
 >
@@ -258,7 +258,7 @@ Agent 路由让主 Agent 根据每个模型的实际工作说明分配子任务�
 ### macOS 普通用户
 
 1. 先安装并登录 Codex Desktop。
-2. 下载 [CodexSplit-2.0.0-beta.1-arm64.dmg](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)。
+2. 下载 [CodexSplit-2.0.0-arm64.dmg](https://github.com/AITabby/codexsplit/releases/download/v2.0.0/CodexSplit-2.0.0-arm64.dmg)。
 3. 打开 DMG，把 `CodexSplit.app` 拖入 `Applications`。
 4. 启动 CodexSplit，进入“网关”配置 API Key 或导入本机订阅。
 5. 保存模型后，在“待应用模型”中测试连接。
@@ -268,10 +268,10 @@ DMG 已包含网关所需的独立 Node.js 和语音运行时。普通用户不�
 
 ### Windows 10/11
 
-当前 Windows 先使用与 macOS Beta 相同的 `v2.0.0-beta.1` 源码：
+当前 Windows 先使用与 macOS 相同的 `v2.0.0` 源码：
 
 1. 安装 Codex Desktop。
-2. 在仓库中切换到 `v2.0.0-beta.1`，按源码说明构建 Windows 版本。
+2. 在仓库中切换到 `v2.0.0`，按源码说明构建 Windows 版本。
 3. Windows 安装包将在 Windows 端功能接入后单独发布。
 
 Windows 版本以对应安装包实际提供的功能为准；当前 macOS 原生订阅导入、CodexSplit Voice Bar 和部分 CDP 集成依赖 macOS 桌面环境。
@@ -341,8 +341,8 @@ API Key 服务商 / 本机订阅 / OpenAI Compatible 服务
 
 CodexSplit 正在持续迭代。当前状态：
 
-- macOS Apple Silicon：`v2.0.0-beta.1` DMG 与完整源码，包含 spawn_agent 网关分流。
-- Windows 10/11：同一 Beta 源码已提供，安装包待 Windows 端接入后发布。
+- macOS Apple Silicon：`v2.0.0` DMG 与完整源码，包含 spawn_agent 网关分流。
+- Windows 10/11：同一 `v2.0.0` 源码已提供，安装包待 Windows 端接入后发布。
 - Linux：暂未发布桌面安装包。
 
 建议通过 [GitHub Releases](https://github.com/AITabby/codexsplit/releases) 获取最新版本，并在提交问题时附上系统版本、CodexSplit 版本、服务商、模型名称和脱敏后的网关日志。
@@ -352,8 +352,8 @@ CodexSplit 正在持续迭代。当前状态：
 - [GitHub Repository](https://github.com/AITabby/codexsplit)
 - [GitHub Issues](https://github.com/AITabby/codexsplit/issues)
 - [Latest Release](https://github.com/AITabby/codexsplit/releases/latest)
-- [Download CodexSplit v2.0.0-beta.1 DMG for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)
-- [CodexSplit v2.0.0-beta.1 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0-beta.1)
+- [Download CodexSplit v2.0.0 DMG for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0/CodexSplit-2.0.0-arm64.dmg)
+- [CodexSplit v2.0.0 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0)
 - [语音助手使用指南](./VOICE_GUIDE.md)
 - [测试流程](./TEST_FLOW.md)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)
@@ -366,9 +366,9 @@ CodexSplit 正在持续迭代。当前状态：
 
 CodexSplit is a local control center for Codex Desktop. It brings third-party models, provider management, dynamic model metadata, voice, GPT-Live, session import, Agent routing, Computer Use compatibility, and Agent tools into one desktop workflow while keeping native Codex routing separate.
 
-> **Project rename**: CodexSplit is the continuation and official rename of the original `OpenCodex` project. Starting with `v2.0.0-beta.1`, the product, source releases, and GitHub repository use the CodexSplit name; the repository is now [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit). Historical commits, older tags, internal paths, and compatibility identifiers may still contain `OpenCodex`; those are historical or compatibility references, not a separate project. The original commit history and GitHub stars remain with the renamed repository.
+> **Project rename**: CodexSplit is the continuation and official rename of the original `OpenCodex` project. Starting with `v2.0.0`, the product, source releases, and GitHub repository use the CodexSplit name; the repository is now [`AITabby/codexsplit`](https://github.com/AITabby/codexsplit). Historical commits, older tags, internal paths, and compatibility identifiers may still contain `OpenCodex`; those are historical or compatibility references, not a separate project. The original commit history and GitHub stars remain with the renamed repository.
 
-Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths by default. Only models explicitly added or imported by the user are routed through the CodexSplit gateway. The Desktop bridge is a process-level switch activated only by an explicit restart after third-party models are enabled; it is not exported through launchd and does not silently replace unrelated native launches. The v2.0.0-beta.1 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed.
+Native Codex models, native login, native Computer Use, MCP, and native Live / Realtime remain on their original paths by default. Only models explicitly added or imported by the user are routed through the CodexSplit gateway. The Desktop bridge is a process-level switch activated only by an explicit restart after third-party models are enabled; it is not exported through launchd and does not silently replace unrelated native launches. The v2.0.0 source build sends gateway-owned `spawn_agent` child turns to `127.0.0.1:8765`, where the selected model/Profile is routed.
 
 ### Screenshots
 
@@ -382,8 +382,8 @@ Native Codex models, native login, native Computer Use, MCP, and native Live / R
 
 ### Current releases
 
-- macOS Apple Silicon: `v2.0.0-beta.1` DMG and complete source release with spawn_agent gateway routing.
-- Windows 10/11: `v2.0.0-beta.1` source release; installer follows in a later Beta.
+- macOS Apple Silicon: `v2.0.0` DMG and complete source release with spawn_agent gateway routing.
+- Windows 10/11: `v2.0.0` source release; installer follows in a later release.
 - Linux: no desktop package is published yet.
 
 The macOS DMG includes a standalone Node.js runtime and the bundled voice runtime. End users do not need Node.js, npm, Homebrew, or the .NET SDK. The current DMG is not notarized; macOS may require allowing the first launch from **System Settings → Privacy & Security**.
@@ -463,13 +463,13 @@ Third-party Computer Use requests are connected to the Codex-native executor rat
 #### macOS
 
 1. Install and sign in to Codex Desktop.
-2. Download the latest published [CodexSplit v2.0.0-beta.1 DMG for Apple Silicon](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg).
+2. Download the latest published [CodexSplit v2.0.0 DMG for Apple Silicon](https://github.com/AITabby/codexsplit/releases/download/v2.0.0/CodexSplit-2.0.0-arm64.dmg).
 3. Drag `CodexSplit.app` into `Applications`.
 4. Configure a provider or import a local subscription, test the model, and restart Codex to apply it.
 
 #### Windows 10/11
 
-The `v2.0.0-beta.1` source is the shared development baseline for Windows. A Windows installer will be attached in a later Beta; macOS-specific local subscription, CodexSplit Voice Bar, and CDP integrations are not assumed to have full Windows parity.
+The `v2.0.0` source is the shared development baseline for Windows. A Windows installer will be attached in a later release; macOS-specific local subscription, CodexSplit Voice Bar, and CDP integrations are not assumed to have full Windows parity.
 
 #### From source
 
@@ -488,8 +488,8 @@ Open `http://127.0.0.1:8765/dashboard` after the gateway starts. For the macOS d
 - [GitHub Repository](https://github.com/AITabby/codexsplit)
 - [GitHub Issues](https://github.com/AITabby/codexsplit/issues)
 - [Latest Release](https://github.com/AITabby/codexsplit/releases/latest)
-- [Download CodexSplit v2.0.0-beta.1 for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0-beta.1/CodexSplit-2.0.0-beta.1-arm64.dmg)
-- [CodexSplit v2.0.0-beta.1 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0-beta.1)
+- [Download CodexSplit v2.0.0 for macOS](https://github.com/AITabby/codexsplit/releases/download/v2.0.0/CodexSplit-2.0.0-arm64.dmg)
+- [CodexSplit v2.0.0 source for Windows development](https://github.com/AITabby/codexsplit/tree/v2.0.0)
 - [Voice Assistant Guide](./VOICE_GUIDE.md)
 - [Test Flow](./TEST_FLOW.md)
 - [X / Twitter: @youngxxxxu](https://x.com/youngxxxxu)

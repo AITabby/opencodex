@@ -8,8 +8,8 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import tls from "node:tls";
 import { URL } from "node:url";
+import WebSocket, { WebSocketServer } from "ws";
 
 const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 
@@ -36,6 +36,10 @@ export type RealtimeProxyOptions = {
   forceNativeSession?: boolean;
   /** Add the native V3 Live sideband protocol header at the local egress. */
   nativeLiveSideband?: boolean;
+  /** Test-only upstream URL override for exercising the WebSocket bridge locally. */
+  upstreamTargetUrl?: string;
+  /** Register a close handle for the transparent proxy socket. */
+  onSocket?: (close: () => void) => void;
   /** Called once when the local or upstream Live socket closes. */
   onClose?: (reason: string) => void;
 };
@@ -55,7 +59,7 @@ function headerValue(req: http.IncomingMessage, name: string): string {
   return typeof value === "string" ? value : "";
 }
 
-type NativeAccountCredential = {
+export type NativeAccountCredential = {
   token: string;
   upstreamId: string;
 };
@@ -99,10 +103,14 @@ function readAccountPoolCredential(accountId: string): NativeAccountCredential {
   return { token: "", upstreamId: "" };
 }
 
-function readNativeAccountCredential(accountId = ""): NativeAccountCredential {
+export function readNativeAccountCredential(accountId = "", requireExactAccount = false): NativeAccountCredential {
   const requested = String(accountId || "").trim() || configuredFixedAccountId();
   const accountCredential = readAccountPoolCredential(requested);
   if (accountCredential.token) return accountCredential;
+  // An explicitly selected pool account must never silently fall back to the
+  // process-global ~/.codex credential. That would make Live appear healthy
+  // while authenticating the session as a different account.
+  if (requested && requireExactAccount) return { token: "", upstreamId: "" };
   try {
     const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
     return {
@@ -211,6 +219,15 @@ export function copyNativeRequestHeaders(req: http.IncomingMessage, options: Rea
     headers["chatgpt-account-id"] = nativeCredential.upstreamId;
   }
   if (options.nativeLiveSideband) {
+    // The native Live sideband is an official ChatGPT WebSocket even when it
+    // reaches this transparent local egress. The old native proxy rewrote the
+    // local app Origin before forwarding the upgrade; preserving the local
+    // egress Origin makes the media call succeed while the transcript
+    // sideband is rejected or never starts.
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "origin") delete headers[key];
+    }
+    headers.origin = "https://chatgpt.com";
     headers["openai-alpha"] = "quicksilver=v2";
   }
   return headers;
@@ -295,12 +312,21 @@ export function normalizeNativeLiveCallBody(rawBody: Buffer, contentType: string
   if (!sdp || !session || typeof session !== "object") {
     throw new Error("native /v1/live multipart body must contain sdp and session parts");
   }
-  return Buffer.from(JSON.stringify({ sdp, session }), "utf8");
+  // The local session id belongs to the desktop transport.  V3 creates the
+  // call on the native backend and rejects/reinterprets a client-supplied id;
+  // the backend must assign the call id itself.
+  const normalizedSession = Array.isArray(session)
+    ? session
+    : { ...(session as Record<string, unknown>) };
+  if (!Array.isArray(normalizedSession)) delete normalizedSession.id;
+  return Buffer.from(JSON.stringify({ sdp, session: normalizedSession }), "utf8");
 }
 
 export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: Buffer, options: RealtimeProxyOptions = {}): void {
   const upstream = resolveRealtimeUpstream(req, options);
-  const target = new URL(upstream.targetUrl);
+  const target = new URL(options.upstreamTargetUrl || upstream.targetUrl);
+  const websocketTarget = new URL(target.toString());
+  websocketTarget.protocol = websocketTarget.protocol === "https:" ? "wss:" : "ws:";
   // The provider bridge speaks JSONL on stdout to the native app-server.
   // Never write transport diagnostics there: one plain-text line makes the
   // Desktop parser drop subsequent child/realtime lifecycle messages.
@@ -312,53 +338,143 @@ export function handleWebRtcProxy(req: http.IncomingMessage, socket: any, head: 
     closeNotified = true;
     options.onClose?.(reason);
   };
-  const targetSocket = tls.connect({
-    host: upstream.targetHost,
-    port: 443,
-    servername: upstream.targetHost,
-    rejectUnauthorized: true,
-  }, () => {
-    let reqLines = `${req.method} ${target.pathname}${target.search} HTTP/1.1\r\n`;
-    reqLines += `Host: ${upstream.targetHost}\r\n`;
-    reqLines += "Connection: Upgrade\r\nUpgrade: websocket\r\n";
-    for (const [key, value] of Object.entries(upstream.headers)) {
-      if (Array.isArray(value)) {
-        for (const item of value) reqLines += `${key}: ${item}\r\n`;
-      } else if (value) {
-        reqLines += `${key}: ${value}\r\n`;
-      }
-    }
-    for (const [key, value] of Object.entries(req.headers)) {
-      if (!key.toLowerCase().startsWith("sec-websocket-")) continue;
-      if (Array.isArray(value)) {
-        for (const item of value) reqLines += `${key}: ${item}\r\n`;
-      } else if (value) {
-        reqLines += `${key}: ${value}\r\n`;
-      }
-    }
-    reqLines += "\r\n";
 
-    targetSocket.write(reqLines);
-    if (head && head.length > 0) targetSocket.write(head);
-    socket.pipe(targetSocket);
-    targetSocket.pipe(socket);
-  });
+  // Do not hand-roll the upstream HTTP Upgrade.  The native Live audio path
+  // can survive a partially accepted raw tunnel, while its transcript
+  // sideband is rejected/reset unless the WebSocket handshake is completed
+  // with the library's generated key/extensions and frame state.  Accept the
+  // desktop socket locally, then bridge decoded WebSocket messages to a
+  // separately negotiated official socket.
+  let localWs: WebSocket | null = null;
+  let upstreamWs: WebSocket | null = null;
+  let closeRequested = false;
+  const pendingMessages: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
 
-  targetSocket.on("error", (err) => {
-    console.error(`[OpenCodex WebRTC Proxy Error] ${err.message}`);
-    notifyClose(`upstream websocket error: ${err.message}`);
+  const closeWs = (ws: WebSocket | null, code: number, reason: string): void => {
+    if (!ws) return;
+    try {
+      if (ws.readyState === WebSocket.OPEN) ws.close(code, reason.slice(0, 123));
+      else if (ws.readyState === WebSocket.CONNECTING) ws.terminate();
+    } catch {
+      try { ws.terminate(); } catch {}
+    }
+  };
+
+  const terminatePair = (reason: string, code = 1011): void => {
+    notifyClose(reason);
+    closeRequested = true;
+    closeWs(localWs, code, reason);
+    closeWs(upstreamWs, code, reason);
+    if (!localWs) {
+      try { socket.destroy(); } catch {}
+    }
+  };
+
+  // The provider bridge needs a synchronous cancellation handle as soon as
+  // the upgrade is accepted. It must work even while the official handshake
+  // is still connecting.
+  options.onSocket?.(() => {
+    closeRequested = true;
+    closeWs(localWs, 1000, "cancelled");
+    closeWs(upstreamWs, 1000, "cancelled");
     try { socket.destroy(); } catch {}
   });
-  targetSocket.on("close", () => {
-    notifyClose("upstream websocket closed");
-    try { socket.destroy(); } catch {}
-  });
-  socket.on("error", (err: Error) => {
-    notifyClose(`local websocket error: ${err.message}`);
-    try { targetSocket.destroy(); } catch {}
-  });
-  socket.on("close", () => {
-    notifyClose("local websocket closed");
-    try { targetSocket.destroy(); } catch {}
-  });
+
+  const protocolHeader = headerValue(req, "sec-websocket-protocol");
+  const protocols = protocolHeader
+    ? protocolHeader.split(",").map((value) => value.trim()).filter(Boolean)
+    : [];
+
+  try {
+    const localWss = new WebSocketServer({
+      noServer: true,
+      perMessageDeflate: false,
+      // The native Live runtime selects its event decoder from the
+      // Sec-WebSocket-Protocol negotiated during the local upgrade. The old
+      // raw tunnel preserved this header implicitly; the message bridge must
+      // explicitly select the same first protocol on the local handshake.
+      handleProtocols: (requested) => requested.values().next().value || false,
+    });
+    localWss.handleUpgrade(req, socket, head, (accepted) => {
+      localWs = accepted;
+      accepted.on("message", (data, isBinary) => {
+        if (closeRequested) return;
+        if (upstreamWs?.readyState === WebSocket.OPEN) {
+          try {
+            upstreamWs.send(data, { binary: isBinary });
+          } catch (error: any) {
+            terminatePair(`upstream websocket send error: ${error.message}`);
+          }
+          return;
+        }
+        // Codex sends the initial session/control messages immediately after
+        // the local 101 response. Keep a bounded queue until the official
+        // sideband handshake completes.
+        if (pendingMessages.length >= 64) {
+          terminatePair("upstream websocket handshake queue overflow");
+          return;
+        }
+        pendingMessages.push({ data, isBinary });
+      });
+      accepted.on("error", (error: Error) => {
+        terminatePair(`local websocket error: ${error.message}`, 1000);
+      });
+      accepted.on("close", () => {
+        notifyClose("local websocket closed");
+        closeWs(upstreamWs, 1000, "local websocket closed");
+      });
+
+      const clientOptions = {
+        headers: upstream.headers,
+        followRedirects: false,
+        handshakeTimeout: 15_000,
+        perMessageDeflate: false,
+        rejectUnauthorized: true,
+      };
+      upstreamWs = new WebSocket(
+        websocketTarget.toString(),
+        protocols.length > 0 ? protocols : undefined,
+        clientOptions,
+      );
+      upstreamWs.on("open", () => {
+        if (closeRequested) {
+          closeWs(upstreamWs, 1000, "cancelled");
+          return;
+        }
+        for (const message of pendingMessages.splice(0)) {
+          try {
+            upstreamWs?.send(message.data, { binary: message.isBinary });
+          } catch (error: any) {
+            terminatePair(`upstream websocket send error: ${error.message}`);
+            return;
+          }
+        }
+      });
+      upstreamWs.on("message", (data, isBinary) => {
+        if (closeRequested || accepted.readyState !== WebSocket.OPEN) return;
+        try {
+          accepted.send(data, { binary: isBinary });
+        } catch (error: any) {
+          terminatePair(`local websocket send error: ${error.message}`);
+        }
+      });
+      upstreamWs.on("unexpected-response", (_request, response) => {
+        console.error(`[OpenCodex WebRTC Proxy Error] upstream websocket HTTP ${response.statusCode || 0} ${response.statusMessage || ""}`.trim());
+        response.resume();
+        terminatePair(`upstream websocket HTTP ${response.statusCode || 0}`);
+      });
+      upstreamWs.on("error", (error: Error) => {
+        console.error(`[OpenCodex WebRTC Proxy Error] ${error.message}`);
+        terminatePair(`upstream websocket error: ${error.message}`);
+      });
+      upstreamWs.on("close", (code, reason) => {
+        const detail = reason?.length ? ` code=${code} reason=${reason.toString()}` : ` code=${code}`;
+        notifyClose(`upstream websocket closed${detail}`);
+        closeWs(accepted, code >= 1000 && code <= 4999 ? code : 1000, reason?.toString() || "upstream websocket closed");
+      });
+    });
+  } catch (error: any) {
+    console.error(`[OpenCodex WebRTC Proxy Error] ${error.message}`);
+    terminatePair(`local websocket upgrade error: ${error.message}`);
+  }
 }

@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import { AgentProfileStore } from "../dist/services/agent_profile_store.js";
 import { TaskRouter, readRoutingCatalog } from "../dist/services/task_router.js";
 import { SubagentOrchestrator } from "../dist/services/subagent_orchestrator.js";
-import { CodexBridgeServer } from "../dist/server/gateway.js";
+import { CodexBridgeServer, shouldResolveLiveWorkRoute } from "../dist/server/gateway.js";
 import { applyDefaultReasoningCapabilities } from "../dist/services/catalog_sync.js";
 
 test("1.1.0 preserves provider-reported reasoning levels beside a broad false flag", () => {
@@ -875,12 +875,15 @@ test("2.0.0 keeps normal and GPT-Live routing settings independent", async () =>
     store.saveRoutingSettings({ mode: "off" }, "subagent");
     const server = new CodexBridgeServer(0);
     server.markRealtimeActive();
-    const liveRoute = await server.chooseLiveWorkRoute({
-      client_metadata: { session_id: "live-independent" },
-      tools: [{ type: "function", name: "exec" }],
-      input: "执行一个自动任务",
-    });
-    assert.ok(liveRoute?.model);
+    assert.equal(shouldResolveLiveWorkRoute(false, "desktop"), false);
+    assert.equal(shouldResolveLiveWorkRoute(false, "gpt-live"), false);
+    assert.equal(shouldResolveLiveWorkRoute(true, "desktop"), false);
+    assert.equal(shouldResolveLiveWorkRoute(true, "gpt-live"), true);
+    assert.equal(server.subagentOrigin({
+      model: "gpt-5.5",
+      client_metadata: { session_id: "ordinary-desktop", thread_id: "ordinary-desktop" },
+      input: "普通会话",
+    }), "desktop");
     assert.equal(server.chooseSubagentRoute({
       client_metadata: { "x-openai-subagent": "1", session_id: "desktop-off", thread_id: "desktop-off-child" },
       input: "普通桌面子任务",

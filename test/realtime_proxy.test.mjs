@@ -1,15 +1,48 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import http from "node:http";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   copyNativeRequestHeaders,
+  handleWebRtcProxy,
   nativeLiveSidebandTarget,
   normalizeNativeLiveCallBody,
+  readNativeAccountCredential,
   resolveRealtimeUpstream,
 } from "../dist/server/webrtc_proxy.js";
 
 function request(url, headers = {}) {
   return { url, headers };
 }
+
+test("an explicitly selected Live account never falls back to the process-global token", async () => {
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  const dataDir = await mkdtemp(join(tmpdir(), "opencodex-live-account-"));
+  try {
+    process.env.OPENCODEX_DATA_DIR = dataDir;
+    const profileDir = join(dataDir, "chatgpt-accounts", "account-selected");
+    await mkdir(profileDir, { recursive: true });
+    await writeFile(join(profileDir, "auth.json"), JSON.stringify({
+      tokens: { account_id: "upstream-selected", access_token: "selected-token" },
+    }));
+
+    assert.deepEqual(readNativeAccountCredential("account-selected", true), {
+      upstreamId: "upstream-selected",
+      token: "selected-token",
+    });
+    assert.deepEqual(readNativeAccountCredential("missing-account", true), {
+      upstreamId: "",
+      token: "",
+    });
+  } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
 
 test("native ChatGPT Realtime requests use the native backend route", () => {
   const upstream = resolveRealtimeUpstream(
@@ -104,6 +137,7 @@ test("native Live sideband keeps the native V3 path-shaped call id", () => {
     request("/v1/live/rtc_test", {
       host: "127.0.0.1:8765",
       authorization: "Bearer gateway-token",
+      origin: "http://127.0.0.1:43127",
     }),
     { localAdminToken: "gateway-token", nativeAccessToken: "native-token" },
   );
@@ -112,12 +146,35 @@ test("native Live sideband keeps the native V3 path-shaped call id", () => {
   assert.equal(upstream.nativeLiveCall, false);
   assert.equal(upstream.targetUrl, "https://api.openai.com/v1/live/rtc_test");
   assert.equal(upstream.headers.authorization, "Bearer native-token");
+  assert.equal(upstream.headers.origin, "https://chatgpt.com");
+  assert.equal(upstream.headers["openai-alpha"], "quicksilver=v2");
 });
 
 test("native Live sideband preserves query parameters", () => {
   assert.equal(
     nativeLiveSidebandTarget("/v1/live/rtc_test", "trace=1"),
     "https://api.openai.com/v1/live/rtc_test?trace=1",
+  );
+});
+
+test("native Live V3 call removes the local session id before upstream create", () => {
+  const body = [
+    "--codex-realtime-call-boundary",
+    'Content-Disposition: form-data; name="sdp"',
+    "",
+    "v=0\r\n",
+    "--codex-realtime-call-boundary",
+    'Content-Disposition: form-data; name="session"',
+    "Content-Type: application/json",
+    "",
+    JSON.stringify({ id: "local-session", model: "gpt-live-1-codex" }),
+    "--codex-realtime-call-boundary--",
+    "",
+  ].join("\r\n");
+
+  assert.deepEqual(
+    JSON.parse(normalizeNativeLiveCallBody(Buffer.from(body), "multipart/form-data; boundary=codex-realtime-call-boundary")),
+    { sdp: "v=0\r\n", session: { model: "gpt-live-1-codex" } },
   );
 });
 
@@ -164,6 +221,7 @@ test("a native V1 Live sideband at /v1/realtime uses the API Realtime path", () 
   assert.equal(upstream.nativeSession, true);
   assert.equal(upstream.targetUrl, "https://api.openai.com/v1/realtime?call_id=rtc_v1_sideband");
   assert.equal(upstream.headers.authorization, "Bearer native-token");
+  assert.equal(upstream.headers.origin, "https://chatgpt.com");
   assert.equal(upstream.headers["openai-alpha"], "quicksilver=v2");
 });
 
@@ -227,4 +285,72 @@ test("native Live multipart calls are converted to the backend JSON shape", () =
     JSON.parse(normalizeNativeLiveCallBody(body, "multipart/form-data; boundary=codex-realtime-call-boundary")),
     { sdp: "v=0\r\n", session: { model: "gpt-live-1-codex" } },
   );
+});
+
+test("native Live WebSocket bridge completes both handshakes and forwards frames", async () => {
+  const upstreamHttp = http.createServer();
+  const upstreamWss = new WebSocketServer({
+    server: upstreamHttp,
+    handleProtocols: (requested) => requested.values().next().value || false,
+  });
+  let upstreamReceived = "";
+  upstreamWss.on("connection", (ws, req) => {
+    assert.equal(req.headers["sec-websocket-protocol"], "realtime-v3");
+    assert.equal(req.headers.authorization, "Bearer native-token");
+    assert.equal(req.headers.origin, "https://chatgpt.com");
+    assert.equal(req.headers["openai-alpha"], "quicksilver=v2");
+    ws.send(JSON.stringify({ type: "transcript.delta", text: "文字" }));
+    ws.on("message", (data) => {
+      upstreamReceived = data.toString();
+      ws.send(JSON.stringify({ type: "echo", value: upstreamReceived }));
+    });
+  });
+  await new Promise((resolve) => upstreamHttp.listen(0, "127.0.0.1", resolve));
+  const upstreamPort = upstreamHttp.address().port;
+
+  const localHttp = http.createServer();
+  localHttp.on("upgrade", (req, socket, head) => {
+    handleWebRtcProxy(req, socket, head, {
+      localAdminToken: "gateway-token",
+      nativeAccessToken: "native-token",
+      forceNativeAccessToken: true,
+      forceNativeSession: true,
+      nativeLiveSideband: true,
+      upstreamTargetUrl: `ws://127.0.0.1:${upstreamPort}/v1/live/rtc_test`,
+    });
+  });
+  await new Promise((resolve) => localHttp.listen(0, "127.0.0.1", resolve));
+  const localPort = localHttp.address().port;
+
+  const received = [];
+  const client = new WebSocket(`ws://127.0.0.1:${localPort}/v1/live/rtc_test`, "realtime-v3", {
+    headers: { authorization: "Bearer gateway-token" },
+  });
+  client.on("message", (data) => received.push(JSON.parse(data.toString())));
+  await new Promise((resolve, reject) => {
+    client.once("open", resolve);
+    client.once("error", reject);
+  });
+  assert.equal(client.protocol, "realtime-v3");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.deepEqual(received[0], { type: "transcript.delta", text: "文字" });
+
+  client.send(JSON.stringify({ type: "client.message" }));
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("local WebSocket bridge did not return upstream frame")), 1000);
+    const check = () => {
+      if (received.some((item) => item.type === "echo")) {
+        clearTimeout(timer);
+        resolve();
+      } else setTimeout(check, 5);
+    };
+    check();
+  });
+  assert.equal(upstreamReceived, JSON.stringify({ type: "client.message" }));
+
+  client.close();
+  await new Promise((resolve) => client.once("close", resolve));
+  await new Promise((resolve) => upstreamWss.close(resolve));
+  await new Promise((resolve) => upstreamHttp.close(resolve));
+  await new Promise((resolve) => localHttp.close(resolve));
 });

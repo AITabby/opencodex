@@ -16,6 +16,7 @@ import {
   isOfficialAuthFailure,
   isOfficialQuotaFailure,
   isNativeControlPlaneRequest,
+  isNativeLiveParentRequest,
   isNativeSubagentRequest,
   isNativeLiveCreateCall,
   nativeLiveUpgradeRequestUrl,
@@ -94,8 +95,16 @@ test("standalone CLI keeps official requests native and sends provider-owned mod
     model: "gpt-5.5",
     client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
   }), false);
+  assert.equal(isNativeLiveParentRequest({
+    model: "opencode/deepseek-v4-flash",
+    client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
+  }), true);
   assert.equal(cliEgressRoute({
     model: "gpt-5.5",
+    client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
+  }), "native");
+  assert.equal(nativeEgressRoute({
+    model: "opencode/deepseek-v4-flash",
     client_metadata: { subagent_origin: "gpt-live", thread_id: "live-parent" },
   }), "native");
 });
@@ -259,6 +268,7 @@ test("native child routing is request-scoped and leaves the native provider unto
     "-c", "features.responses_websockets=false",
     "-c", "features.responses_websockets_v2=false",
   ]);
+  assert.equal(args.filter((value) => value.startsWith("experimental_realtime_")).length, 2);
   assert.equal(args.includes("model_provider=opencodex"), false);
   assert.equal(args[12], "app-server");
 });
