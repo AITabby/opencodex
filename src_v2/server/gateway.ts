@@ -4072,7 +4072,7 @@ export class CodexBridgeServer {
 
     for (const [name, targetPath] of scripts) {
       const sourcePath = [
-        path.join(runtimeDir, "voice", name),
+        path.join(runtimeDir, "..", "voice", name),
         path.join(runtimeDir, "..", "scripts", "voice", name),
         path.join(process.cwd(), "scripts", "voice", name),
       ].find((candidate) => fs.existsSync(candidate));
