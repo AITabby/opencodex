@@ -21,6 +21,11 @@ process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);
 
 function monitorDesktopParent(): void {
+  // App-managed gateways are owned by the macOS shell. Keep the parent PID
+  // watchdog for standalone/CLI launches, but do not run a duplicate watcher
+  // inside the embedded child where a transient process check can look like a
+  // clean shutdown during startup.
+  if (String(process.env.OPENCODEX_APP_MODE || "").trim() === "1") return;
   const parentPid = Number(process.env.OPENCODEX_PARENT_PID || 0);
   if (!Number.isInteger(parentPid) || parentPid <= 0) return;
   const monitor = setInterval(() => {

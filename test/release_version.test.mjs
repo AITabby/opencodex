@@ -12,18 +12,18 @@ test("release surfaces use package.json as the runtime version source", async ()
   const runtimeVersion = await import("../dist/version.js");
 
   assert.equal(packageJson.name, "codexsplit");
-  assert.equal(packageJson.version, "2.0.0");
+  assert.equal(packageJson.version, "2.0.1");
   assert.equal(lockfile.name, "codexsplit");
-  assert.equal(lockfile.version, "2.0.0");
+  assert.equal(lockfile.version, "2.0.1");
   assert.equal(lockfile.packages[""].name, "codexsplit");
-  assert.equal(lockfile.packages[""].version, "2.0.0");
+  assert.equal(lockfile.packages[""].version, "2.0.1");
   assert.equal(runtimeVersion.APP_VERSION, packageJson.version);
   assert.match(plist, /<key>CFBundleIdentifier<\/key>\s*<string>com\.aitabby\.codexsplit<\/string>/);
-  assert.match(plist, /<key>CFBundleShortVersionString<\/key>\s*<string>2\.0\.0<\/string>/);
-  assert.match(plist, /<key>CFBundleVersion<\/key>\s*<string>2000000<\/string>/);
+  assert.match(plist, /<key>CFBundleShortVersionString<\/key>\s*<string>2\.0\.1<\/string>/);
+  assert.match(plist, /<key>CFBundleVersion<\/key>\s*<string>2000010<\/string>/);
   assert.match(voicePlist, /<key>CFBundleIdentifier<\/key>\s*<string>com\.aitabby\.codexsplit\.voicebar<\/string>/);
-  assert.match(voicePlist, /<key>CFBundleShortVersionString<\/key>\s*<string>2\.0\.0<\/string>/);
-  assert.match(voicePlist, /<key>CFBundleVersion<\/key>\s*<string>2000000<\/string>/);
+  assert.match(voicePlist, /<key>CFBundleShortVersionString<\/key>\s*<string>2\.0\.1<\/string>/);
+  assert.match(voicePlist, /<key>CFBundleVersion<\/key>\s*<string>2000010<\/string>/);
   assert.match(packageScript, /MARKETING_VERSION=/);
   assert.match(packageScript, /BUNDLE_VERSION=/);
   assert.match(gateway, /name: "CodexSplit Engine V2", version: APP_VERSION/);

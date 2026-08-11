@@ -34,6 +34,7 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);
   assert.match(gateway, /path\.join\(runtimeDir, "\.\.", "voice", name\)/);
   assert.match(gateway, /useEnergyVAD/);
+  assert.doesNotMatch(gateway, /await CatalogSyncService\.refreshConfiguredProviderMetadata\(configuredProviders\)/);
   assert.match(app, /OPENCODEX_VOICE_RUNTIME_DIR/);
   assert.match(app, /OPENCODEX_VOICE_BAR_PATH/);
   assert.match(app, /gateway_runtime_/);
@@ -63,11 +64,13 @@ test("DMG uses a standard Applications drag-install layout", async () => {
 });
 
 test("desktop app publishes the runtime port and uses the embedded voice bar", async () => {
-  const [app, gatewayProcess, info, gateway] = await Promise.all([
+  const [app, gatewayProcess, info, gateway, server, start] = await Promise.all([
     read("macos-app/Sources/OpenCodex/OpenCodexApp.swift"),
     read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
     read("macos-app/Info.plist"),
-    read("src_v2/server/gateway.ts")
+    read("src_v2/server/gateway.ts"),
+    read("src_v2/server.ts"),
+    read("src_v2/start.ts")
   ]);
   assert.match(app, /applicationShouldTerminateAfterLastWindowClosed/);
   assert.match(app, /applicationShouldHandleReopen/);
@@ -85,7 +88,17 @@ test("desktop app publishes the runtime port and uses the embedded voice bar", a
   assert.doesNotMatch(gatewayProcess, /allowDesktopBridgeTakeover/);
   assert.match(gateway, /buildManagedCodexConfig/);
   assert.match(gateway, /Synchronized managed Codex config to port/);
+  assert.match(server, /OPENCODEX_APP_MODE[\s\S]*return;/);
+  assert.match(start, /OPENCODEX_APP_MODE[\s\S]*return;/);
   assert.match(info, /LSMultipleInstancesProhibited/);
+});
+
+test("dashboard WebView handles JavaScript confirmation dialogs", async () => {
+  const dashboard = await read("macos-app/Sources/OpenCodex/DashboardView.swift");
+  assert.match(dashboard, /webView\.uiDelegate = context\.coordinator/);
+  assert.match(dashboard, /WKUIDelegate/);
+  assert.match(dashboard, /runJavaScriptConfirmPanelWithMessage/);
+  assert.match(dashboard, /alert\.runModal\(\) == \.alertSecondButtonReturn/);
 });
 
 test("login startup leaves native Desktop untouched and clears only legacy bridge state", async () => {

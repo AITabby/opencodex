@@ -29,6 +29,14 @@ test("dashboard keeps visible progress states for destructive and network action
   assert.match(text, /button\.pending/);
 });
 
+test("session dashboard serializes list refreshes and always reconciles deletion", async () => {
+  const text = await source();
+  assert.match(text, /let sessionListRequestSeq=0/);
+  assert.match(text, /if\(requestSeq!==sessionListRequestSeq\)return null/);
+  assert.match(text, /state\.sessions=\(state\.sessions\|\|\[\]\)\.filter/);
+  assert.match(text, /列表刷新失败/);
+});
+
 test("dashboard uses the gateway admin cookie without embedding credentials", async () => {
   const text = await source();
   assert.doesNotMatch(text, /api_key.{0,20}localStorage/i);

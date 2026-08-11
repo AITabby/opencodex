@@ -50,10 +50,7 @@ function configuredProviderVisionCapability(providerName: string, upstreamModel:
   const wanted = String(providerName || "").trim().toLowerCase();
   if (!wanted) return undefined;
   try {
-    const provider = CredentialStore.loadProviders().find((item: any) =>
-      String(item?.name || "").trim().toLowerCase() === wanted
-      || String(item?.preset_id || "").trim().toLowerCase() === wanted,
-    );
+    const provider = CredentialStore.findProvider(CredentialStore.loadProviders(), wanted);
     return provider ? getProviderModelVisionCapability(provider, upstreamModel) : undefined;
   } catch {
     // Capability metadata is an optimization. A damaged catalog must not
@@ -1493,10 +1490,7 @@ export class GatewayRouter {
     const responseAbort = requestSignal ? null : bindResponseAbort(res);
     const effectiveRequestSignal = requestSignal || responseAbort?.signal;
     if (providerName && !selectedApiKey) {
-      const provider = CredentialStore.loadProviders().find((item: any) =>
-        String(item?.name || "").trim().toLowerCase() === String(providerName).trim().toLowerCase()
-        || String(item?.preset_id || "").trim().toLowerCase() === String(providerName).trim().toLowerCase(),
-      ) as any;
+      const provider = CredentialStore.findProvider(CredentialStore.loadProviders(), providerName) as any;
       if (provider) {
         const resolved = CredentialStore.resolveApiKeyWithCredential(provider);
         selectedApiKey = resolved.apiKey;

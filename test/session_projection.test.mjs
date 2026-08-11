@@ -83,6 +83,16 @@ test("session detail filters compact tool traces masquerading as user text", asy
   assert.doesNotMatch(source, /extractTranscriptUserText\(parsed\.content\)\.slice\(0, 300\)/);
 });
 
+test("session list uses bounded metadata reads and idempotent deletion", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const source = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");
+  assert.match(source, /SESSION_LIST_PREFIX_BYTES/);
+  assert.match(source, /readSessionTextSnapshot\(fullPath/);
+  assert.match(source, /already_missing/);
+  assert.match(source, /Could not update thread index/);
+  assert.doesNotMatch(source, /const lines = fs\.readFileSync\(fullPath, "utf-8"\)\.split\("\\n"\)\.filter\(Boolean\);[\s\S]{0,1600}msgCount = projectCodexSessionMessages\(lines\)\.length/);
+});
+
 test("subscription imports require live provider models and explicit ownership", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../src_v2/server/gateway.ts", import.meta.url), "utf8");

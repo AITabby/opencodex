@@ -15,7 +15,7 @@ import {
   getProviderModelVisionCapability,
 } from "../dist/services/catalog_sync.js";
 import { clearProviderModelSelections } from "../dist/services/credential_store.js";
-import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, isFreshDesktopRestartMarker, migrateProviderCatalogOwner, preserveOfficialModels, resolveDesktopBridgeStatus, resolveDesktopRestartMode, stripManagedCodexConfig, stripOwnedLegacyComputerUseConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
+import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, isFreshDesktopRestartMarker, migrateProviderCatalogOwner, preserveOfficialModels, resolveDesktopBridgeStatus, resolveDesktopRestartMode, shouldReconcilePreferredBridgeAfterGatewayReady, stripManagedCodexConfig, stripOwnedLegacyComputerUseConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 import { readRoutingCatalog } from "../dist/services/task_router.js";
 
 test("catalog entries preserve the selected upstream protocol", () => {
@@ -445,6 +445,12 @@ test("Codex restart uses an explicit native or bridge launch mode", async () => 
     gateway,
     /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);/,
   );
+});
+
+test("the packaged app gateway does not relaunch Desktop during ordinary startup", () => {
+  assert.equal(shouldReconcilePreferredBridgeAfterGatewayReady({ OPENCODEX_APP_MODE: "1" }), false);
+  assert.equal(shouldReconcilePreferredBridgeAfterGatewayReady({ OPENCODEX_APP_MODE: "0" }), true);
+  assert.equal(shouldReconcilePreferredBridgeAfterGatewayReady({}), true);
 });
 
 test("native restore persists native mode and returns without waiting for Desktop reconnect", async () => {

@@ -535,6 +535,103 @@ function isInternalRolloutRecord(record: any): boolean {
   return payload.thread_source === "subagent" || Boolean(payload.source && typeof payload.source === "object" && payload.source.subagent);
 }
 
+type SessionTextSnapshot = {
+  lines: string[];
+  complete: boolean;
+};
+
+type SessionListMetadata = {
+  mtimeMs: number;
+  size: number;
+  title: string;
+  isAutoReview: boolean;
+  isInternalSession: boolean;
+  messageCount?: number;
+};
+
+const SESSION_LIST_PREFIX_BYTES = 128 * 1024;
+const SESSION_LIST_FULL_SCAN_BYTES = 256 * 1024;
+const sessionListMetadataCache = new Map<string, SessionListMetadata>();
+
+function readSessionTextSnapshot(filePath: string, maxBytes: number): SessionTextSnapshot {
+  let fd = -1;
+  try {
+    const stat = fs.statSync(filePath);
+    const complete = stat.size <= maxBytes;
+    const buffer = Buffer.alloc(Math.min(Math.max(stat.size, 0), maxBytes));
+    fd = fs.openSync(filePath, "r");
+    const bytesRead = buffer.length > 0 ? fs.readSync(fd, buffer, 0, buffer.length, 0) : 0;
+    let text = buffer.subarray(0, bytesRead).toString("utf-8");
+    let lines = text.split(/\r?\n/).filter(Boolean);
+    // Do not parse a partial final JSONL record from a file that is still being written.
+    if (!complete && !text.endsWith("\n")) lines = lines.slice(0, -1);
+    return { lines, complete };
+  } catch {
+    return { lines: [], complete: false };
+  } finally {
+    if (fd >= 0) {
+      try { fs.closeSync(fd); } catch {}
+    }
+  }
+}
+
+function readSessionListMetadata(fullPath: string, id: string): SessionListMetadata {
+  const stat = fs.statSync(fullPath);
+  const cached = sessionListMetadataCache.get(fullPath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached;
+
+  const snapshot = readSessionTextSnapshot(fullPath, Math.max(SESSION_LIST_PREFIX_BYTES, Math.min(stat.size, SESSION_LIST_FULL_SCAN_BYTES)));
+  let title = `会话 ${id.slice(0, 8)}`;
+  let titleFound = false;
+  let isAutoReview = false;
+  let isInternalSession = false;
+
+  for (const line of snapshot.lines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (isInternalRolloutRecord(parsed)) isInternalSession = true;
+      if (parsed.type === "turn_context" && parsed.payload?.model === "codex-auto-review") {
+        isAutoReview = true;
+        continue;
+      }
+      if (!titleFound && parsed.type === "event_msg" && parsed.payload?.title) {
+        title = String(parsed.payload.title).replace(/\s+/g, " ").slice(0, 50);
+        titleFound = true;
+        continue;
+      }
+      if (!titleFound && parsed.type === "event_msg" && parsed.payload?.type === "user_message" && parsed.payload?.message && !isSyntheticToolTrace(parsed.payload.message)) {
+        const msg = String(parsed.payload.message);
+        if (!msg.startsWith("The following is the Codex agent history") && !msg.startsWith("<")) {
+          title = msg.replace(/\s+/g, " ").slice(0, 50);
+          titleFound = true;
+          continue;
+        }
+      }
+      if (!titleFound && parsed.type === "response_item" && parsed.payload?.role === "user") {
+        const text = parsed.payload?.content?.[0]?.text;
+        if (text && !isSyntheticToolTrace(text) && !text.startsWith("The following is the Codex agent history") && !text.startsWith("<")) {
+          title = String(text).replace(/\s+/g, " ").slice(0, 50);
+          titleFound = true;
+        }
+      }
+    } catch {}
+  }
+
+  const metadata: SessionListMetadata = {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    title,
+    isAutoReview,
+    isInternalSession,
+  };
+  // Counts are useful for small sessions but must never force a multi-megabyte rollout
+  // into the synchronous list request. Full message projection remains detail-only for
+  // large sessions.
+  if (snapshot.complete) metadata.messageCount = projectCodexSessionMessages(snapshot.lines).length;
+  sessionListMetadataCache.set(fullPath, metadata);
+  return metadata;
+}
+
 type ProjectedSessionMessage = { role: "user" | "assistant"; text: string };
 
 function projectCodexSessionMessages(lines: string[]): ProjectedSessionMessage[] {
@@ -629,6 +726,18 @@ export function isFreshDesktopRestartMarker(
   if (!Number.isFinite(requestedAt) || requestedAt <= 0) return false;
   const age = now - requestedAt;
   return age >= 0 && age <= maxAgeMs;
+}
+
+/**
+ * The packaged macOS app starts a private gateway only to serve its own
+ * dashboard. Starting that gateway must not take ownership of an already
+ * running native Codex process. Desktop relaunches remain an explicit action
+ * (restart/apply-models) and use the marker hand-off below.
+ */
+export function shouldReconcilePreferredBridgeAfterGatewayReady(
+  environment: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return String(environment.OPENCODEX_APP_MODE || "").trim() !== "1";
 }
 
 const PROVIDER_BRIDGE_ENV_NAMES = [
@@ -1131,7 +1240,7 @@ function recordProviderTest(providerName: string, status: ProviderTestStatus, me
   const name = String(providerName || "").trim().toLowerCase();
   if (!name) return;
   const providers = CredentialStore.loadProviders();
-  const provider = providers.find((item: any) => item.name === name || item.preset_id === name) as any;
+  const provider = CredentialStore.findProvider(providers, name) as any;
   if (!provider) return;
   provider.last_test_status = status;
   provider.last_test_at = new Date().toISOString();
@@ -1200,10 +1309,7 @@ function recordProviderModelTest(
   const requestedModel = String(model || "").trim();
   if (!name || !requestedModel) return undefined;
   const providers = CredentialStore.loadProviders();
-  const provider = providers.find((item: any) =>
-    String(item?.name || "").trim().toLowerCase() === name
-    || String(item?.preset_id || "").trim().toLowerCase() === name,
-  ) as any;
+  const provider = CredentialStore.findProvider(providers, name) as any;
   if (!provider) return undefined;
   const key = providerModelTestKey(provider, requestedModel);
   if (!key) return undefined;
@@ -1588,9 +1694,7 @@ export function preserveOfficialModels(catalog: any): void {
       ? scopedCatalogSlug(owner, rawSlug, usedSlugs)
       : canonical;
     const backendModel = String(model.backend_model || rawSlug).trim();
-    const configuredProvider = CredentialStore.loadProviders().find((provider: any) =>
-      normalizeNamespace(String(provider?.name || provider?.preset_id || "")) === owner
-    );
+    const configuredProvider = CredentialStore.findProvider(CredentialStore.loadProviders(), owner);
     const backendMetadata = configuredProvider
       ? CatalogSyncService.getKnownModelMetadata(configuredProvider, backendModel)
       : undefined;
@@ -2740,7 +2844,11 @@ export class CodexBridgeServer {
 
   private launchDesktopAfterGatewayReadyIfRequested(): void {
     if (!fs.existsSync(this.desktopRestartMarkerPath)) {
-      this.reconcilePreferredBridgeAfterGatewayReady();
+      if (shouldReconcilePreferredBridgeAfterGatewayReady()) {
+        this.reconcilePreferredBridgeAfterGatewayReady();
+      } else {
+        console.log("[CodexSplit Gateway] App-managed gateway is ready; leaving the existing Desktop process untouched until an explicit restart action.");
+      }
       return;
     }
     let markerContents = "";
@@ -3790,7 +3898,7 @@ export class CodexBridgeServer {
       };
     }
 
-    return providers.find((provider) => provider.name.toLowerCase() === providerName || provider.preset_id?.toLowerCase() === providerName)
+    return CredentialStore.findProvider(providers, providerName)
       || { name: providerName, baseUrl: "", models: matches.map((entry) => String(entry.slug || entry.model || "")).filter(Boolean) };
   }
 
@@ -4432,11 +4540,14 @@ export class CodexBridgeServer {
     if (managedConfig.includes("opencodex managed")) {
       try {
         const configuredProviders = CredentialStore.loadProviders();
-        const metadataChanged = await CatalogSyncService.refreshConfiguredProviderMetadata(configuredProviders);
-        if (metadataChanged) {
-          CredentialStore.saveProviders(configuredProviders);
-          this.config.providers = configuredProviders;
-        }
+        // Do not make gateway readiness depend on one /models request per
+        // configured provider. A provider pool can contain hundreds of
+        // credentials (including historical entries), and resolving every
+        // Keychain secret plus waiting on every endpoint here blocks the
+        // local health endpoint and makes the macOS app look hung. Metadata
+        // is refreshed by explicit provider discovery/import; startup only
+        // needs the durable provider configuration and catalog projection.
+        this.config.providers = configuredProviders;
         const synchronizedConfig = buildManagedCodexConfig(managedConfig, this.port, this.adminToken);
         if (synchronizedConfig !== managedConfig) {
           writePrivateTextFile(configPath, synchronizedConfig);
@@ -5316,9 +5427,13 @@ export class CodexBridgeServer {
             }
           ];
 
-          const apiProviders = CredentialStore.loadProviders().map((p: any) => {
-            const publicCredentials = CredentialStore.getProviderCredentialsPublic(p);
-            const hasApiKey = Boolean(CredentialStore.resolveApiKey(p)) || publicCredentials.some((credential: any) => credential.status !== "missing");
+          const configuredApiProviders = CredentialStore.loadProviders();
+          const publicCredentialsByProvider = await CredentialStore.getProvidersCredentialsPublicAsync(configuredApiProviders);
+          const apiProviders = configuredApiProviders.map((p: any, providerIndex: number) => {
+            const publicCredentials = publicCredentialsByProvider[providerIndex] || [];
+            const hasApiKey = Boolean(String(p.api_key || "").trim())
+              || Boolean(p.api_key_env && process.env[p.api_key_env])
+              || publicCredentials.some((credential: any) => credential.status !== "missing");
             // providers.json is the durable source of the selected model
             // list. The catalog is a derived view and may be stale after
             // Codex refreshes its native cache during a restart.
@@ -5388,8 +5503,8 @@ export class CodexBridgeServer {
             );
 
             let providers = CredentialStore.loadProviders();
-            let provider = providers.find((p: any) => p.name === requestedProviderName)
-              || providers.find((p: any) => p.preset_id === presetId);
+            let provider = CredentialStore.findProvider(providers, presetId)
+              || CredentialStore.findProvider(providers, requestedProviderName);
             const previousProviderName = normalizeNamespace(provider?.name || "");
             const providerName = deriveProviderNamespace(
               presetId === "custom" ? "custom" : (provider?.preset_id || requestedProviderName),
@@ -5897,17 +6012,14 @@ export class CodexBridgeServer {
               return;
             }
             const providers = CredentialStore.loadProviders();
-            const provider = providers.find((item: any) =>
-              String(item?.name || "").trim().toLowerCase() === requestedProviderName
-              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
-            ) as any;
+            const provider = CredentialStore.findProvider(providers, requestedProviderName) as any;
             if (!provider) {
               res.writeHead(400, { "Content-Type": "application/json" });
               res.end(JSON.stringify({ error: "请先保存这个 Provider 的 Endpoint 和模型，再添加第二个 API Key" }));
               return;
             }
             CredentialStore.addApiKeyCredential(providers, provider.name, apiKey, String(body.label || ""));
-            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            const refreshed = CredentialStore.findProvider(CredentialStore.loadProviders(), provider.preset_id || provider.name) as any;
             res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
             res.end(JSON.stringify({
               status: "success",
@@ -5933,13 +6045,10 @@ export class CodexBridgeServer {
               return;
             }
             const providers = CredentialStore.loadProviders();
-            const provider = providers.find((item: any) =>
-              String(item?.name || "").trim().toLowerCase() === requestedProviderName
-              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
-            ) as any;
+            const provider = CredentialStore.findProvider(providers, requestedProviderName) as any;
             if (!provider) throw new Error("没有找到这个 Provider");
             CredentialStore.removeApiKeyCredential(providers, provider.name, credentialId);
-            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            const refreshed = CredentialStore.findProvider(CredentialStore.loadProviders(), provider.preset_id || provider.name) as any;
             res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
             res.end(JSON.stringify({
               status: "success",
@@ -5958,10 +6067,7 @@ export class CodexBridgeServer {
             const body = await this.parseJsonBody(req);
             const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
             const providers = CredentialStore.loadProviders();
-            const provider = providers.find((item: any) =>
-              String(item?.name || "").trim().toLowerCase() === requestedProviderName
-              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
-            ) as any;
+            const provider = CredentialStore.findProvider(providers, requestedProviderName) as any;
             if (!provider) throw new Error("没有找到这个 Provider");
             CredentialStore.setProviderPoolPolicy(
               providers,
@@ -5969,7 +6075,7 @@ export class CodexBridgeServer {
               String(body.pool_mode || body.mode || "fixed") as any,
               String(body.active_credential_id || body.activeCredentialId || "").trim(),
             );
-            const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+            const refreshed = CredentialStore.findProvider(CredentialStore.loadProviders(), provider.preset_id || provider.name) as any;
             res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
             res.end(JSON.stringify({
               status: "success",
@@ -5989,10 +6095,7 @@ export class CodexBridgeServer {
             const requestedProviderName = String(body.name || body.provider || body.preset_id || "").trim().toLowerCase();
             const credentialId = String(body.credential_id || body.credentialId || "").trim();
             const providers = CredentialStore.loadProviders();
-            const provider = providers.find((item: any) =>
-              String(item?.name || "").trim().toLowerCase() === requestedProviderName
-              || String(item?.preset_id || "").trim().toLowerCase() === requestedProviderName,
-            ) as any;
+            const provider = CredentialStore.findProvider(providers, requestedProviderName) as any;
             if (!provider || !credentialId) throw new Error("缺少 Provider 或凭证 ID");
             const selected = CredentialStore.resolveApiKeyCredential(provider, credentialId);
             if (!selected?.apiKey) {
@@ -6008,7 +6111,7 @@ export class CodexBridgeServer {
             try {
               const models = await CatalogSyncService.discoverLiveModels(testProvider);
               CredentialStore.markProviderCredentialSuccess(provider.name, credentialId);
-              const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+              const refreshed = CredentialStore.findProvider(CredentialStore.loadProviders(), provider.preset_id || provider.name) as any;
               res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
               res.end(JSON.stringify({
                 status: "connected",
@@ -6020,7 +6123,7 @@ export class CodexBridgeServer {
               const statusMatch = message.match(/HTTP\s+(\d{3})/i);
               const statusCode = statusMatch ? Number(statusMatch[1]) : 0;
               CredentialStore.markProviderCredentialFailure(provider.name, credentialId, statusCode, message);
-              const refreshed = CredentialStore.loadProviders().find((item: any) => item.name === provider.name) as any;
+              const refreshed = CredentialStore.findProvider(CredentialStore.loadProviders(), provider.preset_id || provider.name) as any;
               res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
               res.end(JSON.stringify({
                 status: "failed",
@@ -6047,7 +6150,8 @@ export class CodexBridgeServer {
 
             let found: any;
             try {
-              found = CredentialStore.loadProviders().find((p: any) => p.name === requestedProviderName || p.name === presetId || p.preset_id === presetId);
+              found = CredentialStore.findProvider(CredentialStore.loadProviders(), presetId)
+                || CredentialStore.findProvider(CredentialStore.loadProviders(), requestedProviderName);
               if (found) {
                 baseUrl = baseUrl || String(found.baseUrl || found.base_url || "");
                 apiKey = apiKey || String(CredentialStore.resolveApiKey(found) || "");
@@ -6096,10 +6200,7 @@ export class CodexBridgeServer {
             let foundProvider: any;
 
             try {
-              foundProvider = CredentialStore.loadProviders().find((p: any) =>
-                String(p?.name || "").trim().toLowerCase() === presetId
-                || String(p?.preset_id || "").trim().toLowerCase() === presetId,
-              );
+              foundProvider = CredentialStore.findProvider(CredentialStore.loadProviders(), presetId);
               if (foundProvider) {
                 baseUrl = baseUrl || String(foundProvider.baseUrl || foundProvider.base_url || "");
                 apiKey = apiKey || String(CredentialStore.resolveApiKey(foundProvider) || "");
@@ -6192,7 +6293,7 @@ export class CodexBridgeServer {
             };
 
             try {
-              foundProvider = CredentialStore.loadProviders().find((p: any) => p.name === providerName || p.preset_id === providerName);
+              foundProvider = CredentialStore.findProvider(CredentialStore.loadProviders(), providerName);
               if (foundProvider) {
                 baseUrl = baseUrl || (foundProvider as any).baseUrl || (foundProvider as any).base_url;
                 const resolved = CredentialStore.resolveApiKeyWithCredential(foundProvider);
@@ -7066,101 +7167,56 @@ export class CodexBridgeServer {
               for (const f of files) {
                 if (typeof f === "string" && (f.endsWith(".json") || f.endsWith(".jsonl"))) {
                   const fullPath = path.join(sessionsDir, f);
-                  const stat = fs.statSync(fullPath);
                   const id = path.basename(f, f.endsWith(".jsonl") ? ".jsonl" : ".json");
-                  
-                  let title = `会话 ${id.slice(0, 8)}`;
-                  let msgCount = 0;
-                  let isAutoReview = false;
-                  let isInternalSession = false;
                   try {
-                    const lines = fs.readFileSync(fullPath, "utf-8").split("\n").filter(Boolean);
-                    for (const line of lines) {
-                      try {
-                        const parsed = JSON.parse(line);
-                        if (isInternalRolloutRecord(parsed)) {
-                          isInternalSession = true;
-                        }
-                        if (parsed.type === "turn_context" && parsed.payload?.model === "codex-auto-review") {
-                          isAutoReview = true;
-                          break;
-                        }
-                        if (parsed.type === "event_msg" && parsed.payload?.title) {
-                          title = parsed.payload.title;
-                          break;
-                        }
-                        if (parsed.type === "event_msg" && parsed.payload?.type === "user_message" && parsed.payload?.message && !isSyntheticToolTrace(parsed.payload.message)) {
-                          const msg = parsed.payload.message;
-                          if (!msg.startsWith("The following is the Codex agent history") && !msg.startsWith("<")) {
-                            title = msg.replace(/\s+/g, " ").slice(0, 50);
-                            break;
-                          }
-                        }
-                        if (parsed.type === "response_item" && parsed.payload?.role === "user") {
-                          const text = parsed.payload?.content?.[0]?.text;
-                          if (text && !isSyntheticToolTrace(text) && !text.startsWith("The following is the Codex agent history") && !text.startsWith("<")) {
-                            title = text.replace(/\s+/g, " ").slice(0, 50);
-                            break;
-                          }
-                        }
-                      } catch {}
-                    }
+                    const stat = fs.statSync(fullPath);
+                    const metadata = readSessionListMetadata(fullPath, id);
+                    let title = metadata.title;
+                    const isAutoReview = metadata.isAutoReview;
+                    const isInternalSession = metadata.isInternalSession;
+                    let msgCount = metadata.messageCount;
 
-                    const transcriptPath = path.join(
-                      os.homedir(),
-                      ".gemini",
-                      "antigravity",
-                      extractSessionUuid(id),
-                      ".system_generated",
-                      "logs",
-                      "transcript.jsonl"
-                    );
-                    if (fs.existsSync(transcriptPath)) {
-                      const transcriptLines = fs.readFileSync(transcriptPath, "utf-8").split("\n").filter(Boolean);
-                      msgCount = projectAntigravitySessionMessages(transcriptLines).length;
-                    } else {
-                      msgCount = projectCodexSessionMessages(lines).length;
-                    }
-                  } catch {}
-
-                  if (title.startsWith("会话 ")) {
-                    const transcriptPath = path.join(
-                      os.homedir(),
-                      ".gemini",
-                      "antigravity",
-                      "brain",
-                      extractSessionUuid(id),
-                      ".system_generated",
-                      "logs",
-                      "transcript.jsonl"
-                    );
-                    if (fs.existsSync(transcriptPath)) {
-                      try {
-                        for (const line of fs.readFileSync(transcriptPath, "utf-8").split("\n").filter(Boolean)) {
-                          const transcript = JSON.parse(line);
-                          if (transcript.type === "USER_INPUT") {
-                            const transcriptText = extractTranscriptUserText(transcript.content);
+                    // Antigravity transcripts can provide a better title, but only read
+                    // a bounded prefix here. The full transcript is loaded on detail.
+                    if (title.startsWith("会话 ")) {
+                      const transcriptPath = path.join(
+                        os.homedir(),
+                        ".gemini",
+                        "antigravity",
+                        "brain",
+                        extractSessionUuid(id),
+                        ".system_generated",
+                        "logs",
+                        "transcript.jsonl"
+                      );
+                      const transcript = readSessionTextSnapshot(transcriptPath, SESSION_LIST_PREFIX_BYTES);
+                      for (const line of transcript.lines) {
+                        try {
+                          const parsed = JSON.parse(line);
+                          if (parsed.type === "USER_INPUT") {
+                            const transcriptText = extractTranscriptUserText(parsed.content);
                             if (transcriptText) {
                               title = transcriptText.replace(/\s+/g, " ").slice(0, 50);
                               break;
                             }
                           }
-                        }
-                      } catch {}
+                        } catch {}
+                      }
+                      if (transcript.complete) msgCount = projectAntigravitySessionMessages(transcript.lines).length;
                     }
-                  }
 
-                  const registeredTitle = registeredTitles.get(fullPath);
-                  if (registeredTitle && !isSyntheticToolTrace(registeredTitle)) title = registeredTitle;
-                  if (!isAutoReview && !isInternalSession && !title.startsWith("The following is the Codex agent history")) {
-                    sessions.push({
-                      id,
-                      text: title,
-                      ts: stat.mtimeMs,
-                      message_count: msgCount,
-                      model: "Codex Session"
-                    });
-                  }
+                    const registeredTitle = registeredTitles.get(fullPath);
+                    if (registeredTitle && !isSyntheticToolTrace(registeredTitle)) title = registeredTitle;
+                    if (!isAutoReview && !isInternalSession && !title.startsWith("The following is the Codex agent history")) {
+                      sessions.push({
+                        id,
+                        text: title,
+                        ts: stat.mtimeMs,
+                        ...(typeof msgCount === "number" ? { message_count: msgCount } : {}),
+                        model: "Codex Session"
+                      });
+                    }
+                  } catch {}
                 }
               }
             } catch {}
@@ -7183,7 +7239,9 @@ export class CodexBridgeServer {
             if (!fs.existsSync(agLogPath) && fs.existsSync(sessionsDir)) {
               const files = fs.readdirSync(sessionsDir, { recursive: true });
               for (const f of files) {
-                if (typeof f === "string" && f.includes(id)) {
+                if (typeof f === "string"
+                  && (f.endsWith(".json") || f.endsWith(".jsonl"))
+                  && path.basename(f, f.endsWith(".jsonl") ? ".jsonl" : ".json") === id) {
                   targetFile = path.join(sessionsDir, f);
                   break;
                 }
@@ -8367,12 +8425,6 @@ export class CodexBridgeServer {
               }
             }
 
-            if (!deletedFiles.length) {
-              res.writeHead(404, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "Session not found", id }));
-              return;
-            }
-
             const historyPath = path.join(codexHomeDir(), "history.jsonl");
             if (fs.existsSync(historyPath)) {
               try {
@@ -8388,13 +8440,20 @@ export class CodexBridgeServer {
 
             const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
             if (fs.existsSync(dbPath)) {
-              const escapedId = id.replace(/'/g, "''");
-              const rolloutPredicates = deletedFiles
-                .map((file) => `rollout_path = '${file.replace(/'/g, "''")}'`)
-                .join(" OR ");
-              const where = [`id = '${escapedId}'`, rolloutPredicates].filter(Boolean).join(" OR ");
-              const cp = await import("node:child_process");
-              cp.execFileSync("sqlite3", [dbPath, `DELETE FROM threads WHERE ${where};`], { stdio: "ignore" });
+              try {
+                const escapedId = id.replace(/'/g, "''");
+                const rolloutPredicates = deletedFiles
+                  .map((file) => `rollout_path = '${file.replace(/'/g, "''")}'`)
+                  .join(" OR ");
+                const where = [`id = '${escapedId}'`, rolloutPredicates].filter(Boolean).join(" OR ");
+                const cp = await import("node:child_process");
+                cp.execFileSync("sqlite3", [dbPath, `DELETE FROM threads WHERE ${where};`], { stdio: "ignore" });
+              } catch (dbError: any) {
+                // The rollout file is the source used by the dashboard list. A
+                // locked/stale SQLite index must not turn a successful file
+                // deletion into a false failure or leave the UI stale.
+                console.warn(`[CodexSplit Sessions] Could not update thread index: ${dbError?.message || dbError}`);
+              }
             }
 
             const stillPresent = deletedFiles.filter((file) => fs.existsSync(file));
@@ -8405,7 +8464,13 @@ export class CodexBridgeServer {
             }
 
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "success", deleted: id, files: deletedFiles, deleted_count: deletedFiles.length }));
+            res.end(JSON.stringify({
+              status: "success",
+              deleted: id,
+              files: deletedFiles,
+              deleted_count: deletedFiles.length,
+              already_missing: deletedFiles.length === 0,
+            }));
           } catch (err: any) {
             res.writeHead(500, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: err.message }));

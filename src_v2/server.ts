@@ -21,6 +21,11 @@ process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);
 
 function monitorDesktopParent(): void {
+  // The packaged macOS shell owns this child through Process.terminate() and
+  // its termination handler. A second kill(pid, 0) watchdog is redundant in
+  // app mode and can misclassify a sandbox/launch transition as a dead parent,
+  // making a healthy gateway exit 0 before the shell's health check completes.
+  if (String(process.env.OPENCODEX_APP_MODE || "").trim() === "1") return;
   const parentPid = Number(process.env.OPENCODEX_PARENT_PID || 0);
   if (!Number.isInteger(parentPid) || parentPid <= 0) return;
 
