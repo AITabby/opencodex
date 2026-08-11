@@ -956,9 +956,92 @@ test("subagent turns do not advertise nested gateway or native agent controls", 
   const raw = stripSubagentDispatchTools([
     { type: "function", function: { name: "spawn_agent" } },
     { type: "function", function: { name: "multi_agent_v1_wait_agent" } },
+    { type: "namespace", name: "collaboration", functions: [{ name: "spawn_agent" }] },
+    { type: "namespace", name: "multi_agent_v2", functions: [{ name: "wait" }] },
     { type: "function", function: { name: "view_file" } },
   ]);
   assert.deepEqual(raw?.map((tool) => tool.function?.name), ["view_file"]);
+});
+
+test("custom apply_patch tools expose structured edit and return native patch calls", async () => {
+  const tools = convertToolsToChatTools([{
+    type: "custom",
+    name: "apply_patch",
+    description: "Apply a patch",
+  }], undefined, false);
+  const edit = tools.find((tool) => tool.function?.name === "edit");
+  const rawPatch = tools.find((tool) => tool.function?.name === "apply_patch");
+  assert.deepEqual(edit?.function?.parameters?.required, ["path", "old_text", "new_text"]);
+  assert.deepEqual(rawPatch?.function?.parameters?.required, ["input"]);
+
+  const patch = "*** Begin Patch\n*** Update File: /tmp/probe.txt\n@@\n-before\n+after\n*** End Patch";
+  const continuation = transformResponsesToChat({
+    model: "third-party",
+    input: [{ type: "custom_tool_call", call_id: "call-patch", name: "apply_patch", input: patch }],
+  }, "third-party");
+  const continuationCall = continuation.messages.find((message) => message.role === "assistant")?.tool_calls?.[0];
+  assert.deepEqual(JSON.parse(continuationCall?.function?.arguments || "{}"), { input: patch });
+
+  const events = [];
+  const engine = new ResponsesStreamEngine("third-party", "edit-turn");
+  const emit = async (event) => events.push(event);
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id: "call-edit",
+      function: {
+        name: "edit",
+        arguments: JSON.stringify({ path: "/tmp/probe.txt", old_text: "before", new_text: "after" }),
+      },
+    }] } }],
+  });
+  await engine.finish(emit);
+
+  const completed = events.find((event) => event.type === "response.output_item.done" && event.item?.type === "custom_tool_call");
+  assert.equal(completed?.item?.name, "apply_patch");
+  assert.equal(completed?.item?.call_id, "call-edit");
+  assert.equal(completed?.item?.input, patch);
+  assert.equal(events.some((event) => event.item?.type === "function_call" && event.item?.name === "edit"), false);
+});
+
+test("MCP namespaces round-trip through flattened Chat tool names", async () => {
+  const tools = convertToolsToChatTools([{
+    type: "namespace",
+    name: "mcp__codegraph",
+    functions: [{ name: "codegraph_explore", parameters: { type: "object" } }],
+  }], undefined, false);
+  assert.equal(tools[0]?.function?.name, "mcp__codegraph__codegraph_explore");
+
+  const continuation = transformResponsesToChat({
+    model: "third-party",
+    input: [{
+      type: "function_call",
+      call_id: "call-mcp-history",
+      namespace: "mcp__codegraph",
+      name: "codegraph_explore",
+      arguments: "{}",
+    }],
+  }, "third-party");
+  const continuationCall = continuation.messages.find((message) => message.role === "assistant")?.tool_calls?.[0];
+  assert.equal(continuationCall?.function?.name, "mcp__codegraph__codegraph_explore");
+
+  const events = [];
+  const engine = new ResponsesStreamEngine("third-party", "mcp-turn");
+  const emit = async (event) => events.push(event);
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id: "call-mcp",
+      function: { name: "mcp__codegraph__codegraph_explore", arguments: "{}" },
+    }] } }],
+  });
+  await engine.finish(emit);
+
+  const completed = events.find((event) => event.type === "response.output_item.done" && event.item?.call_id === "call-mcp");
+  assert.equal(completed?.item?.name, "codegraph_explore");
+  assert.equal(completed?.item?.namespace, "mcp__codegraph");
 });
 
 test("subagent Responses conversion keeps worker tools but removes nested dispatch", () => {

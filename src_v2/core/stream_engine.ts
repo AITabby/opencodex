@@ -124,6 +124,43 @@ export function normalizeToolArguments(name: string, rawArguments: string): stri
   });
 }
 
+function applyPatchInput(rawArguments: string): string {
+  try {
+    const parsed = JSON.parse(rawArguments);
+    if (typeof parsed?.input === "string") return parsed.input;
+    if (typeof parsed?.path === "string" &&
+      !/[\r\n]/.test(parsed.path) &&
+      typeof parsed?.old_text === "string" &&
+      parsed.old_text.length > 0 &&
+      typeof parsed?.new_text === "string") {
+      const oldLines = parsed.old_text.replace(/\r\n/g, "\n").split("\n");
+      const newLines = parsed.new_text === ""
+        ? []
+        : parsed.new_text.replace(/\r\n/g, "\n").split("\n");
+      return [
+        "*** Begin Patch",
+        `*** Update File: ${parsed.path}`,
+        "@@",
+        ...oldLines.map((line: string) => `-${line}`),
+        ...newLines.map((line: string) => `+${line}`),
+        "*** End Patch",
+      ].join("\n");
+    }
+  } catch {}
+  return rawArguments;
+}
+
+function namespacedMcpToolIdentity(name: unknown): { name: string; namespace: string } | undefined {
+  const flattened = String(name || "").trim();
+  if (!flattened.startsWith("mcp__")) return undefined;
+  const separator = flattened.indexOf("__", 5);
+  if (separator < 0) return undefined;
+  const serverLabel = flattened.slice(5, separator);
+  const toolName = flattened.slice(separator + 2);
+  if (!serverLabel || !toolName) return undefined;
+  return { name: toolName, namespace: `mcp__${serverLabel}` };
+}
+
 function extractXmlAndBashToolCalls(text: string): { cleanText: string; calls: any[] } {
   let cleanText = text;
   const calls: any[] = [];
@@ -224,6 +261,7 @@ interface ToolCallState {
   output_index: number;
   added: boolean;
   closed: boolean;
+  isApplyPatchCall?: boolean;
   deferArguments?: boolean;
 }
 
@@ -535,12 +573,13 @@ export class ResponsesStreamEngine {
   private async emitToolDelta(writeSse: (payload: any) => Promise<void>, call: any): Promise<void> {
     const index = Number(call.index || 0);
     const fn = call.function || {};
+    const isApplyPatchCall = fn.name === "apply_patch" || fn.name === "edit";
     const isInternalImageCall = fn.name === NATIVE_IMAGE_TOOL_NAME || Boolean(this.internalImageToolCalls[index]);
     const isInternalGatewayCall = this.internalToolNames.has(String(fn.name || "").trim().toLowerCase()) || Boolean(this.internalToolCalls[index]);
     const mcpDescriptor = nativeComputerUseMcpDescriptor(fn.name);
     const nativeIdentity = mcpDescriptor
       ? { name: mcpDescriptor.toolName, namespace: `mcp__${mcpDescriptor.serverLabel}` }
-      : undefined;
+      : namespacedMcpToolIdentity(fn.name);
     const toolStore = isInternalImageCall
       ? this.internalImageToolCalls
       : isInternalGatewayCall
@@ -570,10 +609,12 @@ export class ResponsesStreamEngine {
         output_index: isInternalImageCall ? -1 : this.nextOutputIndex++,
         added: isInternalImageCall,
         closed: false,
+        isApplyPatchCall,
         deferArguments: !isInternalImageCall && (
           isInternalGatewayCall ||
           (fn.name || "") === "exec_command" ||
-          Boolean(nativeIdentity)
+          Boolean(nativeIdentity) ||
+          isApplyPatchCall
         ),
       };
       toolStore[index] = state;
@@ -591,6 +632,11 @@ export class ResponsesStreamEngine {
     }
 
     if (isInternalImageCall || isInternalGatewayCall) {
+      if (fn.arguments) state.arguments += fn.arguments;
+      return;
+    }
+
+    if (state.isApplyPatchCall) {
       if (fn.arguments) state.arguments += fn.arguments;
       return;
     }
@@ -786,6 +832,21 @@ export class ResponsesStreamEngine {
       const state = Object.values(this.toolCalls).find((candidate) => candidate.output_index === outputIndex);
       if (state && !state.closed) {
         state.closed = true;
+        if (state.isApplyPatchCall) {
+          state.arguments = applyPatchInput(state.arguments);
+          await emit({
+            type: "response.output_item.done",
+            output_index: state.output_index,
+            item: {
+              type: "custom_tool_call",
+              status: "completed",
+              call_id: state.call_id,
+              name: "apply_patch",
+              input: state.arguments,
+            },
+          });
+          continue;
+        }
         const normalizedArguments = state.namespace === "mcp__node_repl"
           ? normalizeNativeComputerUseToolArguments(state.arguments)
           : normalizeToolArguments(state.name, state.arguments);
@@ -850,15 +911,23 @@ export class ResponsesStreamEngine {
       });
     }
     for (const state of Object.values(this.toolCalls)) {
-      output.push({
-        id: state.id,
-        type: "function_call",
-        status: "completed",
-        call_id: state.call_id,
-        name: state.name,
-        arguments: state.arguments,
-        ...(state.namespace ? { namespace: state.namespace } : {}),
-      });
+      output.push(state.isApplyPatchCall
+        ? {
+          type: "custom_tool_call",
+          status: "completed",
+          call_id: state.call_id,
+          name: "apply_patch",
+          input: state.arguments,
+        }
+        : {
+          id: state.id,
+          type: "function_call",
+          status: "completed",
+          call_id: state.call_id,
+          name: state.name,
+          arguments: state.arguments,
+          ...(state.namespace ? { namespace: state.namespace } : {}),
+        });
     }
     for (const image of this.imageGenerations) {
       output.push({

@@ -172,15 +172,19 @@ function responseFunctionCallToolName(item: any): string {
   if (!namespace || name === namespace || name.startsWith(`${namespace}_`) || name.startsWith(`${namespace}__`)) {
     return name;
   }
-  return namespace.endsWith("__") ? `${namespace}${name}` : `${namespace}_${name}`;
+  return namespace.endsWith("__")
+    ? `${namespace}${name}`
+    : `${namespace}${namespace.startsWith("mcp__") ? "__" : "_"}${name}`;
 }
 
 function appendChatToolCall(messages: ChatMessage[], item: any): string {
   const callId = String(item?.call_id || item?.id || `call_${Date.now()}`).trim() || `call_${Date.now()}`;
   const rawArguments = item?.arguments ?? item?.input ?? item?.action;
-  const argsStr = typeof rawArguments === "string"
-    ? rawArguments
-    : JSON.stringify(rawArguments || {});
+  const argsStr = item?.type === "custom_tool_call" && item?.name === "apply_patch"
+    ? JSON.stringify({ input: String(rawArguments ?? "") })
+    : typeof rawArguments === "string"
+      ? rawArguments
+      : JSON.stringify(rawArguments || {});
   const thoughtSignature = String(item?.thought_signature || item?.thoughtSignature || item?.signature || "").trim();
   const toolCall = {
     id: callId,
@@ -382,7 +386,12 @@ export function buildGatewaySubagentResponseTool(): any {
  */
 export function isSubagentDispatchToolName(value: unknown): boolean {
   const name = String(value || "").trim().toLowerCase();
-  return name === "spawn_agent" || name.startsWith("multi_agent_v1_");
+  return name === "spawn_agent" ||
+    name === "collaboration" ||
+    name.startsWith("collaboration_") ||
+    name === "multi_agent_v2" ||
+    name.startsWith("multi_agent_v2_") ||
+    name.startsWith("multi_agent_v1_");
 }
 
 function rawToolName(tool: any): string {
@@ -507,6 +516,38 @@ export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: stri
       }
     } else if (isImageGenerationTool(tool)) {
       result.push(buildNativeImageTool());
+    } else if (tool.type === "custom" && tool.name === "apply_patch") {
+      result.push({
+        type: "function",
+        function: {
+          name: "edit",
+          description: "Edit one file by replacing an exact existing text block. Use this instead of writing patch syntax.",
+          parameters: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "File path." },
+              old_text: { type: "string", description: "Exact existing text to replace." },
+              new_text: { type: "string", description: "Replacement text." },
+            },
+            required: ["path", "old_text", "new_text"],
+            additionalProperties: false,
+          },
+        },
+      }, {
+        type: "function",
+        function: {
+          name: "apply_patch",
+          description: "For edits that cannot use exact replacement, pass a complete raw patch whose first line is exactly *** Begin Patch and last line is exactly *** End Patch.",
+          parameters: {
+            type: "object",
+            properties: {
+              input: { type: "string", description: "The complete raw apply_patch patch text." },
+            },
+            required: ["input"],
+            additionalProperties: false,
+          },
+        },
+      });
     } else if (tool.type === "function" && tool.function) {
       result.push({
         type: "function",
@@ -518,7 +559,9 @@ export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: stri
       for (const f of funcs) {
         if (typeof f !== "object" || f === null) continue;
         const fnName = f.name || "";
-        const fullName = nsName.endsWith("__") ? `${nsName}${fnName}` : `${nsName}_${fnName}`;
+        const fullName = nsName.endsWith("__")
+          ? `${nsName}${fnName}`
+          : `${nsName}${nsName.startsWith("mcp__") ? "__" : "_"}${fnName}`;
         result.push({
           type: "function",
           function: {

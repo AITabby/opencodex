@@ -22,7 +22,9 @@ function flattenResponseFunctionCallName(item: any): string {
   if (!namespace || name === namespace || name.startsWith(`${namespace}_`) || name.startsWith(`${namespace}__`)) {
     return name;
   }
-  return namespace.endsWith("__") ? `${namespace}${name}` : `${namespace}_${name}`;
+  return namespace.endsWith("__")
+    ? `${namespace}${name}`
+    : `${namespace}${namespace.startsWith("mcp__") ? "__" : "_"}${name}`;
 }
 
 function responseContentToChatContent(content: any): string | any[] {
@@ -258,7 +260,9 @@ export class SessionHistoryService {
         } else if (item.type === "function_call" || item.type === "mcp_call" || item.type === "custom_tool_call" || item.type === "computer_call") {
           const callId = String(item.call_id || item.id || `call_repair_${reconstructed.length}`).trim();
           const rawArguments = item.arguments ?? item.input ?? item.action;
-          const argsStr = typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments || {});
+          const argsStr = item.type === "custom_tool_call" && item.name === "apply_patch"
+            ? JSON.stringify({ input: String(rawArguments ?? "") })
+            : typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments || {});
           reconstructed.push({
             role: "assistant",
             content: "",
