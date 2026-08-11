@@ -7,7 +7,7 @@
     <key>CFBundleName</key>
     <string>CodexSplit Voice Bar</string>
     <key>CFBundleVersion</key>
-    <string>2000001</string>
+    <string>2000000</string>
     <key>CFBundleShortVersionString</key>
     <string>2.0.0</string>
     <key>NSMicrophoneUsageDescription</key>

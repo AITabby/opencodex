@@ -16,6 +16,8 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(packageScript, /voice-runtime\/uvx/);
   assert.match(packageScript, /voice-runtime\/uv/);
   assert.match(packageScript, /voice-runtime\/ffmpeg/);
+  assert.match(packageScript, /VOICE_HELPER_FILES/);
+  assert.match(packageScript, /dist\/voice/);
   assert.match(packageScript, /src_v2\/assets/);
   assert.match(packageScript, /otool -L/);
   assert.match(packageScript, /@rpath\/|opt\/homebrew|usr\/local\/\(Cellar\|opt\)/);
@@ -26,6 +28,7 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(packageScript, /Contents\/MacOS\/CodexSplit/);
   assert.match(packageScript, /Resources\/CodexSplitLivePicker/);
   assert.match(verifyScript, /voice-runtime\/uvx/);
+  assert.match(verifyScript, /dist\/voice\/minimax_tts\.py/);
   assert.match(verifyScript, /src_v2\/assets\/codexsplit-logo-compact\.png/);
   assert.match(verifyScript, /Resources\/CodexSplitLivePicker/);
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);

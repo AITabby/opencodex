@@ -25,6 +25,9 @@ required_files=(
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uvx"
   "$APP_BUNDLE/Contents/Resources/voice-runtime/ffmpeg"
   "$APP_BUNDLE/Contents/Resources/dist/server.js"
+  "$APP_BUNDLE/Contents/Resources/dist/voice/minimax_tts.py"
+  "$APP_BUNDLE/Contents/Resources/dist/voice/transcribe.py"
+  "$APP_BUNDLE/Contents/Resources/dist/voice/silero_vad_daemon.py"
   "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets/codexsplit-logo-compact.png"
   "$APP_BUNDLE/Contents/Resources/OpenCodexMac_OpenCodex.bundle"
   "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app/Contents/Info.plist"
@@ -49,7 +52,7 @@ if codesign --verify --deep --strict "$APP_BUNDLE" >/dev/null 2>&1; then
     [[ "$REQUIRE_SIGNED" == "1" ]] && exit 1
   fi
 else
-  print "Code signature: not present (local beta build)"
+  print "Code signature: not present (local Ad-hoc build)"
   [[ "$REQUIRE_SIGNED" == "1" ]] && { print -u2 "A signed build is required."; exit 1; }
 fi
 

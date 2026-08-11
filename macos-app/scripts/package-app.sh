@@ -15,6 +15,15 @@ VERSION="$(node -p 'require("./package.json").version')"
 MARKETING_VERSION="${VERSION%%-*}"
 BUNDLE_VERSION="$(node -p 'const raw=require("./package.json").version; const base=raw.split("-")[0].split(".").map(Number); const beta=raw.includes("-beta.") ? Number(raw.split("-beta.")[1]) : 0; String(base[0]*1000000 + base[1]*1000 + base[2]*10 + beta)')"
 npm run build
+
+VOICE_HELPER_FILES=(minimax_tts.py transcribe.py silero_vad_daemon.py)
+for helper in "${VOICE_HELPER_FILES[@]}"; do
+  if [[ ! -f "$APP_ROOT/dist/voice/$helper" ]]; then
+    print -u2 "Missing packaged voice helper: $APP_ROOT/dist/voice/$helper"
+    exit 1
+  fi
+done
+
 swift build -c release --package-path "$PACKAGE_ROOT" --product CodexSplit
 swift build -c release --package-path "$PACKAGE_ROOT" --product CodexSplitLivePicker
 BIN_ROOT="$(swift build -c release --package-path "$PACKAGE_ROOT" --show-bin-path)"
