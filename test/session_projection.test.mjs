@@ -55,6 +55,10 @@ test("session history reads native JSONL response items and drops empty messages
       { type: "response_item", payload: { item: { type: "message", role: "assistant", content: [] } } },
       { type: "response_item", payload: { type: "custom_tool_call", id: "call-custom", call_id: "call-custom", name: "exec_command", input: "{\"cmd\":\"pwd\"}" } },
       { type: "response_item", payload: { type: "custom_tool_call_output", call_id: "call-custom", output: "/tmp" } },
+      { type: "response_item", payload: { type: "custom_tool_call", id: "call-patch", call_id: "call-patch", name: "apply_patch", input: "*** Begin Patch\n*** End Patch" } },
+      { type: "response_item", payload: { type: "custom_tool_call_output", call_id: "call-patch", output: "Done!" } },
+      { type: "response_item", payload: { type: "function_call", id: "call-mcp", call_id: "call-mcp", namespace: "mcp__codegraph", name: "codegraph_explore", arguments: "{}" } },
+      { type: "response_item", payload: { type: "function_call_output", call_id: "call-mcp", output: "result" } },
     ].map((record) => JSON.stringify(record)).join("\n") + "\n");
 
     const reconstructed = SessionHistoryService.reconstructPastMessages(sessionId);
@@ -62,11 +66,25 @@ test("session history reads native JSONL response items and drops empty messages
     assert.equal(reconstructed[1].reasoning_content, "保留的推理");
     assert.equal(reconstructed[2].tool_calls[0].id, "call-custom");
     assert.equal(reconstructed[3].tool_call_id, "call-custom");
+    assert.deepEqual(JSON.parse(reconstructed[4].tool_calls[0].function.arguments), {
+      input: "*** Begin Patch\n*** End Patch",
+    });
+    assert.equal(reconstructed[6].tool_calls[0].function.name, "mcp__codegraph__codegraph_explore");
 
     const merged = SessionHistoryService.repairAndMergeHistory([
       { role: "user", content: "当前问题" },
     ], sessionId);
-    assert.deepEqual(merged.map((message) => message.content), ["上一条问题", "上一条回答", "", "/tmp", "当前问题"]);
+    assert.deepEqual(merged.map((message) => message.content), [
+      "上一条问题",
+      "上一条回答",
+      "",
+      "/tmp",
+      "",
+      "Done!",
+      "",
+      "result",
+      "当前问题",
+    ]);
   } finally {
     if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
     else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
