@@ -100,3 +100,28 @@ test("voice streaming deduplicates repeated CDP response snapshots before TTS", 
   assert.match(source, /incoming == self\.streamResponseText/);
   assert.match(source, /incoming\.hasPrefix\(self\.streamResponseText\)/);
 });
+
+test("native macOS and voice surfaces use English-first user-facing copy", async () => {
+  const [app, gateway, picker, orb, voice, voiceManager, speechManager, info] = await Promise.all([
+    read("macos-app/Sources/OpenCodex/OpenCodexApp.swift"),
+    read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
+    read("macos-app/Sources/OpenCodex/LiveModelPicker.swift"),
+    read("macos-app/Sources/OpenCodexLivePicker/main.swift"),
+    read("voice/OpenCodexBar/Sources/OpenCodexBar/AppDelegate.swift"),
+    read("voice/OpenCodexBar/Sources/OpenCodexBar/VoiceManager.swift"),
+    read("voice/OpenCodexBar/Sources/OpenCodexBar/SpeechManager.swift"),
+    read("macos-app/Info.plist"),
+  ]);
+
+  assert.match(app, /Choose GPT-Live Model/);
+  assert.match(app, /Button\("Retry"\)/);
+  assert.match(gateway, /Starting gateway/);
+  assert.match(gateway, /Gateway startup timed out/);
+  assert.match(picker, /Choose the model that will execute this task/);
+  assert.match(orb, /Close GPT-Live orb/);
+  assert.match(voice, /Listening/);
+  assert.match(voice, /Thinking/);
+  assert.match(voiceManager, /Switched to session/);
+  assert.match(speechManager, /language: "en-US"/);
+  assert.match(info, /CodexSplit needs microphone access to use the voice bar\./);
+});

@@ -16,7 +16,7 @@ test("Live model picker is independent from OpenCodexBar", async () => {
     read("src_v2/services/live_model_picker.ts")
   ]);
 
-  assert.match(picker, /选择 GPT-Live 执行模型/);
+  assert.match(picker, /Choose GPT-Live Model/);
   assert.match(gatewayProcess, /api\/live-model-picker\/pending/);
   assert.match(gatewayProcess, /api\/live-model-picker\/resolve/);
   assert.match(picker, /\.floating/);
@@ -51,7 +51,7 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(gatewayProcess, /OPENCODEX_LIVE_PICKER_PATH/);
   assert.doesNotMatch(gatewayProcess, /adminToken = readAdminToken\(\);\s*startLiveModelPicker\(\);/);
   assert.match(floatingPicker, /rightMouseDown/);
-  assert.doesNotMatch(floatingPicker, /取消当前模型/);
+  assert.doesNotMatch(floatingPicker, /Cancel Current Model/);
   assert.doesNotMatch(dashboard, /oncontextmenu/);
   assert.match(floatingPicker, /Do not show the orb before the first authoritative gateway poll/);
   assert.match(floatingPicker, /contextPanel\.orderOut\(nil\)/);
@@ -60,5 +60,5 @@ test("Live model picker is independent from OpenCodexBar", async () => {
   assert.match(floatingPicker, /payload\.selected_model/);
   assert.match(gatewayProcess, /selected_model/);
   assert.match(gatewayProcess, /selectedModel/);
-  assert.match(app, /GPT-Live 选择执行模型/);
+  assert.match(app, /Choose GPT-Live Model/);
 });

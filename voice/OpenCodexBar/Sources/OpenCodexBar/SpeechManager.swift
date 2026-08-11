@@ -9,7 +9,7 @@ class SpeechManager {
       .trimmingCharacters(in: .whitespacesAndNewlines)
     guard !clean.isEmpty else { return }
     let utterance = AVSpeechUtterance(string: clean)
-    utterance.voice = AVSpeechSynthesisVoice(language: "zh-CN") // Prefer Chinese
+    utterance.voice = AVSpeechSynthesisVoice(language: "en-US") // Prefer English
     utterance.rate = 0.5
     utterance.volume = 1.0
     synth.stopSpeaking(at: .immediate)

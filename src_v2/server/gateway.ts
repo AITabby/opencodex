@@ -6615,7 +6615,7 @@ export class CodexBridgeServer {
             const apiKey = settings.tts_api_key || CredentialStore.readKeychainSecret("OpenCodex Voice Credential", settings.tts_credential_ref) || "";
             const baseUrl = settings.tts_base_url || "https://api.openai.com/v1";
             const model = settings.tts_model || "tts-1";
-            const voice = settings.tts_voice || "zh-CN-XiaoxiaoNeural";
+            const voice = settings.tts_voice || "en-US-AvaNeural";
 
             let audioBuf: Buffer | null = null;
             const cp = await import("node:child_process");
@@ -6967,7 +6967,7 @@ export class CodexBridgeServer {
               tts_api_key: "",
               tts_base_url: data.tts_base_url || "https://api.openai.com/v1",
               tts_model: data.tts_model || "tts-1",
-              tts_voice: data.tts_voice || "zh-CN-XiaoxiaoNeural",
+              tts_voice: data.tts_voice || "en-US-AvaNeural",
               tts_speed: typeof data.tts_speed === "number" ? data.tts_speed : 1.2,
               tts_appid: data.tts_appid || "",
               tts_resource: data.tts_resource || "",
@@ -7008,7 +7008,7 @@ export class CodexBridgeServer {
             tts_api_key: "",
             tts_base_url: "https://api.openai.com/v1",
             tts_model: "tts-1",
-            tts_voice: "zh-CN-XiaoxiaoNeural",
+            tts_voice: "en-US-AvaNeural",
             tts_speed: 1.2,
             tts_appid: "",
             tts_resource: "",

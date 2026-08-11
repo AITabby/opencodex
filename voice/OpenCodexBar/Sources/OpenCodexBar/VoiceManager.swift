@@ -182,7 +182,7 @@ class VoiceManager: NSObject {
       AppDelegate.shared?.log("[VM] Activate session: \(sid)")
       DispatchQueue.main.async {
         AppDelegate.shared?.sessionId = sid
-        AppDelegate.shared?.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+        AppDelegate.shared?.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "Switched to session: \(sid.prefix(8))...")
       }
     }
 

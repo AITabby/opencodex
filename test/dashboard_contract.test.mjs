@@ -205,6 +205,20 @@ test("dashboard exposes a persistent Chinese-English language switch", async () 
   assert.match(text, /closest\('\.session-item,\.session-message,\.log-row/);
 });
 
+test("dashboard defaults to English while preserving an explicit Chinese preference", async () => {
+  const text = await source();
+  assert.match(text, /<html lang="en">/);
+  assert.match(text, /localStorage\.getItem\('opencodex\.language'\)==='zh'\?'zh':'en'/);
+  assert.match(text, /languageState\.current==='en'\?'中文':'English'/);
+  assert.match(text, /textNodes=\[\]/);
+  assert.match(text, /\[placeholder\],\[title\],\[aria-label\],\[alt\]/);
+  assert.match(text, /raw\.match\(\/\^\\\\s\*\//);
+  assert.match(text, /GPT Account Pool/);
+  assert.match(text, /Independent GPT-Live Model Picker Orb/);
+  assert.match(text, /data\.tts_voice\|\|'en-US-AvaNeural'/);
+  assert.match(text, /engine==='edge-tts'\?'en-US-AvaNeural':'alloy'/);
+});
+
 test("dashboard exposes an explicit Desktop Bridge switch below the compact subscription card", async () => {
   const text = await source();
   for (const marker of [

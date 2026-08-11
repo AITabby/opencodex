@@ -37,13 +37,13 @@ struct OpenCodexApp: App {
                     await gateway.start()
                 }
         }
-        Window("GPT-Live 选择执行模型", id: "live-model-picker") {
+        Window("Choose GPT-Live Model", id: "live-model-picker") {
             LiveModelPickerView(gateway: gateway)
         }
         .defaultSize(width: 430, height: 245)
         .commands {
             CommandGroup(replacing: .appInfo) {
-                Button("关于 CodexSplit") {
+                Button("About CodexSplit") {
                     NSApplication.shared.orderFrontStandardAboutPanel(nil)
                 }
             }
@@ -91,7 +91,7 @@ struct RootView: View {
                 Text(gateway.state.label)
                     .font(.system(size: 13))
                     .foregroundStyle(.secondary)
-                Button("重试") { gateway.retry() }.buttonStyle(.borderedProminent)
+                Button("Retry") { gateway.retry() }.buttonStyle(.borderedProminent)
                 if !gateway.logTail.isEmpty {
                     ScrollView {
                         Text(gateway.logTail)

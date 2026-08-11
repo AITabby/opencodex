@@ -23,7 +23,7 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>CodexSplit 需要麦克风权限以使用语音栏。</string>
+	<string>CodexSplit needs microphone access to use the voice bar.</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<!-- The gateway owns one local port and one background process per user. -->

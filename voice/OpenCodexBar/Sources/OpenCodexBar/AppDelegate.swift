@@ -114,7 +114,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       DispatchQueue.main.async {
         guard let s = self else { return }
         s.sessionId = sid
-        s.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "已切换到会话: \(sid.prefix(8))...")
+        s.hudWindowController?.updateState(state: "idle", amplitude: 0, text: "Switched to session: \(sid.prefix(8))...")
         
         // Invalidate any previous query sequence and reset stream states
         s.currentQuerySequence += 1
@@ -360,7 +360,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     guard hotkeyIsDown, pressedInteractionMode == "push-to-talk", !pushToTalkActive else { return }
     pushToTalkActive = true
     log("[Hotkey] Push-to-talk pressed; interrupting current voice state and starting manual-stop capture.")
-    startListeningSession(autoStop: false, listeningText: "按住说话，松手提交") { [weak self] text in
+    startListeningSession(autoStop: false, listeningText: "Hold to talk, then release to submit") { [weak self] text in
       guard let self = self else { return }
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
       if trimmed.isEmpty || trimmed == "." || trimmed == "。" {
@@ -380,7 +380,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     log("[Hotkey] Push-to-talk released; finalizing STT.")
     statusBar.setStatus(.sending)
-    hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "正在思考...")
+    hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
     voiceManager.stopListening()
   }
 
@@ -475,14 +475,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // 4. Start active listening after a short 150ms delay to let AVAudioEngine reset
     statusBar.setStatus(.listening)
     hudWindowController?.showHUD()
-    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听...")
+    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "Listening...")
     pauseSystemMedia()
     
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
       guard let self = self else { return }
       
       self.voiceManager.amplitudeUpdateHandler = { [weak self] amp in
-        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听...")
+        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "Listening...")
       }
       
       self.voiceManager.startListening { [weak self] text in
@@ -545,11 +545,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
       
       statusBar.setStatus(.listening)
       hudWindowController?.showHUD()
-      hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听...")
+      hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "Listening...")
       pauseSystemMedia()
       
       voiceManager.amplitudeUpdateHandler = { [weak self] amp in
-        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听...")
+        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "Listening...")
       }
       
       voiceManager.startListening { [weak self] text in
@@ -574,7 +574,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     log("[Session] Reset: Session ID cleared successfully")
     
     // Notify the user visually on the HUD card!
-    hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "💬 已成功开启新会话")
+    hudWindowController?.updateState(state: "idle", amplitude: 0.0, text: "💬 New conversation started")
     
     // Play a pleasant Glass chime to notify user
     if let sound = NSSound(contentsOfFile: "/System/Library/Sounds/Glass.aiff", byReference: true) {
@@ -770,7 +770,7 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
     ]
     
     guard let jsonData = try? JSONSerialization.data(withJSONObject: bodyObj) else {
-      cb("[错误]")
+      cb("[Error]")
       return
     }
     request.httpBody = jsonData
@@ -780,14 +780,14 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
       
       if let error = error {
         self.log("[Ask Err] \(error.localizedDescription)")
-        DispatchQueue.main.async { cb("[错误]") }
+        DispatchQueue.main.async { cb("[Error]") }
         return
       }
       
       if let http = response as? HTTPURLResponse, http.statusCode != 200 {
         let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? "unknown"
         self.log("[Ask Err] HTTP \(http.statusCode): \(body)")
-        DispatchQueue.main.async { cb("[错误]") }
+        DispatchQueue.main.async { cb("[Error]") }
         return
       }
       
@@ -1543,10 +1543,10 @@ private func openPty() -> (master: FileHandle, slave: FileHandle)? {
       
       s.log("[Live Mode] Text ended. Transitioning to continuous listening standby...")
       s.statusBar.setStatus(.listening)
-      s.hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "我在听，你说吧...")
+      s.hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "I'm listening...")
       
       s.voiceManager.amplitudeUpdateHandler = { [weak self] amp in
-        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "我在听，你说吧...")
+        self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "I'm listening...")
       }
 
       // Add a safety delay of 800ms before starting recording/listening to ensure afplay output and echo are completely quiet.
@@ -2118,11 +2118,11 @@ if __name__ == "__main__":
     
     statusBar.setStatus(.listening)
     hudWindowController?.showHUD()
-    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "正在倾听指令...")
+    hudWindowController?.updateState(state: "listening", amplitude: 0.0, text: "Listening for instructions...")
     pauseSystemMedia()
 
     voiceManager.amplitudeUpdateHandler = { [weak self] amp in
-      self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "正在倾听指令...")
+      self?.hudWindowController?.updateState(state: "listening", amplitude: amp, text: "Listening for instructions...")
     }
 
     if !didPlayDropPrompt {
@@ -2153,7 +2153,7 @@ if __name__ == "__main__":
 
   private func handleDropCommandTimeout() {
     didPlayDropPrompt = true
-    self.tts("我已经收到您的文件了，请问您需要我做什么？")
+    self.tts("I received your file. What would you like me to do with it?")
   }
 
   private func processDropCommand(_ command: String) {
@@ -2167,7 +2167,7 @@ if __name__ == "__main__":
     hudWindowController?.updateState(state: "thinking", amplitude: 0.0, text: "Thinking...")
     pauseSystemMedia()
     
-    let prompt = "我往你的刘海拖入了一个文件，该文件已保存在本地路径：\(filePath) (原文件名: \(fileName))。关于这个文件，我的指令是：\"\(command)\"。请读取文件内容并执行该指令，然后直接用语音简要回答我。"
+    let prompt = "I dragged a file into your notch. It is available at the local path \(filePath) (original filename: \(fileName)). My instruction for this file is: \"\(command)\". Read the file, carry out the instruction, and respond with a concise spoken answer."
     processVoice(prompt)
   }
 

@@ -423,9 +423,9 @@ private struct LiveCardView: View {
     var body: some View {
         let models = agent.request?.models ?? agent.availableModels
         VStack(alignment: .leading, spacing: 10) {
-            Text("选择 GPT-Live 执行模型")
+            Text("Choose GPT-Live Model")
                 .font(.system(size: 17, weight: .semibold))
-            Text("Live 已准备把任务交给 Codex，请选择真正执行的模型。")
+            Text("Live is ready to hand the task to Codex. Choose the model that should execute it.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             if !models.isEmpty {
@@ -462,7 +462,7 @@ private struct LiveCardView: View {
                 }
                 .frame(maxHeight: 210)
                     if !agent.selectedModels.isEmpty {
-                        Text("当前选中模型：\(agent.selectedModels.joined(separator: ", "))")
+                        Text("Selected models: \(agent.selectedModels.joined(separator: ", "))")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
@@ -471,13 +471,13 @@ private struct LiveCardView: View {
             } else {
                 VStack(alignment: .leading, spacing: 5) {
                     if !agent.selectedModel.isEmpty {
-                        Text("当前执行模型：\(agent.selectedModel)")
+                        Text("Current execution model: \(agent.selectedModel)")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.white)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
-                    Text(agent.request == nil ? "可在 Live 开始前提前选择模型…" : "已开启，等待 Live 准备下一个任务…")
+                    Text(agent.request == nil ? "Choose a model before Live begins…" : "Enabled. Waiting for Live to prepare the next task…")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 }
@@ -506,7 +506,7 @@ private struct LiveContextMenuView: View {
 
     var body: some View {
         Button(action: onClose) {
-            Text("关闭 GPT-Live 悬浮球")
+            Text("Close GPT-Live orb")
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

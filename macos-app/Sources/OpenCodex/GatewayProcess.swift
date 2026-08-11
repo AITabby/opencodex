@@ -30,11 +30,11 @@ final class GatewayProcess: ObservableObject {
 
         var label: String {
             switch self {
-            case .idle: return "准备启动网关"
-            case .starting: return "正在启动网关…"
-            case .ready: return "网关已就绪"
+            case .idle: return "Ready to start gateway"
+            case .starting: return "Starting gateway…"
+            case .ready: return "Gateway ready"
             case .failed(let message): return message
-            case .stopped: return "网关已停止"
+            case .stopped: return "Gateway stopped"
             }
         }
     }
@@ -91,7 +91,7 @@ final class GatewayProcess: ObservableObject {
             ?? resources?.appendingPathComponent("dist/server.js")
 
         guard let serverURL else {
-            state = .failed("找不到网关入口 dist/server.js")
+            state = .failed("Gateway entry point not found: dist/server.js")
             return
         }
 
@@ -165,7 +165,7 @@ final class GatewayProcess: ObservableObject {
                     self.runtimeFileURL = nil
                 }
                 if self.state != .ready {
-                    self.state = .failed("网关启动失败（退出码 \(child.terminationStatus)）")
+                    self.state = .failed("Gateway failed to start (exit code \(child.terminationStatus))")
                 } else {
                     self.state = .stopped
                 }
@@ -178,7 +178,7 @@ final class GatewayProcess: ObservableObject {
             outputPipe = pipe
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
-            state = .failed("无法启动网关：\(error.localizedDescription)")
+            state = .failed("Could not start gateway: \(error.localizedDescription)")
             return
         }
 
@@ -187,7 +187,7 @@ final class GatewayProcess: ObservableObject {
             state = .ready
             adminToken = readAdminToken()
         } else if child.isRunning {
-            state = .failed("网关启动超时，请查看日志")
+            state = .failed("Gateway startup timed out. Check the logs for details.")
         }
     }
 
@@ -249,7 +249,7 @@ final class GatewayProcess: ObservableObject {
         let (data, response) = try await URLSession.shared.data(for: requestURL)
         guard let httpResponse = response as? HTTPURLResponse else { return false }
         guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "模型选择请求已过期"
+            let message = String(data: data, encoding: .utf8) ?? "The model selection request has expired."
             throw NSError(domain: "CodexSplitLivePicker", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: message])
         }
         return true
