@@ -32,6 +32,7 @@ test("macOS packaging carries the complete voice runtime", async () => {
   assert.match(verifyScript, /src_v2\/assets\/codexsplit-logo-compact\.png/);
   assert.match(verifyScript, /Resources\/CodexSplitLivePicker/);
   assert.match(gateway, /OPENCODEX_VOICE_RUNTIME_DIR/);
+  assert.match(gateway, /path\.join\(runtimeDir, "\.\.", "voice", name\)/);
   assert.match(gateway, /useEnergyVAD/);
   assert.match(app, /OPENCODEX_VOICE_RUNTIME_DIR/);
   assert.match(app, /OPENCODEX_VOICE_BAR_PATH/);
