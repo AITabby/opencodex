@@ -1,8 +1,31 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CodexBridgeServer } from "../dist/server/gateway.js";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
+
+test("packaged gateway resolves voice helpers outside the repository cwd", async () => {
+  const sandbox = await mkdtemp(join(tmpdir(), "codexsplit-voice-path-"));
+  const previousCwd = process.cwd();
+  process.chdir(sandbox);
+
+  try {
+    const server = new CodexBridgeServer(0);
+    assert.doesNotThrow(() => server.ensurePythonScripts());
+
+    const [bundled, installed] = await Promise.all([
+      readFile(new URL("../dist/voice/minimax_tts.py", import.meta.url), "utf8"),
+      readFile("/tmp/ocb_minimax_tts.py", "utf8"),
+    ]);
+    assert.equal(installed, bundled);
+  } finally {
+    process.chdir(previousCwd);
+    await rm(sandbox, { recursive: true, force: true });
+  }
+});
 
 test("macOS packaging carries the complete voice runtime", async () => {
   const [packageScript, verifyScript, gateway, app, server, start] = await Promise.all([
