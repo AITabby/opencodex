@@ -655,5 +655,16 @@ function installDesktopBridgePreferenceState(){
   render();window.setTimeout(render,0);
 }
 installDesktopBridgePreferenceState();
+function installOfficialModelFilterControls(){
+  const view=q('#view-settings'),grid=view&&view.querySelector('.panel-grid');
+  if(!grid||q('#official-model-filter-card'))return;
+  const card=document.createElement('article');card.id='official-model-filter-card';card.className='card gateway-card';
+  card.innerHTML='<div class="card-head"><div><h2>Codex 官方模型筛选</h2><p class="help">只调整官方模型在 Desktop 选择器中的显示；第三方 Provider 模型不受影响。</p></div><button id="official-model-filter-save" class="button primary">保存筛选</button></div><label class="setting" style="justify-content:flex-start"><input id="official-model-filter-enabled" type="checkbox" style="width:18px;height:18px;accent-color:var(--cyan)"><span style="margin:0">启用官方模型筛选</span></label><div id="official-model-filter-list" class="settings-stack" style="margin-top:12px"><div class="empty">正在读取官方模型…</div></div>';
+  grid.appendChild(card);
+  const load=async function(){try{const data=await api('/api/official-model-filter'),settings=data.settings||{},selected=new Set(settings.visible_models||[]);q('#official-model-filter-enabled').checked=settings.enabled===true;q('#official-model-filter-list').innerHTML=(data.models||[]).map(function(model){const slug=model.slug||'';return '<label class="setting" style="justify-content:flex-start"><input data-official-model="'+esc(slug)+'" type="checkbox" '+(selected.has(slug.toLowerCase())?'checked':'')+' style="width:18px;height:18px;accent-color:var(--cyan)"><span style="margin:0"><b>'+esc(model.display_name||slug)+'</b><span>'+esc(slug)+'</span></span></label>'}).join('')||'<div class="empty">未读取到 Codex 官方模型。</div>'}catch(e){q('#official-model-filter-list').innerHTML='<div class="empty">'+esc(e.message)+'</div>'}};
+  q('#official-model-filter-save').onclick=async function(){const button=this,visible=Array.from(document.querySelectorAll('[data-official-model]:checked')).map(function(input){return input.dataset.officialModel});try{await runButton(button,{loading:'保存中…',success:'保存成功',failure:'保存失败'},function(){return post('/api/official-model-filter',{enabled:q('#official-model-filter-enabled').checked,visible_models:visible})});toast('官方模型筛选已保存；重启 Codex 后应用模型菜单')}catch(e){toast(e.message,true)}};
+  load();
+}
+installOfficialModelFilterControls();
 </script></body></html>`;
 }

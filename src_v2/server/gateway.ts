@@ -35,6 +35,7 @@ import { SubscriptionAccountPool, SUBSCRIPTION_ACCOUNT_PROVIDERS, type Subscript
 import { SUBSCRIPTION_LOGIN_CAPABILITIES, SubscriptionAccountLoginService } from "../services/subscription_account_auth.js";
 import { API_PROVIDER_PRESETS } from "../services/provider_presets.js";
 import { SUBSCRIPTION_TRANSPORTS } from "../services/provider_transports.js";
+import { applyOfficialModelFilter, readOfficialModelFilterSettings, writeOfficialModelFilterSettings } from "../services/official_model_filter.js";
 import { bindResponseAbort, linkAbortSignal, readWithAbortAndTimeout } from "../services/request_lifecycle.js";
 import { APP_VERSION } from "../version.js";
 
@@ -1774,6 +1775,13 @@ export function preserveOfficialModels(catalog: any): void {
     usedSlugs.add(alias.toLowerCase());
     thirdParty.push(restored);
   }
+
+  // Filtering applies only to the native entries. Provider-owned models keep
+  // their existing visibility and routing regardless of this preference.
+  applyOfficialModelFilter(
+    Array.from(officialMap.values()),
+    readOfficialModelFilterSettings(opencodexDataDir()),
+  );
 
   // Official native entries are deliberately first; the web endpoint filters
   // them out, while the desktop client receives them before third-party ones.
@@ -8247,6 +8255,35 @@ export class CodexBridgeServer {
           }
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ catalog }));
+          return;
+        }
+
+        if (req.method === "GET" && url.pathname === "/api/official-model-filter") {
+          const settings = readOfficialModelFilterSettings(opencodexDataDir());
+          const models = Array.from(readOfficialModelMap().values()).map((model: any) => ({
+            slug: catalogModelSlug(model),
+            display_name: String(model?.display_name || model?.name || catalogModelSlug(model)),
+          }));
+          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+          res.end(JSON.stringify({ settings, models }));
+          return;
+        }
+
+        if (req.method === "POST" && url.pathname === "/api/official-model-filter") {
+          try {
+            const settings = writeOfficialModelFilterSettings(opencodexDataDir(), await this.parseJsonBody(req));
+            const catalogPath = path.join(opencodexDataDir(), "custom_model_catalog.json");
+            if (fs.existsSync(catalogPath)) {
+              const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+              preserveOfficialModels(catalog);
+              writePrivateTextFile(catalogPath, JSON.stringify(catalog, null, 2));
+            }
+            res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+            res.end(JSON.stringify({ settings }));
+          } catch (err: any) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: err.message }));
+          }
           return;
         }
 

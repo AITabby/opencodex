@@ -17,6 +17,43 @@ import {
 import { clearProviderModelSelections } from "../dist/services/credential_store.js";
 import { buildConfiguredProviderCatalogEntries, buildManagedCodexConfig, deriveProviderNamespace, isFreshDesktopRestartMarker, migrateProviderCatalogOwner, preserveOfficialModels, resolveDesktopBridgeStatus, resolveDesktopRestartMode, shouldReconcilePreferredBridgeAfterGatewayReady, stripManagedCodexConfig, stripOwnedLegacyComputerUseConfig, upsertProviderCatalogModel } from "../dist/server/gateway.js";
 import { readRoutingCatalog } from "../dist/services/task_router.js";
+import { applyOfficialModelFilter, normalizeOfficialModelFilterSettings } from "../dist/services/official_model_filter.js";
+
+test("official model filter hides only unselected native models", () => {
+  const official = [
+    { slug: "gpt-5.6-sol", visibility: "hide" },
+    { slug: "gpt-5.5", visibility: "list" },
+  ];
+  const thirdParty = { slug: "grok/grok-4", visibility: "list" };
+  applyOfficialModelFilter(official, { enabled: true, visible_models: ["GPT-5.6-SOL"] });
+  assert.equal(official[0].visibility, "list");
+  assert.equal(official[1].visibility, "hide");
+  assert.equal(thirdParty.visibility, "list");
+});
+
+test("official model filter is disabled by default and deduplicates selections", () => {
+  const models = [{ slug: "gpt-5.5", visibility: "list" }];
+  applyOfficialModelFilter(models, {});
+  assert.equal(models[0].visibility, "list");
+  assert.deepEqual(normalizeOfficialModelFilterSettings({
+    enabled: true,
+    visible_models: [" GPT-5.6-SOL ", "gpt-5.6-sol", ""],
+  }), { enabled: true, visible_models: ["gpt-5.6-sol"] });
+});
+
+test("disabling the official model filter restores native visibility", () => {
+  const models = [
+    { slug: "gpt-visible", visibility: "list" },
+    { slug: "gpt-internal", visibility: "hide" },
+    { slug: "gpt-default" },
+  ];
+  applyOfficialModelFilter(models, { enabled: true, visible_models: ["gpt-internal"] });
+  applyOfficialModelFilter(models, { enabled: false });
+  assert.equal(models[0].visibility, "list");
+  assert.equal(models[1].visibility, "hide");
+  assert.equal(Object.hasOwn(models[2], "visibility"), false);
+  assert.equal(models.some((model) => Object.hasOwn(model, "codexsplit_original_visibility")), false);
+});
 
 test("catalog entries preserve the selected upstream protocol", () => {
   const responses = buildFullCatalogEntry("opencode/deepseek-v4-flash", "opencode", undefined, "responses");

@@ -163,7 +163,11 @@ Key 只属于这个 Provider，密钥保存在 macOS Keychain；前端只显示�
 
 网关停止后，第三方请求没有 <code>8765</code> 可达；官方 GPT 和官方 GPT-Live 仍由原生路径负责。若 Bridge 已经开启，停止网关不会把已保存的 Bridge 状态改成关闭；要恢复原生模式，使用 Desktop Bridge 开关关闭或使用“恢复原生 Codex”。
 
-### 5. 独立启动、停止和检查 <code>8765</code>
+### 5. 筛选 Codex 官方模型
+
+在“应用与安全 → Codex 官方模型筛选”中，可以只勾选希望出现在 Desktop 模型选择器中的官方模型。该设置只修改官方 Codex 模型的显示状态，不会隐藏、删除或改写 DeepSeek、Grok、Kimi 等第三方 Provider 模型；关闭筛选会恢复官方模型原有的可见性。
+
+### 6. 独立启动、停止和检查 <code>8765</code>
 
 从源码运行：
 
@@ -533,7 +537,11 @@ On the Desktop Bridge card:
 
 When the gateway is stopped, third-party requests have no reachable <code>8765</code> route. Official GPT and official GPT-Live remain owned by their native paths. Stopping the gateway does not itself erase the saved Bridge preference; use the Bridge switch or **Restore Native Codex** when you want native Desktop mode.
 
-### 5. Start, stop, and inspect <code>8765</code>
+### 5. Filter official Codex models
+
+Under **App & Security → Official Codex Model Filter**, select which official models should appear in the Desktop picker. This setting only changes official Codex model visibility; it never hides, deletes, or rewrites third-party Provider models such as DeepSeek, Grok, or Kimi. Disabling the filter restores the official models' original visibility.
+
+### 6. Start, stop, and inspect <code>8765</code>
 
 Run from source:
 

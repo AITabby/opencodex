@@ -188,6 +188,16 @@ test("dashboard keeps provider configuration compact and exposes an OAuth add fl
   assert.doesNotMatch(text, /characterData:true/);
 });
 
+test("dashboard exposes an official Codex model filter without touching provider models", async () => {
+  const text = await source();
+  for (const marker of [
+    "official-model-filter-card",
+    "Codex 官方模型筛选",
+    "/api/official-model-filter",
+    "第三方 Provider 模型不受影响",
+  ]) assert.ok(text.includes(marker), `missing official model filter marker: ${marker}`);
+});
+
 test("provider configuration does not show catalog placeholder models before discovery", async () => {
   const text = await source();
   assert.doesNotMatch(text, /seededModels/);
