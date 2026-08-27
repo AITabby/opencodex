@@ -7,9 +7,9 @@
     <key>CFBundleName</key>
     <string>CodexSplit Voice Bar</string>
     <key>CFBundleVersion</key>
-    <string>2000010</string>
+    <string>2000020</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0.1</string>
+    <string>2.0.2</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>CodexSplit requires microphone access for voice command input and transcription.</string>
 </dict>

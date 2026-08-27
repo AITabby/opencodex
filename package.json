@@ -1,6 +1,6 @@
 {
   "name": "codexsplit",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "CodexSplit - The local Codex model routing gateway, provider workspace and Computer Use companion",
   "type": "module",
   "scripts": {

@@ -34,7 +34,7 @@ TTS 支持 API 引擎和 macOS 系统语音。选择 macOS 系统语音时直接
 ./macos-app/scripts/package-dmg.sh
 ```
 
-2.0.1 产物为 `macos-app/build/CodexSplit-2.0.1-arm64.dmg`。当前是本地 arm64 Ad-hoc 签名构建；正式分发前还需要 Apple Developer 签名和公证。
+2.0.2 产物为 `macos-app/build/CodexSplit-2.0.2-arm64.dmg`。当前是本地 arm64 Ad-hoc 签名构建；正式分发前还需要 Apple Developer 签名和公证。
 
 DMG 采用标准拖拽安装方式：打开镜像后，把 `CodexSplit.app` 拖到旁边的 `Applications` 快捷入口，应用就会安装到 `/Applications`。DMG 本身不会在用户打开镜像时静默复制或自动安装应用；如果需要全自动安装，应另外制作 `.pkg` 安装包。
 
