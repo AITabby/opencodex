@@ -655,7 +655,7 @@ test("native vision failure ends only the current turn after the original image 
         role: "user",
         content: [
           { type: "input_text", text: "帮我看看这张图" },
-          { type: "input_image", image_url: "data:image/png;base64,TEST_FAILURE_CASE" },
+          { type: "input_image", image_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=" },
         ],
       }],
       stream: true,

@@ -9,10 +9,10 @@ import { once } from "node:events";
 import readline from "node:readline";
 import { createServer } from "node:http";
 
-// These cases exercise the retired JSON-RPC/session supervisor as a
-// compatibility diagnostic. Production app-server launches use the thin
-// request-scoped Egress path by default; the dedicated bridge regression test
-// covers that default above the legacy protocol suite.
+// These cases exercise the JSON-RPC/session supervisor used by Desktop
+// app-server launches. Standalone CLI invocations remain on the thin
+// request-scoped Egress path; the dedicated bridge regression test covers that
+// path above this protocol suite.
 process.env.OPENCODEX_LEGACY_PROVIDER_BRIDGE = "1";
 
 const fakeNativeSource = `#!/usr/bin/env node
@@ -483,7 +483,16 @@ test("provider bridge keeps a resumed third-party thread on the native app-serve
     send({
       id: 4,
       method: "turn/start",
-      params: { threadId: "thread-1", model: null, input: [] },
+      params: {
+        threadId: "thread-1",
+        model: null,
+        collaborationMode: {
+          mode: "default",
+          settings: { model: "antigravity/gemini-3.6-flash-medium" },
+        },
+        responsesapiClientMetadata: { workspace_kind: "local" },
+        input: [],
+      },
     });
     const turn = await waitForResponse(messages, 4);
     assert.equal(turn.error, undefined);
@@ -494,6 +503,11 @@ test("provider bridge keeps a resumed third-party thread on the native app-serve
       && entry.params?.client_metadata?.opencodex_model_override === "antigravity/gemini-3.6-flash-medium",
     ));
     assert.equal(traceAfterProviderTurn.some((entry) => entry.runtimeProvider === "opencodex"), false);
+    const nativeProviderTurn = traceAfterProviderTurn.find((entry) =>
+      entry.runtimeProvider === "openai" && entry.method === "turn/start"
+    );
+    assert.equal(nativeProviderTurn.params.collaborationMode, undefined);
+    assert.equal(nativeProviderTurn.params.responsesapiClientMetadata, undefined);
 
     send({
       id: 5,
@@ -512,6 +526,26 @@ test("provider bridge keeps a resumed third-party thread on the native app-serve
     assert.equal(nativeTurn.result.thread.id, "thread-1");
     assert.equal(nativeTurn.result.thread.modelProvider, "openai");
     assert.equal((await readFile(traceFile, "utf8")).includes('"runtimeProvider":"opencodex"'), false);
+
+    // A fresh Desktop turn can carry the picker selection only in
+    // collaborationMode.settings.model. It must override the native route
+    // model instead of silently spending the GPT quota.
+    send({
+      id: 7,
+      method: "turn/start",
+      params: {
+        threadId: "thread-1",
+        model: null,
+        collaborationMode: {
+          mode: "default",
+          settings: { model: "antigravity/gemini-3.6-flash-medium" },
+        },
+        input: [],
+      },
+    });
+    const nestedProviderTurn = await waitForResponse(messages, 7);
+    assert.equal(nestedProviderTurn.error, undefined);
+    assert.equal(nestedProviderTurn.result.thread.modelProvider, "opencodex");
   } finally {
     output.close();
     bridge.kill("SIGTERM");
@@ -979,6 +1013,14 @@ test("a third-party image attachment keeps native Codex semantics and remains is
   try {
     send({ id: 41, method: "initialize", params: {} });
     assert.deepEqual(await waitForResponse(messages, 41), { id: 41, result: {} });
+    send({
+      id: 40,
+      method: "config/batchWrite",
+      params: {
+        edits: [{ keyPath: ["openai_base_url"], value: "http://stale-desktop-config/v1" }],
+      },
+    });
+    assert.deepEqual(await waitForResponse(messages, 40), { id: 40, result: {} });
 
     send({ id: 42, method: "thread/start", params: { model: "gpt-5.5" } });
     assert.equal((await waitForResponse(messages, 42)).error, undefined);
@@ -1015,7 +1057,10 @@ test("a third-party image attachment keeps native Codex semantics and remains is
     const nativeTurn = trace.find((entry) => entry.runtimeProvider === "openai" && entry.method === "turn/start"
       && JSON.stringify(entry.params?.input || []).includes("iVBORw0KGgo"));
     assert.equal(nativeTurn?.params?.input?.some((item) => item.type === "image" && item.url === "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="), true);
+    assert.equal(nativeTurn?.params?.model, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(nativeTurn?.params?.modelProvider, "opencodex");
     assert.equal(nativeTurn?.params?.client_metadata?.opencodex_model_override, "antigravity/gemini-3.6-flash-medium");
+    assert.equal(trace.some((entry) => entry.method === "config/batchWrite"), false);
     assert.equal(trace.some((entry) => entry.method === "thread/inject_items"), false);
     assert.equal(trace.some((entry) => entry.runtimeProvider === "opencodex"), false);
 
@@ -1378,6 +1423,7 @@ test("third-party sessions remain visible after the bridge restarts", async () =
       entry.id === "restartable-thirdparty"
       && entry.model === "antigravity/gemini-3.6-flash-medium",
     ));
+    assert.equal(firstList.result.data.every((entry) => Array.isArray(entry.turns)), true);
 
     first.output.close();
     first.bridge.kill("SIGTERM");
@@ -1392,6 +1438,7 @@ test("third-party sessions remain visible after the bridge restarts", async () =
       entry.id === "restartable-thirdparty"
       && entry.model === "antigravity/gemini-3.6-flash-medium",
     ));
+    assert.equal(restartedList.result.data.every((entry) => Array.isArray(entry.turns)), true);
 
     const movedPath = join(tempRoot, "archived-rollout.jsonl");
     await writeFile(movedPath, "durable rollout\n", "utf8");
@@ -1571,7 +1618,7 @@ test("an archived provider route is restored before the bridge resumes it", asyn
     assert.ok(trace.indexOf(resumeEntries[1]) > readIndex);
     assert.equal(resumeEntries[0].params.path, archivedPath);
     assert.equal(resumeEntries[0].params.model, "gpt-5.5");
-    assert.equal(resumeEntries[0].params.modelProvider, "openai");
+    assert.equal(resumeEntries[0].params.modelProvider, "opencodex");
     assert.equal(resumeEntries[1].params.path, activePath);
 
     const savedRoutes = JSON.parse(await readFile(routePath, "utf8"));
@@ -1680,7 +1727,7 @@ test("opening a thread with the current provider picker does not rebind its pers
     assert.equal(nativeReads.at(-1).params.model, "gpt-5.5");
     assert.equal(nativeReads.at(-1).params.modelProvider, "openai");
     assert.equal(nativeResumes.at(-1).params.model, "gpt-5.5");
-    assert.equal(nativeResumes.at(-1).params.modelProvider, "openai");
+    assert.equal(nativeResumes.at(-1).params.modelProvider, "opencodex");
 
     const savedRoutes = JSON.parse(await readFile(routePath, "utf8"));
     assert.equal(savedRoutes.threads[externalId].selectedModel, selectedProviderModel);

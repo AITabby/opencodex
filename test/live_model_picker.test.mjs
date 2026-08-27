@@ -4,7 +4,7 @@ import {
   extractLiveModelIntent,
   isLikelyLiveModelIntentRequest,
   isLikelyLiveWorkRequest,
-  isLiveModelPickerEntryVisible,
+  isLiveModelEntryVisible,
   isToolContinuation,
   liveModelSessionKey,
   normalizeRealtimeWorkModel,
@@ -22,10 +22,10 @@ test("Live model picker keeps official models before third-party models", () => 
 });
 
 test("Live model picker hides internal and non-API catalog entries", () => {
-  assert.equal(isLiveModelPickerEntryVisible({ slug: "gpt-5.6-sol-wm", visibility: "hide", supported_in_api: false }), false);
-  assert.equal(isLiveModelPickerEntryVisible({ slug: "internal-alias", visibility: "hidden" }), false);
-  assert.equal(isLiveModelPickerEntryVisible({ slug: "provider/model", supported_in_api: true }), true);
-  assert.equal(isLiveModelPickerEntryVisible({ slug: "provider/model" }), true);
+  assert.equal(isLiveModelEntryVisible({ slug: "gpt-5.6-sol-wm", visibility: "hide", supported_in_api: false }), false);
+  assert.equal(isLiveModelEntryVisible({ slug: "internal-alias", visibility: "hidden" }), false);
+  assert.equal(isLiveModelEntryVisible({ slug: "provider/model", supported_in_api: true }), true);
+  assert.equal(isLiveModelEntryVisible({ slug: "provider/model" }), true);
 });
 
 test("Live voice intent selects one uniquely named model", () => {

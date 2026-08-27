@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   normalizeLegacyImageRequestBody,
   normalizeLegacyTurnInput,
+  sanitizeInvalidImageData,
   splitLegacyImageText,
 } from "../dist/services/image_input.js";
 
@@ -64,6 +65,23 @@ test("normal Responses and Chat image paths become original data URLs", () => {
 
 test("legacy image splitter leaves ordinary text untouched", () => {
   assert.equal(splitLegacyImageText("这不是附件", "responses"), null);
+});
+
+test("provider-bound image sanitization removes malformed and truncated inline images", () => {
+  const body = {
+    messages: [{
+      role: "tool",
+      content: [
+        { type: "image_url", image_url: { url: "data:image/png;base64,SCREENSHOT" } },
+        { type: "input_text", text: "可继续使用这段状态" },
+      ],
+    }],
+  };
+  const result = sanitizeInvalidImageData(body);
+  assert.equal(result.removed, 1);
+  assert.equal(result.body.messages[0].content[0].type, "text");
+  assert.match(result.body.messages[0].content[0].text, /Invalid image data omitted/);
+  assert.equal(result.body.messages[0].content[1].text, "可继续使用这段状态");
 });
 
 test("native localImage input becomes an unmodified data URL for a third-party turn", () => {

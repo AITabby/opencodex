@@ -2,16 +2,21 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { convertToolsToChatTools, responsesInputToChatMessages, transformResponsesToChat } from "../dist/core/transformer.js";
 import { ResponsesStreamEngine } from "../dist/core/stream_engine.js";
+import { GoogleGeminiAdapter } from "../dist/adapters/google.js";
 import {
   NATIVE_COMPUTER_USE_EXECUTOR_NAMES,
   NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS,
+  acceptNativeComputerUseResult,
   appendComputerUseInstructions,
+  beginNativeComputerUseResultBridge,
+  ensureNativeComputerUseResponsesTool,
   hasComputerUseTool,
   isComputerUseDiscoveryToolName,
   nativeComputerUseMcpDescriptor,
   normalizeComputerUseResponsesTools,
-  normalizeNativeComputerUseToolArguments,
   normalizeNativeComputerUseResponsesPayload,
+  normalizeNativeComputerUseToolArguments,
+  restoreNativeComputerUseResultOutputs,
 } from "../dist/services/computer_use_native.js";
 
 test("Responses computer descriptors become the real Codex native executor", () => {
@@ -88,6 +93,27 @@ test("ordinary third-party requests do not receive a gateway-specific Computer U
   assert.equal(names.includes("mcp__node_repl_js"), false);
 });
 
+test("standard node-repl MCP descriptors become the native Computer Use executor", () => {
+  const descriptor = {
+    type: "mcp",
+    server_label: "node_repl",
+    server_url: "local",
+    allowed_tools: ["js"],
+    require_approval: "never",
+  };
+  assert.equal(hasComputerUseTool([descriptor]), true);
+  const tools = convertToolsToChatTools([descriptor], "mcp-descriptor-turn");
+  assert.equal(tools.some((tool) => tool.function?.name === "mcp__node_repl_js"), true);
+});
+
+test("catalog-enabled models receive native Computer Use even when the client omits the descriptor", () => {
+  const tools = ensureNativeComputerUseResponsesTool([
+    { type: "function", name: "exec_command", parameters: { type: "object" } },
+  ], true);
+  assert.equal(tools?.some((tool) => tool.name === "mcp__node_repl_js"), true);
+  assert.equal(tools?.filter((tool) => tool.name === "mcp__node_repl_js").length, 1);
+});
+
 test("native Computer Use instruction names the Codex executor and forbids discovery", () => {
   const instructions = appendComputerUseInstructions("Base instructions", [{ type: "computer" }]);
   assert.match(instructions, /native node-repl executor/);
@@ -102,6 +128,184 @@ test("native Computer Use instruction names the Codex executor and forbids disco
   assert.match(instructions, /never redeclare an existing top-level/);
   assert.match(instructions, /Do not search for or list MCP servers/);
   assert.equal(appendComputerUseInstructions("Base instructions", []).includes(NATIVE_COMPUTER_USE_SYSTEM_INSTRUCTIONS), false);
+});
+
+test("native Computer Use instructions document the node-repl output and scroll contract", () => {
+  const instructions = appendComputerUseInstructions("Base instructions", [{ type: "computer" }]);
+  assert.match(instructions, /nodeRepl\.write/);
+  assert.match(instructions, /direction: 'up'\|'down'\|'left'\|'right'/);
+  assert.match(instructions, /pages\?: number/);
+  assert.match(instructions, /never reuse an element index/);
+});
+
+test("native Computer Use restores duration-only MCP output through an in-memory sideband", () => {
+  const callId = `call-sideband-${Date.now()}`;
+  const itemId = `fc-sideband-${Date.now()}`;
+  const token = beginNativeComputerUseResultBridge(callId, itemId);
+  assert.equal(typeof token, "string");
+  assert.equal(acceptNativeComputerUseResult(token, { text: "fresh accessibility tree", images: [] }), true);
+
+  const restored = restoreNativeComputerUseResultOutputs({
+    input: [{
+      type: "function_call_output",
+      id: itemId,
+      output: "Wall time: 0.1 seconds\nOutput:\n{\"execution_duration_ms\":57}",
+    }],
+  });
+  assert.equal(restored.recovered, 1);
+  assert.equal(restored.body.input[0].output, "fresh accessibility tree");
+
+  const realOutput = restoreNativeComputerUseResultOutputs({
+    input: [{ type: "function_call_output", call_id: callId, output: "already preserved" }],
+  });
+  assert.equal(realOutput.recovered, 0);
+  assert.equal(realOutput.body.input[0].output, "already preserved");
+});
+
+test("native Computer Use can recover a result from the wrapper token when ids change", () => {
+  const token = beginNativeComputerUseResultBridge(
+    `call-token-source-${Date.now()}`,
+    `fc-token-source-${Date.now()}`,
+  );
+  assert.equal(acceptNativeComputerUseResult(token, { text: "fresh state after scroll", images: [] }), true);
+  const wrappedArguments = JSON.parse(normalizeNativeComputerUseToolArguments(
+    JSON.stringify({ code: "nodeRepl.write('state')" }),
+    { resultToken: token },
+  )).code;
+
+  const restored = restoreNativeComputerUseResultOutputs({
+    input: [
+      { type: "function_call", call_id: "history-call-id", arguments: wrappedArguments },
+      {
+        type: "function_call_output",
+        call_id: "history-call-id",
+        output: "Output: {\"execution_duration_ms\":12}",
+      },
+    ],
+  });
+  assert.equal(restored.recovered, 1);
+  assert.equal(restored.body.input[1].output, "fresh state after scroll");
+});
+
+test("native Computer Use wrapper reports text and screenshots without changing the executor", () => {
+  const wrapped = JSON.parse(normalizeNativeComputerUseToolArguments(
+    JSON.stringify({ code: "nodeRepl.write('state')" }),
+    { resultToken: "token-test" },
+  ));
+  assert.doesNotMatch(wrapped.code, /new Proxy/);
+  assert.match(wrapped.code, /plain facade/);
+  assert.match(wrapped.code, /__opencodexOriginalNodeRepl\.write/);
+  assert.match(wrapped.code, /__opencodexOriginalNodeRepl\.emitImage/);
+  assert.match(wrapped.code, /nodeRepl, console/);
+  assert.match(wrapped.code, /token-test/);
+  assert.match(wrapped.code, /opencodex-native-computer-use-token-test\.json/);
+  assert.match(wrapped.code, /nodeRepl\.write\('state'\)/);
+});
+
+test("Gemini adapter exposes and restores the native Computer Use function call", () => {
+  const adapter = new GoogleGeminiAdapter();
+  const thoughtSignature = "provider-thought-signature";
+  const payload = adapter.transformPayload({
+    model: "gemini-3.6-flash-medium",
+    messages: [
+      { role: "user", content: "打开 Chrome" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call-cu-gemini",
+          type: "function",
+          thought_signature: thoughtSignature,
+          function: { name: "mcp__node_repl_js", arguments: "{}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call-cu-gemini", content: "完成" },
+    ],
+    tools: [{
+      type: "function",
+      function: {
+        name: "mcp__node_repl_js",
+        description: "Native Computer Use",
+        parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] },
+      },
+    }],
+    stream: true,
+  }).body;
+
+  assert.deepEqual(
+    payload.tools?.[0]?.functionDeclarations?.map((tool) => tool.name),
+    ["mcp__node_repl_js"],
+  );
+  assert.equal(payload.contents?.[1]?.parts?.[0]?.thoughtSignature, thoughtSignature);
+  assert.equal(payload.contents?.[2]?.parts?.[0]?.functionResponse?.name, "mcp__node_repl_js");
+
+  const legacyPayload = adapter.transformPayload({
+    model: "gemini-3.6-flash-medium",
+    messages: [
+      { role: "user", content: "继续" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call-legacy",
+          type: "function",
+          function: { name: "mcp__node_repl_js", arguments: "{}" },
+        }],
+      },
+      { role: "tool", tool_call_id: "call-legacy", content: "旧工具结果" },
+    ],
+  }).body;
+  assert.equal(legacyPayload.contents?.some((content) => content.parts?.some((part) => part.functionCall)), false);
+  assert.doesNotMatch(JSON.stringify(legacyPayload.contents), /previous tool (call|result)/i);
+  assert.doesNotMatch(JSON.stringify(legacyPayload.contents), /旧工具结果/);
+
+  const legacyScreenshotPayload = adapter.transformPayload({
+    model: "gemini-3.6-flash-medium",
+    messages: [
+      { role: "user", content: "继续看屏幕" },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "call-legacy-image",
+          type: "function",
+          function: { name: "mcp__node_repl_js", arguments: "{}" },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call-legacy-image",
+        content: [
+          { type: "text", text: "internal accessibility tree" },
+          { type: "image_url", image_url: "data:image/png;base64,c2NyZWVuc2hvdA==" },
+        ],
+      },
+    ],
+  }).body;
+  assert.equal(legacyScreenshotPayload.contents?.some((content) =>
+    content.parts?.some((part) => part.inlineData?.data === "c2NyZWVuc2hvdA=="),
+  ), true);
+  assert.doesNotMatch(JSON.stringify(legacyScreenshotPayload.contents), /internal accessibility tree/);
+
+  const chunks = adapter.processStreamChunk({
+    candidates: [{ content: { parts: [{ functionCall: { name: "mcp__node_repl_js", args: { code: "nodeRepl.write('ok')" } }, thoughtSignature }] } }],
+  });
+  assert.equal(chunks[0]?.choices?.[0]?.delta?.tool_calls?.[0]?.function?.name, "mcp__node_repl_js");
+  assert.equal(chunks[0]?.choices?.[0]?.delta?.tool_calls?.[0]?.thought_signature, thoughtSignature);
+});
+
+test("Gemini adapter drops an orphaned terminal model turn without inventing a prompt", () => {
+  const adapter = new GoogleGeminiAdapter();
+  const payload = adapter.transformPayload({
+    model: "gemini-3.7-flash-medium",
+    messages: [
+      { role: "user", content: "继续操作浏览器" },
+      { role: "assistant", content: "我先检查当前页面。" },
+    ],
+  }).body;
+
+  assert.equal(payload.contents.at(-1)?.role, "user");
+  assert.notEqual(payload.contents.at(-1)?.parts?.[0]?.text, "Continue from the previous tool result.");
 });
 
 test("Responses Computer Use descriptors become a direct function tool for third-party providers", () => {
@@ -125,7 +329,7 @@ test("Responses Computer Use descriptors become a direct function tool for third
   });
   assert.equal(payload.item.name, "js");
   assert.equal(payload.item.namespace, "mcp__node_repl");
-  assert.match(payload.item.arguments, /setupComputerUseRuntime/);
+  assert.match(payload.item.arguments, /import\('@oai\/sky'\)/);
 
   const nativeCallIds = new Set(["call_2"]);
   const completedArguments = normalizeNativeComputerUseResponsesPayload({
@@ -172,7 +376,7 @@ test("native node-repl calls are emitted to the Codex client", async () => {
   assert.equal(call?.item?.call_id, "call-cu-1");
   assert.match(call?.item?.id || "", /^fc_[A-Za-z0-9_-]+$/);
   const completedCall = events.find((event) => event.type === "response.output_item.done" && event.item?.type === "function_call");
-  assert.match(completedCall?.item?.arguments || "", /setupComputerUseRuntime/);
+  assert.match(completedCall?.item?.arguments || "", /import\('@oai\/sky'\)/);
   assert.match(completedCall?.item?.arguments || "", /opencodex-native-computer-use-call/);
   assert.equal(events.some((event) => event.item?.type === "function_call"), true);
   assert.equal(events.some((event) => event.type === "response.function_call_arguments.delta"), true);
@@ -180,6 +384,28 @@ test("native node-repl calls are emitted to the Codex client", async () => {
   assert.equal(events.some((event) => event.type.startsWith("response.mcp_call")), false);
   assert.equal(events.find((event) => event.type === "response.completed")?.response?.output?.[0]?.type, "function_call");
   assert.equal(events.some((event) => event.type === "response.completed"), true);
+});
+
+test("native tool metadata is present in every Responses completion boundary", async () => {
+  const events = [];
+  const engine = new ResponsesStreamEngine("third-party", "cu-signature-turn");
+  const emit = async (event) => events.push(event);
+
+  await engine.start(emit);
+  await engine.processChatChunk(emit, {
+    choices: [{ delta: { tool_calls: [{
+      index: 0,
+      id: "call-cu-signature",
+      thought_signature: "provider-signature",
+      function: { name: "mcp__node_repl_js", arguments: "{}" },
+    }] } }],
+  });
+  await engine.finish(emit);
+
+  const added = events.find((event) => event.type === "response.output_item.added" && event.item?.type === "function_call");
+  const completed = events.find((event) => event.type === "response.completed");
+  assert.equal(added?.item?.thought_signature, "provider-signature");
+  assert.equal(completed?.response?.output?.find((item) => item.type === "function_call")?.thought_signature, "provider-signature");
 });
 
 test("native Computer Use keeps explanatory text in commentary before the first tool call", async () => {

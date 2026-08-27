@@ -25,7 +25,6 @@ for helper in "${VOICE_HELPER_FILES[@]}"; do
 done
 
 swift build -c release --package-path "$PACKAGE_ROOT" --product CodexSplit
-swift build -c release --package-path "$PACKAGE_ROOT" --product CodexSplitLivePicker
 BIN_ROOT="$(swift build -c release --package-path "$PACKAGE_ROOT" --show-bin-path)"
 
 NODE_BINARY="${OPENCODEX_NODE_BINARY:-$(command -v node)}"
@@ -141,7 +140,6 @@ done
 iconutil -c icns "$ICONSET" -o "$APP_BUNDLE/Contents/Resources/CodexSplit.icns"
 
 cp "$BIN_ROOT/CodexSplit" "$APP_BUNDLE/Contents/MacOS/CodexSplit"
-cp "$BIN_ROOT/CodexSplitLivePicker" "$APP_BUNDLE/Contents/Resources/CodexSplitLivePicker"
 if [[ -d "$BIN_ROOT/OpenCodexMac_OpenCodex.bundle" ]]; then
   cp -R "$BIN_ROOT/OpenCodexMac_OpenCodex.bundle" "$APP_BUNDLE/Contents/Resources/"
 fi
@@ -157,7 +155,7 @@ rm -rf "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app"
 cp -R "$VOICE_BAR_APP" "$APP_BUNDLE/Contents/Resources/OpenCodexBar.app"
 mkdir -p "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets"
 cp -R "$APP_ROOT/src_v2/assets/" "$APP_BUNDLE/Contents/Resources/dist/src_v2/assets/"
-chmod +x "$APP_BUNDLE/Contents/MacOS/CodexSplit" "$APP_BUNDLE/Contents/Resources/CodexSplitLivePicker" "$APP_BUNDLE/Contents/Resources/node" \
+chmod +x "$APP_BUNDLE/Contents/MacOS/CodexSplit" "$APP_BUNDLE/Contents/Resources/node" \
   "$APP_BUNDLE/Contents/Resources/dist/codex-provider-bridge" \
   "$APP_BUNDLE/Contents/Resources/dist/opencodex-codex" \
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uv" \

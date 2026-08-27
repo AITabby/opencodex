@@ -167,6 +167,10 @@ const SUBAGENT_EVENT_REPLAY_GRACE_MS = 60_000;
 
 const NATIVE_PROVIDER: CodexProvider = "openai";
 const GATEWAY_PROVIDER: CodexProvider = "opencodex";
+// Use the configured OpenAI-compatible provider name for the native child's
+// process-scoped Egress. The URL is injected per child, while the gateway
+// retains the same provider name for its local configuration and diagnostics.
+const NATIVE_EGRESS_PROVIDER = GATEWAY_PROVIDER;
 
 function codexHomeDir(): string {
   return cleanString(process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME)
@@ -1345,6 +1349,7 @@ async function handleNativeEgressRequest(
   liveBindings: NativeLiveAccountBindings,
   subagentDisplaySettings: Map<string, NativeSubagentDisplaySettings>,
   onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
+  resolveModelForRequest?: (body: JsonRecord, headers: HeaderBag) => string,
 ): Promise<void> {
   const requestUrl = new URL(req.url || "/", `http://${req.headers.host || "127.0.0.1"}`);
   const endpoint = nativeEgressPath(requestUrl.pathname, basePath);
@@ -1374,8 +1379,25 @@ async function handleNativeEgressRequest(
     // The native endpoint will return the authoritative malformed-body error.
   }
   const nativeLiveCall = isNativeLiveCreateCall(requestUrl.pathname, basePath);
-  const route = nativeLiveCall ? "native" : nativeEgressRoute(parsedBody, req.headers);
-  const rewrittenGatewayBody = rewriteNativeGatewayRequestBody(parsedBody, req.headers);
+  // The native app-server generates its own x-codex-turn-metadata header and
+  // drops bridge-only client_metadata fields. Recover the selected provider
+  // from the durable thread route before deciding where /responses goes.
+  const explicitModel = requestModelSlug(parsedBody, req.headers);
+  const resolvedModel = endpoint === "/responses"
+    ? cleanString(resolveModelForRequest?.(parsedBody, req.headers))
+    : "";
+  const selectedModel = resolvedModel && classifyRuntimeModel(resolvedModel) === GATEWAY_PROVIDER
+    ? resolvedModel
+    : explicitModel;
+  const route = nativeLiveCall
+    ? "native"
+    : classifyRuntimeModel(selectedModel) === GATEWAY_PROVIDER
+      ? "gateway"
+      : nativeEgressRoute(parsedBody, req.headers);
+  const routedBody = route === "gateway" && selectedModel && modelSlug(parsedBody.model) !== selectedModel
+    ? { ...parsedBody, model: selectedModel }
+    : parsedBody;
+  const rewrittenGatewayBody = rewriteNativeGatewayRequestBody(routedBody, req.headers);
   const gatewayBody = route === "gateway" && !nativeLiveCall
     && rewrittenGatewayBody !== parsedBody
     ? Buffer.from(JSON.stringify(rewrittenGatewayBody), "utf8")
@@ -1460,12 +1482,13 @@ async function startNativeEgressRouter(
   accountRouter: OfficialAccountRouter,
   onSubagentDisplaySettings?: (update: NativeSubagentDisplayUpdate) => void,
   onLiveClosed?: (callId: string) => void,
+  resolveModelForRequest?: (body: JsonRecord, headers: HeaderBag) => string,
 ): Promise<NativeEgressRouter> {
   const basePath = `/__opencodex_native_egress_${randomBytes(16).toString("hex")}/v1`;
   const liveBindings = new NativeLiveAccountBindings();
   const subagentDisplaySettings = new Map<string, NativeSubagentDisplaySettings>();
   const server = http.createServer((req, res) => {
-    void handleNativeEgressRequest(req, res, basePath, accountRouter, liveBindings, subagentDisplaySettings, onSubagentDisplaySettings).catch((error) => {
+    void handleNativeEgressRequest(req, res, basePath, accountRouter, liveBindings, subagentDisplaySettings, onSubagentDisplaySettings, resolveModelForRequest).catch((error) => {
       console.error(`[OpenCodex Native Egress] request failed: ${error instanceof Error ? error.message : String(error)}`);
       if (!res.headersSent) {
         res.writeHead(400, { "Content-Type": "application/json" });
@@ -1774,8 +1797,16 @@ export function nativeRuntimeArgs(args: string[], egressPort: number, egressBase
   // `/live/<call_id>` sideband path before the local egress handles Upgrade.
   const nativeRealtimeWebSocketBaseUrl = `ws://127.0.0.1:${egressPort}${egressBasePath}/realtime`;
   const overrides = [
-    // Keep ordinary Responses/API traffic on the local Egress so account
-    // selection and provider-owned task routing remain request-scoped.
+    // Force the native child onto an OpenAI-compatible provider so even the
+    // Desktop app-server's ChatGPT-account path crosses this local Egress.
+    // Egress still decides per request whether the model is official (native
+    // account) or provider-owned (CodexSplit gateway).
+    "-c", `model_provider=${NATIVE_EGRESS_PROVIDER}`,
+    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.base_url=${nativeEgressBaseUrl}`,
+    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.wire_api=responses`,
+    "-c", `model_providers.${NATIVE_EGRESS_PROVIDER}.requires_openai_auth=false`,
+    // Keep the legacy OpenAI base override too for child revisions that read
+    // it before resolving the configured provider.
     "-c", `openai_base_url=${nativeEgressBaseUrl}`,
     // Live also crosses this Egress as a transparent native transport. The
     // HTTP call creation and WebSocket sideband have separate settings; the
@@ -1820,6 +1851,51 @@ function requestWithParams(message: JsonRecord, params: JsonRecord): JsonRecord 
 function stripRequestProvider(params: JsonRecord): JsonRecord {
   const next = { ...params };
   delete next.modelProvider;
+  return next;
+}
+
+function rewriteNativeTransportModel(
+  params: JsonRecord,
+  model: string,
+  stripDesktopTransportMetadata = false,
+): JsonRecord {
+  const next = { ...params };
+  // Desktop includes a full config snapshot on some control-plane requests.
+  // It is not a request-scoped setting and can overwrite the child process's
+  // dynamic Egress provider/base URL, so the worker must use its own process
+  // config for every transport model.
+  delete next.config;
+  if (stripDesktopTransportMetadata) {
+    // Desktop's collaboration/Responses metadata selects its in-process
+    // ChatGPT transport. Passing it to the native child can bypass the local
+    // Egress or validate the picker model against the ChatGPT account. Send
+    // the selected provider model as the actual transport model instead; keep
+    // client_metadata as a route hint for runtimes that normalize the model.
+    for (const key of [
+      "collaborationMode",
+      "collaboration_mode",
+      "responsesapiClientMetadata",
+      "responsesApiClientMetadata",
+      "responses_api_client_metadata",
+    ]) delete next[key];
+    return next;
+  }
+  // Keep native-only model metadata aligned for official turns. Provider
+  // turns take the early return above so their picker metadata cannot select
+  // the official ChatGPT transport.
+  for (const key of ["collaborationMode", "collaboration_mode"]) {
+    const collaboration = next[key];
+    if (!collaboration || typeof collaboration !== "object" || Array.isArray(collaboration)) continue;
+    const settings = (collaboration as JsonRecord).settings;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) continue;
+    next[key] = {
+      ...(collaboration as JsonRecord),
+      settings: {
+        ...(settings as JsonRecord),
+        model,
+      },
+    };
+  }
   return next;
 }
 
@@ -1923,12 +1999,10 @@ async function runProviderBridge(): Promise<void> {
     return;
   }
 
-  // Desktop app-server must use the same thin, request-scoped Egress as the
-  // standalone CLI. The native app-server owns stdio, thread ids, rollout
-  // history, images, tool results, and child-process lifecycle; this wrapper
-  // only selects the upstream for each HTTP request. The old JSON-RPC/session
-  // supervisor remains below as an explicit diagnostic fallback, never as the
-  // production bridge path.
+  // Standalone CLI invocations stay on the thin request-scoped Egress. Desktop
+  // is launched with the JSON-RPC supervisor because its app-server can replace
+  // the startup HTTP transport from thread config and drop bridge-only metadata
+  // before the request reaches Egress.
   if (process.env.OPENCODEX_LEGACY_PROVIDER_BRIDGE !== "1") {
     await runCliProviderBridge(args);
     return;
@@ -1956,6 +2030,18 @@ async function runProviderBridge(): Promise<void> {
     applyNativeSubagentDisplaySettings?.(update);
   }, (callId) => {
     void notifyGatewayLiveClosed(callId);
+  }, (body, headers) => {
+    const explicitModel = requestModelSlug(body, headers);
+    if (classifyRuntimeModel(explicitModel) === GATEWAY_PROVIDER) return explicitModel;
+    // Native Codex replaces bridge-only metadata with x-codex-turn-metadata.
+    // Use its durable session/thread identity to recover the provider route.
+    for (const identity of nativeSubagentIdentityValues(body, headers)) {
+      const route = routeForThreadId(identity);
+      if (route && providerForModel(route.selectedModel) === GATEWAY_PROVIDER) {
+        return route.selectedModel;
+      }
+    }
+    return "";
   });
   const nativeSubagentDisplaySettings = nativeEgress.subagentDisplaySettings;
 
@@ -1987,7 +2073,6 @@ async function runProviderBridge(): Promise<void> {
   let serverRequestCounter = 0;
   let inputBuffer = "";
   let bridgeStopping = false;
-  let lastInitializeParams: JsonRecord | null = null;
   let lastInitializeResult: JsonRecord | null = null;
 
   function statePath(): string {
@@ -2174,6 +2259,18 @@ async function runProviderBridge(): Promise<void> {
     return classifyRuntimeModel(model) || fallback;
   }
 
+  function collaborationModel(params: JsonRecord): string {
+    for (const key of ["collaborationMode", "collaboration_mode"]) {
+      const collaboration = params[key];
+      if (!collaboration || typeof collaboration !== "object" || Array.isArray(collaboration)) continue;
+      const settings = (collaboration as JsonRecord).settings;
+      if (!settings || typeof settings !== "object" || Array.isArray(settings)) continue;
+      const model = modelSlug((settings as JsonRecord).model);
+      if (model) return model;
+    }
+    return "";
+  }
+
   function selectedModel(params: JsonRecord, route?: ThreadRoute): string {
     return modelSlug(params.model) || route?.selectedModel || nativeDefaultModel();
   }
@@ -2251,7 +2348,14 @@ async function runProviderBridge(): Promise<void> {
   }
 
   function selectedTurnModel(params: JsonRecord, route: ThreadRoute): string {
-    const explicit = modelSlug(params.model);
+    // Desktop's current protocol puts the picker selection in
+    // collaborationMode.settings.model while leaving turn/start.model empty
+    // (or at the native physical GPT model). Use that field as the selected
+    // provider target; otherwise a fresh third-party conversation is silently
+    // rebound to the native GPT route created by thread/start.
+    const topLevel = modelSlug(params.model);
+    const pickerModel = collaborationModel(params);
+    const explicit = topLevel || pickerModel;
     const pending = pendingSelectedModels.get(route.externalId);
     const explicitProvider = explicit ? providerForModel(explicit) : null;
     // A model change is committed by thread/settings/update. Desktop can
@@ -3007,7 +3111,11 @@ async function runProviderBridge(): Promise<void> {
       }
     });
     const initializeId = "opencodex-provider-initialize-" + (++internalRequestCounter);
-    const initializeParams = lastInitializeParams || {
+    // The nested app-server is a CLI-style transport worker, not the Desktop
+    // frontend. Keep its initialize handshake minimal; forwarding Desktop's
+    // client/capability identity makes Codex select the ChatGPT/Desktop
+    // transport and ignore the process-scoped compatible-provider Egress.
+    const initializeParams = {
       clientInfo: { name: "CodexSplit Provider Bridge", version: APP_VERSION },
       capabilities: { experimentalApi: true, requestAttestation: true },
     };
@@ -3118,12 +3226,15 @@ async function runProviderBridge(): Promise<void> {
       : Object.fromEntries(
           Object.entries(originalMetadata).filter(([key]) => key !== "opencodex_model_override"),
         );
-    const nextParams = stripRequestProvider({
-      ...originalParams,
-      threadId: physicalThreadId,
-      model: transportModel,
-      ...(Object.keys(routedMetadata).length > 0 ? { client_metadata: routedMetadata } : {}),
-    });
+    const nextParams = rewriteNativeTransportModel({
+      ...stripRequestProvider({
+        ...originalParams,
+        threadId: physicalThreadId,
+        model: transportModel,
+        ...(Object.keys(routedMetadata).length > 0 ? { client_metadata: routedMetadata } : {}),
+      }),
+      ...(selectedProvider === GATEWAY_PROVIDER ? { modelProvider: NATIVE_EGRESS_PROVIDER } : {}),
+    }, transportModel, selectedProvider === GATEWAY_PROVIDER);
     activeTurns.set(route.externalId, {
       provider: NATIVE_PROVIDER,
       physicalThreadId,
@@ -3326,15 +3437,18 @@ async function runProviderBridge(): Promise<void> {
     const physicalModel = providerForModel(selected) === NATIVE_PROVIDER ? selected : nativeDefaultModel();
     const thirdParty = providerForModel(selected) === GATEWAY_PROVIDER;
     const native = ensureRuntime(NATIVE_PROVIDER);
-    const nextParams = {
+    const nextParams = rewriteNativeTransportModel({
       ...stripRequestProvider(params),
       // Keep a provider-owned start durable in the native Codex store. The
       // selected provider is request routing metadata; it is not a second
       // app-server or a separate conversation record.
       ...(thirdParty ? { ephemeral: false } : {}),
       model: physicalModel,
-      modelProvider: NATIVE_PROVIDER,
-    };
+      // Keep every logical thread on the local OpenAI-compatible Egress. It
+      // routes official models to the native account and provider-owned models
+      // to the selected third-party gateway without splitting the thread.
+      modelProvider: NATIVE_EGRESS_PROVIDER,
+    }, physicalModel, thirdParty);
     sendParent(native, message, "thread/start", nextParams, {
       displayModel: selected,
       displayProvider: providerForModel(selected),
@@ -3435,8 +3549,9 @@ async function runProviderBridge(): Promise<void> {
           ...(route.settings || {}),
           threadId: route.nativeId,
           model: nativeModel({}, route),
-          modelProvider: NATIVE_PROVIDER,
+          modelProvider: NATIVE_EGRESS_PROVIDER,
         };
+        delete nextParams.config;
         delete nextParams.path;
         if (route.nativePath) nextParams.path = route.nativePath;
         sendParent(native, message, "thread/resume", nextParams, {
@@ -3499,7 +3614,7 @@ async function runProviderBridge(): Promise<void> {
         ...(route.settings || {}),
         threadId: route.nativeId,
         model: nativeModel(params, route),
-        modelProvider: NATIVE_PROVIDER,
+        modelProvider: NATIVE_EGRESS_PROVIDER,
       };
       sendParent(native, message, "thread/fork", nextParams, {
         displayModel: selected,
@@ -3571,6 +3686,10 @@ async function runProviderBridge(): Promise<void> {
             legacyThreads.set(id, { id, model, path: cleanString(entry.path) || undefined });
           }
         }
+        // Codex Desktop consumes thread/list entries as conversation objects
+        // and calls .turns.at(...) even when the list is not loaded. Keep the
+        // contract stable for restored and native entries alike.
+        if (!Array.isArray(entry.turns)) entry.turns = [];
         if (entry.id) visible.push(entry);
       }
       result.data = visible;
@@ -3630,7 +3749,9 @@ async function runProviderBridge(): Promise<void> {
             if (physicalId === route.nativeId || physicalId === route.externalId) {
               updateRouteNativePath(route, thread);
               const entry = cloneValue(thread);
-              delete entry.turns;
+              // A not-loaded thread still needs an empty turns array: Desktop
+              // treats every list entry as a conversation object.
+              entry.turns = [];
               entry.id = route.externalId;
               entry.model = route.selectedModel;
               entry.modelProvider = providerForModel(route.selectedModel);
@@ -3861,7 +3982,15 @@ async function runProviderBridge(): Promise<void> {
         const childParams = isNativeSubagentThread(route)
           ? nativeSubagentTurnParams(providerParams, route, selected)
           : providerParams;
-        sendNativeTurnAttempt(message, childParams, route, selected, native, route.nativeId, nativeDefaultModel());
+        sendNativeTurnAttempt(
+          message,
+          childParams,
+          route,
+          selected,
+          native,
+          route.nativeId,
+          isNativeSubagentThread(route) ? nativeDefaultModel() : selected,
+        );
         return;
       }
       const native = nativeRuntimeForRoute(route);
@@ -3952,15 +4081,6 @@ async function runProviderBridge(): Promise<void> {
     const method = cleanString(message.method);
     const params = message.params && typeof message.params === "object" ? message.params as JsonRecord : {};
     if (method === "initialize") {
-      const parentCapabilities = params.capabilities && typeof params.capabilities === "object" ? params.capabilities : {};
-      lastInitializeParams = {
-        ...params,
-        capabilities: {
-          experimentalApi: true,
-          requestAttestation: true,
-          ...parentCapabilities,
-        },
-      };
       const native = ensureRuntime(NATIVE_PROVIDER);
       if (native.initialized) {
         writeParent({
@@ -3994,6 +4114,14 @@ async function runProviderBridge(): Promise<void> {
     if (method === "turn/start") return handleTurnStart(message, params);
     if ((method === "turn/interrupt" || method === "turn/steer") && handleActiveTurn(message, method, params)) return;
     if (method.startsWith("thread/") && handleGenericThread(message, method, params)) return;
+    if (method === "config/batchWrite") {
+      // Desktop uses this startup write for feature snapshots. Forwarding it to
+      // the child makes the native config loader re-merge ~/.codex/config.toml
+      // and discard the per-process local Egress URL. The bridge owns that
+      // process-scoped routing layer, so acknowledge the UI write here.
+      writeParent({ id: message.id, result: {} });
+      return;
+    }
     const native = ensureRuntime(NATIVE_PROVIDER);
     sendParent(native, message, method, params);
   }

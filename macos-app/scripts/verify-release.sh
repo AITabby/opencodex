@@ -19,7 +19,6 @@ fi
 
 required_files=(
   "$APP_BUNDLE/Contents/MacOS/CodexSplit"
-  "$APP_BUNDLE/Contents/Resources/CodexSplitLivePicker"
   "$APP_BUNDLE/Contents/Resources/node"
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uv"
   "$APP_BUNDLE/Contents/Resources/voice-runtime/uvx"

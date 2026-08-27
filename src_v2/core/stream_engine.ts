@@ -14,6 +14,7 @@
 import { randomBytes } from "crypto";
 import { NATIVE_IMAGE_TOOL_NAME } from "../services/native_image_bridge.js";
 import {
+  beginNativeComputerUseResultBridge,
   nativeComputerUseMcpDescriptor,
   normalizeNativeComputerUseToolArguments,
 } from "../services/computer_use_native.js";
@@ -220,6 +221,7 @@ interface ToolCallState {
   name: string;
   namespace?: string;
   thought_signature?: string;
+  native_result_token?: string;
   arguments: string;
   output_index: number;
   added: boolean;
@@ -307,15 +309,22 @@ export class ResponsesStreamEngine {
   private turnId?: string;
   private forceCommentary = false;
   private internalToolNames: Set<string>;
+  private nativeComputerUseResultBridgeEnabled = false;
   private usage?: Record<string, any>;
 
-  constructor(model: string, turnId?: string, options?: { forceCommentary?: boolean; responseModel?: string; internalToolNames?: string[] }) {
+  constructor(model: string, turnId?: string, options?: {
+    forceCommentary?: boolean;
+    responseModel?: string;
+    internalToolNames?: string[];
+    nativeComputerUseResultBridgeEnabled?: boolean;
+  }) {
     this.model = options?.responseModel || model;
     this.responseId = generateHexId("resp", 24);
     this.messageItemId = generateHexId("msg", 24);
     this.turnId = turnId;
     this.forceCommentary = options?.forceCommentary === true;
     this.internalToolNames = new Set((options?.internalToolNames || []).map((name) => String(name || "").trim().toLowerCase()).filter(Boolean));
+    this.nativeComputerUseResultBridgeEnabled = options?.nativeComputerUseResultBridgeEnabled === true;
   }
 
   public getResponseId(): string {
@@ -563,6 +572,9 @@ export class ResponsesStreamEngine {
         call_id: callId,
         name: nativeIdentity?.name || fn.name || "",
         ...(nativeIdentity?.namespace ? { namespace: nativeIdentity.namespace } : {}),
+        ...(nativeIdentity && this.nativeComputerUseResultBridgeEnabled
+          ? { native_result_token: beginNativeComputerUseResultBridge(callId, itemId) }
+          : {}),
         ...((call.thought_signature || call.thoughtSignature || call.signature)
           ? { thought_signature: String(call.thought_signature || call.thoughtSignature || call.signature) }
           : {}),
@@ -583,6 +595,9 @@ export class ResponsesStreamEngine {
       state.name = nativeIdentity.name;
       state.namespace = nativeIdentity.namespace;
       state.deferArguments = true;
+      if (!state.native_result_token && this.nativeComputerUseResultBridgeEnabled) {
+        state.native_result_token = beginNativeComputerUseResultBridge(state.call_id, state.id);
+      }
     } else if (fn.name && !state.name) {
       state.name = fn.name;
     }
@@ -609,6 +624,9 @@ export class ResponsesStreamEngine {
           name: state.name,
           arguments: "",
           ...(state.namespace ? { namespace: state.namespace } : {}),
+          ...(state.thought_signature
+            ? { thought_signature: state.thought_signature, thoughtSignature: state.thought_signature }
+            : {}),
         },
       });
     }
@@ -787,7 +805,9 @@ export class ResponsesStreamEngine {
       if (state && !state.closed) {
         state.closed = true;
         const normalizedArguments = state.namespace === "mcp__node_repl"
-          ? normalizeNativeComputerUseToolArguments(state.arguments)
+          ? normalizeNativeComputerUseToolArguments(state.arguments, {
+            resultToken: state.native_result_token,
+          })
           : normalizeToolArguments(state.name, state.arguments);
         if (state.deferArguments && normalizedArguments) {
           await emit({
@@ -858,6 +878,9 @@ export class ResponsesStreamEngine {
         name: state.name,
         arguments: state.arguments,
         ...(state.namespace ? { namespace: state.namespace } : {}),
+        ...(state.thought_signature
+          ? { thought_signature: state.thought_signature, thoughtSignature: state.thought_signature }
+          : {}),
       });
     }
     for (const image of this.imageGenerations) {

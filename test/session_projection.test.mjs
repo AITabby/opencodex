@@ -40,6 +40,36 @@ test("orphaned tool calls are repaired before the next ordinary user message", (
   ]);
 });
 
+test("long Computer Use history keeps only the latest native tool turns", () => {
+  const messages = [{ role: "user", content: "操作浏览器" }];
+  for (let index = 0; index < 10; index += 1) {
+    const callId = `call-native-${index}`;
+    messages.push({
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: callId,
+        type: "function",
+        function: { name: "mcp__node_repl_js", arguments: "{}" },
+      }],
+    });
+    messages.push({
+      role: "tool",
+      tool_call_id: callId,
+      name: "mcp__node_repl_js",
+      content: `state-${index}`,
+    });
+  }
+
+  const compacted = SessionHistoryService.repairAndMergeHistory(messages);
+  const nativeCalls = compacted
+    .flatMap((message) => message.tool_calls || [])
+    .map((call) => call.id);
+  assert.equal(nativeCalls.includes("call-native-0"), false);
+  assert.equal(nativeCalls.includes("call-native-9"), true);
+  assert.equal(compacted.some((message) => message.content === "操作浏览器"), true);
+});
+
 test("session history reads native JSONL response items and drops empty messages", async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-session-history-"));
   const previousCodexHome = process.env.OPENCODEX_CODEX_HOME;
@@ -53,7 +83,7 @@ test("session history reads native JSONL response items and drops empty messages
       { type: "response_item", payload: { item: { type: "message", role: "user", content: [{ type: "input_text", text: "上一条问题" }] } } },
       { type: "response_item", payload: { item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "上一条回答" }], internal_chat_message_metadata_passthrough: { reasoning_content: "保留的推理" } } } },
       { type: "response_item", payload: { item: { type: "message", role: "assistant", content: [] } } },
-      { type: "response_item", payload: { type: "custom_tool_call", id: "call-custom", call_id: "call-custom", name: "exec_command", input: "{\"cmd\":\"pwd\"}" } },
+      { type: "response_item", payload: { type: "custom_tool_call", id: "call-custom", call_id: "call-custom", name: "exec_command", input: "{\"cmd\":\"pwd\"}", thought_signature: "provider-signature" } },
       { type: "response_item", payload: { type: "custom_tool_call_output", call_id: "call-custom", output: "/tmp" } },
     ].map((record) => JSON.stringify(record)).join("\n") + "\n");
 
@@ -61,7 +91,9 @@ test("session history reads native JSONL response items and drops empty messages
     assert.deepEqual(reconstructed.slice(0, 2).map((message) => message.content), ["上一条问题", "上一条回答"]);
     assert.equal(reconstructed[1].reasoning_content, "保留的推理");
     assert.equal(reconstructed[2].tool_calls[0].id, "call-custom");
+    assert.equal(reconstructed[2].tool_calls[0].thought_signature, "provider-signature");
     assert.equal(reconstructed[3].tool_call_id, "call-custom");
+    assert.equal(reconstructed[3].name, "exec_command");
 
     const merged = SessionHistoryService.repairAndMergeHistory([
       { role: "user", content: "当前问题" },

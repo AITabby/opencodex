@@ -247,6 +247,9 @@ test("dashboard exposes an explicit Desktop Bridge switch below the compact subs
   assert.match(text, /post\('\/api\/restart-codex',applyModels\?\{apply_models:true\}:\{\}\)/);
   assert.match(text, /q\('#restart-button'\)\.onclick=function\(\)\{restart\(this,\{applyModels:true\}\)\}/);
   assert.match(text, /waitForDesktopMode\(result&&result\.mode\|\|expectedMode,Boolean\(applyModels&&result&&result\.desktop_relaunch_required\)\)/);
+  const bridgeControls = text.indexOf("installDesktopBridgePreferenceState();");
+  const initialLoads = text.indexOf("Promise.all([loadGateway(),loadPresets(),loadProviders(),loadSubscriptions(),loadModels()])");
+  assert.ok(bridgeControls >= 0 && initialLoads > bridgeControls, "initial status load must run after Bridge controls are installed");
 });
 
 test("dashboard distinguishes imported subscription models from Bridge exposure", async () => {

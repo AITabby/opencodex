@@ -106,6 +106,15 @@ function reasoningContentFromItem(item: any): string {
           : "";
 }
 
+function thoughtSignatureFromItem(item: any): string {
+  const value = item?.thought_signature || item?.thoughtSignature || item?.signature;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toolCallNameFromChatCall(call: any): string {
+  return String(call?.function?.name || call?.name || "").trim();
+}
+
 function sessionItemsFromFile(raw: string, sessionFile: string): any[] {
   if (sessionFile.toLowerCase().endsWith(".jsonl")) {
     const items: any[] = [];
@@ -184,6 +193,62 @@ function mergePastAndCurrentMessages(pastMessages: ChatMessage[], currentMessage
   return [...pastMessages, ...currentMessages];
 }
 
+const NATIVE_COMPUTER_USE_HISTORY_MESSAGE_LIMIT = 16;
+
+function isNativeComputerUseName(name: unknown): boolean {
+  const value = String(name || "").trim().toLowerCase();
+  return value === "mcp__node_repl_js"
+    || value === "mcp__node_repl__js"
+    || (value === "js" && value.includes("node_repl"));
+}
+
+function compactNativeComputerUseHistory(messages: ChatMessage[]): ChatMessage[] {
+  const nativeCallIds = new Set<string>();
+  const nativeMessageIndexes: number[] = [];
+
+  messages.forEach((message, index) => {
+    const nativeCalls = Array.isArray(message.tool_calls)
+      ? message.tool_calls.filter((call) => isNativeComputerUseName(call?.function?.name || (call as any)?.name))
+      : [];
+    if (nativeCalls.length > 0) {
+      nativeMessageIndexes.push(index);
+      for (const call of nativeCalls) {
+        const callId = String(call?.id || (call as any)?.call_id || "").trim();
+        if (callId) nativeCallIds.add(callId);
+      }
+      return;
+    }
+
+    if (message.role === "tool" && nativeCallIds.has(String(message.tool_call_id || "").trim())) {
+      nativeMessageIndexes.push(index);
+    }
+  });
+
+  if (nativeMessageIndexes.length <= NATIVE_COMPUTER_USE_HISTORY_MESSAGE_LIMIT) return messages;
+
+  const keepFrom = nativeMessageIndexes[nativeMessageIndexes.length - NATIVE_COMPUTER_USE_HISTORY_MESSAGE_LIMIT];
+  return messages.flatMap((message, index) => {
+    if (index >= keepFrom) return [message];
+
+    if (message.role === "tool" && nativeCallIds.has(String(message.tool_call_id || "").trim())) {
+      return [];
+    }
+
+    if (message.role === "assistant" && Array.isArray(message.tool_calls)) {
+      const toolCalls = message.tool_calls.filter((call) => !isNativeComputerUseName(call?.function?.name || (call as any)?.name));
+      if (toolCalls.length === 0) {
+        const content = typeof message.content === "string" ? message.content.trim() : message.content;
+        if (!content && !message.reasoning_content) return [];
+        const { tool_calls: _discarded, ...withoutNativeCalls } = message;
+        return [withoutNativeCalls];
+      }
+      return [{ ...message, tool_calls: toolCalls }];
+    }
+
+    return [message];
+  });
+}
+
 export class SessionHistoryService {
   private static get codexHome(): string {
     return String(process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME || "").trim()
@@ -239,6 +304,7 @@ export class SessionHistoryService {
       const items = sessionItemsFromFile(raw, sessionFile);
 
       const reconstructed: ChatMessage[] = [];
+      const toolNames = new Map<string, string>();
 
       for (const item of items) {
         if (!item || typeof item !== "object") continue;
@@ -248,45 +314,78 @@ export class SessionHistoryService {
           if (role === "developer") role = "system";
           const content = responseContentToChatContent(item.content);
           const reasoningContent = reasoningContentFromItem(item);
-          if (hasUsableChatContent(content) || (Array.isArray(item.tool_calls) && item.tool_calls.length > 0)) {
+          const nestedToolCalls = Array.isArray(item.tool_calls)
+            ? item.tool_calls.map((call: any, index: number) => {
+              const callId = String(call?.id || call?.call_id || `call_repair_${reconstructed.length}_${index}`).trim();
+              const name = toolCallNameFromChatCall(call);
+              if (callId && name) toolNames.set(callId, name);
+              const signature = thoughtSignatureFromItem(call);
+              return {
+                id: callId,
+                type: "function",
+                function: {
+                  name,
+                  arguments: typeof call?.function?.arguments === "string"
+                    ? call.function.arguments
+                    : typeof call?.arguments === "string"
+                      ? call.arguments
+                      : JSON.stringify(call?.function?.arguments ?? call?.arguments ?? {}),
+                },
+                ...(signature ? { thought_signature: signature, thoughtSignature: signature } : {}),
+              };
+            })
+            : [];
+          if (hasUsableChatContent(content) || nestedToolCalls.length > 0) {
             reconstructed.push({
               role: role as any,
               content,
               ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+              ...(nestedToolCalls.length > 0 ? { tool_calls: nestedToolCalls } : {}),
             });
           }
         } else if (item.type === "function_call" || item.type === "mcp_call" || item.type === "custom_tool_call" || item.type === "computer_call") {
           const callId = String(item.call_id || item.id || `call_repair_${reconstructed.length}`).trim();
           const rawArguments = item.arguments ?? item.input ?? item.action;
           const argsStr = typeof rawArguments === "string" ? rawArguments : JSON.stringify(rawArguments || {});
+          const name = flattenResponseFunctionCallName(item);
+          const signature = thoughtSignatureFromItem(item);
+          if (callId && name) toolNames.set(callId, name);
           reconstructed.push({
             role: "assistant",
             content: "",
             tool_calls: [{
               id: callId || `call_repair_${reconstructed.length}`,
               type: "function",
-              function: { name: flattenResponseFunctionCallName(item), arguments: argsStr }
+              function: { name, arguments: argsStr },
+              ...(signature ? { thought_signature: signature, thoughtSignature: signature } : {}),
             }]
           });
           if ((item.type === "mcp_call" || item.type === "custom_tool_call" || item.type === "computer_call") && item.output !== undefined) {
             reconstructed.push({
               role: "tool",
               tool_call_id: callId || `call_repair_${reconstructed.length}`,
+              ...(name ? { name } : {}),
               content: responseContentToChatContent(item.output),
             });
           }
         } else if (item.type === "function_call_output"
           || item.type === "custom_tool_call_output"
           || item.type === "computer_call_output") {
+          const callId = typeof item.call_id === "string" ? item.call_id.trim() : item.call_id;
+          const name = String(item.name || toolNames.get(String(callId || "").trim()) || "").trim();
           reconstructed.push({
             role: "tool",
-            tool_call_id: typeof item.call_id === "string" ? item.call_id.trim() : item.call_id,
+            tool_call_id: callId,
+            ...(name ? { name } : {}),
             content: responseContentToChatContent(item.output),
           });
         } else if (item.type === "mcp_call_output") {
+          const callId = typeof item.call_id === "string" ? item.call_id.trim() : item.call_id;
+          const name = String(item.name || toolNames.get(String(callId || "").trim()) || "").trim();
           reconstructed.push({
             role: "tool",
-            tool_call_id: typeof item.call_id === "string" ? item.call_id.trim() : item.call_id,
+            tool_call_id: callId,
+            ...(name ? { name } : {}),
             content: responseContentToChatContent(item.output),
           });
         }
@@ -308,6 +407,7 @@ export class SessionHistoryService {
     // Repair tool_calls & tool role alignment for upstream providers (Claude, Gemini, etc.)
     const repaired: ChatMessage[] = [];
     const activeToolCallIds = new Set<string>();
+    const toolNames = new Map<string, string>();
 
     let generatedToolId = 0;
     const flushOrphanToolCalls = (): void => {
@@ -333,13 +433,16 @@ export class SessionHistoryService {
           const existingId = typeof tc.id === "string" ? tc.id.trim() : "";
           const id = existingId || `call_repair_${generatedToolId++}`;
           if (id) activeToolCallIds.add(id);
+          const name = toolCallNameFromChatCall(tc);
+          if (id && name) toolNames.set(id, name);
           return { ...tc, id };
         });
         repaired.push({ ...msg, tool_calls: toolCalls });
       } else if (msg.role === "tool") {
         const toolCallId = typeof msg.tool_call_id === "string" ? msg.tool_call_id.trim() : "";
         if (toolCallId && activeToolCallIds.has(toolCallId)) {
-          repaired.push({ ...msg, tool_call_id: toolCallId });
+          const name = String(msg.name || toolNames.get(toolCallId) || "").trim();
+          repaired.push({ ...msg, tool_call_id: toolCallId, ...(name ? { name } : {}) });
           activeToolCallIds.delete(toolCallId);
         } else {
           if (activeToolCallIds.size > 0) flushOrphanToolCalls();
@@ -369,6 +472,9 @@ export class SessionHistoryService {
     // place (at the end is correct only when the assistant call is last).
     flushOrphanToolCalls();
 
-    return repaired;
+    // A long-running Computer Use task can leave dozens of old screenshot and
+    // tool-call pairs in the reconstructed transcript. Keep the latest few
+    // native turns for provider context; local session files remain untouched.
+    return compactNativeComputerUseHistory(repaired);
   }
 }

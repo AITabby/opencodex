@@ -4,61 +4,24 @@ import { readFile } from "node:fs/promises";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("Live model picker is independent from OpenCodexBar", async () => {
-  const [picker, statusBar, app, gatewayProcess, dashboard, gateway, floatingPicker, liveModelPicker] = await Promise.all([
-    read("macos-app/Sources/OpenCodex/LiveModelPicker.swift"),
-    read("voice/OpenCodexBar/Sources/OpenCodexBar/StatusBarController.swift"),
+test("CodexSplit no longer ships a standalone GPT-Live picker UI", async () => {
+  const [packageFile, packageScript, verifyScript, app, gatewayProcess, dashboard, gateway] = await Promise.all([
+    read("macos-app/Package.swift"),
+    read("macos-app/scripts/package-app.sh"),
+    read("macos-app/scripts/verify-release.sh"),
     read("macos-app/Sources/OpenCodex/OpenCodexApp.swift"),
     read("macos-app/Sources/OpenCodex/GatewayProcess.swift"),
     read("src_v2/services/dashboard.ts"),
-    read("src_v2/server/gateway.ts"),
-    read("macos-app/Sources/OpenCodexLivePicker/main.swift"),
-    read("src_v2/services/live_model_picker.ts")
+    read("src_v2/server/gateway.ts")
   ]);
+  const removedSurface = [packageFile, packageScript, verifyScript, app, gatewayProcess, dashboard, gateway].join("\n");
 
-  assert.match(picker, /选择 GPT-Live 执行模型/);
-  assert.match(gatewayProcess, /api\/live-model-picker\/pending/);
-  assert.match(gatewayProcess, /api\/live-model-picker\/resolve/);
-  assert.match(picker, /\.floating/);
-  assert.doesNotMatch(statusBar, /LiveModelPicker/);
-  assert.match(dashboard, /live-model-picker-enabled/);
-  assert.match(dashboard, /#view-voice \.settings-stack/);
-  assert.match(dashboard, /live-picker-setting/);
-  assert.match(dashboard, /live-picker-orb/);
-  assert.match(dashboard, /z-index:2147483000/);
-  assert.match(dashboard, /onpointermove/);
-  assert.match(dashboard, /max-height:min\(420px/);
-  assert.match(dashboard, /api\('\/api\/live-model-picker\/pending'/);
-  assert.match(dashboard, /post\('\/api\/live-model-picker\/settings'/);
-  assert.match(dashboard, /native-live-picker-only/);
-  assert.match(dashboard, /\.live-picker-orb\{display:none!important\}/);
-  assert.match(gateway, /api\/live-model-picker\/settings/);
-  assert.match(gateway, /api\/live-model-picker\/select/);
-  assert.match(gateway, /isLiveModelPickerEntryVisible/);
-  assert.match(gateway, /selectedLiveModelForPicker/);
+  assert.doesNotMatch(removedSurface, /CodexSplitLivePicker|OpenCodexLivePicker/);
+  assert.doesNotMatch(removedSurface, /live-model-picker|live-picker-orb|LiveModelPicker/);
+  assert.doesNotMatch(removedSurface, /OPENCODEX_LIVE_PICKER_PATH/);
+  assert.doesNotMatch(removedSurface, /liveModelPickerEnabled|liveModelPickerWaiters/);
+  assert.doesNotMatch(removedSurface, /LIVE_MODEL_PICKER_TIMEOUT_MS/);
+  assert.match(gateway, /chooseLiveWorkRoute/);
   assert.match(gateway, /currentLiveModelBinding/);
-  assert.match(gateway, /livePickerOverlayPids/);
-  assert.match(gateway, /liveModelPickerEnabled = false/);
-  assert.match(gateway, /resetLivePickerForGatewayStart/);
-  assert.match(gateway, /Cache-Control.*no-store/);
-  assert.match(liveModelPicker, /supported_in_api !== false/);
-  assert.match(liveModelPicker, /visibility !== "hide"/);
-  assert.match(gateway, /liveModelPickerStatePath/);
-  assert.match(gateway, /Do not let a generic/);
-  assert.match(gateway, /this\.resetLiveModelPicker\(\)/);
-  assert.match(gateway, /if \(!this\.isLiveModelPickerEnabled\(\)\) return/);
-  assert.doesNotMatch(gateway, /this\.startLivePickerOverlay\(\);\s*this\.launchDesktopAfterGatewayReadyIfRequested\(\);/);
-  assert.match(gatewayProcess, /OPENCODEX_LIVE_PICKER_PATH/);
-  assert.doesNotMatch(gatewayProcess, /adminToken = readAdminToken\(\);\s*startLiveModelPicker\(\);/);
-  assert.match(floatingPicker, /rightMouseDown/);
-  assert.doesNotMatch(floatingPicker, /取消当前模型/);
-  assert.doesNotMatch(dashboard, /oncontextmenu/);
-  assert.match(floatingPicker, /Do not show the orb before the first authoritative gateway poll/);
-  assert.match(floatingPicker, /contextPanel\.orderOut\(nil\)/);
-  assert.match(floatingPicker, /onOpen: \{ \[weak self\] in self\?\.toggleCard\(\) \}/);
-  assert.match(floatingPicker, /availableModels/);
-  assert.match(floatingPicker, /payload\.selected_model/);
-  assert.match(gatewayProcess, /selected_model/);
-  assert.match(gatewayProcess, /selectedModel/);
-  assert.match(app, /GPT-Live 选择执行模型/);
+  assert.match(gatewayProcess, /OPENCODEX_VOICE_BAR_PATH/);
 });

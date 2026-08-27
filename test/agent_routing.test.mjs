@@ -136,26 +136,6 @@ async function fixture() {
   return dataDir;
 }
 
-test("2.0.0 starts GPT-Live picker disabled after a gateway restart", async () => {
-  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-live-picker-restart-"));
-  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
-  try {
-    await fs.writeFile(path.join(dataDir, "live_model_picker.json"), JSON.stringify({ enabled: true }));
-    await fs.writeFile(path.join(dataDir, "voice_settings.json"), JSON.stringify({ live_model_picker_enabled: true }));
-    process.env.OPENCODEX_DATA_DIR = dataDir;
-
-    const server = new CodexBridgeServer(0);
-    const state = server.pendingLiveModelPicker();
-    assert.equal(state.enabled, false);
-    assert.equal(state.native_overlay, false);
-    assert.deepEqual(state.models, []);
-  } finally {
-    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
-    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
-    await fs.rm(dataDir, { recursive: true, force: true });
-  }
-});
-
 test("1.1.0 Agent Profiles survive save/load and auto routing uses user policy", async () => {
   const dataDir = await fixture();
   try {
@@ -711,7 +691,6 @@ test("1.2.0 applies Live model precedence across automatic, forced, and off mode
       input: "接下来请使用 MiniMax 执行任务",
     });
     assert.equal(voiceSelection, null);
-    assert.equal(server.pendingLiveModelPicker().selected_model, "minimax/minimax-m3");
 
     const liveBinding = server.chooseSubagentRoute({
       client_metadata: {
@@ -939,10 +918,6 @@ test("2.0.0 resolves an explicitly named Profile and records Live children indep
     });
     assert.equal(liveFirst?.model, "thirdparty/review-model");
     assert.equal(liveSecond?.model, "antigravity/code-model");
-    assert.deepEqual(server.pendingLiveModelPicker().selected_models.sort(), [
-      "antigravity/code-model",
-      "thirdparty/review-model",
-    ]);
     const liveTasks = server.subagentOrchestrator.list(10).filter((task) => task.origin === "gpt-live");
     assert.deepEqual(liveTasks.map((task) => task.model).sort(), ["antigravity/code-model", "thirdparty/review-model"]);
     server.subagentOrchestrator.complete(liveFirst?.task_id);

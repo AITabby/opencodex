@@ -19,12 +19,12 @@ import { isNativeControlPlaneModel } from "../core/model_identity.js";
 import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
-import { getClaudeDesktopVersion, getCursorClientVersion } from "../services/subscription_auth.js";
+import { getAntigravityUserAgent, getClaudeDesktopVersion, getCursorClientVersion, getGrokUserAgent } from "../services/subscription_auth.js";
 import { copyNativeRequestHeaders, handleWebRtcProxy, normalizeNativeLiveCallBody, readNativeAccountCredential, resolveRealtimeUpstream } from "./webrtc_proxy.js";
 import { ProviderConfig, ProviderModelTestState } from "../core/types.js";
 import { isNativeResponsesReasoningId } from "../core/responses_safety.js";
 import { closeUpstreamDispatcher, fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
-import { LIVE_MODEL_BINDING_TTL_MS, LIVE_MODEL_PICKER_TIMEOUT_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isLiveModelPickerEntryVisible, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel, orderOfficialModelsFirst } from "../services/live_model_picker.js";
+import { LIVE_MODEL_BINDING_TTL_MS, extractLiveModelIntent, isLikelyLiveModelIntentRequest, isLikelyLiveWorkRequest, isLiveModelEntryVisible, isToolContinuation, liveModelSessionKey, normalizeRealtimeWorkModel, orderOfficialModelsFirst } from "../services/live_model_picker.js";
 import { copySafeResponseHeaders, writeHttpResponseChunked, writeSseData } from "../services/http_stream.js";
 import { AgentProfileStore } from "../services/agent_profile_store.js";
 import { TaskRouter, extractTaskText } from "../services/task_router.js";
@@ -746,6 +746,7 @@ const PROVIDER_BRIDGE_ENV_NAMES = [
   "OPENCODEX_PROVIDER_BRIDGE_PATH",
   "OPENCODEX_PROVIDER_SPLIT",
   "OPENCODEX_PROVIDER_BRIDGE_RUNTIME",
+  "OPENCODEX_LEGACY_PROVIDER_BRIDGE",
   "OPENCODEX_GATEWAY_PORT",
 ] as const;
 
@@ -774,7 +775,15 @@ export function buildDesktopLaunchEnvironment(
     environment.OPENCODEX_NATIVE_CODEX_PATH = nativeCodexPath;
     environment.OPENCODEX_PROVIDER_BRIDGE_PATH = bridgePath;
     environment.OPENCODEX_PROVIDER_SPLIT = "1";
+    // Desktop's app-server can overwrite the startup HTTP transport with its
+    // own thread config. The JSON-RPC supervisor rewrites provider turns to a
+    // native transport model and lets the local Egress route them safely.
+    environment.OPENCODEX_LEGACY_PROVIDER_BRIDGE = "1";
     environment.OPENCODEX_GATEWAY_PORT = String(Number.isInteger(gatewayPort) && gatewayPort > 0 ? gatewayPort : 8765);
+    // Do not let a detached Desktop process fall back to ~/.opencodex when
+    // its gateway was started with an app-specific data directory. Keep the
+    // bridge's catalog, credentials and route state on the same instance.
+    environment.OPENCODEX_DATA_DIR = String(baseEnvironment.OPENCODEX_DATA_DIR || opencodexDataDir()).trim();
   } else if (nativeCodexPath) {
     // Explicitly override a stale CODEX_CLI_PATH inherited from an older
     // OpenCodex release when restoring the official Desktop path.
@@ -797,12 +806,25 @@ function stopDesktopClients(): void {
 
 function providerBridgePath(): string {
   const configured = String(process.env.OPENCODEX_PROVIDER_BRIDGE_PATH || "").trim();
+  const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
   const candidates = [
     configured,
+    // Compiled gateway code lives in dist/server while the executable bridge
+    // is copied to dist/. This absolute lookup also works when a packaged app
+    // is launched with / as its current directory.
+    path.join(runtimeDir, "..", "codex-provider-bridge"),
+    path.join(runtimeDir, "..", "codex-provider-bridge.js"),
+    path.join(runtimeDir, "codex-provider-bridge"),
     path.join(process.cwd(), "dist", "codex-provider-bridge"),
     path.join(process.cwd(), "codex-provider-bridge"),
   ].filter(Boolean);
-  return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate) && fs.statSync(candidate).isFile();
+    } catch {
+      return false;
+    }
+  }) || "";
 }
 
 function nativeCodexExecutablePath(): string {
@@ -1226,15 +1248,6 @@ function maskVoiceSettings(settings: any): any {
 }
 
 type ProviderTestStatus = "untested" | "connected" | "failed" | "simulated";
-
-type LiveModelPickerWaiter = {
-  requestId: string;
-  sessionKey: string;
-  models: string[];
-  createdAt: number;
-  resolve: (model: string) => void;
-  timer: ReturnType<typeof setTimeout>;
-};
 
 function recordProviderTest(providerName: string, status: ProviderTestStatus, message: string): void {
   const name = String(providerName || "").trim().toLowerCase();
@@ -2041,7 +2054,6 @@ export class CodexBridgeServer {
   private readonly subscriptionAccountPool: SubscriptionAccountPool;
   private readonly subscriptionAccountLogin: SubscriptionAccountLoginService;
   private subagentRouteBindings = new Map<string, SubagentRouteBinding>();
-  private liveModelPickerWaiters = new Map<string, LiveModelPickerWaiter>();
   private liveModelBindings = new Map<string, { model: string; expiresAt: number }>();
   private activeLiveModel: { model: string; expiresAt: number } | null = null;
   private realtimeActiveUntil = 0;
@@ -2058,11 +2070,6 @@ export class CodexBridgeServer {
   // actual request controllers by task id so the dashboard cancel action can
   // abort the provider stream, child tool, and native egress boundary.
   private activeSubagentRequests = new Map<string, Set<AbortController>>();
-  private livePickerOverlayProcess: ReturnType<typeof spawn> | null = null;
-  // The floating picker is an opt-in runtime surface. A gateway restart must
-  // never resurrect the previous process-level toggle from disk.
-  private liveModelPickerEnabled = false;
-
   constructor(port = 8765) {
     this.port = port;
     this.dataDir = opencodexDataDir();
@@ -2078,6 +2085,7 @@ export class CodexBridgeServer {
     this.subscriptionAccountLogin = new SubscriptionAccountLoginService(this.subscriptionAccountPool);
     SubscriptionAuthService.configureAccountPool(this.subscriptionAccountPool);
     this.router.setSubagentDispatcher((calls, context, signal) => this.dispatchThirdPartySubagents(calls, context, signal));
+    this.router.setNativeComputerUseResultBridgeEnabled(true);
     this.config.providers = CredentialStore.loadProviders();
   }
 
@@ -2655,7 +2663,7 @@ export class CodexBridgeServer {
     if (requestedKeys.size > 0 && cancelled === 0) {
       if (this.activeLiveRequests.size === 0 && this.activeNativeLiveSockets.size === 0) {
         this.realtimeActiveUntil = 0;
-        this.resetLiveModelPicker();
+        this.resetLiveModelBindings();
         console.warn(`[OpenCodex Realtime] ${reason}; no active Live scope remained; reset=true`);
         return { cancelled: 0, reset: true };
       }
@@ -2663,14 +2671,14 @@ export class CodexBridgeServer {
       return { cancelled: 0, reset: false };
     }
     // A call-scoped socket can close while another Live call is still active.
-    // Do not reset the shared picker/binding state until the last scoped
+    // Do not reset the shared Live binding state until the last scoped
     // request/socket has gone away.
     if (requestedKeys.size > 0 && (this.activeLiveRequests.size > 0 || this.activeNativeLiveSockets.size > 0)) {
       console.warn(`[OpenCodex Realtime] ${reason}; cancelled=${cancelled}; other Live scopes remain`);
       return { cancelled, reset: false };
     }
     this.realtimeActiveUntil = 0;
-    this.resetLiveModelPicker();
+    this.resetLiveModelBindings();
     console.warn(`[OpenCodex Realtime] ${reason}; cancelled=${cancelled}`);
     return { cancelled, reset: true };
   }
@@ -2897,7 +2905,7 @@ export class CodexBridgeServer {
       try {
         const catalog = JSON.parse(fs.readFileSync(catalogPath, "utf-8"));
         for (const model of Array.isArray(catalog?.models) ? catalog.models : []) {
-          if (!isLiveModelPickerEntryVisible(model)) continue;
+          if (!isLiveModelEntryVisible(model)) continue;
           const slug = normalizeRealtimeWorkModel(model?.slug || model?.id || model?.model);
           if (slug) models.add(slug);
         }
@@ -2926,132 +2934,13 @@ export class CodexBridgeServer {
 
   private liveModelIntentCandidates(): string[] {
     const models = new Set(this.availableRealtimeWorkModels());
-    // Keep provider-only models out of the native picker list, but allow
+    // Keep provider-only models out of the native catalog list, but allow
     // Live speech to address a model that is already configured locally.
     for (const model of runtimeProviderCatalogEntries()) {
       const slug = normalizeRealtimeWorkModel(model.slug);
       if (slug) models.add(slug);
     }
     return orderOfficialModelsFirst(Array.from(models), readOfficialModelMap().keys());
-  }
-
-  private liveModelPickerSettingsPath(): string {
-    return path.join(this.dataDir, "voice_settings.json");
-  }
-
-  private liveModelPickerStatePath(): string {
-    return path.join(this.dataDir, "live_model_picker.json");
-  }
-
-  private isLiveModelPickerEnabled(): boolean {
-    return this.liveModelPickerEnabled;
-  }
-
-  private persistLiveModelPickerEnabled(enabled: boolean): void {
-    const statePath = this.liveModelPickerStatePath();
-    fs.mkdirSync(path.dirname(statePath), { recursive: true, mode: 0o700 });
-    fs.writeFileSync(statePath, JSON.stringify({ enabled }, null, 2), "utf-8");
-    try { fs.chmodSync(statePath, 0o600); } catch {}
-  }
-
-  private resetLivePickerForGatewayStart(): void {
-    this.liveModelPickerEnabled = false;
-    this.resetLiveModelPicker();
-    // Make the reset visible to any other local helper immediately. The
-    // in-memory flag remains authoritative for this gateway instance.
-    this.persistLiveModelPickerEnabled(false);
-    // A hard gateway kill does not run stop(); remove an orphaned native
-    // helper before the new gateway can serve the dashboard.
-    this.stopLivePickerOverlay();
-  }
-
-  private setLiveModelPickerEnabled(enabled: boolean): void {
-    this.liveModelPickerEnabled = enabled === true;
-    this.persistLiveModelPickerEnabled(this.liveModelPickerEnabled);
-    if (!this.liveModelPickerEnabled) {
-      this.resetLiveModelPicker();
-      this.stopLivePickerOverlay();
-    } else {
-      this.startLivePickerOverlay();
-    }
-  }
-
-  private livePickerOverlayExecutable(): string {
-    const configured = String(process.env.OPENCODEX_LIVE_PICKER_PATH || "").trim();
-    const candidates = [
-      configured,
-      path.join(process.cwd(), "macos-app", ".build", "out", "Products", "Release", "CodexSplitLivePicker"),
-      path.join(process.cwd(), "macos-app", ".build", "out", "Products", "Release", "OpenCodexLivePicker"),
-      path.join(process.cwd(), "macos-app", ".build", "arm64-apple-macosx", "release", "CodexSplitLivePicker"),
-      path.join(process.cwd(), "macos-app", ".build", "arm64-apple-macosx", "release", "OpenCodexLivePicker"),
-    ].filter(Boolean);
-    return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
-  }
-
-  private startLivePickerOverlay(): void {
-    if (process.platform !== "darwin" || this.livePickerOverlayProcess || !this.isLiveModelPickerEnabled()) return;
-    const executable = this.livePickerOverlayExecutable();
-    if (!executable) {
-      console.warn("[OpenCodex Realtime] Native Live picker overlay is unavailable; the web duplicate remains disabled.");
-      return;
-    }
-    const existingPids = this.livePickerOverlayPids(executable);
-    if (existingPids.length > 0) {
-      // The gateway can be restarted independently from the native picker.
-      // Stop every old copy before starting the current binary, otherwise an
-      // old helper survives the restart and its UI code never gets updated.
-      for (const pid of existingPids) {
-        try { process.kill(pid); } catch {}
-      }
-      console.log("[OpenCodex Realtime] Refreshing native Live picker overlay; removed " + existingPids.length + " old copy/copies");
-    }
-    const child = spawn(executable, [], {
-      cwd: path.dirname(executable),
-      env: {
-        ...process.env,
-        OPENCODEX_APP_PORT: String(this.port),
-        OPENCODEX_ADMIN_TOKEN_PATH: path.join(this.dataDir, "admin_token"),
-        OPENCODEX_APP_MODE: "1",
-      },
-      stdio: "ignore",
-    });
-    this.livePickerOverlayProcess = child;
-    child.once("error", (error) => {
-      console.warn(`[OpenCodex Realtime] Could not start native Live picker overlay: ${error.message}`);
-      if (this.livePickerOverlayProcess === child) this.livePickerOverlayProcess = null;
-    });
-    child.once("exit", () => {
-      if (this.livePickerOverlayProcess === child) this.livePickerOverlayProcess = null;
-    });
-    console.log(`[OpenCodex Realtime] Native Live picker overlay started for port ${this.port}`);
-  }
-
-  private livePickerOverlayPids(executable: string): number[] {
-    if (!executable) return [];
-    try {
-      const output = execFileSync("pgrep", ["-f", executable], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      return output
-        .split(/\s+/)
-        .map((value) => Number.parseInt(value, 10))
-        .filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
-    } catch {
-      return [];
-    }
-  }
-
-  private stopLivePickerOverlay(): void {
-    const child = this.livePickerOverlayProcess;
-    this.livePickerOverlayProcess = null;
-    if (child && !child.killed) child.kill();
-    if (!child) {
-      const executable = this.livePickerOverlayExecutable();
-      for (const pid of this.livePickerOverlayPids(executable)) {
-        try { process.kill(pid); } catch {}
-      }
-    }
   }
 
   private liveRoutingMode(): "auto" | "forced" | "off" {
@@ -3094,48 +2983,6 @@ export class CodexBridgeServer {
     }
     if (this.activeLiveModel) this.activeLiveModel = null;
     return null;
-  }
-
-  private selectedLiveModelForPicker(sessionKey = ""): string {
-    const mode = this.liveRoutingMode();
-    if (mode === "off") return "";
-
-    if (mode === "forced") {
-      const settings = this.liveTaskRouter.getSettings();
-      const forcedModel = normalizeRealtimeWorkModel(settings.forced_model);
-      if (forcedModel) return forcedModel;
-      if (settings.forced_profile_id) {
-        const profile = this.liveTaskRouter.findProfileSelector(settings.forced_profile_id);
-        const profileModel = normalizeRealtimeWorkModel(profile?.model_ref?.catalog_slug || profile?.model_ref?.backend_model);
-        if (profileModel) return profileModel;
-      }
-    }
-
-    if (sessionKey) {
-      const binding = this.liveModelBindings.get(sessionKey);
-      if (binding?.expiresAt > Date.now()) return binding.model;
-      if (binding) this.liveModelBindings.delete(sessionKey);
-    }
-    if (this.activeLiveModel?.expiresAt > Date.now()) return this.activeLiveModel.model;
-    if (this.activeLiveModel) this.activeLiveModel = null;
-    return "";
-  }
-
-  private selectedLiveModels(): string[] {
-    const now = Date.now();
-    const selected = new Set<string>();
-    const forced = this.selectedLiveModelForPicker();
-    if (forced) selected.add(forced);
-    if (this.activeLiveModel?.expiresAt > now) selected.add(this.activeLiveModel.model);
-    else if (this.activeLiveModel) this.activeLiveModel = null;
-    for (const [key, binding] of this.liveModelBindings) {
-      if (binding.expiresAt <= now) {
-        this.liveModelBindings.delete(key);
-        continue;
-      }
-      selected.add(binding.model);
-    }
-    return Array.from(selected);
   }
 
   private isSubagentResponsesRequest(body: any, req?: http.IncomingMessage): boolean {
@@ -3409,9 +3256,8 @@ export class CodexBridgeServer {
     });
     routingRouter.record(routeRequest, route);
     if (origin === "gpt-live") {
-      // Automatic/explicit child selection is scoped to this Live child. It
-      // must appear in the multi-model picker without changing other child
-      // bindings or becoming the global default for the next child.
+      // Automatic/explicit child selection is scoped to this Live child and
+      // must not become the global default for the next child.
       this.bindLiveModel(route.model, liveModelSessionKey(body), false);
     }
     console.log(`[OpenCodex Subagent] Routed child task: ${route.model}${route.reasoning_effort ? ` reasoning=${route.reasoning_effort}` : ""} (${route.reason})`);
@@ -3429,7 +3275,6 @@ export class CodexBridgeServer {
 
   private async chooseLiveWorkRoute(
     body: any,
-    requestSignal?: AbortSignal,
   ): Promise<{ model: string; reasoning_effort?: string; profile_id?: string; reason?: string } | null> {
     if (!this.isRealtimeActive()) {
       this.activeLiveModel = null;
@@ -3438,7 +3283,6 @@ export class CodexBridgeServer {
     }
 
     const mode = this.liveRoutingMode();
-    const now = Date.now();
     const sessionKey = liveModelSessionKey(body);
     const isLiveRequest = isLikelyLiveWorkRequest(body) || isToolContinuation(body);
     const isLiveSessionRequest = isLiveRequest || isLikelyLiveModelIntentRequest(body, this.isRealtimeActive());
@@ -3457,7 +3301,6 @@ export class CodexBridgeServer {
         if (route.ok && route.model) {
           this.liveTaskRouter.record(routeRequest, route);
           const selected = this.bindLiveModel(route.model, sessionKey);
-          this.resolvePendingLiveModelSelection(selected, sessionKey, true);
           console.log(`[OpenCodex Realtime] Voice model selection updated: ${selected}${isLiveRequest ? " (current work handoff)" : " (next work handoff)"}`);
           return isLiveRequest ? { model: selected, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "explicit voice model selection" } : null;
         }
@@ -3521,110 +3364,12 @@ export class CodexBridgeServer {
       const route = this.liveTaskRouter.resolve(routeRequest);
       if (route.ok && route.model) {
         this.liveTaskRouter.record(routeRequest, route);
-        return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "existing Live picker binding" };
+        return { model: route.model, reasoning_effort: route.reasoning_effort, profile_id: route.profile_id, reason: "existing Live model binding" };
       }
-      console.warn("[OpenCodex Realtime] Existing Live picker binding was not routable: " + route.reason);
+      console.warn("[OpenCodex Realtime] Existing Live model binding was not routable: " + route.reason);
       return null;
     }
-
-    if (!this.isLiveModelPickerEnabled()) return null;
-
-    const models = this.availableRealtimeWorkModels();
-    if (models.length === 0) {
-      console.warn("[OpenCodex Realtime] No models available for the Live picker; falling back to the desktop model");
-      return null;
-    }
-
-    const requestId = randomUUID();
-    const selected = await new Promise<string>((resolve) => {
-      let settled = false;
-      const finish = (value: string): void => {
-        if (settled) return;
-        settled = true;
-        requestSignal?.removeEventListener("abort", onAbort);
-        resolve(value);
-      };
-      const timer = setTimeout(() => {
-        this.liveModelPickerWaiters.delete(requestId);
-        finish("");
-      }, LIVE_MODEL_PICKER_TIMEOUT_MS);
-      const onAbort = (): void => {
-        clearTimeout(timer);
-        this.liveModelPickerWaiters.delete(requestId);
-        finish("");
-      };
-      if (requestSignal?.aborted) {
-        onAbort();
-        return;
-      }
-      requestSignal?.addEventListener("abort", onAbort, { once: true });
-      this.liveModelPickerWaiters.set(requestId, {
-        requestId,
-        sessionKey,
-        models,
-        createdAt: now,
-        resolve: finish,
-        timer,
-      });
-    });
-
-    if (requestSignal?.aborted) return null;
-
-    if (selected) {
-      this.bindLiveModel(selected, sessionKey);
-      return { model: selected, reason: "manual Live picker selection" };
-    }
-
-    const fallbackModel = normalizeRealtimeWorkModel(body?.model);
-    if (fallbackModel) {
-      this.bindLiveModel(fallbackModel, sessionKey, false);
-      console.warn(`[OpenCodex Realtime] Live picker timed out; using incoming default model: ${fallbackModel}`);
-      return { model: fallbackModel, reason: "Live picker timeout fallback" };
-    }
-    console.warn("[OpenCodex Realtime] Live picker timed out; no incoming default model was available");
     return null;
-  }
-
-  private pendingLiveModelPicker(): any {
-    const waiter = Array.from(this.liveModelPickerWaiters.values())
-      .sort((a, b) => a.createdAt - b.createdAt)[0];
-    if (!waiter) {
-      return {
-        pending: false,
-        realtime_active: this.isRealtimeActive(),
-        enabled: this.isLiveModelPickerEnabled(),
-        native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
-        models: this.isLiveModelPickerEnabled() ? this.availableRealtimeWorkModels() : [],
-        selected_model: this.selectedLiveModelForPicker(),
-        selected_models: this.selectedLiveModels(),
-      };
-    }
-    return {
-      pending: true,
-      realtime_active: this.isRealtimeActive(),
-      enabled: this.isLiveModelPickerEnabled(),
-      native_overlay: Boolean(this.livePickerOverlayProcess && !this.livePickerOverlayProcess.killed),
-      request_id: waiter.requestId,
-      models: waiter.models,
-      selected_model: this.selectedLiveModelForPicker(waiter.sessionKey),
-      selected_models: this.selectedLiveModels(),
-      created_at: waiter.createdAt,
-    };
-  }
-
-  private selectLiveModel(model: unknown): { ok: boolean; error?: string; model?: string } {
-    if (!this.isLiveModelPickerEnabled()) return { ok: false, error: "GPT-Live 模型选择未开启" };
-    if (this.liveRoutingMode() === "off") return { ok: false, error: "当前已关闭 GPT-Live 路由，模型由 Live 原生选择" };
-    const selected = normalizeRealtimeWorkModel(model);
-    const models = this.availableRealtimeWorkModels();
-    if (!selected) {
-      this.activeLiveModel = null;
-      this.liveModelBindings.clear();
-      return { ok: true, model: "" };
-    }
-    if (!models.includes(selected)) return { ok: false, error: "所选模型不在当前可用模型列表中" };
-    this.bindLiveModel(selected);
-    return { ok: true, model: selected };
   }
 
   private bindLiveModel(selected: string, sessionKey = "", promoteToDefault = true): string {
@@ -3643,44 +3388,7 @@ export class CodexBridgeServer {
     return selected;
   }
 
-  private resolveLiveModelPicker(requestId: unknown, model: unknown): { ok: boolean; error?: string; cancelled?: boolean } {
-    const id = typeof requestId === "string" ? requestId.trim() : "";
-    const waiter = this.liveModelPickerWaiters.get(id);
-    if (!waiter) return { ok: false, error: "模型选择请求已过期" };
-    const selected = normalizeRealtimeWorkModel(model);
-    if (!selected) {
-      clearTimeout(waiter.timer);
-      waiter.resolve("");
-      this.liveModelPickerWaiters.delete(id);
-      this.activeLiveModel = null;
-      this.liveModelBindings.delete(waiter.sessionKey);
-      return { ok: true, cancelled: true };
-    }
-    if (!waiter.models.includes(selected)) {
-      return { ok: false, error: "所选模型不在当前可用模型列表中" };
-    }
-    this.bindLiveModel(selected, waiter.sessionKey);
-    this.resolvePendingLiveModelSelection(selected, waiter.sessionKey);
-    return { ok: true };
-  }
-
-  private resolvePendingLiveModelSelection(selected: string, sessionKey = "", allowOutsidePicker = false): void {
-    // Resolve only the waiters belonging to this Live child. A concurrent
-    // child must retain its own picker and model binding.
-    for (const [requestId, pending] of this.liveModelPickerWaiters) {
-      if (sessionKey && pending.sessionKey !== sessionKey) continue;
-      clearTimeout(pending.timer);
-      pending.resolve(allowOutsidePicker || pending.models.includes(selected) ? selected : "");
-      this.liveModelPickerWaiters.delete(requestId);
-    }
-  }
-
-  private resetLiveModelPicker(): void {
-    for (const pending of this.liveModelPickerWaiters.values()) {
-      clearTimeout(pending.timer);
-      pending.resolve("");
-    }
-    this.liveModelPickerWaiters.clear();
+  private resetLiveModelBindings(): void {
     this.activeLiveModel = null;
     this.liveModelBindings.clear();
   }
@@ -4303,19 +4011,21 @@ export class CodexBridgeServer {
         return [];
       }
 
-      const fetchModels = async (accessToken: string): Promise<Response> => fetch(
-        SUBSCRIPTION_TRANSPORTS.antigravity.modelsEndpoint!,
-        {
+      const fetchModels = async (accessToken: string): Promise<Response> => {
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        };
+        const userAgent = getAntigravityUserAgent();
+        if (userAgent) headers["User-Agent"] = userAgent;
+
+        return fetch(SUBSCRIPTION_TRANSPORTS.antigravity.modelsEndpoint!, {
           method: "POST",
-          headers: {
-            "Authorization": `Bearer ${accessToken}`,
-            "Content-Type": "application/json",
-            "User-Agent": "antigravity/hub/2.2.1 darwin/arm64"
-          },
+          headers,
           body: JSON.stringify({ project: "default-cli-project" }),
           signal: AbortSignal.timeout(30000),
-        },
-      );
+        });
+      };
 
       let res = await fetchModels(token);
       if (res.status === 401 || res.status === 403) {
@@ -4371,21 +4081,22 @@ export class CodexBridgeServer {
       let token = await SubscriptionAuthService.getGrokAccessToken();
 
       if (token) {
-        let res = await fetch("https://api.x.ai/v1/models", {
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json"
-          }
-        });
+        const fetchModels = async (accessToken: string): Promise<Response> => {
+          const headers: Record<string, string> = {
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+          };
+          const userAgent = getGrokUserAgent();
+          if (userAgent) headers["User-Agent"] = userAgent;
+
+          return fetch("https://api.x.ai/v1/models", { headers });
+        };
+
+        let res = await fetchModels(token);
         if (res.status === 401 || res.status === 403) {
           token = await SubscriptionAuthService.getGrokAccessToken(true);
           if (token) {
-            res = await fetch("https://api.x.ai/v1/models", {
-              headers: {
-                "Authorization": `Bearer ${token}`,
-                "Content-Type": "application/json"
-              }
-            });
+            res = await fetchModels(token);
           }
         }
         if (res.ok) {
@@ -4485,7 +4196,7 @@ export class CodexBridgeServer {
       this.port = overridePort;
     }
     this.acquireServerLock();
-    this.resetLivePickerForGatewayStart();
+    this.resetLiveModelBindings();
     // Older releases exported the bridge through launchd. Remove only that
     // owned legacy state; the current gateway never registers a global
     // CODEX_CLI_PATH during ordinary startup.
@@ -4792,7 +4503,7 @@ export class CodexBridgeServer {
             const isSubagentRequest = this.isSubagentResponsesRequest(body, req);
             const subagentOrigin = this.subagentOrigin(body, req);
             const nativeLiveParentRequest = subagentOrigin === "gpt-live" && !isSubagentRequest;
-            // Live activity is global state used by the picker, not a signal
+            // Live activity is global state used by model routing, not a signal
             // that an unrelated Responses request belongs to Live. The
             // request must carry an explicit Live origin/binding.
             const liveRequestCandidate = subagentOrigin === "gpt-live";
@@ -4845,7 +4556,7 @@ export class CodexBridgeServer {
               isSubagentRequest,
               subagentOrigin,
             )
-              ? await this.chooseLiveWorkRoute(body, liveRequestAbort?.signal)
+              ? await this.chooseLiveWorkRoute(body)
               : null;
             subagentTaskId = subagentRoute?.task_id || "";
             if (subagentTaskId) {
@@ -4891,7 +4602,6 @@ export class CodexBridgeServer {
             if (selectedWorkRoute?.model && body.model !== selectedWorkRoute.model) {
               console.log(`[OpenCodex Routing] Applied selected work model: ${body.model || "(default)"} -> ${selectedWorkRoute.model}`);
             }
-            console.log(`[CodexBridge V2 DEBUG] POST /v1/responses body keys:`, Object.keys(effectiveBody), "model:", effectiveBody.model);
             const rawRequestedModel = effectiveBody.model || this.defaultRequestModel();
             const requestedModel = this.stripReasoningSuffix(rawRequestedModel);
             const providers = CredentialStore.loadProviders();
@@ -5115,70 +4825,6 @@ export class CodexBridgeServer {
           const removed = this.chatgptAccountPool.removeAccount(decodeURIComponent(chatgptAccountPathMatch[1]));
           res.writeHead(removed ? 200 : 404, { "Content-Type": "application/json" });
           res.end(JSON.stringify(removed || { error: "ChatGPT 账号不存在" }));
-          return;
-        }
-
-        if (req.method === "GET" && url.pathname === "/api/live-model-picker/pending") {
-          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify(this.pendingLiveModelPicker()));
-          return;
-        }
-
-        if (req.method === "GET" && url.pathname === "/api/live-model-picker/settings") {
-          res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-          res.end(JSON.stringify({ enabled: this.isLiveModelPickerEnabled() }));
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/live-model-picker/settings") {
-          try {
-            const body = await this.parseJsonBody(req);
-            if (typeof body?.enabled !== "boolean") {
-              res.writeHead(400, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "enabled 必须是布尔值" }));
-              return;
-            }
-            const enabled = body.enabled && this.liveRoutingMode() !== "off";
-            this.setLiveModelPickerEnabled(enabled);
-            res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ enabled }));
-          } catch (err: any) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
-          }
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/live-model-picker/resolve") {
-          try {
-            const body = await this.parseJsonBody(req);
-            const result = this.resolveLiveModelPicker(body?.request_id, body?.model);
-            res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result));
-          } catch (err: any) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
-          }
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/live-model-picker/select") {
-          try {
-            const body = await this.parseJsonBody(req);
-            const result = this.selectLiveModel(body?.model);
-            res.writeHead(result.ok ? 200 : 409, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result));
-          } catch (err: any) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: err.message }));
-          }
-          return;
-        }
-
-        if (req.method === "POST" && url.pathname === "/api/live-model-picker/reset") {
-          this.resetLiveModelPicker();
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, reset: true }));
           return;
         }
 
@@ -5631,7 +5277,7 @@ export class CodexBridgeServer {
                 writePrivateTextFile(configPath, buildCodexRoutingConfig(content, this.port, this.adminToken, catalogPath, bridgeActive));
               }
               // The catalog file is the source of truth, but Codex's desktop
-              // picker reads its local model cache on the next launch. Keep
+              // model menu reads its local model cache on the next launch. Keep
               // the cache in sync at the same moment the provider is saved.
               if (bridgeActive) CatalogSyncService.syncCustomModelsToCodexCache();
               else CatalogSyncService.syncNativeModelsToCodexCache();
@@ -7078,9 +6724,6 @@ export class CodexBridgeServer {
               vad_threshold: typeof data.vad_threshold === "number" ? data.vad_threshold : -35.0,
               vad_duration: typeof data.vad_duration === "number" ? data.vad_duration : 2.0,
               voice_llm_model: data.voice_llm_model || "",
-              // GPT-Live has its own persisted state. Do not let a generic
-              // voice-settings save overwrite the floating-ball toggle.
-              live_model_picker_enabled: this.isLiveModelPickerEnabled(),
               interaction_mode: data.interaction_mode === "push-to-talk" ? "push-to-talk" : (data.interaction_mode === "toggle" ? "toggle" : "toggle"),
               enable_wake_word: typeof data.enable_wake_word === "boolean" ? data.enable_wake_word : false,
               hud_theme: ["vortex", "siri"].includes(data.hud_theme) ? data.hud_theme : "vortex",
@@ -7119,14 +6762,13 @@ export class CodexBridgeServer {
             vad_threshold: -35.0,
             vad_duration: 2.0,
             voice_llm_model: "",
-            live_model_picker_enabled: false,
             interaction_mode: "toggle",
             hud_theme: "vortex"
           };
           if (fs.existsSync(settingsPath)) {
             try { settings = { ...settings, ...JSON.parse(fs.readFileSync(settingsPath, "utf-8")) }; } catch {}
           }
-          settings.live_model_picker_enabled = this.isLiveModelPickerEnabled();
+          delete settings.live_model_picker_enabled;
           
           let available_models: string[] = [];
           try {
@@ -8969,9 +8611,6 @@ export class CodexBridgeServer {
 
       this.server.listen(this.port, "127.0.0.1", () => {
         console.log(`[CodexBridge V2] Server listening on http://127.0.0.1:${this.port}`);
-        // GPT-Live's floating picker is opt-in. Do not relaunch a persisted
-        // picker just because the DMG/gateway has started; the settings POST
-        // below is the explicit user action that starts it.
         this.launchDesktopAfterGatewayReadyIfRequested();
         resolve();
       });
@@ -9314,10 +8953,7 @@ export class CodexBridgeServer {
       // launchd cleanup belongs to startup or an explicit native-mode switch,
       // never to ordinary gateway shutdown.
       this.chatgptAccountLogin.stopAll();
-      this.liveModelPickerEnabled = false;
-      this.resetLiveModelPicker();
-      try { this.persistLiveModelPickerEnabled(false); } catch {}
-      this.stopLivePickerOverlay();
+      this.resetLiveModelBindings();
       if (this.server) {
         this.server.close(() => {
           this.releaseServerLock();

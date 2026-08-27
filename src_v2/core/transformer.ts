@@ -19,6 +19,7 @@ import {
   hasComputerUseTool,
   isComputerUseDiscoveryToolName,
   isComputerUseTool,
+  isNativeComputerUseMcpTool,
   isNativeComputerUseExecutorName,
 } from "../services/computer_use_native.js";
 
@@ -272,7 +273,12 @@ export function responsesInputToChatMessages(input?: any[]): ChatMessage[] {
       || itemType === "custom_tool_call_output"
       || itemType === "computer_call_output") {
       const callId = item.call_id || item.id;
-      appendChatToolOutput(messages, callId, item.output, toolNames.get(String(callId || "").trim()) || "");
+      appendChatToolOutput(
+        messages,
+        callId,
+        item.output,
+        String(item.name || toolNames.get(String(callId || "").trim()) || "").trim(),
+      );
     }
   }
 
@@ -501,7 +507,11 @@ export function convertToolsToChatTools(tools?: ResponseTool[], sessionId?: stri
     if (typeof rawTool !== "object" || rawTool === null) continue;
     const tool = rawTool as any;
 
-    if (isComputerUseTool(tool)) {
+    if (isNativeComputerUseMcpTool(tool)) {
+      if (!result.some((candidate) => isNativeComputerUseExecutorName(candidate.function?.name))) {
+        result.push(buildNativeComputerUseChatTool(tool));
+      }
+    } else if (isComputerUseTool(tool)) {
       if (!result.some((candidate) => isNativeComputerUseExecutorName(candidate.function?.name))) {
         result.push(buildNativeComputerUseChatTool(tool));
       }

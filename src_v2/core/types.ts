@@ -49,6 +49,10 @@ export interface ResponseFunctionCallItem {
   name: string;
   namespace?: string;
   arguments: string;
+  /** Provider-owned metadata that must survive a Responses continuation. */
+  thought_signature?: string;
+  thoughtSignature?: string;
+  signature?: string;
 }
 
 export interface ResponseFunctionCallOutputItem {
@@ -67,6 +71,10 @@ export interface ResponseMcpCallItem {
   arguments: string;
   output?: string | ResponseContentPart[];
   error?: string;
+  /** Provider-owned metadata that must survive a Responses continuation. */
+  thought_signature?: string;
+  thoughtSignature?: string;
+  signature?: string;
 }
 
 /** Client-side MCP continuations may use this explicit output item shape. */
@@ -85,6 +93,10 @@ export interface ResponseComputerCallItem {
   action?: Record<string, any>;
   arguments?: string | Record<string, any>;
   output?: string | ResponseContentPart[] | Record<string, any>;
+  /** Provider-owned metadata that must survive a Responses continuation. */
+  thought_signature?: string;
+  thoughtSignature?: string;
+  signature?: string;
 }
 
 export interface ResponseComputerCallOutputItem {
@@ -156,6 +168,14 @@ export type ResponseTool =
       environment?: "browser" | "computer";
     }
   | {
+      type: "mcp";
+      server_label?: string;
+      serverLabel?: string;
+      server_url?: string;
+      allowed_tools?: string[];
+      require_approval?: "never" | "always" | string;
+    }
+  | {
       name: string;
       description?: string;
       parameters?: Record<string, any>;
@@ -188,6 +208,10 @@ export interface ChatFunctionCall {
     name: string;
     arguments: string;
   };
+  /** Provider-owned metadata; adapters decide how to serialize it. */
+  thought_signature?: string;
+  thoughtSignature?: string;
+  signature?: string;
 }
 
 export interface ChatMessage {

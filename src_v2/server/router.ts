@@ -7,12 +7,12 @@ import { buildGatewaySubagentResponseTool, isSubagentDispatchToolName, stripSuba
 import { AdapterFactory } from "../adapters/factory.js";
 import { GoogleGeminiAdapter } from "../adapters/google.js";
 import { AnthropicAdapter } from "../adapters/anthropic.js";
-import { getClaudeDesktopVersion, getCursorClientVersion, SubscriptionAuthService } from "../services/subscription_auth.js";
+import { getAntigravityUserAgent, getClaudeDesktopVersion, getCursorClientVersion, getGrokUserAgent, SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchUpstream, upstreamErrorDetails } from "../services/upstream_fetch.js";
 import { extractImageGenerationContext, generateNativeCodexImage, parseImageGenerationArguments } from "../services/native_image_bridge.js";
 import { analyzeWithNativeVision, assertNoNativeVisionImages, extractNativeVisionImages, extractNativeVisionImagesInCurrentTurn, hasNativeVisionImages, hasNativeVisionImagesInCurrentTurn, isProviderImageInputRejection, nativeVisionAuthorizationFingerprint, nativeVisionImageKey, NativeVisionBridgeError, normalizeTextOnlyProviderChatPayload, replaceImagesWithNativeVisionText, stripImageInspectionToolsForTextOnlyTurn, type NativeVisionErrorCode, type NativeVisionImageReference, type NativeVisionResult } from "../services/native_vision_bridge.js";
-import { normalizeLegacyImageRequestBody } from "../services/image_input.js";
-import { appendComputerUseInstructions, hasComputerUseTool, hasNativeComputerUseTool, normalizeComputerUseResponsesTools, normalizeNativeComputerUseResponsesPayload } from "../services/computer_use_native.js";
+import { normalizeLegacyImageRequestBody, sanitizeInvalidImageData } from "../services/image_input.js";
+import { appendComputerUseInstructions, ensureNativeComputerUseResponsesTool, hasComputerUseTool, hasNativeComputerUseTool, normalizeComputerUseResponsesTools, normalizeNativeComputerUseResponsesPayload, restoreNativeComputerUseResultOutputs } from "../services/computer_use_native.js";
 import {
   hasChatToolImages,
   isConsoleGoToolImageRejection,
@@ -57,6 +57,44 @@ function configuredProviderVisionCapability(providerName: string, upstreamModel:
     // make an otherwise routable provider unavailable.
     return undefined;
   }
+}
+
+function providerModelSupportsComputerUse(providerName: string, upstreamModel: string): boolean {
+  const name = String(providerName || "").trim();
+  const model = String(upstreamModel || "").trim();
+  if (!name || !model) return false;
+  try {
+    const configured = CredentialStore.findProvider(CredentialStore.loadProviders(), name);
+    const provider = configured || { name, preset_id: name };
+    const metadata = CatalogSyncService.getKnownModelMetadata(provider, model);
+    if (metadata?.supports_computer_use === true) return true;
+    const experimental = Array.isArray(metadata?.experimental_supported_tools)
+      ? metadata.experimental_supported_tools.map((value: any) => String(value || "").trim().toLowerCase())
+      : [];
+    return experimental.includes("computer_use");
+  } catch {
+    return false;
+  }
+}
+
+function providerPayloadForLogging(payload: any, isAntigravityModel: boolean): any {
+  const request = payload?.request;
+  return isAntigravityModel && request && typeof request === "object" ? request : payload;
+}
+
+function providerPayloadToolNames(payload: any): string[] {
+  if (!Array.isArray(payload?.tools)) return [];
+  return payload.tools
+    .flatMap((tool: any) => Array.isArray(tool?.functionDeclarations)
+      ? tool.functionDeclarations.map((declaration: any) => String(declaration?.name || "").trim())
+      : [String(tool?.function?.name || tool?.name || "").trim()])
+    .filter(Boolean);
+}
+
+function providerPayloadMessageCount(payload: any): number {
+  if (Array.isArray(payload?.messages)) return payload.messages.length;
+  if (Array.isArray(payload?.contents)) return payload.contents.length;
+  return 0;
 }
 
 /**
@@ -1336,6 +1374,11 @@ function rememberCursorSession(
 
 export class GatewayRouter {
   private subagentDispatcher: GatewaySubagentDispatcher | null = null;
+  private nativeComputerUseResultBridgeEnabled = false;
+
+  public setNativeComputerUseResultBridgeEnabled(enabled = true): void {
+    this.nativeComputerUseResultBridgeEnabled = enabled === true;
+  }
 
   public setSubagentDispatcher(dispatcher: GatewaySubagentDispatcher | null): void {
     this.subagentDispatcher = dispatcher;
@@ -1593,7 +1636,17 @@ export class GatewayRouter {
   subagentSource: GatewaySubagentDispatchContext["source"] = "main-agent",
   requestSignal?: AbortSignal,
   ): Promise<GatewayResponsesResult> {
+    const restoredNativeResults = restoreNativeComputerUseResultOutputs(reqBody);
+    reqBody = restoredNativeResults.body;
+    if (restoredNativeResults.recovered > 0) {
+      console.info(`[OpenCodex Computer Use] restored native output count=${restoredNativeResults.recovered}`);
+    }
     reqBody = normalizeLegacyImageRequestBody(reqBody);
+    const sanitizedInputImages = sanitizeInvalidImageData(reqBody);
+    reqBody = sanitizedInputImages.body;
+    if (sanitizedInputImages.removed > 0) {
+      console.warn(`[OpenCodex Images] omitted invalid provider-bound image count=${sanitizedInputImages.removed}`);
+    }
     const selectedResponseModel = String(responseModel || reqBody?.model || upstreamModel).trim() || upstreamModel;
     const textOnlyProvider = configuredProviderVisionCapability(providerName, upstreamModel) === false;
     const preprocessed = await preprocessKnownTextOnlyImages(
@@ -1611,6 +1664,20 @@ export class GatewayRouter {
     const sessionId = reqBody?.client_metadata?.session_id || reqBody?.session_id;
     const cursorHistoryId = cursorHistoryKey(reqBody);
     const cursorStateKey = cursorRequestStateKey(reqBody);
+    const modelSupportsComputerUse = providerModelSupportsComputerUse(providerName, upstreamModel);
+    const hadComputerUseTool = hasComputerUseTool(reqBody?.tools);
+    if (modelSupportsComputerUse) {
+      reqBody = {
+        ...reqBody,
+        tools: ensureNativeComputerUseResponsesTool(reqBody.tools, true),
+      };
+      if (!hadComputerUseTool) {
+        console.info(
+          `[OpenCodex Computer Use] injected native executor `
+          + `provider=${providerName || "provider"} model=${upstreamModel} reason=model_capability`,
+        );
+      }
+    }
     const requestUsesComputerUse = hasComputerUseTool(reqBody?.tools);
     if (requestUsesComputerUse) {
       // Native third-party Responses providers do not pass through the Chat
@@ -1685,6 +1752,11 @@ export class GatewayRouter {
     );
     if (preprocessedChat.failed) return { completed: false, output: "" };
     chatBody = preprocessedChat.requestBody;
+    const sanitizedChatImages = sanitizeInvalidImageData(chatBody);
+    chatBody = sanitizedChatImages.body;
+    if (sanitizedChatImages.removed > 0) {
+      console.warn(`[OpenCodex Images] omitted invalid reconstructed image count=${sanitizedChatImages.removed}`);
+    }
     if (textOnlyProvider) {
       chatBody = normalizeTextOnlyProviderChatPayload(chatBody);
       assertNoNativeVisionImages(chatBody);
@@ -1762,7 +1834,9 @@ export class GatewayRouter {
       if (oauthToken) {
         finalTargetUrl = subscriptionTransport!.endpoint;
         finalHeaders["Authorization"] = `Bearer ${oauthToken}`;
-        finalHeaders["User-Agent"] = "antigravity/hub/2.2.1 darwin/arm64";
+        const userAgent = getAntigravityUserAgent();
+        if (userAgent) finalHeaders["User-Agent"] = userAgent;
+        else delete finalHeaders["User-Agent"];
 
         activeAdapter = new GoogleGeminiAdapter();
         const geminiPayload = activeAdapter.transformPayload(optimizedChatBody).body;
@@ -1782,7 +1856,9 @@ export class GatewayRouter {
       const grokToken = await SubscriptionAuthService.getGrokAccessToken();
       if (grokToken) {
         finalHeaders["Authorization"] = `Bearer ${grokToken}`;
-        finalHeaders["User-Agent"] = "grok-cli/1.89.0";
+        const userAgent = getGrokUserAgent();
+        if (userAgent) finalHeaders["User-Agent"] = userAgent;
+        else delete finalHeaders["User-Agent"];
         finalTargetUrl = subscriptionTransport!.endpoint;
       }
     }
@@ -1932,10 +2008,13 @@ export class GatewayRouter {
       });
     };
 
+    const logPayload = providerPayloadForLogging(finalPayloadBody, isAntigravityModel);
+    const logToolNames = providerPayloadToolNames(logPayload);
     console.info(
       `[CodexSplit Provider] request provider=${providerName || "provider"} model=${upstreamModel} ` +
-      `messages=${Array.isArray(finalPayloadBody?.messages) ? finalPayloadBody.messages.length : 0} ` +
-      `tools=${Array.isArray(finalPayloadBody?.tools) ? finalPayloadBody.tools.map((tool: any) => tool?.function?.name || tool?.name).filter(Boolean).join(",") || "(none)" : "(none)"} ` +
+      `messages=${providerPayloadMessageCount(logPayload)} ` +
+      `tools=${logToolNames.join(",") || "(none)"} ` +
+      `payload_shape=${isAntigravityModel ? "antigravity.request" : "chat"} ` +
       `tool_images=${hasChatToolImages(finalPayloadBody)} ` +
       `continuation=${Boolean(reqBody?.input?.some?.((item: any) => [
         "function_call_output",
@@ -1985,6 +2064,7 @@ export class GatewayRouter {
       {
         forceCommentary: nativeComputerUseTurn,
         responseModel: selectedResponseModel,
+        nativeComputerUseResultBridgeEnabled: this.nativeComputerUseResultBridgeEnabled,
         // A third-party main model must be handled by the gateway itself.
         // Child turns are intentionally excluded so delegation cannot recurse.
         internalToolNames: !isSubagentRequest && !isCursorModel && this.subagentDispatcher

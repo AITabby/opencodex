@@ -226,7 +226,7 @@ test("native child routing is request-scoped and leaves the native provider unto
   assert.equal(nativeEgressRoute(routedThirdPartyRequest, {}), "gateway");
   assert.equal(rewriteNativeGatewayRequestBody(routedThirdPartyRequest).model, "antigravity/gemini-3.6-flash-medium");
   assert.equal(rewriteNativeGatewayRequestBody({ model: "gpt-5.5" }).model, "gpt-5.5");
-  const nativeEgressBase = "/__opencodex_native_egress_test/v1";
+  const nativeEgressBase = "/__opencodex_test/v1";
   assert.equal(isNativeLiveCreateCall(`${nativeEgressBase}/live`, nativeEgressBase), true);
   assert.equal(isNativeLiveCreateCall(`${nativeEgressBase}/live/rtc_test`, nativeEgressBase), false);
   // Live remains in the native lane; only its upstream path/body shape is
@@ -258,19 +258,23 @@ test("native child routing is request-scoped and leaves the native provider unto
   assert.equal(shouldResolveSubagentRoute(true, false), true);
 
   const args = nativeRuntimeArgs(["--profile", "default", "app-server", "--listen", "stdio"], 43127);
-  assert.deepEqual(args.slice(0, 8), [
+  assert.deepEqual(args.slice(0, 12), [
     "--profile", "default",
+    "-c", "model_provider=opencodex",
+    "-c", "model_providers.opencodex.base_url=http://127.0.0.1:43127/v1",
+    "-c", "model_providers.opencodex.wire_api=responses",
+    "-c", "model_providers.opencodex.requires_openai_auth=false",
     "-c", "openai_base_url=http://127.0.0.1:43127/v1",
+  ]);
+  assert.deepEqual(args.slice(12, 20), [
     "-c", "experimental_realtime_webrtc_call_base_url=http://127.0.0.1:43127/v1",
     "-c", "experimental_realtime_ws_base_url=ws://127.0.0.1:43127/v1/realtime",
-  ]);
-  assert.deepEqual(args.slice(8, 12), [
     "-c", "features.responses_websockets=false",
     "-c", "features.responses_websockets_v2=false",
   ]);
   assert.equal(args.filter((value) => value.startsWith("experimental_realtime_")).length, 2);
-  assert.equal(args.includes("model_provider=opencodex"), false);
-  assert.equal(args[12], "app-server");
+  assert.equal(args.includes("model_provider=opencodex"), true);
+  assert.equal(args[20], "app-server");
 });
 
 test("native Live response ids can bind the following sideband to the same account", () => {
@@ -315,7 +319,7 @@ test("native Live response ids can bind the following sideband to the same accou
   );
   assert.equal(
     nativeLiveUpgradeRequestUrl(
-      "/__opencodex_native_egress_test/v1/v1/live/rtc_u9_duplicate-v1",
+      "/__opencodex_test/v1/v1/live/rtc_u9_duplicate-v1",
       "/v1/live/rtc_u9_duplicate-v1",
     ),
     "/v1/live/rtc_u9_duplicate-v1",
@@ -844,9 +848,9 @@ rl.on("line", (line) => { void handleLine(line); });
     const trace = JSON.parse(await readFile(tracePath, "utf8"));
     assert.equal(trace.websocketFallback.status, 426);
     assert.match(trace.websocketFallback.body, /Upgrade Required|upgrade_required/);
-    assert.match(trace.argv.join(" "), /openai_base_url=http:\/\/127\.0\.0\.1:\d+\/__opencodex_native_egress_[a-f0-9]+\/v1/);
+    assert.match(trace.argv.join(" "), /openai_base_url=http:\/\/127\.0\.0\.1:\d+\/__opencodex_(?:native_egress_)?[a-f0-9]+\/v1/);
     assert.match(trace.argv.join(" "), /features\.responses_websockets=false/);
-    assert.equal(trace.argv.some((value) => value.includes("model_provider=opencodex")), false);
+    assert.equal(trace.argv.some((value) => value.includes("model_provider=opencodex")), true);
   } finally {
     output.close();
     bridge.kill("SIGTERM");
@@ -1268,7 +1272,9 @@ test("Desktop bridge environment is process-scoped and native restore removes br
     OPENCODEX_PROVIDER_BRIDGE_PATH: "/old/opencodex/codex-provider-bridge",
     OPENCODEX_PROVIDER_SPLIT: "1",
     OPENCODEX_PROVIDER_BRIDGE_RUNTIME: "opencodex",
+    OPENCODEX_LEGACY_PROVIDER_BRIDGE: "1",
     OPENCODEX_GATEWAY_PORT: "8765",
+    OPENCODEX_DATA_DIR: "/tmp/codexsplit-app-data",
     PATH: "/usr/bin",
   };
 
@@ -1278,6 +1284,7 @@ test("Desktop bridge environment is process-scoped and native restore removes br
   assert.equal(native.OPENCODEX_PROVIDER_BRIDGE_PATH, undefined);
   assert.equal(native.OPENCODEX_PROVIDER_SPLIT, undefined);
   assert.equal(native.OPENCODEX_PROVIDER_BRIDGE_RUNTIME, undefined);
+  assert.equal(native.OPENCODEX_LEGACY_PROVIDER_BRIDGE, undefined);
   assert.equal(native.OPENCODEX_GATEWAY_PORT, undefined);
 
   const bridge = buildDesktopLaunchEnvironment(
@@ -1290,7 +1297,9 @@ test("Desktop bridge environment is process-scoped and native restore removes br
   assert.equal(bridge.CODEX_CLI_PATH, "/Applications/CodexSplit.app/Contents/Resources/dist/codex-provider-bridge");
   assert.equal(bridge.OPENCODEX_NATIVE_CODEX_PATH, "/Applications/ChatGPT.app/Contents/Resources/codex");
   assert.equal(bridge.OPENCODEX_PROVIDER_SPLIT, "1");
+  assert.equal(bridge.OPENCODEX_LEGACY_PROVIDER_BRIDGE, "1");
   assert.equal(bridge.OPENCODEX_GATEWAY_PORT, "18765");
+  assert.equal(bridge.OPENCODEX_DATA_DIR, "/tmp/codexsplit-app-data");
 });
 
 test("native restore clears an inherited legacy bridge environment", () => {
@@ -1300,6 +1309,7 @@ test("native restore clears an inherited legacy bridge environment", () => {
     "OPENCODEX_PROVIDER_BRIDGE_PATH",
     "OPENCODEX_PROVIDER_SPLIT",
     "OPENCODEX_PROVIDER_BRIDGE_RUNTIME",
+    "OPENCODEX_LEGACY_PROVIDER_BRIDGE",
     "OPENCODEX_GATEWAY_PORT",
   ];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -1307,10 +1317,12 @@ test("native restore clears an inherited legacy bridge environment", () => {
     process.env.CODEX_CLI_PATH = "/old/opencodex/codex-provider-bridge";
     process.env.OPENCODEX_PROVIDER_BRIDGE_PATH = "/old/opencodex/codex-provider-bridge";
     process.env.OPENCODEX_PROVIDER_SPLIT = "1";
+    process.env.OPENCODEX_LEGACY_PROVIDER_BRIDGE = "1";
     assert.equal(clearOwnedProviderBridgeLaunchEnvironment(), true);
     assert.equal(process.env.CODEX_CLI_PATH, undefined);
     assert.equal(process.env.OPENCODEX_PROVIDER_BRIDGE_PATH, undefined);
     assert.equal(process.env.OPENCODEX_PROVIDER_SPLIT, undefined);
+    assert.equal(process.env.OPENCODEX_LEGACY_PROVIDER_BRIDGE, undefined);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];

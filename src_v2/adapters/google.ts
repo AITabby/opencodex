@@ -5,8 +5,6 @@
 import { ProtocolAdapter } from "./base.js";
 import { ChatMessage, ChatCompletionRequestBody } from "../core/types.js";
 
-const DEFAULT_THOUGHT_SIGNATURE = "EocDCoQDARFNMg/wQatFS7RFDS/KgCjQ6PF5Ftu7blOIEB1GIMFDxWS15lf54PftREjCt22MZCJUvG8TJlo7t2Zxd7PI6ZaJUykSf/mgzo++cO8oirHVi7QETe5HrdvR9Y7aH09xNADrqwtADWS/Jr/JRKNWGEFlbBf0hRhp/U/WzJQsek8Dg/wHPeWV7VEESUz9SRVTVkN4NuPAmhtQvW5ekCQjrcQagIaYhd/dFIrz5We5WZYXlLefPT4FHI/5AP7dwWhv8ZK8uYwdJ1twAzsjF7HgVc5mJhtlTjY2blQb7jkfnw5oAKX7Stl6JuZNMQ0yiB3RrpLCcIxb377FjKpeKxob37SHwzfr1qFQsaVJe1m2SySbQqmoYzDRx956QPT0dgoztsSPrrqSFutXGOcGkEc9xj198GPhn5R2JfiGBb6rjGVgFjGlr9dhzZOWSrNzwlkpKJTSA5OcXDmsJMRfWRMhovJMaYTITR2UwEzNc75nKHL/Xh/Rsh4/+IRQSagYbV1luM8yYA==";
-
 function sanitizeGeminiSchema(schema: any): any {
   if (!schema || typeof schema !== "object") {
     return { type: "STRING" };
@@ -82,6 +80,23 @@ function appendGeminiContentParts(parts: any[], content: any): void {
   }
 }
 
+function toolCallThoughtSignature(toolCall: any): string {
+  const value = toolCall?.thought_signature || toolCall?.thoughtSignature || toolCall?.signature;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function appendLegacyToolImages(parts: any[], content: any): void {
+  if (!Array.isArray(content)) return;
+  // A signatureless historical function call cannot be sent back to Gemini
+  // as a functionCall/functionResponse pair. Keep only the visual state from
+  // its result; textual tool transcripts are internal protocol data and must
+  // not become model-visible user text that can be echoed to Codex.
+  appendGeminiContentParts(parts, content.filter((part: any) => {
+    if (!part || typeof part !== "object") return false;
+    return part.type === "image_url" || part.type === "input_image" || part.type === "output_image";
+  }));
+}
+
 export class GoogleGeminiAdapter implements ProtocolAdapter {
   public name = "google";
 
@@ -96,6 +111,15 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
   } {
     const rawContents: any[] = [];
     let systemInstruction: any = undefined;
+    const toolNames = new Map<string, string>();
+    const signaturelessToolCallIds = new Set<string>();
+    for (const message of chatBody.messages) {
+      for (const toolCall of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+        if (!toolCallThoughtSignature(toolCall) && toolCall?.id) {
+          signaturelessToolCallIds.add(String(toolCall.id));
+        }
+      }
+    }
 
     for (const msg of chatBody.messages) {
       if (msg.role === "system") {
@@ -114,26 +138,46 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
         for (const tc of msg.tool_calls) {
           let args = {};
           try { args = JSON.parse(tc.function.arguments || "{}"); } catch {}
+          const sig = toolCallThoughtSignature(tc);
+          if (!sig) {
+            // A previous native Responses rollout may not have persisted the
+            // provider-owned signature. Never invent one: Gemini rejects a
+            // signatureless functionCall. Omit the stale call from provider
+            // history instead of turning internal tool data into plain text.
+            if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
+            continue;
+          }
           const partObj: any = {
             functionCall: {
               name: tc.function.name,
               args,
             }
           };
-          const sig = (tc as any).thought_signature || (tc as any).thoughtSignature || (tc as any).signature || DEFAULT_THOUGHT_SIGNATURE;
-          partObj.thoughtSignature = sig;
-          partObj.thought_signature = sig;
+          if (sig) {
+            partObj.thoughtSignature = sig;
+            partObj.thought_signature = sig;
+          }
+          if (tc.id && tc.function?.name) toolNames.set(String(tc.id), String(tc.function.name));
           parts.push(partObj);
         }
       }
 
       if (msg.role === "tool") {
-        parts.push({
-          functionResponse: {
-            name: msg.name || "exec_command",
-            response: { output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "") }
-          }
-        });
+        const responseName = String(msg.name || toolNames.get(String(msg.tool_call_id || "")) || "exec_command").trim();
+        if (msg.tool_call_id && signaturelessToolCallIds.has(String(msg.tool_call_id))) {
+          // The matching call was omitted above because its Gemini thought
+          // signature is unrecoverable. A functionResponse without that call
+          // is also invalid, so preserve only screenshots and omit the
+          // textual result from the provider transcript.
+          appendLegacyToolImages(parts, msg.content);
+        } else {
+          parts.push({
+            functionResponse: {
+              name: responseName,
+              response: { output: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "") }
+            }
+          });
+        }
         // A local Computer Use result carries the screenshot beside the
         // function response so Gemini can inspect the updated desktop.
         if (Array.isArray(msg.content)) appendGeminiContentParts(parts, msg.content.filter((part: any) => part?.type !== "text"));
@@ -156,6 +200,18 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
 
     if (mergedContents.length > 0 && mergedContents[0].role === "model") {
       mergedContents.unshift({ role: "user", parts: [{ text: "Hello" }] });
+    }
+
+    // Gemini's native endpoint rejects a request whose final turn is `model`.
+    // A trailing model turn here is an orphaned historical continuation: its
+    // tool result was not present, so sending invented user text would make
+    // the provider re-plan the same desktop action indefinitely. Drop only
+    // trailing model turns and let the current user/tool turn drive the next
+    // request.
+    if (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === "model") {
+      while (mergedContents.length > 0 && mergedContents[mergedContents.length - 1].role === "model") {
+        mergedContents.pop();
+      }
     }
 
     const functionDeclarations = (chatBody.tools || []).map((t: any) => {
@@ -205,6 +261,16 @@ export class GoogleGeminiAdapter implements ProtocolAdapter {
       }
       if (part.functionCall) {
         const sig = part.thoughtSignature || part.thought_signature || candidate.content?.thoughtSignature || candidate.content?.thought_signature;
+        let argumentSize = 0;
+        try {
+          argumentSize = JSON.stringify(part.functionCall.args || {}).length;
+        } catch {
+          argumentSize = 0;
+        }
+        console.info(
+          `[CodexSplit Gemini] functionCall name=${String(part.functionCall.name || "").trim() || "(empty)"} ` +
+          `args_chars=${argumentSize} thought_signature=${Boolean(sig)}`,
+        );
         const toolCallObj: any = {
           index: i,
           id: `call_gemini_${Date.now()}_${i}`,

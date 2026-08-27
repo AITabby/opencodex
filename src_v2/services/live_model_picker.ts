@@ -1,8 +1,7 @@
-export const LIVE_MODEL_PICKER_TIMEOUT_MS = 15 * 1000;
 export const LIVE_MODEL_BINDING_TTL_MS = 30 * 60 * 1000;
 
 /**
- * Keep the Live picker aligned with the Desktop model menu: native/official
+ * Keep Live model candidates aligned with the Desktop model menu: native/official
  * models are shown first, followed by provider-owned models. The input is
  * sorted once for deterministic UI output, then partitioned without allowing
  * a third-party model to move ahead of the official group.
@@ -21,7 +20,7 @@ export function orderOfficialModelsFirst(models: string[], officialModels: Itera
 }
 
 /** Internal Codex aliases such as Work Mode are not user-selectable Live models. */
-export function isLiveModelPickerEntryVisible(model: any): boolean {
+export function isLiveModelEntryVisible(model: any): boolean {
   const visibility = String(model?.visibility || "").trim().toLowerCase();
   return visibility !== "hide" && visibility !== "hidden" && model?.supported_in_api !== false;
 }
@@ -166,7 +165,7 @@ function isUserMessage(value: unknown): boolean {
 /**
  * Responses requests often contain the complete prior conversation in input.
  * Keep user turns separate and inspect them from newest to oldest. This lets a
- * model choice spoken before the actual task persist like a manual picker,
+ * model choice spoken before the actual task persist like a prior model choice,
  * while preventing an older Mimo mention from being merged with a newer Qwen
  * mention and becoming ambiguous.
  */
@@ -344,7 +343,7 @@ function hasModelDirectiveContext(text: string, index: number, aliasLength: numb
   const end = Math.min(text.length, index + aliasLength + 64);
   const context = text.slice(start, end);
   if (NEGATED_MODEL_DIRECTIVE_PATTERN.test(text.slice(start, index))) return false;
-  // A short model-only utterance such as “千问 3.7” is itself a picker
+  // A short model-only utterance such as “千问 3.7” is itself a model-selection
   // action. Reject obvious discussion/education mentions, but do not require
   // a fixed verb before accepting a uniquely matched model name. This is
   // deliberately not a keyword-trigger system: the model name is the signal.

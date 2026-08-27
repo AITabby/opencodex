@@ -19,6 +19,10 @@ import {
 } from "../dist/services/cursor_protocol.js";
 import {
   decryptClaudeSafeStorageValue,
+  buildAntigravityUserAgent,
+  buildGrokUserAgent,
+  normalizeAntigravityClientVersion,
+  normalizeGrokClientVersion,
   selectClaudeDesktopTokenCache,
   selectAntigravityOAuthClientId,
   extractAntigravityOAuthClientSecrets,
@@ -94,6 +98,23 @@ test("Antigravity OAuth discovery does not merge adjacent client secrets", () =>
   const second = `GOCSPX-${"b".repeat(28)}`;
 
   assert.deepEqual(extractAntigravityOAuthClientSecrets(`${first}${second}`), [first, second]);
+});
+
+test("Antigravity User-Agent uses the detected client version", () => {
+  assert.equal(normalizeAntigravityClientVersion(" 2.8.0\n"), "2.8.0");
+  assert.equal(normalizeAntigravityClientVersion("unknown"), null);
+  assert.equal(
+    buildAntigravityUserAgent("2.8.0", "darwin", "arm64"),
+    "antigravity/hub/2.8.0 darwin/arm64",
+  );
+  assert.equal(buildAntigravityUserAgent(null, "darwin", "arm64"), null);
+});
+
+test("Grok User-Agent uses the detected CLI version", () => {
+  assert.equal(normalizeGrokClientVersion("grok 0.2.112 (9bbd559437aa)"), "0.2.112");
+  assert.equal(normalizeGrokClientVersion("unknown"), null);
+  assert.equal(buildGrokUserAgent("0.2.112"), "grok-cli/0.2.112");
+  assert.equal(buildGrokUserAgent(null), null);
 });
 
 test("Cursor unary requests are raw protobuf, not Connect response frames", () => {

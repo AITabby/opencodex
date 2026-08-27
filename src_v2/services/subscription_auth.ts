@@ -18,6 +18,23 @@ function defaultGrokAuthDir(): string {
   const configured = String(process.env.OPENCODEX_GROK_AUTH_DIR || process.env.GROK_AUTH_DIR || "").trim();
   return configured || path.join(os.homedir(), ".grok");
 }
+
+function grokCliCandidates(): string[] {
+  return Array.from(new Set([
+    String(process.env.OPENCODEX_GROK_CLI_PATH || "").trim(),
+    "grok",
+    path.join(os.homedir(), ".local", "bin", "grok"),
+    path.join(os.homedir(), ".grok", "bin", "grok"),
+  ].filter(Boolean)));
+}
+
+function grokVersionFileCandidates(): string[] {
+  return Array.from(new Set([
+    path.join(defaultGrokAuthDir(), "version.json"),
+    path.join(os.homedir(), ".grok", "version.json"),
+  ]));
+}
+
 const ANTIGRAVITY_KEYCHAIN_ACCOUNT = "antigravity";
 const ANTIGRAVITY_KEYCHAIN_SERVICE = "gemini";
 const ANTIGRAVITY_KEYCHAIN_PREFIX = "go-keyring-base64:";
@@ -45,6 +62,10 @@ const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 const ANTIGRAVITY_APP_PATHS = [
   "/Applications/Antigravity.app/Contents/Resources/bin/language_server",
   path.join(os.homedir(), "Applications/Antigravity.app/Contents/Resources/bin/language_server")
+];
+const ANTIGRAVITY_INFO_PATHS = [
+  "/Applications/Antigravity.app/Contents/Info.plist",
+  path.join(os.homedir(), "Applications/Antigravity.app/Contents/Info.plist")
 ];
 
 type GrokSession = Record<string, any>;
@@ -475,6 +496,78 @@ export function getClaudeDesktopVersion(): string {
   return "unknown";
 }
 
+export function normalizeGrokClientVersion(value: unknown): string | null {
+  const text = String(value ?? "").trim();
+  const match = text.match(/(?:^|\s)v?(\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?)(?=\s|$|\()/);
+  return match?.[1] || null;
+}
+
+export function getGrokClientVersion(): string | null {
+  for (const command of grokCliCandidates()) {
+    try {
+      const version = normalizeGrokClientVersion(execFileSync(
+        command,
+        ["--version"],
+        { encoding: "utf-8", timeout: 1500, stdio: ["ignore", "pipe", "ignore"] },
+      ));
+      if (version) return version;
+    } catch {}
+  }
+
+  for (const versionPath of grokVersionFileCandidates()) {
+    try {
+      const value = JSON.parse(fs.readFileSync(versionPath, "utf-8"));
+      const version = normalizeGrokClientVersion(value?.version || value?.stable_version);
+      if (version) return version;
+    } catch {}
+  }
+  return null;
+}
+
+export function buildGrokUserAgent(version: unknown): string | null {
+  const normalizedVersion = normalizeGrokClientVersion(version);
+  return normalizedVersion ? `grok-cli/${normalizedVersion}` : null;
+}
+
+export function getGrokUserAgent(): string | null {
+  return buildGrokUserAgent(getGrokClientVersion());
+}
+
+export function normalizeAntigravityClientVersion(value: unknown): string | null {
+  const version = String(value || "").trim();
+  return /^\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(version) ? version : null;
+}
+
+export function getAntigravityClientVersion(): string | null {
+  for (const infoPath of ANTIGRAVITY_INFO_PATHS) {
+    try {
+      const version = normalizeAntigravityClientVersion(execFileSync(
+        "/usr/libexec/PlistBuddy",
+        ["-c", "Print :CFBundleShortVersionString", infoPath],
+        { encoding: "utf-8" },
+      ));
+      if (version) return version;
+    } catch {}
+  }
+  return null;
+}
+
+export function buildAntigravityUserAgent(
+  version: unknown,
+  platform = process.platform,
+  arch = process.arch,
+): string | null {
+  const normalizedVersion = normalizeAntigravityClientVersion(version);
+  const normalizedPlatform = String(platform || "").trim();
+  const normalizedArch = String(arch || "").trim();
+  if (!normalizedVersion || !normalizedPlatform || !normalizedArch) return null;
+  return `antigravity/hub/${normalizedVersion} ${normalizedPlatform}/${normalizedArch}`;
+}
+
+export function getAntigravityUserAgent(): string | null {
+  return buildAntigravityUserAgent(getAntigravityClientVersion());
+}
+
 function jwtExpiry(token: string): number | null {
   try {
     const payload = token.split(".")[1];
@@ -616,9 +709,15 @@ export class SubscriptionAuthService {
     const clientId = String(current.session.oidc_client_id || "");
     if (!clientId) return null;
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/x-www-form-urlencoded",
+    };
+    const userAgent = getGrokUserAgent();
+    if (userAgent) headers["User-Agent"] = userAgent;
+
     const response = await fetch(`${issuer}/oauth2/token`, {
       method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "grok-cli/1.89.0" },
+      headers,
       body: new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken }),
       signal: AbortSignal.timeout(15000)
     });
