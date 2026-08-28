@@ -90,6 +90,9 @@ rl.on("line", (line) => {
           model,
           modelProvider: provider,
           turns: [],
+          ...(process.env.FAKE_THREAD_SETTINGS === "1"
+            ? { threadSettings: { model, modelProvider: provider, effort: "medium" } }
+            : {}),
         } } });
       }
       break;
@@ -1017,7 +1020,11 @@ test("a third-party image attachment keeps native Codex semantics and remains is
       id: 40,
       method: "config/batchWrite",
       params: {
-        edits: [{ keyPath: ["openai_base_url"], value: "http://stale-desktop-config/v1" }],
+        edits: [
+          { keyPath: "openai_base_url", value: "http://stale-desktop-config/v1" },
+          { keyPath: "model", value: "antigravity/gemini-3.6-flash-medium", mergeStrategy: "upsert" },
+          { keyPath: "model_reasoning_effort", value: "high", mergeStrategy: "upsert" },
+        ],
       },
     });
     assert.deepEqual(await waitForResponse(messages, 40), { id: 40, result: {} });
@@ -1060,7 +1067,12 @@ test("a third-party image attachment keeps native Codex semantics and remains is
     assert.equal(nativeTurn?.params?.model, "antigravity/gemini-3.6-flash-medium");
     assert.equal(nativeTurn?.params?.modelProvider, "opencodex");
     assert.equal(nativeTurn?.params?.client_metadata?.opencodex_model_override, "antigravity/gemini-3.6-flash-medium");
-    assert.equal(trace.some((entry) => entry.method === "config/batchWrite"), false);
+    const modelConfigWrite = trace.find((entry) => entry.method === "config/batchWrite");
+    assert.deepEqual(modelConfigWrite?.params?.edits, [
+      { keyPath: "model", value: "antigravity/gemini-3.6-flash-medium", mergeStrategy: "upsert" },
+      { keyPath: "model_reasoning_effort", value: "high", mergeStrategy: "upsert" },
+    ]);
+    assert.equal(modelConfigWrite?.params?.reloadUserConfig, false);
     assert.equal(trace.some((entry) => entry.method === "thread/inject_items"), false);
     assert.equal(trace.some((entry) => entry.runtimeProvider === "opencodex"), false);
 
@@ -1735,6 +1747,68 @@ test("opening a thread with the current provider picker does not rebind its pers
 
     const savedRoutes = JSON.parse(await readFile(routePath, "utf8"));
     assert.equal(savedRoutes.threads[externalId].selectedModel, selectedProviderModel);
+  } finally {
+    output.close();
+    bridge.kill("SIGTERM");
+    await once(bridge, "exit").catch(() => {});
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("third-party reasoning effort survives settings updates and native reads", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-provider-bridge-reasoning-settings-"));
+  const fakeNativePath = join(tempRoot, "fake-native-app-server.mjs");
+  const emptyCatalogPath = join(tempRoot, "empty-catalog.json");
+  const routePath = join(tempRoot, "routes.json");
+  const traceFile = join(tempRoot, "trace.jsonl");
+  const selectedProviderModel = "antigravity/gemini-3.6-flash-medium";
+  await writeFile(fakeNativePath, fakeNativeSource, "utf8");
+  await chmod(fakeNativePath, 0o755);
+  await writeFile(emptyCatalogPath, JSON.stringify({ models: [] }), "utf8");
+  await writeFile(routePath, JSON.stringify({ version: 1, threads: {} }), "utf8");
+
+  const bridgePath = fileURLToPath(new URL("../dist/codex-provider-bridge.js", import.meta.url));
+  const bridge = spawn(process.execPath, [bridgePath, "app-server"], {
+    env: {
+      ...process.env,
+      CODEX_CLI_PATH: "",
+      OPENCODEX_NATIVE_CODEX_PATH: fakeNativePath,
+      OPENCODEX_MODEL_CATALOG_PATH: emptyCatalogPath,
+      OPENCODEX_PROVIDER_SESSION_MAP_PATH: routePath,
+      FAKE_THREAD_SETTINGS: "1",
+      FAKE_TRACE_FILE: traceFile,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const messages = [];
+  const output = readline.createInterface({ input: bridge.stdout });
+  output.on("line", (line) => {
+    if (!line.trim()) return;
+    try { messages.push(JSON.parse(line)); } catch {}
+  });
+  const send = (message) => bridge.stdin.write(`${JSON.stringify(message)}\n`);
+  try {
+    send({ id: 901, method: "initialize", params: {} });
+    assert.deepEqual(await waitForResponse(messages, 901), { id: 901, result: {} });
+
+    send({ id: 902, method: "thread/start", params: { model: "gpt-5.5" } });
+    assert.equal((await waitForResponse(messages, 902)).error, undefined);
+    send({
+      id: 903,
+      method: "thread/settings/update",
+      params: { threadId: "thread-1", model: selectedProviderModel, effort: "high" },
+    });
+    assert.deepEqual(await waitForResponse(messages, 903), { id: 903, result: {} });
+    send({ id: 904, method: "thread/read", params: { threadId: "thread-1" } });
+    const read = await waitForResponse(messages, 904);
+    assert.equal(read.error, undefined);
+    assert.equal(read.result.thread.model, selectedProviderModel);
+    assert.equal(read.result.thread.modelProvider, "opencodex");
+    assert.equal(read.result.thread.threadSettings.effort, "high");
+
+    const savedRoutes = JSON.parse(await readFile(routePath, "utf8"));
+    assert.equal(savedRoutes.threads["thread-1"].settings.effort, "high");
+    assert.equal(savedRoutes.threads["thread-1"].settings.config.model_reasoning_effort, "high");
   } finally {
     output.close();
     bridge.kill("SIGTERM");

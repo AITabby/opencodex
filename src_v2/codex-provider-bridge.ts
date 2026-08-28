@@ -1889,6 +1889,25 @@ function stripRequestProvider(params: JsonRecord): JsonRecord {
   return next;
 }
 
+function modelConfigEdits(params: JsonRecord): JsonRecord[] {
+  if (!Array.isArray(params.edits)) return [];
+  return params.edits.filter((edit): edit is JsonRecord => {
+    if (!edit || typeof edit !== "object" || Array.isArray(edit)) return false;
+    const keyPath = typeof edit.keyPath === "string"
+      ? edit.keyPath.split(".")
+      : edit.keyPath;
+    if (!Array.isArray(keyPath) || keyPath.length === 0) return false;
+    const normalized = keyPath.map(cleanString);
+    if (normalized.some((part) => !part)) return false;
+    const leaf = normalized[normalized.length - 1];
+    // Desktop writes the selected model and effort through config/batchWrite
+    // when the composer is still a new-thread draft. Forward only these model
+    // settings; forwarding the full startup snapshot can overwrite the
+    // bridge-owned process Egress URL/provider in the native child.
+    return leaf === "model" || leaf === "model_reasoning_effort";
+  });
+}
+
 function rewriteNativeTransportModel(
   params: JsonRecord,
   model: string,
@@ -2485,6 +2504,42 @@ async function runProviderBridge(): Promise<void> {
         model_reasoning_effort: effort,
       },
     };
+  }
+
+  function requestedReasoningEffort(params: JsonRecord): string {
+    const reasoning = params.reasoning && typeof params.reasoning === "object" && !Array.isArray(params.reasoning)
+      ? params.reasoning as JsonRecord
+      : {};
+    return cleanString(
+      params.effort
+        || params.reasoning_effort
+        || params.reasoningEffort
+        || reasoning.effort,
+    );
+  }
+
+  function routeReasoningEffort(
+    route?: ThreadRoute,
+    display?: NativeSubagentDisplaySettings,
+  ): string | undefined {
+    return cleanString(display?.effort)
+      || cleanString(route?.settings?.effort)
+      || cleanString(route?.settings?.reasoning_effort)
+      || cleanString(route?.settings?.reasoningEffort)
+      || cleanString(
+        route?.settings?.config
+        && typeof route.settings.config === "object"
+        && !Array.isArray(route.settings.config)
+          ? (route.settings.config as JsonRecord).model_reasoning_effort
+          : undefined,
+      )
+      || undefined;
+  }
+
+  function persistRequestedReasoningEffort(route: ThreadRoute, params: JsonRecord): string {
+    const effort = requestedReasoningEffort(params);
+    if (effort) applyDisplaySettingsToRoute(route, { effort });
+    return effort;
   }
 
   function isRetiredNativeId(nativeId: string): boolean {
@@ -3295,7 +3350,7 @@ async function runProviderBridge(): Promise<void> {
           selected,
           native,
           physicalThreadId,
-          childDisplay?.effort,
+          routeReasoningEffort(route, childDisplay),
           selectedProvider,
         ));
       },
@@ -3346,8 +3401,9 @@ async function runProviderBridge(): Promise<void> {
     if (route) rewriteThreadIds(output, route.nativeId, route.externalId);
     const displayModel = childDisplay?.model || route?.selectedModel;
     const displayProvider = displayModel ? providerForModel(displayModel) : undefined;
-    if (displayModel || childDisplay?.effort) {
-      decorateThreadModel(output, displayModel, displayProvider, childDisplay?.effort);
+    const displayReasoning = routeReasoningEffort(route, childDisplay);
+    if (displayModel || displayReasoning) {
+      decorateThreadModel(output, displayModel, displayProvider, displayReasoning);
     }
     if (["turn/completed", "turn/failed", "turn/interrupted", "turn/cancelled"].includes(message.method) && route) {
       drainSubagentEventPolling(route.externalId);
@@ -3494,6 +3550,7 @@ async function runProviderBridge(): Promise<void> {
       displayModel: selected,
       displayProvider: providerForModel(selected),
       onResponse: (response) => {
+        let startedRoute: ThreadRoute | undefined;
         if (!response.error) {
           const result = response.result && typeof response.result === "object" ? response.result as JsonRecord : {};
           const thread = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
@@ -3508,7 +3565,9 @@ async function runProviderBridge(): Promise<void> {
               threadOrigin: threadOrigin(params),
               parentThreadId: parentThreadId(params),
             });
+            startedRoute = route;
             rememberSettings(route, params);
+            persistRequestedReasoningEffort(route, params);
             // The first native thread/start response can arrive after the
             // child egress has already returned the gateway-selected effort.
             // Re-apply the cached value after rememberSettings so the native
@@ -3535,7 +3594,7 @@ async function runProviderBridge(): Promise<void> {
           runtime: native,
           displayModel: selected,
           displayProvider: providerForModel(selected),
-          displayReasoning: childDisplay?.effort,
+          displayReasoning: routeReasoningEffort(startedRoute, childDisplay),
         });
       },
     });
@@ -3563,6 +3622,7 @@ async function runProviderBridge(): Promise<void> {
       rememberSettings(route, params);
       saveRoute(route);
       const native = nativeRuntimeForRoute(route);
+      const childDisplay = nativeDisplaySettingsForRoute(route);
       let archiveRepairAttempted = false;
       const decoratedResumeResponse = (response: JsonRecord, nextParams: JsonRecord): JsonRecord => {
         if (!response.error) {
@@ -3582,6 +3642,7 @@ async function runProviderBridge(): Promise<void> {
           physicalThreadId: route.nativeId,
           displayModel: selected,
           displayProvider: providerForModel(selected),
+          displayReasoning: routeReasoningEffort(route, childDisplay),
         });
       };
       const sendResume = (): void => {
@@ -3600,6 +3661,7 @@ async function runProviderBridge(): Promise<void> {
           physicalThreadId: route.nativeId,
           displayModel: selected,
           displayProvider: providerForModel(selected),
+          displayReasoning: routeReasoningEffort(route, childDisplay),
           onResponse: (response) => {
             if (response.error
               && !archiveRepairAttempted
@@ -3906,7 +3968,7 @@ async function runProviderBridge(): Promise<void> {
           physicalThreadId: route.nativeId,
           displayModel: selected,
           displayProvider: providerForModel(selected),
-          displayReasoning: childDisplay?.effort,
+          displayReasoning: routeReasoningEffort(route, childDisplay),
         });
       };
       const sendRead = (): void => {
@@ -3915,7 +3977,7 @@ async function runProviderBridge(): Promise<void> {
           physicalThreadId: route.nativeId,
           displayModel: selected,
           displayProvider: providerForModel(selected),
-          displayReasoning: childDisplay?.effort,
+          displayReasoning: routeReasoningEffort(route, childDisplay),
           onResponse: (response) => {
             if (response.error
               && !archiveRepairAttempted
@@ -3965,10 +4027,10 @@ async function runProviderBridge(): Promise<void> {
         const childDisplay = isNativeSubagentThread(route)
           ? nativeDisplaySettingsForRoute(route)
           : undefined;
-        const selectedEffort = childDisplay?.effort
-          || cleanString(params.effort || params.reasoning_effort || params.reasoning?.effort);
-        if (childDisplay?.effort) {
-          applyDisplaySettingsToRoute(route, childDisplay);
+        const selectedEffort = requestedReasoningEffort(params)
+          || routeReasoningEffort(route, childDisplay);
+        if (selectedEffort) {
+          applyDisplaySettingsToRoute(route, { effort: selectedEffort });
           saveRoute(route);
         }
         emitSyntheticSettings(route.externalId, selected, selectedEffort || undefined);
@@ -4017,6 +4079,7 @@ async function runProviderBridge(): Promise<void> {
       }
       route.selectedModel = selected;
       rememberSettings(route, params);
+      persistRequestedReasoningEffort(route, params);
       saveRoute(route);
       if (providerForModel(selected) === GATEWAY_PROVIDER) {
         // Keep the native app-server as the sole owner of the local thread.
@@ -4166,10 +4229,24 @@ async function runProviderBridge(): Promise<void> {
     if ((method === "turn/interrupt" || method === "turn/steer") && handleActiveTurn(message, method, params)) return;
     if (method.startsWith("thread/") && handleGenericThread(message, method, params)) return;
     if (method === "config/batchWrite") {
-      // Desktop uses this startup write for feature snapshots. Forwarding it to
-      // the child makes the native config loader re-merge ~/.codex/config.toml
-      // and discard the per-process local Egress URL. The bridge owns that
-      // process-scoped routing layer, so acknowledge the UI write here.
+      const edits = modelConfigEdits(params);
+      if (edits.length > 0) {
+        // The composer persists a new-thread model/effort pair through this
+        // control-plane method. Preserve that user setting, but do not pass
+        // the rest of Desktop's startup snapshot to the child: reloading
+        // openai_base_url/model_provider there can bypass the bridge Egress.
+        const native = ensureRuntime(NATIVE_PROVIDER);
+        sendParent(native, message, method, {
+          ...params,
+          edits,
+          reloadUserConfig: false,
+        });
+        return;
+      }
+      // Desktop also uses this method for startup feature snapshots.
+      // Forwarding those unrelated edits makes the native config loader
+      // re-merge ~/.codex/config.toml and discard the process-scoped Egress
+      // URL, so the bridge owns those writes and acknowledges them here.
       writeParent({ id: message.id, result: {} });
       return;
     }
