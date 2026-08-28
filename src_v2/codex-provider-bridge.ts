@@ -177,6 +177,41 @@ function codexHomeDir(): string {
     || path.join(os.homedir(), ".codex");
 }
 
+const LOCAL_THREAD_PREFIX = "local:";
+const CLIENT_CREATED_THREAD_PREFIX = "client-new-thread:";
+const CODEX_GLOBAL_STATE_FILE = ".codex-global-state.json";
+
+/**
+ * Codex Desktop keeps a short-lived client id while a new thread is being
+ * created. The client later binds that id to the native thread id in its
+ * global state, but control-plane calls such as thread/section/move can still
+ * arrive with the temporary id during that handoff. Resolve the alias before
+ * forwarding those calls to the native app-server; otherwise pin/unpin is
+ * optimistically reflected in the UI and then restored when the request fails.
+ */
+export function resolveClientCreatedThreadId(threadId: string): string {
+  const value = cleanString(threadId);
+  const bindingKey = value.startsWith(LOCAL_THREAD_PREFIX)
+    ? value.slice(LOCAL_THREAD_PREFIX.length)
+    : value;
+  if (!bindingKey.startsWith(CLIENT_CREATED_THREAD_PREFIX)) return value;
+
+  try {
+    const globalStatePath = path.join(codexHomeDir(), CODEX_GLOBAL_STATE_FILE);
+    const globalState = JSON.parse(fs.readFileSync(globalStatePath, "utf8")) as JsonRecord;
+    const atomState = globalState["electron-persisted-atom-state"];
+    const bindings = atomState && typeof atomState === "object"
+      ? (atomState["client-thread-bindings-v1"] as JsonRecord | undefined)
+      : undefined;
+    const resolved = bindings && typeof bindings === "object" ? bindings[bindingKey] : undefined;
+    return cleanString(resolved) || value;
+  } catch {
+    // The global state file may be unavailable during first launch. Keep the
+    // original id so ordinary unknown-thread handling remains unchanged.
+    return value;
+  }
+}
+
 function isArchivedNativeRolloutPath(filePath: string): boolean {
   const archivedRoot = path.resolve(path.join(codexHomeDir(), "archived_sessions"));
   const resolvedPath = path.resolve(String(filePath || ""));
@@ -3363,7 +3398,12 @@ async function runProviderBridge(): Promise<void> {
     callback: (route: ThreadRoute | null, error?: string) => void,
     options: EnsureCanonicalOptions = {},
   ): void {
-    const existing = routes.get(externalId);
+    const canonicalExternalId = resolveClientCreatedThreadId(externalId);
+    // Prefer the durable native route when the parent still addresses the
+    // client-created alias. Falling back to the original key preserves the
+    // existing behavior for unknown or not-yet-bound threads.
+    const existing = routes.get(canonicalExternalId)
+      || (canonicalExternalId === externalId ? routes.get(externalId) : undefined);
     const requested = options.preserveRequestedModel ? "" : modelSlug(params.model);
     if (existing) {
       // `thread/read`, `thread/resume`, and several Desktop revisions of
@@ -3380,12 +3420,13 @@ async function runProviderBridge(): Promise<void> {
       callback(existing);
       return;
     }
-    const legacy = legacyThreads.get(externalId);
+    const legacy = legacyThreads.get(canonicalExternalId)
+      || (canonicalExternalId === externalId ? legacyThreads.get(externalId) : undefined);
     const savedModel = requested || legacy?.model || "";
     const createDirectRoute = (): void => {
       const route = saveRoute({
-        externalId,
-        nativeId: externalId,
+        externalId: canonicalExternalId,
+        nativeId: canonicalExternalId,
         nativePath: legacy?.path,
         selectedModel: savedModel || nativeDefaultModel(),
       });
@@ -3398,25 +3439,25 @@ async function runProviderBridge(): Promise<void> {
     // selection to that same local thread instead of creating another one.
     if (!legacy && !requested) {
       const native = ensureRuntime(NATIVE_PROVIDER);
-      sendInternal(native, "thread/read", { threadId: externalId, includeTurns: false }, (read) => {
+      sendInternal(native, "thread/read", { threadId: canonicalExternalId, includeTurns: false }, (read) => {
         if (!read.error) {
           const result = read.result && typeof read.result === "object" ? read.result as JsonRecord : {};
           const source = result.thread && typeof result.thread === "object" ? result.thread as JsonRecord : {};
           const discoveredModel = modelSlug(source.model);
           if (providerForModel(discoveredModel) === GATEWAY_PROVIDER) {
             const discovered = {
-              id: externalId,
+              id: canonicalExternalId,
               model: discoveredModel,
               path: cleanString(source.path) || undefined,
             };
-            legacyThreads.set(externalId, discovered);
+            legacyThreads.set(canonicalExternalId, discovered);
             // The rollout already belongs to the local Codex store. Register
             // the provider selection against that same id/path; never create
             // a replacement native thread and never copy its history into a
             // second conversation.
             const route = saveRoute({
-              externalId,
-              nativeId: externalId,
+              externalId: canonicalExternalId,
+              nativeId: canonicalExternalId,
               nativePath: discovered.path,
               selectedModel: discoveredModel,
             });
@@ -4021,7 +4062,13 @@ async function runProviderBridge(): Promise<void> {
         return;
       }
       const native = nativeRuntimeForRoute(route);
-      const nextParams = { ...stripRequestProvider(params), threadId: route.nativeId };
+      const nextParams = {
+        ...stripRequestProvider(params),
+        threadId: route.nativeId,
+        ...(typeof params.beforeThreadId === "string"
+          ? { beforeThreadId: resolveClientCreatedThreadId(params.beforeThreadId) }
+          : {}),
+      };
       const archiveMutation = method === "thread/archive" || method === "thread/unarchive";
       sendParent(native, message, method, nextParams, {
         externalThreadId: route.externalId,

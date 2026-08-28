@@ -24,6 +24,7 @@ import {
   rewriteNativeGatewayRequestBody,
   nativeRuntimeArgs,
   normalizeThreadListParams,
+  resolveClientCreatedThreadId,
 } from "../dist/codex-provider-bridge.js";
 import {
   buildDesktopLaunchEnvironment,
@@ -57,6 +58,41 @@ test("1.1.5 classifies official and namespaced provider-owned models safely", ()
     models: [{ slug: "antigravity/gemini-3.6-flash-medium", provider: "openai" }],
   }]), "opencodex");
   assert.equal(classifyProviderModel("not-in-catalog", catalogs), null);
+});
+
+test("client-created thread aliases resolve to their native ids for control-plane calls", async () => {
+  const tempRoot = await mkdtemp(join(tmpdir(), "opencodex-client-thread-binding-"));
+  const previousHome = process.env.OPENCODEX_CODEX_HOME;
+  process.env.OPENCODEX_CODEX_HOME = tempRoot;
+  try {
+    await writeFile(join(tempRoot, ".codex-global-state.json"), JSON.stringify({
+      "electron-persisted-atom-state": {
+        "client-thread-bindings-v1": {
+          "client-new-thread:client-alias": "01native-thread-id",
+        },
+      },
+    }), "utf8");
+    assert.equal(
+      resolveClientCreatedThreadId("local:client-new-thread:client-alias"),
+      "01native-thread-id",
+    );
+    assert.equal(
+      resolveClientCreatedThreadId("client-new-thread:client-alias"),
+      "01native-thread-id",
+    );
+    assert.equal(
+      resolveClientCreatedThreadId("local:ordinary-thread-id"),
+      "local:ordinary-thread-id",
+    );
+    assert.equal(
+      resolveClientCreatedThreadId("local:client-new-thread:unknown"),
+      "local:client-new-thread:unknown",
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+    else process.env.OPENCODEX_CODEX_HOME = previousHome;
+    await rm(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("standalone CLI keeps official requests native and sends provider-owned models to the gateway", () => {
