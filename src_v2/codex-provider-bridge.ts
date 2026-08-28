@@ -3846,7 +3846,11 @@ async function runProviderBridge(): Promise<void> {
         writeParent(output);
       };
       const native = runtimes.get("default");
-      if (native) restoreMissingThirdPartyRoutes(native, seen, finishOutput);
+      // A section-filtered list (especially the native Pinned section) must
+      // remain authoritative. Restoring every provider route into that result
+      // makes all third-party conversations appear pinned even when the native
+      // state database says is_pinned=0. Only repair the unfiltered catalog.
+      if (native && nextParams.sectionId == null) restoreMissingThirdPartyRoutes(native, seen, finishOutput);
       else finishOutput();
     };
 

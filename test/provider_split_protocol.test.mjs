@@ -1425,6 +1425,10 @@ test("third-party sessions remain visible after the bridge restarts", async () =
     ));
     assert.equal(firstList.result.data.every((entry) => Array.isArray(entry.turns)), true);
 
+    first.send({ id: 7031, method: "thread/list", params: { sectionId: "pinned-section" } });
+    const sectionList = await waitForResponse(first.messages, 7031);
+    assert.equal(sectionList.result.data.some((entry) => entry.id === "restartable-thirdparty"), false);
+
     first.output.close();
     first.bridge.kill("SIGTERM");
     await once(first.bridge, "exit").catch(() => {});
