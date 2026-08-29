@@ -8,7 +8,7 @@ import fs from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { transformResponsesToChat, convertToolsToChatTools, stripSubagentDispatchTools, stripSubagentRuntimeTools, buildGatewaySubagentResponseTool } from "../dist/core/transformer.js";
+import { transformResponsesToChat, convertToolsToChatTools, stripSubagentDispatchTools, stripSubagentRuntimeTools, buildGatewaySubagentResponseTool, capThirdPartyChatHistory, THIRD_PARTY_HISTORY_WINDOW } from "../dist/core/transformer.js";
 import {
   hasChatToolImages,
   isConsoleGoToolImageRejection,
@@ -1190,4 +1190,59 @@ test("v2 executes internal image calls without leaking them as client function c
   assert.equal(events.find((event) => event.type === "response.output_item.done")?.item?.result, "AAAA");
   assert.equal(events.find((event) => event.type === "response.completed")?.response?.output?.[0]?.type, "image_generation_call");
   assert.equal(events.some((event) => event.item?.type === "message"), false);
+});
+
+test("third-party chat history is capped to bound input-token usage on long sessions", () => {
+  const longInput = [];
+  for (let i = 0; i < 743; i += 1) {
+    longInput.push({ role: "user", content: `message-${i}` });
+    longInput.push({ role: "assistant", content: `reply-${i}` });
+  }
+  const capped = transformResponsesToChat({
+    model: "minimax-m3",
+    input: longInput,
+  }, "MiniMax-M3", undefined, true, "minimax");
+  const systemMessages = capped.messages.filter((message) => message.role === "system");
+  // The bridge note is the only system message when the dev environment
+  // doesn't ship an instructions string. It must always name the adapter.
+  assert.equal(systemMessages.length, 1);
+  assert.match(systemMessages[0].content, /CodexSplit Bridge/);
+  assert.match(systemMessages[0].content, /minimax/);
+  // The total transcript must not exceed the cap plus the synthetic note.
+  assert.ok(capped.messages.length <= THIRD_PARTY_HISTORY_WINDOW + 1);
+  // The last user turn is the freshest message in the thread, so it survives.
+  assert.equal(capped.messages.at(-1).role, "assistant");
+  assert.equal(capped.messages.at(-1).content, `reply-${742}`);
+});
+
+test("third-party history cap leaves short sessions untouched", () => {
+  const shortInput = [
+    { role: "user", content: "first user message" },
+    { role: "assistant", content: "first assistant reply" },
+    { role: "user", content: "second user message" },
+    { role: "assistant", content: "second assistant reply" },
+  ];
+  const capped = transformResponsesToChat({
+    model: "minimax-m3",
+    input: shortInput,
+  }, "MiniMax-M3", undefined, true, "minimax");
+  assert.equal(
+    capped.messages.some((message) => /CodexSplit Bridge/.test(String(message.content))),
+    false,
+  );
+  assert.equal(capped.messages.at(-1).content, "second assistant reply");
+});
+
+test("third-party history cap can be disabled via window override", () => {
+  const longInput = [];
+  for (let i = 0; i < 80; i += 1) {
+    longInput.push({ role: "user", content: `m-${i}` });
+  }
+  const disabled = capThirdPartyChatHistory(
+    longInput.map((entry) => ({ role: entry.role, content: entry.content })),
+    "minimax",
+    0,
+  );
+  assert.equal(disabled.dropped, 0);
+  assert.equal(disabled.messages.length, longInput.length);
 });

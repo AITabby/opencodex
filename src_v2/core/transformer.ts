@@ -599,6 +599,58 @@ export function mergeConsecutiveMessages(messages: ChatMessage[]): ChatMessage[]
 
 import { SessionHistoryService } from "../services/session_history.js";
 
+/**
+ * Window size applied to the *chat* transcript that the gateway forwards to a
+ * third-party provider. Third-party APIs (MiniMax, DeepSeek, custom OpenAI
+ * clones, ...) usually charge per input token without the prompt-cache prefix
+ * discount that native GPT provides, so a long Codex session can balloon a
+ * single user turn into a noticeable slice of the provider's quota.
+ *
+ * The cap only trims the *reconstructed history*; the current user/assistant
+ * turn, tool calls and tool results for that turn are always preserved. A
+ * synthetic system note is inserted whenever older turns are dropped so the
+ * downstream model still knows that context existed upstream.
+ *
+ * The window can be overridden per-process through `OPENCODEX_THIRD_PARTY_HISTORY_WINDOW`
+ * (positive integer; `0` disables the cap). Native Codex GPT responses never
+ * flow through this function, so the cap cannot affect that path.
+ */
+export const THIRD_PARTY_HISTORY_WINDOW = (() => {
+  const raw = process.env.OPENCODEX_THIRD_PARTY_HISTORY_WINDOW;
+  if (raw === undefined || raw === "") return 32;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return 32;
+  return Math.floor(parsed);
+})();
+
+export interface CapThirdPartyHistoryResult {
+  messages: ChatMessage[];
+  dropped: number;
+}
+
+export function capThirdPartyChatHistory(
+  messages: ChatMessage[],
+  adapterName?: string,
+  windowSize: number = THIRD_PARTY_HISTORY_WINDOW,
+): CapThirdPartyHistoryResult {
+  if (windowSize <= 0) return { messages, dropped: 0 };
+  if (!Array.isArray(messages)) return { messages, dropped: 0 };
+  if (messages.length <= windowSize) return { messages, dropped: 0 };
+  const dropped = messages.length - windowSize;
+  const kept = messages.slice(-windowSize);
+  const providerLabel = String(adapterName || "third-party").trim() || "third-party";
+  const note: ChatMessage = {
+    role: "system",
+    content:
+      `[CodexSplit Bridge] Dropped the oldest ${dropped} message(s) of this Codex session `
+      + `before forwarding the request to the third-party provider "${providerLabel}". `
+      + `Native GPT keeps prompt-cache discounts on long transcripts; third-party APIs do not, `
+      + `so trimming here keeps input-token usage bounded for providers that bill every token. `
+      + `The remaining ${kept.length} messages below are the most recent ones in the local Codex session.`,
+  };
+  return { messages: [note, ...kept], dropped };
+}
+
 export function transformResponsesToChat(
   body: ResponsesRequestBody,
   upstreamModel: string,
@@ -634,7 +686,15 @@ export function transformResponsesToChat(
       : ((body as any).messages || []);
   const inputMessages = responsesInputToChatMessages(rawInput);
   const repairedMessages = SessionHistoryService.repairAndMergeHistory(inputMessages, sessionId);
-  messages.push(...repairedMessages);
+  // Cap the reconstructed history before it reaches a third-party provider.
+  // Native GPT never reaches this helper, so the cap is intentionally limited
+  // to the third-party Chat path.
+  const cappedHistory = capThirdPartyChatHistory(repairedMessages, adapterName);
+  if (cappedHistory.dropped > 0) {
+    messages.push(...cappedHistory.messages);
+  } else {
+    messages.push(...repairedMessages);
+  }
 
   // Apply model-specific adapter (DeepSeek, MiniMax, Anthropic, Google)
   const adapter = AdapterFactory.getAdapter(undefined, undefined, adapterName);
