@@ -594,6 +594,11 @@ test("text-only image turns remove image inspection tools but preserve command t
 });
 
 test("native vision failure ends only the current turn after the original image attempt", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-test-vision-"));
+  const previousDataDir = process.env.OPENCODEX_DATA_DIR;
+  const previousCodexHome = process.env.OPENCODEX_CODEX_HOME;
+  process.env.OPENCODEX_DATA_DIR = tempDir;
+  process.env.OPENCODEX_CODEX_HOME = tempDir;
   let upstreamRequests = 0;
   let capturedUpstreamBody = "";
   const upstream = createServer(async (_req, res) => {
@@ -690,6 +695,11 @@ test("native vision failure ends only the current turn after the original image 
     assert.equal(upstreamRequests, 2);
     assert.match(Buffer.concat(nextSink.chunks).toString(), /后续文字正常/);
   } finally {
+    if (previousDataDir === undefined) delete process.env.OPENCODEX_DATA_DIR;
+    else process.env.OPENCODEX_DATA_DIR = previousDataDir;
+    if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+    else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
+    await fs.rm(tempDir, { recursive: true, force: true });
     await new Promise((resolve) => upstream.close(resolve));
   }
 });

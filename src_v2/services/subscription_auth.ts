@@ -791,23 +791,53 @@ export class SubscriptionAuthService {
     const profileDir = this.selectProfile("antigravity");
     const auth = readAntigravityAuth(profileDir || undefined) || (profileDir ? null : readAntigravityAuth());
     const token = auth?.token;
-    if (!token) return null;
-    const accessToken = token.access_token || "";
-    const expiry = token.expiry || token.expires_at;
-    if (!forceRefresh && isValidAccessToken(accessToken, expiry)) return accessToken;
+    if (token) {
+      const accessToken = token.access_token || "";
+      const expiry = token.expiry || token.expires_at;
+      if (!forceRefresh && isValidAccessToken(accessToken, expiry)) return accessToken;
 
-    if (!this.antigravityRefresh) {
-      this.antigravityRefresh = this.refreshAntigravityToken(profileDir || undefined).finally(() => { this.antigravityRefresh = null; });
+      if (!this.antigravityRefresh) {
+        this.antigravityRefresh = this.refreshAntigravityToken(profileDir || undefined).finally(() => { this.antigravityRefresh = null; });
+      }
+      const refreshed = await this.antigravityRefresh;
+      if (refreshed) return refreshed;
+
+      // A refresh can fail transiently while the current token is still valid.
+      // Keep that token for the caller; the API request can then succeed or
+      // trigger the normal one-time 401/403 refresh path. Treating the
+      // refresh-skew window as an immediate logout made subscription imports
+      // fail even though the desktop session was still usable.
+      if (!forceRefresh && isStillUsableAccessToken(accessToken, expiry)) return accessToken;
     }
-    const refreshed = await this.antigravityRefresh;
-    if (refreshed) return refreshed;
 
-    // A refresh can fail transiently while the current token is still valid.
-    // Keep that token for the caller; the API request can then succeed or
-    // trigger the normal one-time 401/403 refresh path. Treating the
-    // refresh-skew window as an immediate logout made subscription imports
-    // fail even though the desktop session was still usable.
-    return !forceRefresh && isStillUsableAccessToken(accessToken, expiry) ? accessToken : null;
+    // If the selected pool profile's token was missing, expired, or failed to
+    // refresh, fall back to the native system Keychain credentials. When the
+    // Keychain has a valid login, heal the profile with it.
+    if (profileDir) {
+      const keychainAuth = readAntigravityAuth();
+      const kcToken = keychainAuth?.token;
+      if (kcToken) {
+        const kcAccessToken = kcToken.access_token || "";
+        const kcExpiry = kcToken.expiry || kcToken.expires_at;
+        if (!forceRefresh && isValidAccessToken(kcAccessToken, kcExpiry)) {
+          try { writeAntigravityAuth(keychainAuth, profileDir); } catch {}
+          return kcAccessToken;
+        }
+        const kcRefreshed = await this.refreshAntigravityToken(undefined);
+        if (kcRefreshed) {
+          try {
+            const updated = readAntigravityAuth();
+            if (updated) writeAntigravityAuth(updated, profileDir);
+          } catch {}
+          return kcRefreshed;
+        }
+        if (!forceRefresh && isStillUsableAccessToken(kcAccessToken, kcExpiry)) {
+          return kcAccessToken;
+        }
+      }
+    }
+
+    return null;
   }
 
   public static getClaudeApiKey(): string | null {

@@ -143,3 +143,64 @@ if (process.argv[2] === "unarchive") {
     await fs.rm(dataDir, { recursive: true, force: true });
   }
 });
+
+test("native rollout repair and database repair heal third-party models to opencodex provider", async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "opencodex-tp-provider-repair-"));
+  const previousCodexHome = process.env.OPENCODEX_CODEX_HOME;
+  process.env.OPENCODEX_CODEX_HOME = codexHome;
+  const dbPath = path.join(codexHome, "state_5.sqlite");
+  const rolloutPath = path.join(codexHome, "sessions", "2026", "09", "05", "rollout-gpt.jsonl");
+  const thirdPartyRolloutPath = path.join(codexHome, "sessions", "2026", "09", "05", "rollout-thirdparty.jsonl");
+
+  const schema = `
+    CREATE TABLE threads (
+      id TEXT PRIMARY KEY,
+      rollout_path TEXT NOT NULL,
+      model_provider TEXT NOT NULL,
+      model TEXT
+    );
+  `;
+  const sqlQuote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+
+  try {
+    await fs.mkdir(path.dirname(rolloutPath), { recursive: true });
+    // Write official model rollout with openai provider
+    await fs.writeFile(rolloutPath, [
+      { type: "session_meta", payload: { id: "thread-gpt", model_provider: "openai", model: "gpt-5.6-luna" } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n", { mode: 0o600 });
+
+    // Write third-party model rollout that was incorrectly stamped with openai provider
+    await fs.writeFile(thirdPartyRolloutPath, [
+      { type: "session_meta", payload: { id: "thread-tp", model_provider: "openai", model: "antigravity/gemini-3.8-flash-high" } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hello tp" }] } },
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n", { mode: 0o600 });
+
+    // Create sqlite DB with both threads
+    execFileSync("sqlite3", [dbPath, schema], { stdio: "pipe" });
+    execFileSync("sqlite3", [dbPath, `INSERT INTO threads (id, rollout_path, model_provider, model) VALUES ('thread-gpt', ${sqlQuote(rolloutPath)}, 'openai', 'gpt-5.6-luna');`], { stdio: "pipe" });
+    execFileSync("sqlite3", [dbPath, `INSERT INTO threads (id, rollout_path, model_provider, model) VALUES ('thread-tp', ${sqlQuote(thirdPartyRolloutPath)}, 'openai', 'antigravity/gemini-3.8-flash-high');`], { stdio: "pipe" });
+
+    // Run repair
+    assert.equal(repairNativeRollouts(), 1);
+
+    // Verify rollout file for official model stayed openai
+    const gptRecords = (await fs.readFile(rolloutPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(gptRecords[0].payload.model_provider, "openai");
+
+    // Verify third-party rollout file was repaired to opencodex
+    const tpRecords = (await fs.readFile(thirdPartyRolloutPath, "utf8")).trim().split("\n").map((l) => JSON.parse(l));
+    assert.equal(tpRecords[0].payload.model_provider, "opencodex");
+
+    // Verify sqlite threads: official stayed openai, third-party healed to opencodex
+    const rows = JSON.parse(execFileSync("sqlite3", ["-json", dbPath, "SELECT id, model_provider, model FROM threads;"], { encoding: "utf8" }));
+    const gptRow = rows.find((r) => r.id === "thread-gpt");
+    const tpRow = rows.find((r) => r.id === "thread-tp");
+    assert.equal(gptRow?.model_provider, "openai");
+    assert.equal(tpRow?.model_provider, "opencodex");
+  } finally {
+    if (previousCodexHome === undefined) delete process.env.OPENCODEX_CODEX_HOME;
+    else process.env.OPENCODEX_CODEX_HOME = previousCodexHome;
+    await fs.rm(codexHome, { recursive: true, force: true });
+  }
+});

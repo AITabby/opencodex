@@ -769,6 +769,7 @@ export class CatalogSyncService {
           context_window: explicitContext,
           max_context_window: explicitContext,
           context_window_source: "provider_metadata",
+          ...(registry?.limit ? { limit: { ...registry.limit, context: explicitContext } } : {}),
         }
         : registryContext
           ? {
@@ -802,7 +803,10 @@ export class CatalogSyncService {
     for (const model of Array.isArray(existingModels) ? existingModels : []) {
       const slug = String(model?.slug || "").trim();
       if (!slug || !isNativeCodexCacheModel(model)) continue;
-      next.set(slug, model);
+      next.set(slug, {
+        ...model,
+        supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
+      });
     }
 
     for (const model of Array.isArray(catalogModels) ? catalogModels : []) {
@@ -810,6 +814,7 @@ export class CatalogSyncService {
       if (!slug || isNativeCodexCacheModel(model)) continue;
       next.set(slug, withComputerUseCatalogInstructions(applyDefaultReasoningCapabilities({
         ...model,
+        supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
         provider: "opencodex",
         model_provider: "opencodex",
       })));
@@ -856,7 +861,12 @@ export class CatalogSyncService {
       const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
       if (!Array.isArray(cache.models)) return false;
 
-      cache.models = cache.models.filter((model: any) => isNativeCodexCacheModel(model));
+      cache.models = cache.models
+        .filter((model: any) => isNativeCodexCacheModel(model))
+        .map((model: any) => ({
+          ...model,
+          supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
+        }));
       fs.writeFileSync(cachePath, JSON.stringify(cache, null, 2), "utf-8");
       return true;
     } catch (error: any) {
@@ -875,7 +885,12 @@ export class CatalogSyncService {
       try {
         const raw = execFileSync("/Applications/ChatGPT.app/Contents/Resources/codex", ["debug", "models"], { stdio: ["ignore", "pipe", "ignore"] }).toString();
         const json = JSON.parse(raw);
-        return (json.models || []).filter((m: any) => m.slug !== "codex-auto-review");
+        return (json.models || [])
+          .filter((m: any) => m.slug !== "codex-auto-review")
+          .map((m: any) => ({
+            ...m,
+            supports_parallel_tool_calls: m?.supports_parallel_tool_calls ?? true,
+          }));
       } finally {
         writePrivateTextFile(configPath, backup);
       }
@@ -1176,12 +1191,16 @@ export class CatalogSyncService {
       const officialModels = CatalogSyncService.getOfficialModels();
       for (const off of officialModels) {
         if (!modelsMap.has(off.slug.toLowerCase())) {
-          modelsMap.set(off.slug.toLowerCase(), off);
+          modelsMap.set(off.slug.toLowerCase(), {
+            ...off,
+            supports_parallel_tool_calls: off?.supports_parallel_tool_calls ?? true,
+          });
         }
       }
 
       const catalogModels = Array.from(modelsMap.values()).map(m => ({
         ...m,
+        supports_parallel_tool_calls: m?.supports_parallel_tool_calls ?? true,
         supports_reasoning_summaries: m.supports_reasoning_summaries ?? true,
         reasoning_summary_format: m.reasoning_summary_format ?? "none"
       }));

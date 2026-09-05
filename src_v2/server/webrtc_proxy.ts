@@ -11,7 +11,11 @@ import path from "node:path";
 import { URL } from "node:url";
 import WebSocket, { WebSocketServer } from "ws";
 
-const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
+function codexAuthPath(): string {
+  const custom = process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME;
+  if (custom) return path.join(custom, "auth.json");
+  return path.join(os.homedir(), ".codex", "auth.json");
+}
 
 function accountPoolProfileRoot(): string {
   return path.join(process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"), "chatgpt-accounts");
@@ -64,12 +68,35 @@ export type NativeAccountCredential = {
   upstreamId: string;
 };
 
+function accountPoolAccountsPath(): string {
+  return path.join(process.env.OPENCODEX_DATA_DIR || path.join(os.homedir(), ".opencodex"), "chatgpt_accounts.json");
+}
+
+function isAccountEligible(accountIdOrDir: string): boolean {
+  try {
+    const registryPath = accountPoolAccountsPath();
+    if (!fs.existsSync(registryPath)) return true;
+    const data = JSON.parse(fs.readFileSync(registryPath, "utf8"));
+    const accounts = Array.isArray(data?.accounts) ? data.accounts : [];
+    const normalized = path.basename(accountIdOrDir);
+    const found = accounts.find((acc: any) => acc.id === normalized || path.basename(acc.profile_dir || "") === normalized);
+    if (found) {
+      if (found.enabled === false || found.needs_reauth === true) return false;
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function configuredFixedAccountId(): string {
   try {
     const settings = JSON.parse(fs.readFileSync(accountPoolSettingsPath(), "utf8"));
     if (settings?.rotation_enabled !== true || settings?.mode !== "fixed") return "";
     const accountId = typeof settings?.default_account_id === "string" ? settings.default_account_id.trim() : "";
-    return accountId && !/[^a-zA-Z0-9._-]/.test(accountId) ? accountId : "";
+    if (!accountId || /[^a-zA-Z0-9._-]/.test(accountId)) return "";
+    if (!isAccountEligible(accountId)) return "";
+    return accountId;
   } catch {
     return "";
   }
@@ -90,6 +117,7 @@ function readAccountPoolCredential(accountId: string): NativeAccountCredential {
     return { token: "", upstreamId: "" };
   }
   for (const profile of candidates) {
+    if (!isAccountEligible(profile)) continue;
     try {
       const auth = JSON.parse(fs.readFileSync(path.join(profile, "auth.json"), "utf8"));
       const profileAccountId = typeof auth?.tokens?.account_id === "string" ? auth.tokens.account_id.trim() : "";
@@ -112,7 +140,7 @@ export function readNativeAccountCredential(accountId = "", requireExactAccount 
   // while authenticating the session as a different account.
   if (requested && requireExactAccount) return { token: "", upstreamId: "" };
   try {
-    const auth = JSON.parse(fs.readFileSync(CODEX_AUTH_PATH, "utf-8"));
+    const auth = JSON.parse(fs.readFileSync(codexAuthPath(), "utf-8"));
     return {
       token: typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token.trim() : "",
       upstreamId: typeof auth?.tokens?.account_id === "string" ? auth.tokens.account_id.trim() : "",

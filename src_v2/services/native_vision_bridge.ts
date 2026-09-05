@@ -84,7 +84,11 @@ function headerValue(headers: Record<string, string>, name: string): string {
   return "";
 }
 
-const CODEX_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
+function codexAuthPath(): string {
+  const codexHome = cleanString(process.env.OPENCODEX_CODEX_HOME || process.env.CODEX_HOME)
+    || path.join(os.homedir(), ".codex");
+  return path.join(codexHome, "auth.json");
+}
 
 function copyHeadersWithOfficialCredential(
   nativeHeaders: Record<string, string>,
@@ -182,7 +186,7 @@ function nativeVisionHeaderCandidates(nativeHeaders: Record<string, string>): Re
   add(headersFromOfficialAccountPool(nativeHeaders));
   add(nativeHeaders);
 
-  const globalCredential = readOfficialCredential(CODEX_AUTH_PATH);
+  const globalCredential = readOfficialCredential(codexAuthPath());
   if (globalCredential) {
     add(copyHeadersWithOfficialCredential(nativeHeaders, globalCredential.token, globalCredential.upstreamId));
   }
@@ -227,7 +231,7 @@ export function nativeVisionAuthorizationFingerprint(nativeHeaders: Record<strin
         });
       let globalAuth = [0, 0];
       try {
-        const stat = fs.statSync(CODEX_AUTH_PATH);
+        const stat = fs.statSync(codexAuthPath());
         globalAuth = [stat.mtimeMs, stat.size];
       } catch {
         // The pool may be usable even when the global native auth file is absent.

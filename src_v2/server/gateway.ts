@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { GatewayRouter, type GatewaySubagentDispatchCall, type GatewaySubagentDispatchContext, type GatewaySubagentDispatchResult } from "./router.js";
 import { clearProviderModelSelections, CredentialStore } from "../services/credential_store.js";
 import { RequestDecompressor } from "../core/decompressor.js";
-import { isNativeControlPlaneModel } from "../core/model_identity.js";
+import { isNativeControlPlaneModel, isOfficialModelSlug } from "../core/model_identity.js";
 import { applyDefaultReasoningCapabilities, CatalogSyncService, buildFullCatalogEntry, getDefaultReasoningPresets } from "../services/catalog_sync.js";
 import { SubscriptionAuthService } from "../services/subscription_auth.js";
 import { fetchCursorModels } from "../services/cursor_protocol.js";
@@ -487,7 +487,7 @@ export function buildManagedCodexConfig(
   // assigns provider-owned models to opencodex at the thread/turn boundary;
   // making the gateway the global default hides native history whenever the
   // Desktop client is not yet attached to the bridge.
-  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\n# <<< opencodex managed >>>\n`;
+  const managedTop = `# >>> opencodex managed >>>\nmodel_catalog_json = "${catalogPath}"\nmodel_provider = "openai"\ncheck_for_update_on_startup = false\n# <<< opencodex managed >>>\n`;
   const managedProvider = `\n# >>> opencodex managed >>>\n[model_providers.opencodex]\nname = "CodexSplit"\nbase_url = "http://127.0.0.1:${port}/v1"\nwire_api = "responses"\nrequires_openai_auth = true\nexperimental_bearer_token = "${adminToken}"\nrequest_max_retries = 3\nstream_max_retries = 3\nstream_idle_timeout_ms = 600000\n# <<< opencodex managed >>>\n`;
   return `${managedTop}\n${preserved}\n${managedProvider}`;
 }
@@ -835,6 +835,32 @@ function nativeCodexExecutablePath(): string {
     "/Applications/Codex.app/Contents/Resources/codex",
   ].filter(Boolean);
   return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile()) || "";
+}
+
+function ensureCliBridgeSymlink(): void {
+  try {
+    const runtimeDir = path.dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      path.join(runtimeDir, "..", "opencodex-codex"),
+      path.join(runtimeDir, "opencodex-codex"),
+      path.join(process.cwd(), "dist", "opencodex-codex"),
+    ];
+    const target = candidates.find((c) => {
+      try { return fs.existsSync(c) && fs.statSync(c).isFile(); } catch { return false; }
+    });
+    if (!target) return;
+    const localBinDir = path.join(os.homedir(), ".local", "bin");
+    const codexBin = path.join(localBinDir, "codex");
+    fs.mkdirSync(localBinDir, { recursive: true, mode: 0o755 });
+    try {
+      if (fs.lstatSync(codexBin).isSymbolicLink()) {
+        const currentTarget = fs.readlinkSync(codexBin);
+        if (currentTarget === target) return;
+        fs.unlinkSync(codexBin);
+      }
+    } catch {}
+    fs.symlinkSync(target, codexBin);
+  } catch {}
 }
 
 function launchctlEnvironmentValue(name: string): string {
@@ -1542,7 +1568,12 @@ function readOfficialModelMap(): Map<string, any> {
   try {
     const cache = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
     for (const model of Array.isArray(cache.models) ? cache.models : []) {
-      if (isOfficialCachedModel(model)) official.set(catalogModelSlug(model).toLowerCase(), model);
+      if (isOfficialCachedModel(model)) {
+        official.set(catalogModelSlug(model).toLowerCase(), {
+          ...model,
+          supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
+        });
+      }
     }
   } catch {}
 
@@ -1552,7 +1583,12 @@ function readOfficialModelMap(): Map<string, any> {
   if (official.size === 0) {
     for (const model of CatalogSyncService.getOfficialModels()) {
       const slug = catalogModelSlug(model).toLowerCase();
-      if (slug && slug !== "codex-auto-review") official.set(slug, model);
+      if (slug && slug !== "codex-auto-review") {
+        official.set(slug, {
+          ...model,
+          supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
+        });
+      }
     }
   }
   return official;
@@ -1790,7 +1826,10 @@ export function preserveOfficialModels(catalog: any): void {
 
   // Official native entries are deliberately first; the web endpoint filters
   // them out, while the desktop client receives them before third-party ones.
-  catalog.models = [...officialMap.values(), ...ownerless, ...thirdParty];
+  catalog.models = [...officialMap.values(), ...ownerless, ...thirdParty].map((model: any) => ({
+    ...model,
+    supports_parallel_tool_calls: model?.supports_parallel_tool_calls ?? true,
+  }));
 }
 
 
@@ -1918,7 +1957,20 @@ function normalizeStoredFunctionCallId(record: any): boolean {
  * deleting those would damage a normal GPT rollout, so the V2 pattern also
  * requires the null encrypted_content that this gateway emitted.
  */
+export function repairDatabaseThreads(): void {
+  try {
+    const dbPath = path.join(codexHomeDir(), "state_5.sqlite");
+    if (fs.existsSync(dbPath)) {
+      execFileSync("sqlite3", [
+        dbPath,
+        "UPDATE threads SET model_provider = 'opencodex' WHERE model_provider != 'opencodex' AND (model LIKE '%/%' OR model LIKE '%gemini%' OR model LIKE '%minimax%' OR model LIKE '%claude%' OR model LIKE '%deepseek%' OR model LIKE '%qwen%');",
+      ], { stdio: "ignore" });
+    }
+  } catch {}
+}
+
 export function repairNativeRollouts(): number {
+  repairDatabaseThreads();
   const roots = [
     path.join(codexHomeDir(), "sessions"),
     path.join(codexHomeDir(), "archived_sessions"),
@@ -1939,6 +1991,13 @@ export function repairNativeRollouts(): number {
     let changed = false;
     for (const record of records) {
       if (normalizeStoredFunctionCallId(record)) changed = true;
+      if (record?.type === "session_meta" && record.payload?.model_provider === "openai") {
+        const model = record.payload?.model || record.payload?.provenance?.model;
+        if (model && !isOfficialModelSlug(String(model))) {
+          record.payload.model_provider = "opencodex";
+          changed = true;
+        }
+      }
     }
 
     const sanitized = records.filter((record) => {
@@ -1973,6 +2032,7 @@ export function repairNativeRollouts(): number {
  * change does not block the gateway's HTTP event loop.
  */
 export async function repairNativeRolloutsAsync(): Promise<number> {
+  repairDatabaseThreads();
   const roots = [
     path.join(codexHomeDir(), "sessions"),
     path.join(codexHomeDir(), "archived_sessions"),
@@ -2005,6 +2065,13 @@ export async function repairNativeRolloutsAsync(): Promise<number> {
     let changed = false;
     for (const record of records) {
       if (normalizeStoredFunctionCallId(record)) changed = true;
+      if (record?.type === "session_meta" && record.payload?.model_provider === "openai") {
+        const model = record.payload?.model || record.payload?.provenance?.model;
+        if (model && !isOfficialModelSlug(String(model))) {
+          record.payload.model_provider = "opencodex";
+          changed = true;
+        }
+      }
     }
 
     const sanitized = records.filter((record) => {
@@ -3702,10 +3769,32 @@ export class CodexBridgeServer {
         transport: "node_https",
         signal: effectiveSignal,
       });
-      const responseHeaders = copySafeResponseHeaders(upstreamRes.headers);
-      res.writeHead(upstreamRes.status, responseHeaders);
-      if (upstreamRes.body) {
-        const reader = upstreamRes.body.getReader();
+      let activeRes = upstreamRes;
+      if (activeRes.status === 401) {
+        const freshAuth = readNativeAccountCredential();
+        const currentBearer = (forwardHeaders.authorization || "").replace(/^Bearer\s+/i, "").trim();
+        if (freshAuth.token && freshAuth.token !== currentBearer) {
+          const retryHeaders = { ...forwardHeaders, authorization: `Bearer ${freshAuth.token}` };
+          if (freshAuth.upstreamId) retryHeaders["chatgpt-account-id"] = freshAuth.upstreamId;
+          try {
+            const retryRes = await fetchUpstream(targetUrl, {
+              method: "POST",
+              headers: retryHeaders,
+              body: requestBody as any,
+              maxAttempts: 2,
+              timeoutMs: 600_000,
+              operation: endpoint === "responses" ? "native-responses-auth-retry" : "native-responses-compact-auth-retry",
+              transport: "node_https",
+              signal: effectiveSignal,
+            });
+            activeRes = retryRes;
+          } catch {}
+        }
+      }
+      const responseHeaders = copySafeResponseHeaders(activeRes.headers);
+      res.writeHead(activeRes.status, responseHeaders);
+      if (activeRes.body) {
+        const reader = activeRes.body.getReader();
         try {
           while (true) {
             const result = await readWithAbortAndTimeout(
@@ -4307,6 +4396,11 @@ export class CodexBridgeServer {
       }, 2000);
       delayedCatalogSync.unref?.();
     }
+    ensureCliBridgeSymlink();
+    const cliBridgeTimer = setInterval(() => {
+      ensureCliBridgeSymlink();
+    }, 60000);
+    cliBridgeTimer.unref?.();
     // Desktop launch mode is an explicit user action. Starting or restarting
     // the gateway alone must never kill or relaunch ChatGPT/Codex.
     return new Promise(async (resolve, reject) => {
